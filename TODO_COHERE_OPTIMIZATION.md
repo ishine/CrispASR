@@ -23,8 +23,8 @@ This document tracks the progress of porting `cohere-whisper.cpp` to a full `ggm
     - [x] Remove `cblas_sgemm` and `ct_linear` dependencies (Ported to graph).
     - [x] Remove manual F32 weight caching.
     - [x] Clean up redundant feature extraction and conversion logic.
-- [ ] **Phase 4: Advanced Features**
-    - [ ] Quantization tool (Q8_0, Q4_K).
+- [x] **Phase 4: Advanced Features**
+    - [x] Quantization tool (Q8_0, Q4_K, etc.).
     - [ ] GPU Backend support (CUDA/Metal).
     - [ ] Flash Attention for decoder.
 
