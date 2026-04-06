@@ -298,18 +298,33 @@ make -j$(nproc) cohere-main
 
 ---
 
-## Comparison with Reference Implementations
+## Comparison with Reference Implementations (45s audio, same machine)
 
-| Implementation | Speed (11s audio) | Notes |
-|----------------|------------------|-------|
-| ONNX int8 CPU | ~1–2s | int8 encoder + F32 decoder |
-| PyTorch F16 GPU | ~0.3s | A100 / RTX 3090 |
-| Rust (cpu, no simd) | ~90–180s | pure Rust, no BLAS |
-| **Ours (baseline)** | **~825s** | naive DFT + scalar GEMM |
-| **Ours (P1+P2A+P3, measured)** | **104s** | FFTW3f + OpenBLAS + cross KV |
-| **Ours (+ ggml graph P2B, F16)** | **~12.4s** | ~67× total |
-| **Ours (+ BN folding, F16)** | **~11.5s** | ~72× total |
-| **Ours (Q8_0)** | **~10.8s** | RTF 1.02× |
-| **Ours (Q4_K)** | **~9.6s** | **RTF 1.15×** — real-time on CPU |
-| **Ours (ggml + GPU, est.)** | **~0.3–1s** | stretch goal |
+| Implementation | Enc | Dec | Total (inf) | RTF | Notes |
+|----------------|-----|-----|-------------|-----|-------|
+| ONNX INT8 (Tristan) | 19.5s | 11.7s | **31.2s** | 1.44× | DNNL AVX-512 INT8 GEMM |
+| ONNX INT4 | 22.5s | 12.7s | 35.2s | 1.28× | INT4 weight-only quant |
+| **Ours F16** | 49.1s | **4.1s** | 53.5s | 0.84× | ggml AVX-512 F16 GEMM |
+| **Ours Q8_0** | 51.2s | **4.3s** | 55.8s | 0.81× | ggml AVX2 Q8 (slower — no AVX-512 in quants.c) |
+| **Ours Q4_K** | 42.1s | **3.1s** | **45.4s** | **0.99×** | near real-time |
+| PyTorch F16 GPU | — | — | ~1–2s | ~25× | A100 / RTX 3090 |
+| Ours (GPU/Metal, est.) | — | — | ~1–3s | ~15-45× | blocked on Metal test |
+
+### Root cause of encoder gap (2.5× slower than ONNX INT8)
+
+1. **DNNL uses AVX-512 INT8 GEMM** — `VPMADDUBSW` accumulates INT8 pairs in INT16, giving 2× higher throughput/cycle vs FP32. Our ggml `quants.c.o` has **0 zmm instructions** (AVX2 only). Our `repack.cpp.o` has 4744 zmm (F16 uses AVX-512), but Q8_0 doesn't.
+
+2. **INT8 = ½ memory bandwidth of F16** — DNNL loads 1 byte/weight vs our 2 bytes. For these matrix sizes (~6.5 MB weight per layer), memory bandwidth dominates.
+
+3. **Why Q8_0 is SLOWER than F16 on our system**: Q8_0 uses AVX2 `quants.c` path; F16 uses AVX-512 `repack.cpp` path. INT8 memory advantage (+1×) is completely eaten by AVX2 vs AVX-512 SIMD downgrade (−2×). Net: Q8_0 slower.
+
+4. **Threading is already optimal**: default ggml uses 4 threads without any explicit call. `COHERE_THREADS` override disrupts the warm threadpool. Threading gives 3.4× over single-thread (85% efficiency) but ONNX is 2.5× faster per-thread anyway.
+
+### Decoder advantage: we are 2.8–3.8× FASTER than ONNX
+
+ONNX passes full KV cache arrays (~268 MB) in and out of Python→ONNX→Python every decode step. For 167 tokens that's 45 GB of unnecessary data shuffling. Our ggml in-place KV cache with tensor views moves zero data. This advantage grows with sequence length.
+
+### The fix: Metal (GPU)
+
+There is no CPU path to close the 2.5× encoder gap without implementing AVX-512 INT8 GEMM in ggml's `quants.c` (a major upstream contribution). On Metal/Apple Silicon, F16 GEMM runs on GPU shader units at ~10-30× this CPU — the ONNX comparison becomes irrelevant.
 | **Ours (ggml + GPU, est.)** | **~0.3–1s** | stretch goal |
