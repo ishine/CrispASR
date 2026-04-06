@@ -42,32 +42,116 @@
 static bool cohere_debug_enabled(void) {
     static bool init = false;
     static bool enabled = false;
-    if (!init) {
-        enabled = getenv("COHERE_DEBUG") != nullptr;
-        init = true;
-    }
+    if (!init) { enabled = getenv("COHERE_DEBUG") != nullptr; init = true; }
+    return enabled;
+}
+
+static bool cohere_bench_enabled(void) {
+    static bool init = false;
+    static bool enabled = false;
+    if (!init) { enabled = getenv("COHERE_BENCH") != nullptr; init = true; }
     return enabled;
 }
 
 static void cohere_debug(const char * fmt, ...) {
     if (!cohere_debug_enabled()) return;
-    va_list args;
-    va_start(args, fmt);
-    vprintf(fmt, args);
-    va_end(args);
+    va_list args; va_start(args, fmt); vprintf(fmt, args); va_end(args);
     fflush(stdout);
 }
 
 static void cohere_log_tensor(const char * name, const struct ggml_tensor * t) {
     if (!cohere_debug_enabled()) return;
-    if (!t) {
-        cohere_debug("%-25s: NULL\n", name);
-        return;
-    }
+    if (!t) { cohere_debug("%-25s: NULL\n", name); return; }
     cohere_debug("%-25s: shape [%4ld, %4ld, %4ld, %4ld] type %d\n",
         name,
         (long)t->ne[0], (long)t->ne[1], (long)t->ne[2], (long)t->ne[3],
         (int)t->type);
+}
+
+// ---------------------------------------------------------------------------
+// Performance counters — accumulated per cohere_transcribe() call
+// ---------------------------------------------------------------------------
+
+struct cohere_perf {
+    int64_t t_features_us    = 0; // STFT + mel filterbank
+    int64_t t_enc_build_us   = 0; // encoder graph construction
+    int64_t t_enc_alloc_us   = 0; // encoder ggml_backend_sched_alloc_graph
+    int64_t t_enc_compute_us = 0; // encoder ggml_backend_sched_graph_compute
+    int64_t t_cross_kv_us    = 0; // copying cross-KV tensors from encoder output
+    int64_t t_dec_build_us   = 0; // decoder graph build (all steps summed)
+    int64_t t_dec_alloc_us   = 0; // decoder sched alloc (all steps summed)
+    int64_t t_dec_compute_us = 0; // decoder compute (all steps summed)
+    int64_t t_dec_logits_us  = 0; // decoder ggml_backend_tensor_get logits (all steps)
+    int64_t t_dec_step_min_us = INT64_MAX;
+    int64_t t_dec_step_max_us = 0;
+    int     n_dec_steps       = 0; // total autoregressive steps (prompt + generated)
+    int64_t t_total_us        = 0; // wall time for entire cohere_transcribe()
+    // Graph sizes
+    int enc_n_nodes           = 0;
+    int dec_n_nodes_prompt    = 0; // first decode call (full prompt batch)
+    int dec_n_nodes_step      = 0; // subsequent calls (n_tok=1)
+    // Memory (bytes, snapshot after init / after cross-kv alloc)
+    size_t mem_model_buf      = 0;
+    size_t mem_kv_buf         = 0;
+    size_t mem_cross_kv_buf   = 0;
+    size_t mem_sched_buf      = 0;
+    size_t mem_compute_meta   = 0;
+};
+
+static void cohere_perf_reset(cohere_perf & p) {
+    p = cohere_perf{};
+}
+
+static void cohere_perf_print(const cohere_perf & p, int n_samples, int sample_rate) {
+    double audio_sec = (double)n_samples / sample_rate;
+    double total_sec = p.t_total_us / 1e6;
+    double rtf       = (total_sec > 0) ? (audio_sec / total_sec) : 0.0;
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "cohere: =========== performance report ===========\n");
+    fprintf(stderr, "cohere:  audio            %.2f s\n", audio_sec);
+    fprintf(stderr, "cohere:  total wall       %7.1f ms   (%.3f× real-time)\n",
+            p.t_total_us / 1e3, rtf);
+    fprintf(stderr, "cohere: ----- feature extraction -----\n");
+    fprintf(stderr, "cohere:  features         %7.1f ms\n", p.t_features_us / 1e3);
+    fprintf(stderr, "cohere: ----- encoder -----\n");
+    fprintf(stderr, "cohere:  enc graph build  %7.1f ms   nodes=%d\n",
+            p.t_enc_build_us / 1e3, p.enc_n_nodes);
+    fprintf(stderr, "cohere:  enc sched alloc  %7.1f ms\n", p.t_enc_alloc_us / 1e3);
+    fprintf(stderr, "cohere:  enc compute      %7.1f ms\n", p.t_enc_compute_us / 1e3);
+    fprintf(stderr, "cohere:  cross-kv copy    %7.1f ms\n", p.t_cross_kv_us / 1e3);
+    fprintf(stderr, "cohere:  enc total        %7.1f ms\n",
+            (p.t_enc_build_us + p.t_enc_alloc_us + p.t_enc_compute_us + p.t_cross_kv_us) / 1e3);
+    fprintf(stderr, "cohere: ----- decoder (%d steps) -----\n", p.n_dec_steps);
+    if (p.n_dec_steps > 0) {
+        double dprompt = p.dec_n_nodes_prompt;
+        double dstep   = p.dec_n_nodes_step;
+        fprintf(stderr, "cohere:  dec graph build  %7.1f ms   %.2f ms/step  (nodes: prompt=%d step=%d)\n",
+                p.t_dec_build_us / 1e3,
+                p.t_dec_build_us / 1e3 / p.n_dec_steps,
+                p.dec_n_nodes_prompt, p.dec_n_nodes_step);
+        (void)dprompt; (void)dstep;
+        fprintf(stderr, "cohere:  dec sched alloc  %7.1f ms   %.2f ms/step\n",
+                p.t_dec_alloc_us / 1e3,
+                p.t_dec_alloc_us / 1e3 / p.n_dec_steps);
+        fprintf(stderr, "cohere:  dec compute      %7.1f ms   %.2f ms/step  min=%.2f max=%.2f\n",
+                p.t_dec_compute_us / 1e3,
+                p.t_dec_compute_us / 1e3 / p.n_dec_steps,
+                (p.t_dec_step_min_us == INT64_MAX ? 0 : p.t_dec_step_min_us) / 1e3,
+                p.t_dec_step_max_us / 1e3);
+        fprintf(stderr, "cohere:  dec logits get   %7.1f ms   %.2f ms/step\n",
+                p.t_dec_logits_us / 1e3,
+                p.t_dec_logits_us / 1e3 / p.n_dec_steps);
+        fprintf(stderr, "cohere:  dec total        %7.1f ms\n",
+                (p.t_dec_build_us + p.t_dec_alloc_us + p.t_dec_compute_us + p.t_dec_logits_us) / 1e3);
+    }
+    fprintf(stderr, "cohere: ----- memory -----\n");
+    fprintf(stderr, "cohere:  model weights    %7.1f MiB\n", p.mem_model_buf  / 1048576.0);
+    fprintf(stderr, "cohere:  kv cache         %7.1f MiB\n", p.mem_kv_buf     / 1048576.0);
+    fprintf(stderr, "cohere:  cross-kv cache   %7.1f MiB\n", p.mem_cross_kv_buf / 1048576.0);
+    fprintf(stderr, "cohere:  sched buf        %7.1f MiB\n", p.mem_sched_buf  / 1048576.0);
+    fprintf(stderr, "cohere:  compute_meta     %7.1f KiB\n", p.mem_compute_meta / 1024.0);
+    fprintf(stderr, "cohere: ================================================\n\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +349,9 @@ struct cohere_context {
     // Cached decoder graph for n_tokens=1
     struct ggml_cgraph * gf_decode_1 = nullptr;
     int cached_offset_1 = -1;
+
+    // Performance counters (reset at start of each cohere_transcribe())
+    cohere_perf perf;
 };
 
 static void cohere_log_tensor(const char * name, const struct ggml_tensor * t);
@@ -354,7 +441,8 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
 
         // FF1
         struct ggml_tensor * ff1 = ggml_norm(ctx0, cur, 1e-5f);
-        ff1 = ggml_add(ctx0, ggml_mul(ctx0, ff1, layer.ff1_norm_w), layer.ff1_norm_b);
+        ff1 = ggml_mul_inplace(ctx0, ff1, layer.ff1_norm_w);
+        ff1 = ggml_add_inplace(ctx0, ff1, layer.ff1_norm_b);
         ff1 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff1_up_w, ff1), layer.ff1_up_b);
         ff1 = ggml_silu_inplace(ctx0, ff1);
         ff1 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff1_dn_w, ff1), layer.ff1_dn_b);
@@ -363,12 +451,13 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
         struct ggml_tensor * inpAtn = cur;
 
         // Self-Attention
-        struct ggml_tensor * attn = ggml_norm(ctx0, cur, 1e-5f);
-        attn = ggml_add(ctx0, ggml_mul(ctx0, attn, layer.attn_norm_w), layer.attn_norm_b);
+        cur = ggml_norm(ctx0, cur, 1e-5f);
+        cur = ggml_mul_inplace(ctx0, cur, layer.attn_norm_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.attn_norm_b);
         
-        struct ggml_tensor * Q = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_q_w, attn), layer.attn_q_b);
-        struct ggml_tensor * K = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_k_w, attn), layer.attn_k_b);
-        struct ggml_tensor * V = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_v_w, attn), layer.attn_v_b);
+        struct ggml_tensor * Q = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_q_w, cur), layer.attn_q_b);
+        struct ggml_tensor * K = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_k_w, cur), layer.attn_k_b);
+        struct ggml_tensor * V = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_v_w, cur), layer.attn_v_b);
         
         struct ggml_tensor * R = ggml_mul_mat(ctx0, layer.attn_pos_w, pos_enc); // [d, 2T-1]
         
@@ -415,11 +504,12 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
         struct ggml_tensor * inpCnv = cur;
 
         // Convolution module
-        struct ggml_tensor * cnv = ggml_norm(ctx0, cur, 1e-5f);
-        cnv = ggml_add(ctx0, ggml_mul(ctx0, cnv, layer.conv_norm_w), layer.conv_norm_b);
+        cur = ggml_norm(ctx0, cur, 1e-5f);
+        cur = ggml_mul_inplace(ctx0, cur, layer.conv_norm_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.conv_norm_b);
         
         struct ggml_tensor * pw1_w = ggml_reshape_2d(ctx0, layer.conv_pw1_w, d, 2 * d);
-        cnv = ggml_add(ctx0, ggml_mul_mat(ctx0, pw1_w, cnv), layer.conv_pw1_b);
+        struct ggml_tensor * cnv = ggml_add(ctx0, ggml_mul_mat(ctx0, pw1_w, cur), layer.conv_pw1_b);
 
         struct ggml_tensor * cnv_gate = ggml_view_2d(ctx0, cnv, d, T, cnv->nb[1], d * sizeof(float));
         cnv = ggml_mul(ctx0, 
@@ -463,7 +553,8 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
 
         // FF2
         struct ggml_tensor * ff2 = ggml_norm(ctx0, cur, 1e-5f);
-        ff2 = ggml_add(ctx0, ggml_mul(ctx0, ff2, layer.ff2_norm_w), layer.ff2_norm_b);
+        ff2 = ggml_mul_inplace(ctx0, ff2, layer.ff2_norm_w);
+        ff2 = ggml_add_inplace(ctx0, ff2, layer.ff2_norm_b);
         ff2 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff2_up_w, ff2), layer.ff2_up_b);
         ff2 = ggml_silu_inplace(ctx0, ff2);
         ff2 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff2_dn_w, ff2), layer.ff2_dn_b);
@@ -471,7 +562,8 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
 
         // Final output norm for the layer
         cur = ggml_norm(ctx0, cur, 1e-5f);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.out_norm_w), layer.out_norm_b);
+        cur = ggml_mul_inplace(ctx0, cur, layer.out_norm_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.out_norm_b);
     }
 
     // Encoder-decoder projection
@@ -982,17 +1074,18 @@ static struct ggml_cgraph * cohere_build_graph_decoder(
     cohere_log_tensor("input_embd", cur);
 
     // emb_ln
-    cur = ggml_norm(ctx0, cur, 1e-5f);
-    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.dec_emb_ln_w), model.dec_emb_ln_b);
+        cur = ggml_norm(ctx0, cur, 1e-5f);
+        cur = ggml_mul_inplace(ctx0, cur, model.dec_emb_ln_w);
+        cur = ggml_add_inplace(ctx0, cur, model.dec_emb_ln_b);
     cohere_log_tensor("emb_ln", cur);
 
     for (int il = 0; il < hp.dec_n_layers; il++) {
         const auto & layer = model.dec_layers[il];
         struct ggml_tensor * inpL = cur;
 
-        // self-attention norm
         cur = ggml_norm(ctx0, inpL, 1e-5f);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_w), layer.attn_ln_b);
+        cur = ggml_mul_inplace(ctx0, cur, layer.attn_ln_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.attn_ln_b);
 
         // self-attention Q, K, V
         struct ggml_tensor * Qcur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_q_w, cur), layer.attn_q_b);
@@ -1060,7 +1153,8 @@ KQ = ggml_soft_max_inplace(ctx0, KQ);
 
         // cross-attention
         cur = ggml_norm(ctx0, inpCA, 1e-5f);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.cross_ln_w), layer.cross_ln_b);
+        cur = ggml_mul_inplace(ctx0, cur, layer.cross_ln_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.cross_ln_b);
 
         struct ggml_tensor * CQ = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.cross_q_w, cur), layer.cross_q_b);
         CQ = ggml_reshape_3d(ctx0, CQ, head_dim, n_heads, n_tokens);
@@ -1087,7 +1181,8 @@ KQ = ggml_soft_max_inplace(ctx0, KQ);
 
         // FFN
         cur = ggml_norm(ctx0, inpFFN, 1e-5f);
-        cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.ffn_ln_w), layer.ffn_ln_b);
+        cur = ggml_mul_inplace(ctx0, cur, layer.ffn_ln_w);
+        cur = ggml_add_inplace(ctx0, cur, layer.ffn_ln_b);
 
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ffn_up_w, cur), layer.ffn_up_b);
         cur = ggml_relu_inplace(ctx0, cur);
@@ -1101,9 +1196,11 @@ KQ = ggml_soft_max_inplace(ctx0, KQ);
         }
     }
 
-    // final norm
+    // final output norm
     cur = ggml_norm(ctx0, cur, 1e-5f);
-    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.dec_out_ln_w), model.dec_out_ln_b);
+    cur = ggml_mul_inplace(ctx0, cur, model.dec_out_ln_w);
+    cur = ggml_add_inplace(ctx0, cur, model.dec_out_ln_b);
+
 
     // logits
     cur = ggml_add(ctx0, ggml_mul_mat(ctx0, model.dec_head_w, cur), model.dec_head_b);
@@ -1126,16 +1223,26 @@ static std::vector<float> cohere_decode_step(
 ) {
     const auto & hp = ctx->model.hparams;
     const int vocab_size = hp.vocab_size;
+    auto & perf = ctx->perf;
+    int64_t t0, t1;
 
     ctx->cached_T_enc = T_enc;
 
+    t0 = ggml_time_us();
     struct ggml_cgraph * gf = cohere_build_graph_decoder(ctx, tokens, n_tok, offset);
+    t1 = ggml_time_us();
+    perf.t_dec_build_us += (t1 - t0);
+    if      (perf.n_dec_steps == 0) perf.dec_n_nodes_prompt = ggml_graph_n_nodes(gf);
+    else if (perf.n_dec_steps == 1) perf.dec_n_nodes_step   = ggml_graph_n_nodes(gf);
 
+    t0 = ggml_time_us();
     ggml_backend_sched_reset(ctx->ggml_alloc);
     if (!ggml_backend_sched_alloc_graph(ctx->ggml_alloc, gf)) {
         fprintf(stderr, "cohere: failed to allocate decoder graph\n");
         return {};
     }
+    t1 = ggml_time_us();
+    perf.t_dec_alloc_us += (t1 - t0);
 
     // Set inputs
     struct ggml_tensor * embd = ggml_graph_get_tensor(gf, "embd");
@@ -1146,16 +1253,26 @@ static std::vector<float> cohere_decode_step(
     for (int i = 0; i < n_tok; i++) pos_data[i] = offset + i;
     ggml_backend_tensor_set(position, pos_data.data(), 0, n_tok * sizeof(int));
 
-    // Execute
+    t0 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(ctx->ggml_alloc, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cohere: failed to compute decoder graph\n");
         return {};
+    }
+    t1 = ggml_time_us();
+    {
+        int64_t dt = t1 - t0;
+        perf.t_dec_compute_us += dt;
+        if (dt < perf.t_dec_step_min_us) perf.t_dec_step_min_us = dt;
+        if (dt > perf.t_dec_step_max_us) perf.t_dec_step_max_us = dt;
     }
 
     // Extract logits (last node in graph)
     struct ggml_tensor * logits_t = ggml_graph_node(gf, -1);
     std::vector<float> logits(n_tok * vocab_size);
+    t0 = ggml_time_us();
     ggml_backend_tensor_get(logits_t, logits.data(), 0, logits.size() * sizeof(float));
+    t1 = ggml_time_us();
+    perf.t_dec_logits_us += (t1 - t0);
 
     if (offset == 0) {
         // Log some interesting hidden states for the first step (prompt)
@@ -1210,8 +1327,23 @@ struct cohere_context_params cohere_context_default_params(void) {
 
 struct cohere_context * cohere_init_from_file(const char * path_model,
                                               struct cohere_context_params params) {
+    ggml_time_init();
     auto * ctx = new cohere_context;
     ctx->params = params;
+
+    // Thread count: params.n_threads, overridable via COHERE_THREADS env var.
+    // NOTE: ggml_backend_cpu_set_n_threads is intentionally NOT called by default —
+    // profiling showed it regressed performance for our matrix sizes.
+    // Set COHERE_THREADS=N to opt-in and compare.
+    {
+        const char * env = getenv("COHERE_THREADS");
+        if (env) {
+            int n = atoi(env);
+            if (n > 0) params.n_threads = n;
+        }
+    }
+    fprintf(stderr, "cohere: n_threads param=%d (use COHERE_THREADS=N to override)\n",
+            params.n_threads);
 
     // Initialize ggml backend
     ctx->ggml_backend = ggml_backend_cpu_init();
@@ -1219,6 +1351,15 @@ struct cohere_context * cohere_init_from_file(const char * path_model,
         fprintf(stderr, "cohere: failed to initialize ggml CPU backend\n");
         delete ctx;
         return nullptr;
+    }
+
+    // Apply thread count only when explicitly requested via env var
+    if (getenv("COHERE_THREADS")) {
+        fprintf(stderr, "cohere: applying ggml_backend_cpu_set_n_threads(%d) [COHERE_THREADS override]\n",
+                params.n_threads);
+        ggml_backend_cpu_set_n_threads(ctx->ggml_backend, params.n_threads);
+    } else {
+        fprintf(stderr, "cohere: NOT calling ggml_backend_cpu_set_n_threads (single-thread default)\n");
     }
 
     if (!cohere_load_model(ctx->model, ctx->vocab, path_model, ctx->ggml_backend)) {
@@ -1236,22 +1377,23 @@ struct cohere_context * cohere_init_from_file(const char * path_model,
             .no_alloc   = true,
         };
         ctx->kv_ctx = ggml_init(kv_params);
-        // K is [head_dim, max_ctx, n_heads, n_layers]
         ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
-        // V is [head_dim, max_ctx, n_heads, n_layers]
         ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
-        
-        ggml_backend_buffer_t kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend, ggml_nbytes(ctx->kv_k) + ggml_nbytes(ctx->kv_v));
+        ggml_backend_buffer_t kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend,
+                                           ggml_nbytes(ctx->kv_k) + ggml_nbytes(ctx->kv_v));
         char * base = (char *)ggml_backend_buffer_get_base(kv_buf);
         ggml_backend_tensor_alloc(kv_buf, ctx->kv_k, (void *)(base));
         ggml_backend_tensor_alloc(kv_buf, ctx->kv_v, (void *)(base + ggml_nbytes(ctx->kv_k)));
+
+        fprintf(stderr, "cohere: kv cache     = %.1f MiB  (dec_head_dim=%d max_ctx=%d n_heads=%d n_layers=%d)\n",
+                ggml_backend_buffer_get_size(kv_buf) / 1048576.0,
+                hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
     }
 
     // Initialize scheduler
     ggml_backend_t backends[] = { ctx->ggml_backend };
     ctx->ggml_alloc = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
 
-    // Sized generously for graph nodes
     ctx->compute_meta.resize(ggml_tensor_overhead() * 16384 + 1024);
 
     // Create constants context
@@ -1262,6 +1404,13 @@ struct cohere_context * cohere_init_from_file(const char * path_model,
 
     ctx->cross_kv_ctx = nullptr;
     ctx->cross_kv_buf = nullptr;
+
+    // Log static memory layout
+    if (ctx->model.buf) {
+        fprintf(stderr, "cohere: model weights = %.1f MiB\n",
+                ggml_backend_buffer_get_size(ctx->model.buf) / 1048576.0);
+    }
+    fprintf(stderr, "cohere: compute_meta  = %.1f KiB\n", ctx->compute_meta.size() / 1024.0);
 
     return ctx;
 }
@@ -1315,67 +1464,81 @@ static std::vector<float> ct_get_f32(const ggml_tensor * t) {
 char * cohere_transcribe(struct cohere_context * ctx,
                          const float * samples, int n_samples,
                          const char * lang) {
-    fprintf(stderr, "cohere: transcribe started, n_samples=%d\n", n_samples);
     const auto & hp  = ctx->model.hparams;
     const auto & voc = ctx->vocab;
     const int n_heads  = hp.dec_n_heads;
     const int head_dim = hp.dec_head_dim;
-    // Feature extraction
+    auto & perf = ctx->perf;
+    int64_t t0, t1;
+
+    cohere_perf_reset(perf);
+    int64_t t_total_start = ggml_time_us();
+
+    fprintf(stderr, "cohere: transcribe started   n_samples=%d  audio=%.2fs\n",
+            n_samples, (double)n_samples / hp.sample_rate);
+
+    // --- Feature extraction ---
     auto mel_fb = ct_get_f32(ctx->model.fe_mel_fb);
     auto window = ct_get_f32(ctx->model.fe_window);
 
     int T_mel = 0;
-    auto mel = cohere_compute_features(hp,
-        mel_fb.data(),
-        window.data(),
-        samples, n_samples, T_mel);
+    t0 = ggml_time_us();
+    auto mel = cohere_compute_features(hp, mel_fb.data(), window.data(),
+                                       samples, n_samples, T_mel);
+    t1 = ggml_time_us();
+    perf.t_features_us = t1 - t0;
+    fprintf(stderr, "cohere: features done         T_mel=%d  %.1f ms\n",
+            T_mel, perf.t_features_us / 1e3);
 
     // --- Encoder Graph ---
+    t0 = ggml_time_us();
     struct ggml_cgraph * gf_enc = cohere_build_graph_encoder(ctx, T_mel);
+    t1 = ggml_time_us();
+    perf.t_enc_build_us = t1 - t0;
+    perf.enc_n_nodes = ggml_graph_n_nodes(gf_enc);
+    fprintf(stderr, "cohere: enc graph built       nodes=%d  %.1f ms\n",
+            perf.enc_n_nodes, perf.t_enc_build_us / 1e3);
 
-    cohere_debug("cohere: allocating encoder graph...\n");
+    t0 = ggml_time_us();
     ggml_backend_sched_reset(ctx->ggml_alloc);
     if (!ggml_backend_sched_alloc_graph(ctx->ggml_alloc, gf_enc)) {
         fprintf(stderr, "cohere: failed to allocate encoder graph\n");
         return nullptr;
     }
+    t1 = ggml_time_us();
+    perf.t_enc_alloc_us = t1 - t0;
+    perf.mem_sched_buf = ggml_backend_sched_get_buffer_size(ctx->ggml_alloc, ctx->ggml_backend);
+    fprintf(stderr, "cohere: enc sched alloc       %.1f ms   sched_buf=%.1f MiB\n",
+            perf.t_enc_alloc_us / 1e3, perf.mem_sched_buf / 1048576.0);
 
-    cohere_debug("cohere: setting encoder inputs...\n");
-    // Set mel input
     struct ggml_tensor * mel_t = ggml_graph_get_tensor(gf_enc, "mel");
     if (!mel_t) { fprintf(stderr, "error: mel tensor not found\n"); return nullptr; }
-    if (!mel_t->buffer) { fprintf(stderr, "error: mel_t buffer is NULL\n"); }
-    else ggml_backend_tensor_set(mel_t, mel.data(), 0, mel.size() * sizeof(float));
+    ggml_backend_tensor_set(mel_t, mel.data(), 0, mel.size() * sizeof(float));
 
-    // Set pos_enc input
     int H1 = (T_mel + 2 - 3) / 2 + 1;
-    int H2 = (H1 + 2 - 3) / 2 + 1;
-    int H3 = (H2 + 2 - 3) / 2 + 1;
+    int H2 = (H1   + 2 - 3) / 2 + 1;
+    int H3 = (H2   + 2 - 3) / 2 + 1;
     auto pos_enc_data = ct_rel_pos_enc(H3, hp.enc_d_model);
-    
     struct ggml_tensor * pos_enc_t = ggml_graph_get_tensor(gf_enc, "pos_enc");
     if (!pos_enc_t) { fprintf(stderr, "error: pos_enc tensor not found\n"); return nullptr; }
-    if (!pos_enc_t->buffer) { fprintf(stderr, "error: pos_enc_t buffer is NULL\n"); }
-    else ggml_backend_tensor_set(pos_enc_t, pos_enc_data.data(), 0, pos_enc_data.size() * sizeof(float));
+    ggml_backend_tensor_set(pos_enc_t, pos_enc_data.data(), 0, pos_enc_data.size() * sizeof(float));
 
-    cohere_debug("cohere: computing encoder graph...\n");
+    t0 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(ctx->ggml_alloc, gf_enc) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cohere: failed to compute encoder graph\n");
         return nullptr;
     }
+    t1 = ggml_time_us();
+    perf.t_enc_compute_us = t1 - t0;
+    fprintf(stderr, "cohere: enc compute done      %.1f ms\n", perf.t_enc_compute_us / 1e3);
 
-    cohere_debug("cohere: encoder done.\n");
     struct ggml_tensor * enc_out_t = ggml_graph_get_tensor(gf_enc, "enc_out");
     if (!enc_out_t) { fprintf(stderr, "error: enc_out tensor not found\n"); return nullptr; }
-    
-    if (!enc_out_t->buffer) {
-        fprintf(stderr, "error: enc_out_t buffer is NULL! type=%d, name=%s\n", enc_out_t->type, enc_out_t->name);
-    }
-
     const int T_enc_actual = enc_out_t->ne[1];
     cohere_debug("cohere: enc_out shape [%d, %d]\n", T_enc_actual, (int)enc_out_t->ne[0]);
-    
-    // Allocate cross KV tensors on backend
+
+    // --- Cross-KV extraction ---
+    t0 = ggml_time_us();
     {
         if (ctx->cross_kv_ctx) ggml_free(ctx->cross_kv_ctx);
         if (ctx->cross_kv_buf) ggml_backend_buffer_free(ctx->cross_kv_buf);
@@ -1389,117 +1552,122 @@ char * cohere_transcribe(struct cohere_context * ctx,
             .no_alloc   = true,
         };
         ctx->cross_kv_ctx = ggml_init(cross_kv_params);
-        
-        // We store K as [hd, T_enc, H] and V_trans as [T_enc, hd, H] (as pre-computed in encoder graph)
+
         for (int il = 0; il < hp.dec_n_layers; il++) {
-            ctx->cross_kv_k[il] = ggml_new_tensor_3d(ctx->cross_kv_ctx, GGML_TYPE_F32, head_dim, T_enc_actual, n_heads);
-            ctx->cross_kv_v[il] = ggml_new_tensor_3d(ctx->cross_kv_ctx, GGML_TYPE_F32, T_enc_actual, head_dim, n_heads);
+            ctx->cross_kv_k[il] = ggml_new_tensor_3d(ctx->cross_kv_ctx, GGML_TYPE_F32,
+                                                       head_dim, T_enc_actual, n_heads);
+            ctx->cross_kv_v[il] = ggml_new_tensor_3d(ctx->cross_kv_ctx, GGML_TYPE_F32,
+                                                       T_enc_actual, head_dim, n_heads);
         }
 
         size_t k_size = ggml_nbytes(ctx->cross_kv_k[0]);
         size_t v_size = ggml_nbytes(ctx->cross_kv_v[0]);
-        ctx->cross_kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend, (k_size + v_size) * hp.dec_n_layers);
-        
+        ctx->cross_kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend,
+                                (k_size + v_size) * hp.dec_n_layers);
         char * base = (char *)ggml_backend_buffer_get_base(ctx->cross_kv_buf);
+
         for (int il = 0; il < hp.dec_n_layers; il++) {
-            ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_k[il], (void *)(base + il * (k_size + v_size)));
-            ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_v[il], (void *)(base + il * (k_size + v_size) + k_size));
-            
-            // Get from encoder graph
+            ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_k[il],
+                                      (void *)(base + il * (k_size + v_size)));
+            ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_v[il],
+                                      (void *)(base + il * (k_size + v_size) + k_size));
             char ck_name[32], cv_name[32];
             snprintf(ck_name, sizeof(ck_name), "ck_%d", il);
             snprintf(cv_name, sizeof(cv_name), "cv_%d", il);
             struct ggml_tensor * ck_src = ggml_graph_get_tensor(gf_enc, ck_name);
             struct ggml_tensor * cv_src = ggml_graph_get_tensor(gf_enc, cv_name);
-            
             if (!ck_src || !cv_src) {
-                fprintf(stderr, "error: cross-KV source tensor %s or %s not found in encoder graph\n", ck_name, cv_name);
+                fprintf(stderr, "error: cross-KV tensor %s or %s not found\n", ck_name, cv_name);
                 return nullptr;
             }
-
             ggml_backend_tensor_copy(ck_src, ctx->cross_kv_k[il]);
             ggml_backend_tensor_copy(cv_src, ctx->cross_kv_v[il]);
         }
     }
+    t1 = ggml_time_us();
+    perf.t_cross_kv_us    = t1 - t0;
+    perf.mem_cross_kv_buf = ggml_backend_buffer_get_size(ctx->cross_kv_buf);
+    fprintf(stderr, "cohere: cross-kv done         %.1f ms   buf=%.1f MiB\n",
+            perf.t_cross_kv_us / 1e3, perf.mem_cross_kv_buf / 1048576.0);
 
     const int T_enc = T_enc_actual;
 
-    // --- Decoder: build prompt ---
-    // Special token IDs from vocab
+    // --- Decoder prompt ---
     auto tid = [&](const std::string & s) { return voc.token_id(s); };
     const char * lang_tok = lang ? lang : "en";
     char lang_tok_str[32];
     snprintf(lang_tok_str, sizeof(lang_tok_str), "<|%s|>", lang_tok);
 
     std::vector<int> prompt = {
-        tid("<|startofcontext|>"),
-        tid("<|startoftranscript|>"),
-        tid("<|emo:undefined|>"),
-        tid(lang_tok_str),
-        tid(lang_tok_str),  // second occurrence (language + task)
-        tid("<|pnc|>"),
-        tid("<|noitn|>"),
-        tid("<|notimestamp|>"),
-        tid("<|nodiarize|>"),
+        tid("<|startofcontext|>"), tid("<|startoftranscript|>"), tid("<|emo:undefined|>"),
+        tid(lang_tok_str), tid(lang_tok_str),
+        tid("<|pnc|>"), tid("<|noitn|>"), tid("<|notimestamp|>"), tid("<|nodiarize|>"),
     };
-    // Filter out any missing tokens
-    prompt.erase(std::remove_if(prompt.begin(), prompt.end(), [](int t){ return t == -1; }), prompt.end());
-
+    prompt.erase(std::remove_if(prompt.begin(), prompt.end(),
+                                [](int t){ return t == -1; }), prompt.end());
+    fprintf(stderr, "cohere: prompt               n=%d\n", (int)prompt.size());
     cohere_debug("cohere: prompt IDs: ");
     for (int id : prompt) cohere_debug("%d ", id);
     cohere_debug("\n");
 
-    // Reset persistent KV cache
-    {
-        ggml_backend_buffer_clear(ctx->kv_k->buffer, 0);
-        ggml_backend_buffer_clear(ctx->kv_v->buffer, 0);
-    }
+    ggml_backend_buffer_clear(ctx->kv_k->buffer, 0);
+    ggml_backend_buffer_clear(ctx->kv_v->buffer, 0);
 
     const int eos_id  = tid("<|endoftext|>");
-    const int max_gen = 100; // debug cap; was: hp.dec_max_ctx - (int)prompt.size() - 4
+    const int max_gen = hp.dec_max_ctx - (int)prompt.size() - 4;
 
-    // --- Run prompt through decoder ---
-    auto logits = cohere_decode_step(ctx, T_enc,
-                                      prompt.data(), (int)prompt.size(), 0);
+    // Prompt pass
+    auto logits = cohere_decode_step(ctx, T_enc, prompt.data(), (int)prompt.size(), 0);
+    perf.n_dec_steps++;
     int offset = (int)prompt.size();
+    fprintf(stderr, "cohere: prompt pass done      nodes=%d  build=%.1f alloc=%.1f compute=%.1f ms\n",
+            perf.dec_n_nodes_prompt,
+            perf.t_dec_build_us / 1e3,
+            perf.t_dec_alloc_us / 1e3,
+            perf.t_dec_compute_us / 1e3);
 
     // Greedy decode
     std::vector<int> generated;
     for (int step = 0; step < max_gen; step++) {
-        // Argmax over last token's logits
-        const float * last_logits = logits.data() + ((offset - (step > 0 ? 0 : 0)) - 1) * hp.vocab_size;
-        // After prompt pass: last token logits are at offset prompt.size()-1
-        int vocab = hp.vocab_size;
-        if (step == 0) last_logits = logits.data() + ((int)prompt.size() - 1) * vocab;
-        else           last_logits = logits.data();  // n_tok=1
+        const int vocab = hp.vocab_size;
+        const float * last_logits = (step == 0)
+            ? logits.data() + ((int)prompt.size() - 1) * vocab
+            : logits.data();
 
         int next_tok = (int)(std::max_element(last_logits, last_logits + vocab) - last_logits);
-        fprintf(stderr, "cohere: step %d → tok %d (%s)\n", step, next_tok,
-                next_tok >= 0 && next_tok < (int)voc.id_to_token.size()
+        fprintf(stderr, "cohere: step %3d  tok=%5d  %s\n",
+                step, next_tok,
+                (next_tok >= 0 && next_tok < (int)voc.id_to_token.size())
                     ? voc.id_to_token[next_tok].c_str() : "?");
         if (next_tok == eos_id || next_tok < 0) break;
 
         generated.push_back(next_tok);
         offset++;
 
-        // Next step: decode single token
-        logits = cohere_decode_step(ctx, T_enc,
-                                    &next_tok, 1, offset - 1);
+        logits = cohere_decode_step(ctx, T_enc, &next_tok, 1, offset - 1);
+        perf.n_dec_steps++;
     }
+
+    // Snapshot memory
+    perf.mem_model_buf    = ctx->model.buf ? ggml_backend_buffer_get_size(ctx->model.buf) : 0;
+    perf.mem_kv_buf       = (ctx->kv_k && ctx->kv_k->buffer)
+                            ? ggml_backend_buffer_get_size(ctx->kv_k->buffer) : 0;
+    perf.mem_compute_meta = ctx->compute_meta.size();
+    perf.t_total_us       = ggml_time_us() - t_total_start;
+
+    cohere_perf_print(perf, n_samples, hp.sample_rate);
 
     // --- Decode tokens to text ---
     std::string text;
     for (int id : generated) {
         if (id < 0 || id >= (int)voc.id_to_token.size()) continue;
         const std::string & tok = voc.id_to_token[id];
-        if (tok.front() == '<' && tok.back() == '>') continue; // skip special tokens
-        // SentencePiece: ▁ (U+2581) = word boundary
+        if (tok.front() == '<' && tok.back() == '>') continue;
         std::string t = tok;
         size_t pos;
         while ((pos = t.find("\xe2\x96\x81")) != std::string::npos) t.replace(pos, 3, " ");
         text += t;
     }
-    // Trim leading space
     if (!text.empty() && text[0] == ' ') text = text.substr(1);
 
     char * result = (char *)malloc(text.size() + 1);
