@@ -65,11 +65,12 @@ static bool read_wav(const char * path, std::vector<float> & out, int target_sr 
 }
 
 static void print_usage(const char * prog) {
-    fprintf(stderr, "Usage: %s -m MODEL.gguf -f AUDIO.wav [-l LANG] [-t THREADS]\n", prog);
+    fprintf(stderr, "Usage: %s -m MODEL.gguf -f AUDIO.wav [-l LANG] [-t THREADS] [--flash]\n", prog);
     fprintf(stderr, "  -m   path to cohere-transcribe.gguf\n");
     fprintf(stderr, "  -f   input WAV file (16 kHz mono PCM recommended)\n");
     fprintf(stderr, "  -l   language code (default: en)\n");
     fprintf(stderr, "  -t   number of threads (default: 4)\n");
+    fprintf(stderr, "  --flash  use flash attention\n");
 }
 
 int main(int argc, char ** argv) {
@@ -77,12 +78,14 @@ int main(int argc, char ** argv) {
     const char * audio_path = nullptr;
     const char * lang       = "en";
     int n_threads = 4;
+    bool use_flash = false;
 
     for (int i = 1; i < argc; i++) {
         if      (strcmp(argv[i], "-m") == 0 && i+1 < argc) model_path = argv[++i];
         else if (strcmp(argv[i], "-f") == 0 && i+1 < argc) audio_path = argv[++i];
         else if (strcmp(argv[i], "-l") == 0 && i+1 < argc) lang       = argv[++i];
         else if (strcmp(argv[i], "-t") == 0 && i+1 < argc) n_threads  = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--flash") == 0)          use_flash  = true;
         else if (strcmp(argv[i], "-h") == 0) { print_usage(argv[0]); return 0; }
         else { fprintf(stderr, "Unknown option: %s\n", argv[i]); print_usage(argv[0]); return 1; }
     }
@@ -95,6 +98,7 @@ int main(int argc, char ** argv) {
     // Load model
     struct cohere_context_params params = cohere_context_default_params();
     params.n_threads = n_threads;
+    params.use_flash = use_flash;
 
     fprintf(stderr, "cohere-main: loading model from '%s'...\n", model_path);
     struct cohere_context * ctx = cohere_init_from_file(model_path, params);

@@ -39,8 +39,18 @@
 // Logging & Debugging
 // ---------------------------------------------------------------------------
 
+static bool cohere_debug_enabled(void) {
+    static bool init = false;
+    static bool enabled = false;
+    if (!init) {
+        enabled = getenv("COHERE_DEBUG") != nullptr;
+        init = true;
+    }
+    return enabled;
+}
+
 static void cohere_debug(const char * fmt, ...) {
-    if (!getenv("COHERE_DEBUG")) return;
+    if (!cohere_debug_enabled()) return;
     va_list args;
     va_start(args, fmt);
     vprintf(fmt, args);
@@ -49,7 +59,7 @@ static void cohere_debug(const char * fmt, ...) {
 }
 
 static void cohere_log_tensor(const char * name, const struct ggml_tensor * t) {
-    if (!getenv("COHERE_DEBUG")) return;
+    if (!cohere_debug_enabled()) return;
     if (!t) {
         cohere_debug("%-25s: NULL\n", name);
         return;
@@ -107,10 +117,12 @@ struct cohere_enc_layer {
     ggml_tensor * ff1_dn_w, * ff1_dn_b;
     // Self-attention (relative pos)
     ggml_tensor * attn_norm_w, * attn_norm_b;
-    ggml_tensor * attn_q_w, * attn_q_b;
-    ggml_tensor * attn_k_w, * attn_k_b;
-    ggml_tensor * attn_v_w, * attn_v_b;
-    ggml_tensor * attn_out_w, * attn_out_b;
+    ggml_tensor * attn_q_w,    * attn_q_b;
+    ggml_tensor * attn_k_w,    * attn_k_b;
+    ggml_tensor * attn_v_w,    * attn_v_b;
+    ggml_tensor * attn_qkv_w,  * attn_qkv_b; // combined
+    ggml_tensor * attn_out_w,  * attn_out_b;
+
     ggml_tensor * attn_pos_w;          // linear_pos  [d,d]
     ggml_tensor * attn_pos_bias_u;     // [heads, head_dim]
     ggml_tensor * attn_pos_bias_v;
@@ -249,6 +261,10 @@ struct cohere_context {
     // Constants
     struct ggml_context * ctx_const = nullptr;
     struct ggml_tensor * eps = nullptr;
+
+    // Cached decoder graph for n_tokens=1
+    struct ggml_cgraph * gf_decode_1 = nullptr;
+    int cached_offset_1 = -1;
 };
 
 static void cohere_log_tensor(const char * name, const struct ggml_tensor * t);
@@ -340,7 +356,7 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
         struct ggml_tensor * ff1 = ggml_norm(ctx0, cur, 1e-5f);
         ff1 = ggml_add(ctx0, ggml_mul(ctx0, ff1, layer.ff1_norm_w), layer.ff1_norm_b);
         ff1 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff1_up_w, ff1), layer.ff1_up_b);
-        ff1 = ggml_mul(ctx0, ff1, ggml_sigmoid(ctx0, ff1));
+        ff1 = ggml_silu_inplace(ctx0, ff1);
         ff1 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff1_dn_w, ff1), layer.ff1_dn_b);
         cur = ggml_add(ctx0, inpL, ggml_scale(ctx0, ff1, 0.5f));
 
@@ -367,14 +383,29 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
         struct ggml_tensor * AC = ggml_mul_mat(ctx0, ggml_cont(ctx0, K), ggml_cont(ctx0, Q_u)); // [T, T, H]
         struct ggml_tensor * BD_raw = ggml_mul_mat(ctx0, ggml_cont(ctx0, R), ggml_cont(ctx0, Q_v)); // [2T-1, T, H]
 
+        if (il == 0) {
+            cohere_log_tensor("K", K);
+            cohere_log_tensor("Q_u", Q_u);
+            cohere_log_tensor("AC", AC);
+        }
+
         struct ggml_tensor * BD = cohere_rel_shift(ctx0, BD_raw); // [T, T, H]
         
-        struct ggml_tensor * scores = ggml_add(ctx0, AC, BD);
-        scores = ggml_scale(ctx0, scores, 1.0f / sqrtf((float)head_dim));
-        scores = ggml_soft_max(ctx0, scores);
+        struct ggml_tensor * scores = ggml_add_inplace(ctx0, AC, BD);
+        scores = ggml_scale_inplace(ctx0, scores, 1.0f / sqrtf((float)head_dim));
+        scores = ggml_soft_max_inplace(ctx0, scores);
 
-        struct ggml_tensor * V_trans = ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, head_dim, n_heads, T), 1, 2, 0, 3); // [T, hd, H]
+        struct ggml_tensor * V_reshaped = ggml_reshape_3d(ctx0, V, head_dim, n_heads, T);
+        if (il == 0) cohere_log_tensor("V_reshaped", V_reshaped);
+
+        struct ggml_tensor * V_trans = ggml_permute(ctx0, V_reshaped, 1, 2, 0, 3); // [T, hd, H]
         struct ggml_tensor * attn_out = ggml_mul_mat(ctx0, ggml_cont(ctx0, V_trans), scores); // [hd, T, H]
+
+        if (il == 0) {
+            cohere_log_tensor("scores", scores);
+            cohere_log_tensor("V_trans", V_trans);
+            cohere_log_tensor("attn_out", attn_out);
+        }
 
         attn_out = ggml_reshape_2d(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, attn_out, 0, 2, 1, 3)), d, T);
 
@@ -422,7 +453,7 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
         cnv = ggml_mul(ctx0, cnv, ggml_div(ctx0, bn_w, ggml_sqrt(ctx0, ggml_add(ctx0, bn_var, ctx->eps))));
         cnv = ggml_add(ctx0, cnv, bn_b);
         
-        cnv = ggml_mul(ctx0, cnv, ggml_sigmoid(ctx0, cnv)); // swish
+        cnv = ggml_silu_inplace(ctx0, cnv); // swish
         
         struct ggml_tensor * pw2_w = ggml_reshape_2d(ctx0, layer.conv_pw2_w, d, d);
         cnv = ggml_add(ctx0, ggml_mul_mat(ctx0, pw2_w, cnv), layer.conv_pw2_b);
@@ -434,7 +465,7 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
         struct ggml_tensor * ff2 = ggml_norm(ctx0, cur, 1e-5f);
         ff2 = ggml_add(ctx0, ggml_mul(ctx0, ff2, layer.ff2_norm_w), layer.ff2_norm_b);
         ff2 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff2_up_w, ff2), layer.ff2_up_b);
-        ff2 = ggml_mul(ctx0, ff2, ggml_sigmoid(ctx0, ff2));
+        ff2 = ggml_silu_inplace(ctx0, ff2);
         ff2 = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ff2_dn_w, ff2), layer.ff2_dn_b);
         cur = ggml_add(ctx0, inpFF2, ggml_scale(ctx0, ff2, 0.5f));
 
@@ -454,14 +485,22 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
         struct ggml_tensor * ck = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.cross_k_w, cur), layer.cross_k_b);
         struct ggml_tensor * cv = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.cross_v_w, cur), layer.cross_v_b);
         
+        // CK: [d, T] -> [hd, H, T] -> [hd, T, H]
+        struct ggml_tensor * ck_ready = ggml_cont(ctx0, ggml_permute(ctx0, 
+            ggml_reshape_3d(ctx0, ck, hp.dec_head_dim, hp.dec_n_heads, T), 0, 2, 1, 3));
+        
+        // CV: [d, T] -> [hd, H, T] -> [T, hd, H] (pre-transposed for decoder mul_mat)
+        struct ggml_tensor * cv_ready = ggml_cont(ctx0, ggml_permute(ctx0, 
+            ggml_reshape_3d(ctx0, cv, hp.dec_head_dim, hp.dec_n_heads, T), 1, 2, 0, 3));
+
         char ck_name[32], cv_name[32];
         snprintf(ck_name, sizeof(ck_name), "ck_%d", il);
         snprintf(cv_name, sizeof(cv_name), "cv_%d", il);
-        ggml_set_name(ck, ck_name);
-        ggml_set_name(cv, cv_name);
+        ggml_set_name(ck_ready, ck_name);
+        ggml_set_name(cv_ready, cv_name);
         
-        ggml_build_forward_expand(gf, ck);
-        ggml_build_forward_expand(gf, cv);
+        ggml_build_forward_expand(gf, ck_ready);
+        ggml_build_forward_expand(gf, cv_ready);
     }
 
     ggml_build_forward_expand(gf, cur);
@@ -848,15 +887,15 @@ static std::vector<float> cohere_compute_features(const cohere_hparams & hp,
     }
 
     // mel filterbank: fe_mel_fb shape [1, n_mels, n_freqs]
+    // power [T, n_freqs] @ fe_mel_fb^T [n_freqs, n_mels] = mel [T, n_mels]
     std::vector<float> mel(n_mels * T, 0.0f);
-    for (int t = 0; t < T; t++) {
-        for (int m = 0; m < n_mels; m++) {
-            float v = 0.0f;
-            for (int f = 0; f < n_freqs; f++) {
-                v += fe_mel_fb_data[m * n_freqs + f] * power[t * n_freqs + f];
-            }
-            mel[t * n_mels + m] = logf(v + log_grd);
-        }
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                T, n_mels, n_freqs,
+                1.0f, power.data(), n_freqs, fe_mel_fb_data, n_freqs,
+                0.0f, mel.data(), n_mels);
+
+    for (int i = 0; i < T * n_mels; i++) {
+        mel[i] = logf(mel[i] + log_grd);
     }
 
     // Per-feature normalization: biased std (matches ONNX: std = sqrt(mean(diff²)))
@@ -981,6 +1020,7 @@ static struct ggml_cgraph * cohere_build_graph_decoder(
             struct ggml_tensor * K_perm = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Kcur, head_dim, n_heads, n_tokens), 0, 2, 1, 3);
             struct ggml_tensor * V_perm = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Vcur, head_dim, n_heads, n_tokens), 0, 2, 1, 3);
 
+
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, K_perm, k_view));
             ggml_build_forward_expand(gf, ggml_cpy(ctx0, V_perm, v_view));
         }
@@ -992,11 +1032,12 @@ static struct ggml_cgraph * cohere_build_graph_decoder(
             ctx->kv_k->nb[1], ctx->kv_k->nb[2],
             il * ctx->kv_k->nb[3]); // [hd, offset+n_tok, n_heads]
         K = ggml_cont(ctx0, K);
-
-        struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q); // [n_tok, offset+n_tok, n_heads]
-        KQ = ggml_scale(ctx0, KQ, 1.0f / sqrtf((float)head_dim));
-        KQ = ggml_diag_mask_inf(ctx0, KQ, offset);
-        KQ = ggml_soft_max(ctx0, KQ);
+struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q); // [n_tok, L, H]
+KQ = ggml_scale_inplace(ctx0, KQ, 1.0f / sqrtf((float)head_dim));
+if (n_tokens > 1) {
+    KQ = ggml_diag_mask_inf_inplace(ctx0, KQ, offset);
+}
+KQ = ggml_soft_max_inplace(ctx0, KQ);
 
         struct ggml_tensor * V = ggml_view_3d(ctx0, ctx->kv_v,
             head_dim, offset + n_tokens, n_heads,
@@ -1004,19 +1045,11 @@ static struct ggml_cgraph * cohere_build_graph_decoder(
             il * ctx->kv_v->nb[3]); // [hd, offset+n_tok, n_heads]
 
         struct ggml_tensor * V_trans = ggml_cont(ctx0, ggml_permute(ctx0, V, 1, 0, 2, 3)); // [offset+n_tok, hd, n_heads]
-        struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V_trans, KQ); // [hd, n_tok, n_heads]
-        
-        if (il == 0) {
-            cohere_log_tensor("Q", Q);
-            cohere_log_tensor("K", K);
-            cohere_log_tensor("KQ", KQ);
-            cohere_log_tensor("V_trans", V_trans);
-            cohere_log_tensor("KQV", KQV);
-        }
+        struct ggml_tensor * sa_out = ggml_mul_mat(ctx0, V_trans, KQ); // [hd, n_tok, n_heads]
 
-        KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3); // [hd, n_heads, n_tok]
-        KQV = ggml_cont(ctx0, KQV);
-        cur = ggml_reshape_2d(ctx0, KQV, d, n_tokens);
+        sa_out = ggml_permute(ctx0, sa_out, 0, 2, 1, 3); // [hd, n_heads, n_tok]
+        sa_out = ggml_cont(ctx0, sa_out);
+        cur = ggml_reshape_2d(ctx0, sa_out, d, n_tokens);
 
         // out projection
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.attn_o_w, cur), layer.attn_o_b);
@@ -1033,32 +1066,18 @@ static struct ggml_cgraph * cohere_build_graph_decoder(
         CQ = ggml_reshape_3d(ctx0, CQ, head_dim, n_heads, n_tokens);
         CQ = ggml_permute(ctx0, CQ, 0, 2, 1, 3); // [hd, n_tok, n_heads]
 
-        // CK and CV are now provided as constant inputs to the decoder graph
-        struct ggml_tensor * CK_in = ctx->cross_kv_k[il];
-        struct ggml_tensor * CV_in = ctx->cross_kv_v[il];
-
-        struct ggml_tensor * CK = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, CK_in, head_dim, n_heads, ctx->cached_T_enc), 0, 2, 1, 3));
-
-        struct ggml_tensor * CV = ggml_reshape_3d(ctx0, CV_in, head_dim, n_heads, ctx->cached_T_enc);
-        CV = ggml_permute(ctx0, CV, 0, 2, 1, 3); // [hd, T_enc, n_heads]
-        struct ggml_tensor * CV_trans = ggml_cont(ctx0, ggml_permute(ctx0, CV, 1, 0, 2, 3)); // [T_enc, hd, n_heads]
+        struct ggml_tensor * CK = ctx->cross_kv_k[il]; // [hd, T_enc, n_heads]
+        struct ggml_tensor * CV_trans = ctx->cross_kv_v[il]; // [T_enc, hd, n_heads]
 
         struct ggml_tensor * C_KQ = ggml_mul_mat(ctx0, CK, CQ); // [T_enc, n_tokens, n_heads]
-        C_KQ = ggml_scale(ctx0, C_KQ, 1.0f / sqrtf((float)head_dim));
-        C_KQ = ggml_soft_max(ctx0, C_KQ);
+        C_KQ = ggml_scale_inplace(ctx0, C_KQ, 1.0f / sqrtf((float)head_dim));
+        C_KQ = ggml_soft_max_inplace(ctx0, C_KQ);
 
-        struct ggml_tensor * C_KQV = ggml_mul_mat(ctx0, CV_trans, C_KQ); // [hd, n_tok, n_heads]
-        
-        if (il == 0) {
-            cohere_log_tensor("CQ", CQ);
-            cohere_log_tensor("CK", CK);
-            cohere_log_tensor("C_KQ", C_KQ);
-            cohere_log_tensor("C_KQV", C_KQV);
-        }
+        struct ggml_tensor * ca_out = ggml_mul_mat(ctx0, CV_trans, C_KQ); // [hd, n_tok, n_heads]
 
-        C_KQV = ggml_permute(ctx0, C_KQV, 0, 2, 1, 3); // [hd, n_heads, n_tok]
-        C_KQV = ggml_cont(ctx0, C_KQV);
-        cur = ggml_reshape_2d(ctx0, C_KQV, d, n_tokens);
+        ca_out = ggml_permute(ctx0, ca_out, 0, 2, 1, 3); // [hd, n_heads, n_tok]
+        ca_out = ggml_cont(ctx0, ca_out);
+        cur = ggml_reshape_2d(ctx0, ca_out, d, n_tokens);
 
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.cross_o_w, cur), layer.cross_o_b);
         cur = ggml_add(ctx0, cur, inpCA);
@@ -1071,9 +1090,9 @@ static struct ggml_cgraph * cohere_build_graph_decoder(
         cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.ffn_ln_w), layer.ffn_ln_b);
 
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ffn_up_w, cur), layer.ffn_up_b);
-        cur = ggml_relu(ctx0, cur);
-
+        cur = ggml_relu_inplace(ctx0, cur);
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.ffn_dn_w, cur), layer.ffn_dn_b);
+
 
         cur = ggml_add(ctx0, cur, inpFFN);
 
@@ -1211,17 +1230,18 @@ struct cohere_context * cohere_init_from_file(const char * path_model,
 
     // Allocate persistent KV cache
     {
-        // Shape: [head_dim, max_ctx, n_heads, n_layers]
         struct ggml_init_params kv_params = {
             .mem_size   = ggml_tensor_overhead() * 2 + 1024,
             .mem_buffer = nullptr,
             .no_alloc   = true,
         };
         ctx->kv_ctx = ggml_init(kv_params);
+        // K is [head_dim, max_ctx, n_heads, n_layers]
         ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
+        // V is [head_dim, max_ctx, n_heads, n_layers]
         ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
         
-        ggml_backend_buffer_t kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend, ggml_nbytes(ctx->kv_k) * 2);
+        ggml_backend_buffer_t kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend, ggml_nbytes(ctx->kv_k) + ggml_nbytes(ctx->kv_v));
         char * base = (char *)ggml_backend_buffer_get_base(kv_buf);
         ggml_backend_tensor_alloc(kv_buf, ctx->kv_k, (void *)(base));
         ggml_backend_tensor_alloc(kv_buf, ctx->kv_v, (void *)(base + ggml_nbytes(ctx->kv_k)));
@@ -1298,6 +1318,8 @@ char * cohere_transcribe(struct cohere_context * ctx,
     fprintf(stderr, "cohere: transcribe started, n_samples=%d\n", n_samples);
     const auto & hp  = ctx->model.hparams;
     const auto & voc = ctx->vocab;
+    const int n_heads  = hp.dec_n_heads;
+    const int head_dim = hp.dec_head_dim;
     // Feature extraction
     auto mel_fb = ct_get_f32(ctx->model.fe_mel_fb);
     auto window = ct_get_f32(ctx->model.fe_window);
@@ -1367,20 +1389,23 @@ char * cohere_transcribe(struct cohere_context * ctx,
             .no_alloc   = true,
         };
         ctx->cross_kv_ctx = ggml_init(cross_kv_params);
+        
+        // We store K as [hd, T_enc, H] and V_trans as [T_enc, hd, H] (as pre-computed in encoder graph)
         for (int il = 0; il < hp.dec_n_layers; il++) {
-            ctx->cross_kv_k[il] = ggml_new_tensor_2d(ctx->cross_kv_ctx, GGML_TYPE_F32, hp.dec_d_model, T_enc_actual);
-            ctx->cross_kv_v[il] = ggml_new_tensor_2d(ctx->cross_kv_ctx, GGML_TYPE_F32, hp.dec_d_model, T_enc_actual);
+            ctx->cross_kv_k[il] = ggml_new_tensor_3d(ctx->cross_kv_ctx, GGML_TYPE_F32, head_dim, T_enc_actual, n_heads);
+            ctx->cross_kv_v[il] = ggml_new_tensor_3d(ctx->cross_kv_ctx, GGML_TYPE_F32, T_enc_actual, head_dim, n_heads);
         }
 
-        size_t layer_kv_size = ggml_nbytes(ctx->cross_kv_k[0]);
-        ctx->cross_kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend, layer_kv_size * hp.dec_n_layers * 2);
+        size_t k_size = ggml_nbytes(ctx->cross_kv_k[0]);
+        size_t v_size = ggml_nbytes(ctx->cross_kv_v[0]);
+        ctx->cross_kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend, (k_size + v_size) * hp.dec_n_layers);
         
         char * base = (char *)ggml_backend_buffer_get_base(ctx->cross_kv_buf);
         for (int il = 0; il < hp.dec_n_layers; il++) {
-            ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_k[il], (void *)(base + (2*il + 0) * layer_kv_size));
-            ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_v[il], (void *)(base + (2*il + 1) * layer_kv_size));
+            ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_k[il], (void *)(base + il * (k_size + v_size)));
+            ggml_backend_tensor_alloc(ctx->cross_kv_buf, ctx->cross_kv_v[il], (void *)(base + il * (k_size + v_size) + k_size));
             
-            // Copy from encoder graph output tensors
+            // Get from encoder graph
             char ck_name[32], cv_name[32];
             snprintf(ck_name, sizeof(ck_name), "ck_%d", il);
             snprintf(cv_name, sizeof(cv_name), "cv_%d", il);
