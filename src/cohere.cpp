@@ -25,6 +25,10 @@
 #include <unordered_map>
 #include <vector>
 #include <cstdarg>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -702,10 +706,20 @@ static bool cohere_load_model(cohere_model & model,
         // Create backend buffer for all tensors
         model.buf = ggml_backend_alloc_ctx_tensors(weight_ctx, backend);
 
-        FILE * file = fopen(path, "rb");
-        if (!file) {
-            fprintf(stderr, "cohere: failed to open '%s' for reading\n", path);
+        // mmap the GGUF file — one syscall instead of N fread calls, zero per-tensor heap alloc
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            fprintf(stderr, "cohere: failed to open '%s' for mmap\n", path);
             return false;
+        }
+        struct stat st;
+        fstat(fd, &st);
+        size_t file_size = (size_t)st.st_size;
+        void * mmap_base = mmap(nullptr, file_size, PROT_READ, MAP_SHARED, fd, 0);
+        close(fd);
+        if (mmap_base == MAP_FAILED) {
+            fprintf(stderr, "cohere: mmap failed for '%s', falling back to fread\n", path);
+            mmap_base = nullptr;
         }
 
         size_t data_offset = gguf_get_data_offset(gguf_ctx);
@@ -714,21 +728,29 @@ static bool cohere_load_model(cohere_model & model,
              t = ggml_get_next_tensor(weight_ctx, t)) {
             model.tensors[ggml_get_name(t)] = t;
 
-            // Read data from GGUF into backend tensor
             int64_t tensor_id = gguf_find_tensor(gguf_ctx, ggml_get_name(t));
             if (tensor_id < 0) continue;
 
             size_t t_offset = gguf_get_tensor_offset(gguf_ctx, tensor_id);
-            fseek(file, data_offset + t_offset, SEEK_SET);
-            std::vector<uint8_t> data(ggml_nbytes(t));
-            if (fread(data.data(), 1, ggml_nbytes(t), file) != ggml_nbytes(t)) {
-                fprintf(stderr, "cohere: failed to read data for tensor '%s'\n", ggml_get_name(t));
-                continue;
+            size_t nbytes   = ggml_nbytes(t);
+
+            if (mmap_base) {
+                // Direct pointer into mmap region — no heap allocation, no fread
+                ggml_backend_tensor_set(t, (const char *)mmap_base + data_offset + t_offset, 0, nbytes);
+            } else {
+                // Fallback: fread per tensor
+                FILE * file = fopen(path, "rb");
+                if (file) {
+                    fseek(file, (long)(data_offset + t_offset), SEEK_SET);
+                    std::vector<uint8_t> tmp(nbytes);
+                    if (fread(tmp.data(), 1, nbytes, file) == nbytes)
+                        ggml_backend_tensor_set(t, tmp.data(), 0, nbytes);
+                    fclose(file);
+                }
             }
-            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
         }
 
-        fclose(file);
+        if (mmap_base) munmap(mmap_base, file_size);
 
         model.ctx = weight_ctx;
         gguf_free(gguf_ctx);
