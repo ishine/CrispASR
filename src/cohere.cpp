@@ -666,17 +666,13 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
         struct ggml_tensor * ck = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.cross_k_w, cur), layer.cross_k_b);
         struct ggml_tensor * cv = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.cross_v_w, cur), layer.cross_v_b);
         
-        // CK: [d, T] -> [hd, H, T] -> [hd, T, H] -> F16 (halves cross-attn memory bandwidth)
-        struct ggml_tensor * ck_ready = ggml_cast(ctx0,
-            ggml_cont(ctx0, ggml_permute(ctx0,
-                ggml_reshape_3d(ctx0, ck, hp.dec_head_dim, hp.dec_n_heads, T), 0, 2, 1, 3)),
-            GGML_TYPE_F16);
-
-        // CV: [d, T] -> [hd, H, T] -> [T, hd, H] -> F16 (pre-transposed for decoder mul_mat)
-        struct ggml_tensor * cv_ready = ggml_cast(ctx0,
-            ggml_cont(ctx0, ggml_permute(ctx0,
-                ggml_reshape_3d(ctx0, cv, hp.dec_head_dim, hp.dec_n_heads, T), 1, 2, 0, 3)),
-            GGML_TYPE_F16);
+        // CK: [d, T] -> [hd, H, T] -> [hd, T, H]
+        struct ggml_tensor * ck_ready = ggml_cont(ctx0, ggml_permute(ctx0, 
+            ggml_reshape_3d(ctx0, ck, hp.dec_head_dim, hp.dec_n_heads, T), 0, 2, 1, 3));
+        
+        // CV: [d, T] -> [hd, H, T] -> [T, hd, H] (pre-transposed for decoder mul_mat)
+        struct ggml_tensor * cv_ready = ggml_cont(ctx0, ggml_permute(ctx0, 
+            ggml_reshape_3d(ctx0, cv, hp.dec_head_dim, hp.dec_n_heads, T), 1, 2, 0, 3));
 
         char ck_name[32], cv_name[32];
         snprintf(ck_name, sizeof(ck_name), "ck_%d", il);
@@ -1702,10 +1698,10 @@ char * cohere_transcribe(struct cohere_context * ctx,
     int T_enc_total = 0;
 
     // Per-chunk K/V CPU storage: partial_k[il][chunk] and partial_v[il][chunk]
-    // K chunk: [head_dim, T_c, n_heads] layout (F16 bytes, cast in encoder graph)
-    // V chunk: [T_c, head_dim, n_heads] layout (F16 bytes, cast in encoder graph)
-    std::vector<std::vector<std::vector<ggml_fp16_t>>> partial_k(hp.dec_n_layers);
-    std::vector<std::vector<std::vector<ggml_fp16_t>>> partial_v(hp.dec_n_layers);
+    // K chunk: [head_dim, T_c, n_heads] layout (F32; converted to F16 on upload)
+    // V chunk: [T_c, head_dim, n_heads] layout (F32; converted to F16 on upload)
+    std::vector<std::vector<std::vector<float>>> partial_k(hp.dec_n_layers);
+    std::vector<std::vector<std::vector<float>>> partial_v(hp.dec_n_layers);
     std::vector<int> T_enc_chunks;
     for (int il = 0; il < hp.dec_n_layers; il++) {
         partial_k[il].reserve(4);
@@ -1876,16 +1872,22 @@ char * cohere_transcribe(struct cohere_context * ctx,
         }
 
         const int n_chunks = (int)T_enc_chunks.size();
+        const int64_t kv_nelems = (int64_t)head_dim * T_enc_total * n_heads;
+        // Temporary F16 staging buffer (reused for K and V across all layers)
+        std::vector<ggml_fp16_t> fp16_staging(kv_nelems);
+
         if (n_chunks == 1) {
-            // Fast path: single chunk — direct upload from CPU vectors
+            // Fast path: single chunk — convert F32→F16 then upload
             for (int il = 0; il < hp.dec_n_layers; il++) {
-                ggml_backend_tensor_set(ctx->cross_kv_k[il], partial_k[il][0].data(),
+                ggml_fp32_to_fp16_row(partial_k[il][0].data(), fp16_staging.data(), partial_k[il][0].size());
+                ggml_backend_tensor_set(ctx->cross_kv_k[il], fp16_staging.data(),
                                         0, partial_k[il][0].size() * sizeof(ggml_fp16_t));
-                ggml_backend_tensor_set(ctx->cross_kv_v[il], partial_v[il][0].data(),
+                ggml_fp32_to_fp16_row(partial_v[il][0].data(), fp16_staging.data(), partial_v[il][0].size());
+                ggml_backend_tensor_set(ctx->cross_kv_v[il], fp16_staging.data(),
                                         0, partial_v[il][0].size() * sizeof(ggml_fp16_t));
             }
         } else {
-            // Multi-chunk: scatter-copy each chunk's K/V into the final layout.
+            // Multi-chunk: scatter-copy into F32, then convert F32→F16 before upload.
             //
             // K layout [head_dim, T_enc_total, n_heads]: for head h, all T frames are at
             //   offset h × T_enc_total × head_dim (a contiguous block of T×head_dim floats).
@@ -1894,31 +1896,33 @@ char * cohere_transcribe(struct cohere_context * ctx,
             // V layout [T_enc_total, head_dim, n_heads]: for head h and dim d, the T frames are at
             //   h × head_dim × T_enc_total + d × T_enc_total + T_so_far (stride 1).
             //   Each chunk's (h,d) slice: chunk_v[h × head_dim × T_c + d × T_c .. + T_c)
-            std::vector<ggml_fp16_t> k_full(head_dim * T_enc_total * n_heads);
-            std::vector<ggml_fp16_t> v_full(T_enc_total * head_dim * n_heads);
+            std::vector<float> k_full(head_dim * T_enc_total * n_heads);
+            std::vector<float> v_full(T_enc_total * head_dim * n_heads);
 
             for (int il = 0; il < hp.dec_n_layers; il++) {
                 int T_so_far = 0;
                 for (int c = 0; c < n_chunks; c++) {
                     int T_c = T_enc_chunks[c];
-                    const ggml_fp16_t * ck = partial_k[il][c].data();
-                    const ggml_fp16_t * cv = partial_v[il][c].data();
+                    const float * ck = partial_k[il][c].data();
+                    const float * cv = partial_v[il][c].data();
                     for (int h = 0; h < n_heads; h++) {
                         // K: head h block in chunk = ck[h × T_c × head_dim .. ]
-                        const ggml_fp16_t * ks = ck + h * T_c * head_dim;
-                        ggml_fp16_t * kd = k_full.data() + h * T_enc_total * head_dim + T_so_far * head_dim;
-                        memcpy(kd, ks, T_c * head_dim * sizeof(ggml_fp16_t));
+                        const float * ks = ck + h * T_c * head_dim;
+                        float * kd = k_full.data() + h * T_enc_total * head_dim + T_so_far * head_dim;
+                        memcpy(kd, ks, T_c * head_dim * sizeof(float));
                         // V: for each dim d, copy T_c consecutive frames
                         for (int d = 0; d < head_dim; d++) {
-                            const ggml_fp16_t * vs = cv + h * head_dim * T_c + d * T_c;
-                            ggml_fp16_t * vd = v_full.data() + h * head_dim * T_enc_total + d * T_enc_total + T_so_far;
-                            memcpy(vd, vs, T_c * sizeof(ggml_fp16_t));
+                            const float * vs = cv + h * head_dim * T_c + d * T_c;
+                            float * vd = v_full.data() + h * head_dim * T_enc_total + d * T_enc_total + T_so_far;
+                            memcpy(vd, vs, T_c * sizeof(float));
                         }
                     }
                     T_so_far += T_c;
                 }
-                ggml_backend_tensor_set(ctx->cross_kv_k[il], k_full.data(), 0, k_full.size() * sizeof(ggml_fp16_t));
-                ggml_backend_tensor_set(ctx->cross_kv_v[il], v_full.data(), 0, v_full.size() * sizeof(ggml_fp16_t));
+                ggml_fp32_to_fp16_row(k_full.data(), fp16_staging.data(), k_full.size());
+                ggml_backend_tensor_set(ctx->cross_kv_k[il], fp16_staging.data(), 0, k_full.size() * sizeof(ggml_fp16_t));
+                ggml_fp32_to_fp16_row(v_full.data(), fp16_staging.data(), v_full.size());
+                ggml_backend_tensor_set(ctx->cross_kv_v[il], fp16_staging.data(), 0, v_full.size() * sizeof(ggml_fp16_t));
             }
         }
 
