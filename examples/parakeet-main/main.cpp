@@ -97,11 +97,23 @@ int main(int argc, char ** argv) {
                 (double)pcm.size() / parakeet_sample_rate(ctx),
                 parakeet_sample_rate(ctx));
 
-        if (parakeet_test_audio(ctx, pcm.data(), (int)pcm.size()) < 0) {
-            fprintf(stderr, "%s: audio encode test FAILED\n", argv[0]);
+        parakeet_result * r = parakeet_transcribe_ex(ctx, pcm.data(), (int)pcm.size(), 0);
+        if (!r) {
+            fprintf(stderr, "%s: transcription failed\n", argv[0]);
             parakeet_free(ctx);
             return 4;
         }
+        printf("%s\n", r->text ? r->text : "");
+        if (verbosity >= 2) {
+            for (int i = 0; i < r->n_tokens; i++) {
+                const auto & td = r->tokens[i];
+                fprintf(stderr, "  [%5d.%02ds → %5d.%02ds]  id=%5d  '%s'\n",
+                    (int)(td.t0 / 100), (int)(td.t0 % 100),
+                    (int)(td.t1 / 100), (int)(td.t1 % 100),
+                    td.id, td.text);
+            }
+        }
+        parakeet_result_free(r);
     }
 
     parakeet_free(ctx);

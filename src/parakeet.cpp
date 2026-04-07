@@ -44,6 +44,33 @@
 #include <vector>
 
 // ===========================================================================
+// CPU weight caches for the predictor LSTM and joint head
+//
+// Both are populated lazily (parakeet_init_pred_weights / _joint_weights)
+// from the model's GGUF tensors and used by the manual F32 stepping in
+// predictor_step / joint_step. Stored on the parakeet_context by value.
+// ===========================================================================
+
+struct parakeet_predictor_weights {
+    std::vector<float> embed;     // [vocab+1, H]
+    std::vector<float> w_ih_0, w_hh_0, b_ih_0, b_hh_0;
+    std::vector<float> w_ih_1, w_hh_1, b_ih_1, b_hh_1;
+    int  H = 0;
+    bool initialised = false;
+};
+
+struct parakeet_joint_weights {
+    std::vector<float> enc_w,  enc_b;     // (joint_hidden, d_model), (joint_hidden,)
+    std::vector<float> pred_w, pred_b;    // (joint_hidden, pred_hidden), (joint_hidden,)
+    std::vector<float> out_w,  out_b;     // (vocab_total, joint_hidden), (vocab_total,)
+    int joint_hidden = 0;
+    int d_model      = 0;
+    int pred_hidden  = 0;
+    int vocab_total  = 0;
+    bool initialised = false;
+};
+
+// ===========================================================================
 // Hyper-parameters
 // ===========================================================================
 
@@ -173,6 +200,11 @@ struct parakeet_context {
     ggml_backend_sched_t sched       = nullptr;
 
     std::vector<uint8_t> compute_meta;     // metadata buffer for graph allocation
+
+    // CPU-side weight caches for the predictor LSTM and joint head.
+    // Lazy-initialised on first transcribe call.
+    parakeet_predictor_weights pred_w;
+    parakeet_joint_weights     joint_w;
 
     int n_threads = 4;
 };
@@ -879,6 +911,346 @@ static std::vector<float> parakeet_encode_mel(parakeet_context * ctx,
 }
 
 // ===========================================================================
+// LSTM predictor (manual F32 step on the CPU)
+//
+// We don't go through ggml here — the predictor runs once per *emitted token*
+// (not per encoder frame), the input is a single 640-vector, and the work
+// per step is two small (640 → 4*640) GEMMs. A direct loop is simpler than
+// building a per-step graph and the performance ceiling is identical.
+//
+// PyTorch LSTM weight layout:
+//   weight_ih [4H, in_dim]   gates packed as [i, f, g, o]
+//   weight_hh [4H, H]
+//   bias_ih   [4H]
+//   bias_hh   [4H]
+// Forward (per layer):
+//   gates = weight_ih @ x + bias_ih + weight_hh @ h + bias_hh
+//   i = sigmoid(gates[0..H])
+//   f = sigmoid(gates[H..2H])
+//   g = tanh   (gates[2H..3H])
+//   o = sigmoid(gates[3H..4H])
+//   c' = f * c + i * g
+//   h' = o * tanh(c')
+// ===========================================================================
+
+struct parakeet_lstm_state {
+    std::vector<float> h0, c0;   // layer 0
+    std::vector<float> h1, c1;   // layer 1
+};
+
+static void lstm_init_state(parakeet_lstm_state & s, int H) {
+    s.h0.assign(H, 0.0f);
+    s.c0.assign(H, 0.0f);
+    s.h1.assign(H, 0.0f);
+    s.c1.assign(H, 0.0f);
+}
+
+// Read an F16/F32 ggml tensor into a flat F32 std::vector for CPU stepping.
+static std::vector<float> tensor_to_f32(ggml_tensor * t) {
+    const size_t n = ggml_nelements(t);
+    std::vector<float> out(n);
+    if (t->type == GGML_TYPE_F32) {
+        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
+    } else if (t->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> tmp(n);
+        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(ggml_fp16_t));
+        for (size_t i = 0; i < n; i++) out[i] = ggml_fp16_to_fp32(tmp[i]);
+    } else {
+        // Quantised types: dequantise via ggml-cpu helper
+        const struct ggml_type_traits * tr = ggml_get_type_traits(t->type);
+        std::vector<uint8_t> raw(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+        tr->to_float(raw.data(), out.data(), n);
+    }
+    return out;
+}
+
+static void lstm_step_layer(const float * x,                  // [in_dim]
+                            const float * w_ih, const float * b_ih,
+                            const float * w_hh, const float * b_hh,
+                            float * h, float * c,             // [H]   in/out
+                            float * h_out,                    // [H]   out
+                            int in_dim, int H)
+{
+    const int H4 = 4 * H;
+    std::vector<float> gates(H4);
+
+    // gates = b_ih + b_hh + w_ih @ x + w_hh @ h
+    for (int i = 0; i < H4; i++) gates[i] = b_ih[i] + b_hh[i];
+
+    for (int i = 0; i < H4; i++) {
+        const float * row = w_ih + (size_t)i * in_dim;
+        float s = 0.0f;
+        for (int k = 0; k < in_dim; k++) s += row[k] * x[k];
+        gates[i] += s;
+    }
+    for (int i = 0; i < H4; i++) {
+        const float * row = w_hh + (size_t)i * H;
+        float s = 0.0f;
+        for (int k = 0; k < H; k++) s += row[k] * h[k];
+        gates[i] += s;
+    }
+
+    auto sig = [](float x) { return 1.0f / (1.0f + expf(-x)); };
+
+    for (int j = 0; j < H; j++) {
+        float i_g = sig (gates[0*H + j]);
+        float f_g = sig (gates[1*H + j]);
+        float g_g = tanhf(gates[2*H + j]);
+        float o_g = sig (gates[3*H + j]);
+        c[j]    = f_g * c[j] + i_g * g_g;
+        h_out[j] = o_g * tanhf(c[j]);
+    }
+}
+
+// Run one predictor step:  input token id  →  pred_out [H]
+static void predictor_step(const parakeet_predictor_weights & W,
+                           int token_id,
+                           parakeet_lstm_state & state,
+                           std::vector<float> & pred_out)
+{
+    const int H = W.H;
+    pred_out.assign(H, 0.0f);
+
+    // Embed token
+    std::vector<float> x(W.embed.data() + (size_t)token_id * H,
+                         W.embed.data() + (size_t)(token_id + 1) * H);
+
+    // Layer 0
+    std::vector<float> h0_new(H);
+    lstm_step_layer(x.data(),
+                    W.w_ih_0.data(), W.b_ih_0.data(),
+                    W.w_hh_0.data(), W.b_hh_0.data(),
+                    state.h0.data(), state.c0.data(),
+                    h0_new.data(),
+                    H, H);
+    state.h0 = h0_new;
+
+    // Layer 1 — input is layer 0's hidden
+    std::vector<float> h1_new(H);
+    lstm_step_layer(state.h0.data(),
+                    W.w_ih_1.data(), W.b_ih_1.data(),
+                    W.w_hh_1.data(), W.b_hh_1.data(),
+                    state.h1.data(), state.c1.data(),
+                    h1_new.data(),
+                    H, H);
+    state.h1 = h1_new;
+
+    pred_out = state.h1;
+}
+
+// ===========================================================================
+// Joint head (CPU, F32) — runs once per (encoder_frame, predictor_state)
+//
+//   joint_in_e = enc_w @ enc[t]  + enc_b           [joint_hidden]
+//   joint_in_p = pred_w @ pred_u + pred_b          [joint_hidden]
+//   logits     = out_w @ tanh(joint_in_e + joint_in_p) + out_b
+// Output: [vocab+1+n_dur] (8198 for parakeet-tdt-0.6b-v3)
+// ===========================================================================
+
+// Pre-compute proj_e once per encoder frame so we don't redo it inside the
+// inner predictor loop.
+static void joint_proj_enc(const parakeet_joint_weights & J,
+                           const float * enc_t, std::vector<float> & out)
+{
+    out.assign(J.joint_hidden, 0.0f);
+    for (int i = 0; i < J.joint_hidden; i++) {
+        float s = J.enc_b[i];
+        const float * row = J.enc_w.data() + (size_t)i * J.d_model;
+        for (int k = 0; k < J.d_model; k++) s += row[k] * enc_t[k];
+        out[i] = s;
+    }
+}
+
+static void joint_step(const parakeet_joint_weights & J,
+                       const float * proj_enc,    // [joint_hidden]
+                       const float * pred_u,      // [pred_hidden]
+                       std::vector<float> & logits)
+{
+    std::vector<float> mid(J.joint_hidden);
+    for (int i = 0; i < J.joint_hidden; i++) {
+        float s = J.pred_b[i];
+        const float * row = J.pred_w.data() + (size_t)i * J.pred_hidden;
+        for (int k = 0; k < J.pred_hidden; k++) s += row[k] * pred_u[k];
+        // NeMo RNNTJoint uses ReLU (not tanh) — see jointnet.activation in
+        // model_config.yaml.
+        float v = proj_enc[i] + s;
+        mid[i] = v > 0.0f ? v : 0.0f;
+    }
+
+    logits.assign(J.vocab_total, 0.0f);
+    for (int v = 0; v < J.vocab_total; v++) {
+        float s = J.out_b[v];
+        const float * row = J.out_w.data() + (size_t)v * J.joint_hidden;
+        for (int k = 0; k < J.joint_hidden; k++) s += row[k] * mid[k];
+        logits[v] = s;
+    }
+}
+
+// ===========================================================================
+// Lazy weight cache initialisation (predictor + joint, F32 on CPU)
+// ===========================================================================
+
+static void parakeet_init_pred_weights(parakeet_context * ctx) {
+    if (ctx->pred_w.initialised) return;
+    auto & p   = ctx->model.predictor;
+    auto & W   = ctx->pred_w;
+    const int H = (int)ctx->model.hparams.pred_hidden;
+
+    W.embed  = tensor_to_f32(p.embed_w);
+    W.w_ih_0 = tensor_to_f32(p.lstm0_w_ih);
+    W.w_hh_0 = tensor_to_f32(p.lstm0_w_hh);
+    W.b_ih_0 = tensor_to_f32(p.lstm0_b_ih);
+    W.b_hh_0 = tensor_to_f32(p.lstm0_b_hh);
+    W.w_ih_1 = tensor_to_f32(p.lstm1_w_ih);
+    W.w_hh_1 = tensor_to_f32(p.lstm1_w_hh);
+    W.b_ih_1 = tensor_to_f32(p.lstm1_b_ih);
+    W.b_hh_1 = tensor_to_f32(p.lstm1_b_hh);
+
+    W.H = H;
+    W.initialised = true;
+}
+
+static void parakeet_init_joint_weights(parakeet_context * ctx) {
+    if (ctx->joint_w.initialised) return;
+    auto & j = ctx->model.joint;
+    auto & J = ctx->joint_w;
+    const auto & hp = ctx->model.hparams;
+
+    J.enc_w  = tensor_to_f32(j.enc_w);
+    J.enc_b  = tensor_to_f32(j.enc_b);
+    J.pred_w = tensor_to_f32(j.pred_w);
+    J.pred_b = tensor_to_f32(j.pred_b);
+    J.out_w  = tensor_to_f32(j.out_w);
+    J.out_b  = tensor_to_f32(j.out_b);
+
+    J.joint_hidden = (int)hp.joint_hidden;
+    J.d_model      = (int)hp.d_model;
+    J.pred_hidden  = (int)hp.pred_hidden;
+    J.vocab_total  = (int)j.out_b->ne[0];   // 8198 = 8192 vocab + 1 blank + 5 dur
+    J.initialised  = true;
+}
+
+// ===========================================================================
+// TDT greedy decode
+//
+// State at each step: (t, u, predictor_state, last_token).
+//   t = current encoder frame index (0 .. T_enc-1)
+//   u = predictor step index (used for the predictor's autoregressive state)
+//
+// At each step, run the joint head on (enc[t], pred_state) and split the
+// 8198-class output into (vocab_logits[8193], duration_logits[5]).
+//
+// Greedy:
+//   token_id = argmax(vocab_logits)            (8192 = blank)
+//   dur_skip = argmax(duration_logits)         (in {0, 1, 2, 3, 4})
+//
+// If token_id == blank: do not emit. Advance t by max(1, dur_skip).
+// Else: emit (token_id, t, t + dur_skip). Advance the predictor by feeding
+//       token_id, advance u++, advance t by max(1, dur_skip).
+//
+// Word timestamps come for free: each emitted token spans frames
+// [t, t + dur_skip), and frame_dur = 80 ms in this model.
+//
+// Stop when t >= T_enc.
+// ===========================================================================
+
+struct parakeet_emitted_token {
+    int  id;
+    int  t_start;   // encoder frame at emission
+    int  t_end;     // emission + duration
+};
+
+static std::vector<parakeet_emitted_token>
+parakeet_tdt_decode(parakeet_context * ctx,
+                    const float * enc, int T_enc, int d_model)
+{
+    parakeet_init_pred_weights(ctx);
+    parakeet_init_joint_weights(ctx);
+
+    const auto & hp = ctx->model.hparams;
+    const int blank_id     = (int)hp.blank_id;          // 8192
+    const int n_vocab_blk  = blank_id + 1;              // 8193 (vocab + blank)
+    const int n_dur        = (int)hp.n_tdt_durations;   // 5
+    const int max_per_step = 10;                        // safety: cap predictor advances per t
+
+    auto & W = ctx->pred_w;
+    auto & J = ctx->joint_w;
+    if (J.vocab_total != n_vocab_blk + n_dur) {
+        fprintf(stderr,
+            "parakeet: joint vocab_total mismatch (%d vs expected %d)\n",
+            J.vocab_total, n_vocab_blk + n_dur);
+    }
+
+    std::vector<parakeet_emitted_token> emitted;
+    emitted.reserve(256);
+
+    parakeet_lstm_state state;
+    lstm_init_state(state, W.H);
+
+    // SOS / first input is the blank token (NeMo convention)
+    std::vector<float> pred_out;
+    predictor_step(W, blank_id, state, pred_out);
+
+    std::vector<float> proj_e(J.joint_hidden);
+    std::vector<float> logits(J.vocab_total);
+
+    int t = 0;
+    while (t < T_enc) {
+        joint_proj_enc(J, enc + (size_t)t * d_model, proj_e);
+
+        int n_inner = 0;
+        while (n_inner < max_per_step) {
+            joint_step(J, proj_e.data(), pred_out.data(), logits);
+
+            // Argmax over the vocab+blank logits
+            int   tok    = 0;
+            float tok_lp = logits[0];
+            for (int v = 1; v < n_vocab_blk; v++) {
+                if (logits[v] > tok_lp) { tok_lp = logits[v]; tok = v; }
+            }
+
+            // Argmax over the duration logits (last n_dur entries)
+            int   dur_id = 0;
+            float dur_lp = logits[n_vocab_blk];
+            for (int d = 1; d < n_dur; d++) {
+                if (logits[n_vocab_blk + d] > dur_lp) {
+                    dur_lp = logits[n_vocab_blk + d];
+                    dur_id = d;
+                }
+            }
+            int dur_skip = (int)hp.tdt_durations[dur_id];   // 0..4
+
+            if (tok == blank_id) {
+                // Blank → never emit, always advance t by at least 1 frame.
+                t += std::max(1, dur_skip);
+                break;
+            }
+
+            // Real token: emit and advance the predictor
+            int t_end = std::min(T_enc, t + std::max(0, dur_skip));
+            emitted.push_back({tok, t, t_end});
+            predictor_step(W, tok, state, pred_out);
+
+            // Advance encoder frame by the predicted duration (≥ 0). If 0,
+            // we stay on this frame for another inner step.
+            if (dur_skip > 0) {
+                t += dur_skip;
+                break;
+            }
+            n_inner++;
+        }
+
+        if (n_inner >= max_per_step) {
+            // Force a one-frame advance to guarantee progress.
+            t++;
+        }
+    }
+
+    return emitted;
+}
+
+// ===========================================================================
 // Backend selection
 // ===========================================================================
 
@@ -1005,16 +1377,81 @@ extern "C" const char * parakeet_token_to_str(struct parakeet_context * ctx, int
     return ctx->vocab.id_to_token[id].c_str();
 }
 
-// Forward-pass entry points — stubs for now. Full implementation in next commit.
-extern "C" char * parakeet_transcribe(struct parakeet_context * /*ctx*/,
-                                      const float * /*samples*/, int /*n_samples*/) {
-    fprintf(stderr, "parakeet: transcribe() not yet implemented\n");
-    return nullptr;
+// ===========================================================================
+// Public transcribe entry points
+// ===========================================================================
+
+// Convert a SentencePiece vocab string to user-visible text:
+//   '▁foo'  → ' foo'    (word-start prefix)
+//   '<unk>' → ''        (filtered)
+//   anything else → as-is
+static std::string spiece_to_text(const std::string & piece) {
+    if (piece.empty()) return "";
+    if (piece.size() >= 2 && piece[0] == '<' && piece.back() == '>') return "";
+    // Replace leading U+2581 (▁ = 0xE2 0x96 0x81) with a space
+    if (piece.size() >= 3 &&
+        (unsigned char)piece[0] == 0xE2 &&
+        (unsigned char)piece[1] == 0x96 &&
+        (unsigned char)piece[2] == 0x81) {
+        return std::string(" ") + piece.substr(3);
+    }
+    return piece;
 }
 
 extern "C" struct parakeet_result * parakeet_transcribe_ex(
-    struct parakeet_context * /*ctx*/, const float * /*samples*/, int /*n_samples*/,
-    int64_t /*t_offset_cs*/) {
-    fprintf(stderr, "parakeet: transcribe_ex() not yet implemented\n");
-    return nullptr;
+    struct parakeet_context * ctx, const float * samples, int n_samples,
+    int64_t t_offset_cs)
+{
+    if (!ctx || !samples || n_samples <= 0) return nullptr;
+
+    // 1. Mel
+    int T_mel = 0;
+    auto mel = parakeet_compute_mel(ctx, samples, n_samples, T_mel);
+    if (mel.empty()) return nullptr;
+
+    // 2. Encoder
+    int T_enc = 0;
+    auto enc = parakeet_encode_mel(ctx, mel.data(),
+                                   (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    if (enc.empty()) return nullptr;
+
+    // 3. TDT greedy decode
+    auto emitted = parakeet_tdt_decode(ctx, enc.data(), T_enc,
+                                       (int)ctx->model.hparams.d_model);
+
+    // 4. Build result
+    auto * r = (parakeet_result *)calloc(1, sizeof(parakeet_result));
+    r->n_tokens = (int)emitted.size();
+    r->tokens = (parakeet_token_data *)calloc(r->n_tokens > 0 ? r->n_tokens : 1,
+                                              sizeof(parakeet_token_data));
+    std::string text;
+    const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
+    for (int i = 0; i < r->n_tokens; i++) {
+        const auto & e = emitted[i];
+        const std::string & piece = (e.id >= 0 && e.id < (int)ctx->vocab.id_to_token.size())
+            ? ctx->vocab.id_to_token[e.id] : std::string("");
+        std::string vis = spiece_to_text(piece);
+
+        parakeet_token_data & td = r->tokens[i];
+        td.id  = e.id;
+        td.t0  = t_offset_cs + (int64_t)e.t_start * frame_dur_cs;
+        td.t1  = t_offset_cs + (int64_t)e.t_end   * frame_dur_cs;
+        size_t n = std::min(vis.size(), sizeof(td.text) - 1);
+        memcpy(td.text, vis.data(), n);
+        td.text[n] = '\0';
+        text += vis;
+    }
+    // strip leading space
+    if (!text.empty() && text[0] == ' ') text = text.substr(1);
+    r->text = strdup(text.c_str());
+    return r;
+}
+
+extern "C" char * parakeet_transcribe(struct parakeet_context * ctx,
+                                      const float * samples, int n_samples) {
+    parakeet_result * r = parakeet_transcribe_ex(ctx, samples, n_samples, 0);
+    if (!r) return nullptr;
+    char * out = strdup(r->text ? r->text : "");
+    parakeet_result_free(r);
+    return out;
 }
