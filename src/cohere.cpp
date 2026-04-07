@@ -1713,9 +1713,10 @@ static void cohere_fold_batchnorm(cohere_model & model, int verbosity) {
             model.hparams.enc_n_layers);
 }
 
-char * cohere_transcribe(struct cohere_context * ctx,
-                         const float * samples, int n_samples,
-                         const char * lang) {
+struct cohere_result * cohere_transcribe_ex(struct cohere_context * ctx,
+                                            const float * samples, int n_samples,
+                                            const char * lang,
+                                            int64_t t_offset_cs) {
     const auto & hp  = ctx->model.hparams;
     const auto & voc = ctx->vocab;
     const int n_heads  = hp.dec_n_heads;
@@ -2024,7 +2025,8 @@ char * cohere_transcribe(struct cohere_context * ctx,
     }
 
     // Greedy decode
-    std::vector<int> generated;
+    std::vector<int>   generated;
+    std::vector<float> gen_probs;
     for (int step = 0; step < max_gen; step++) {
         const int vocab = hp.vocab_size;
         const float * last_logits = (step == 0)
@@ -2032,13 +2034,21 @@ char * cohere_transcribe(struct cohere_context * ctx,
             : logits.data();
 
         int next_tok = (int)(std::max_element(last_logits, last_logits + vocab) - last_logits);
-        COHERE_VLOG2(vb, "cohere: step %3d  tok=%5d  %s\n",
-                step, next_tok,
+
+        // Numerically-stable softmax probability of chosen token
+        float max_l = last_logits[next_tok];
+        float sum_e = 0.0f;
+        for (int v = 0; v < vocab; v++) sum_e += expf(last_logits[v] - max_l);
+        float tok_p = 1.0f / sum_e;
+
+        COHERE_VLOG2(vb, "cohere: step %3d  tok=%5d  p=%.3f  %s\n",
+                step, next_tok, tok_p,
                 (next_tok >= 0 && next_tok < (int)voc.id_to_token.size())
                     ? voc.id_to_token[next_tok].c_str() : "?");
         if (next_tok == eos_id || next_tok < 0) break;
 
         generated.push_back(next_tok);
+        gen_probs.push_back(tok_p);
         offset++;
 
         logits = cohere_decode_step(ctx, T_enc, &next_tok, 1, offset - 1);
@@ -2054,20 +2064,73 @@ char * cohere_transcribe(struct cohere_context * ctx,
 
     cohere_perf_print(perf, n_samples, hp.sample_rate, vb);
 
-    // --- Decode tokens to text ---
-    std::string text;
-    for (int id : generated) {
+    // --- Decode tokens to text + build per-token data ---
+    struct cohere_result * res = (struct cohere_result *)calloc(1, sizeof(struct cohere_result));
+    std::string full_text;
+    std::vector<cohere_token_data> tok_data;
+
+    for (int i = 0; i < (int)generated.size(); i++) {
+        int id = generated[i];
         if (id < 0 || id >= (int)voc.id_to_token.size()) continue;
         const std::string & tok = voc.id_to_token[id];
         if (tok.front() == '<' && tok.back() == '>') continue;
         std::string t = tok;
         size_t pos;
         while ((pos = t.find("\xe2\x96\x81")) != std::string::npos) t.replace(pos, 3, " ");
-        text += t;
-    }
-    if (!text.empty() && text[0] == ' ') text = text.substr(1);
 
-    char * result = (char *)malloc(text.size() + 1);
-    memcpy(result, text.c_str(), text.size() + 1);
-    return result;
+        cohere_token_data td;
+        td.id = id;
+        td.p  = gen_probs[i];
+        td.t0 = 0;
+        td.t1 = 0;
+        snprintf(td.text, sizeof(td.text), "%s", t.c_str());
+        tok_data.push_back(td);
+        full_text += t;
+    }
+    if (!full_text.empty() && full_text[0] == ' ') full_text = full_text.substr(1);
+    // Strip leading space from first token text too
+    if (!tok_data.empty() && tok_data[0].text[0] == ' ') {
+        memmove(tok_data[0].text, tok_data[0].text + 1, strlen(tok_data[0].text));
+    }
+
+    // Linear time interpolation: distribute segment duration proportional to char length
+    const int64_t seg_dur_cs = (int64_t)((double)n_samples / hp.sample_rate * 100.0);
+    int total_chars = 0;
+    for (const auto & td : tok_data) total_chars += (int)strlen(td.text);
+    if (total_chars > 0) {
+        int char_pos = 0;
+        for (auto & td : tok_data) {
+            int len = (int)strlen(td.text);
+            td.t0 = t_offset_cs + (int64_t)((double)char_pos / total_chars * seg_dur_cs);
+            char_pos += len;
+            td.t1 = t_offset_cs + (int64_t)((double)char_pos / total_chars * seg_dur_cs);
+        }
+    }
+
+    res->n_tokens = (int)tok_data.size();
+    if (res->n_tokens > 0) {
+        res->tokens = (cohere_token_data *)malloc(res->n_tokens * sizeof(cohere_token_data));
+        memcpy(res->tokens, tok_data.data(), res->n_tokens * sizeof(cohere_token_data));
+    }
+    res->text = (char *)malloc(full_text.size() + 1);
+    memcpy(res->text, full_text.c_str(), full_text.size() + 1);
+    return res;
+}
+
+void cohere_result_free(struct cohere_result * r) {
+    if (!r) return;
+    free(r->text);
+    free(r->tokens);
+    free(r);
+}
+
+char * cohere_transcribe(struct cohere_context * ctx,
+                         const float * samples, int n_samples,
+                         const char * lang) {
+    struct cohere_result * r = cohere_transcribe_ex(ctx, samples, n_samples, lang, 0);
+    if (!r) return nullptr;
+    char * text = r->text;
+    r->text = nullptr;
+    cohere_result_free(r);
+    return text;
 }

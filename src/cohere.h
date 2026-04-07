@@ -41,6 +41,45 @@ int         cohere_n_vocab(struct cohere_context * ctx);
 const char* cohere_token_to_str(struct cohere_context * ctx, int token_id);
 int         cohere_str_to_token(struct cohere_context * ctx, const char * str);
 
+// ---- Extended API: per-token confidence and timing ----
+
+// Per-token data returned by cohere_transcribe_ex().
+struct cohere_token_data {
+    int     id;        // vocabulary token ID
+    char    text[48];  // decoded text (SentencePiece '▁' already converted to ' ')
+    float   p;         // softmax probability [0, 1]
+    int64_t t0;        // start time, centiseconds (absolute, includes t_offset_cs)
+    int64_t t1;        // end time, centiseconds
+};
+
+// Result from cohere_transcribe_ex() — free with cohere_result_free().
+struct cohere_result {
+    char   * text;                     // full transcript (malloc'd)
+    struct cohere_token_data * tokens; // per-token data (malloc'd)
+    int      n_tokens;
+};
+
+void cohere_result_free(struct cohere_result * r);
+
+// Like cohere_transcribe() but also returns per-token probability and timing.
+//
+// t_offset_cs: absolute start time of this audio slice, in centiseconds.
+//   Token t0/t1 values equal (t_offset_cs + interpolated_offset_within_segment).
+//   Pass 0 when processing a single file without VAD segmentation.
+//   With VAD, pass (vad_segment_t0_seconds * 100).
+//
+// Token times are linearly interpolated across the segment duration,
+// proportional to each token's decoded text length (best approximation
+// without model-native timestamp tokens).
+//
+// Returns NULL on failure. Free result with cohere_result_free().
+struct cohere_result * cohere_transcribe_ex(
+    struct cohere_context * ctx,
+    const float * samples,
+    int           n_samples,
+    const char  * lang,
+    int64_t       t_offset_cs);
+
 #ifdef __cplusplus
 }
 #endif

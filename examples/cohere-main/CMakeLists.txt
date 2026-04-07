@@ -4,7 +4,7 @@ add_executable(${TARGET} cohere-main.cpp)
 include(DefaultTargetOptions)
 
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)
-target_link_libraries(${TARGET} PRIVATE cohere common Threads::Threads)
+target_link_libraries(${TARGET} PRIVATE cohere whisper common Threads::Threads)
 
 set(TARGET_Q cohere-quantize)
 add_executable(${TARGET_Q} cohere-quantize.cpp)
