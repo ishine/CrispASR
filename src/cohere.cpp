@@ -467,6 +467,15 @@ struct cohere_context {
     struct ggml_cgraph * gf_decode_1 = nullptr;
     int cached_offset_1 = -1;
 
+    // Cross-attention alignment weights for token-level timestamps.
+    // Populated by cohere_decode_step when collect_attn=true and n_tok==1.
+    // step_attn[i] = cross-attn weights for generated token i (last decoder layer, all heads).
+    // Layout per step: [T_enc * n_heads] in row-major (head h: w[h*T_enc .. h*T_enc+T_enc-1]).
+    bool   collect_attn = false;
+    int    attn_T_enc   = 0;
+    int    attn_n_heads = 0;
+    std::vector<std::vector<float>> step_attn;
+
     // Performance counters (reset at start of each cohere_transcribe())
     cohere_perf perf;
 };
@@ -1320,6 +1329,19 @@ static struct ggml_cgraph * cohere_build_graph_decoder(
         // cross-attention: no causal mask (encoder output is fully visible)
         struct ggml_tensor * ca_out = ggml_flash_attn_ext(ctx0, CQ, CK, CV, nullptr,
                                                            1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+
+        // For single-token generation steps: also compute explicit cross-attn weights for
+        // the last decoder layer so we can use them for token timestamp alignment.
+        // CQ: [head_dim, 1, n_heads]   CK: [head_dim, T_enc, n_heads]
+        // ca_w = softmax(CQ^T @ CK / sqrt(hd)) : [T_enc, 1, n_heads]
+        if (ctx->collect_attn && il == hp.dec_n_layers - 1 && n_tokens == 1) {
+            struct ggml_tensor * ca_w = ggml_mul_mat(ctx0, CK, CQ); // [T_enc, 1, n_heads]
+            ca_w = ggml_scale_inplace(ctx0, ca_w, 1.0f / sqrtf((float)head_dim));
+            ca_w = ggml_soft_max_inplace(ctx0, ca_w);
+            ggml_set_name(ca_w, "ca_attn_w");
+            ggml_build_forward_expand(gf, ca_w);
+        }
+
         cur = ggml_reshape_2d(ctx0, ca_out, d, n_tokens);
 
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, layer.cross_o_w, cur), layer.cross_o_b);
@@ -1455,8 +1477,24 @@ static std::vector<float> cohere_decode_step(
         const float * last_logits = logits.data() + (n_tok - 1) * vocab_size;
         int top_id = 0;
         for (int i = 1; i < vocab_size; i++) if (last_logits[i] > last_logits[top_id]) top_id = i;
-        cohere_debug("cohere: step 0 (prompt) top_tok: %d, logit: %.4f, tok_749_logit: %.4f\n", 
+        cohere_debug("cohere: step 0 (prompt) top_tok: %d, logit: %.4f, tok_749_logit: %.4f\n",
                top_id, last_logits[top_id], last_logits[749]);
+    }
+
+    // Extract cross-attention alignment weights for token timestamp estimation.
+    // Only collected for single-token generation steps (n_tok==1); the graph only
+    // contains "ca_attn_w" when collect_attn=true and n_tok==1.
+    if (ctx->collect_attn && n_tok == 1) {
+        struct ggml_tensor * ca_w_t = ggml_graph_get_tensor(gf, "ca_attn_w");
+        if (ca_w_t) {
+            int T_enc   = (int)ca_w_t->ne[0];
+            int n_heads = (int)ca_w_t->ne[2];
+            ctx->attn_T_enc   = T_enc;
+            ctx->attn_n_heads = n_heads;
+            std::vector<float> w(T_enc * n_heads);
+            ggml_backend_tensor_get(ca_w_t, w.data(), 0, w.size() * sizeof(float));
+            ctx->step_attn.push_back(std::move(w));
+        }
     }
 
     return logits;
@@ -2066,6 +2104,12 @@ struct cohere_result * cohere_transcribe_ex(struct cohere_context * ctx,
     ggml_backend_buffer_clear(ctx->kv_k->buffer, 0);
     ggml_backend_buffer_clear(ctx->kv_v->buffer, 0);
 
+    // Enable cross-attention weight collection for token timestamp alignment.
+    ctx->collect_attn = true;
+    ctx->step_attn.clear();
+    ctx->attn_T_enc   = T_enc;
+    ctx->attn_n_heads = hp.dec_n_heads;
+
     const int eos_id  = tid("<|endoftext|>");
     const int max_gen = hp.dec_max_ctx - (int)prompt.size() - 4;
 
@@ -2134,6 +2178,8 @@ struct cohere_result * cohere_transcribe_ex(struct cohere_context * ctx,
     struct cohere_result * res = (struct cohere_result *)calloc(1, sizeof(struct cohere_result));
     std::string full_text;
     std::vector<cohere_token_data> tok_data;
+    // Maps tok_data index → generated[] index (needed for cross-attn lookup)
+    std::vector<int> tok_to_gen_idx;
 
     // Diarization token IDs (from vocabulary scan)
     const int tok_spkchange = voc.token_id("<|spkchange|>");   // 14
@@ -2174,6 +2220,7 @@ struct cohere_result * cohere_transcribe_ex(struct cohere_context * ctx,
         td.t1 = 0;
         snprintf(td.text, sizeof(td.text), "%s", t.c_str());
         tok_data.push_back(td);
+        tok_to_gen_idx.push_back(i);
         full_text += t;
     }
     if (!full_text.empty() && full_text[0] == ' ') full_text = full_text.substr(1);
@@ -2182,18 +2229,71 @@ struct cohere_result * cohere_transcribe_ex(struct cohere_context * ctx,
     // make_disp_segments uses it as a word-boundary signal; flush() strips it on output.
     // Stripping here causes cross-chunk merges like "ofAmerican." and "point.Representative."
 
-    // Linear time interpolation: distribute segment duration proportional to char length
-    const int64_t seg_dur_cs = (int64_t)((double)n_samples / hp.sample_rate * 100.0);
-    int total_chars = 0;
-    for (const auto & td : tok_data) total_chars += (int)strlen(td.text);
-    if (total_chars > 0) {
-        int char_pos = 0;
-        for (auto & td : tok_data) {
-            int len = (int)strlen(td.text);
-            td.t0 = t_offset_cs + (int64_t)((double)char_pos / total_chars * seg_dur_cs);
-            char_pos += len;
-            td.t1 = t_offset_cs + (int64_t)((double)char_pos / total_chars * seg_dur_cs);
+    // Token timestamps via cross-attention alignment.
+    //
+    // For each generated token we have step_attn[gen_idx] = cross-attn weights from
+    // the last decoder layer, layout [T_enc * n_heads] row-major (head h occupies
+    // w[h*T_enc .. h*T_enc+T_enc-1]).  Average across heads, then argmax gives the
+    // encoder frame the decoder was attending to most strongly → convert to centiseconds.
+    //
+    // Encoder frame duration:
+    //   hop_length * subsampling / sample_rate = 160 * 8 / 16000 = 0.08 s = 8 cs/frame
+    //
+    // Fallback: linear interpolation proportional to character length (as before).
+    const int64_t seg_end_cs = t_offset_cs + (int64_t)((double)n_samples / hp.sample_rate * 100.0);
+    constexpr int64_t CS_PER_FRAME = 8; // 160 * 8 / 16000 * 100
+
+    const bool have_attn = !ctx->step_attn.empty()
+                        && ctx->attn_T_enc > 0
+                        && ctx->step_attn.size() == generated.size();
+
+    if (have_attn && !tok_data.empty()) {
+        const int T_enc   = ctx->attn_T_enc;
+        const int n_heads = ctx->attn_n_heads;
+
+        // Compute the peak encoder frame for each tok_data entry.
+        std::vector<int64_t> tok_cs(tok_data.size());
+        for (int j = 0; j < (int)tok_data.size(); j++) {
+            int gi = tok_to_gen_idx[j];
+            const float * w = ctx->step_attn[gi].data();
+
+            // Average cross-attn weights across all heads
+            std::vector<float> avg(T_enc, 0.0f);
+            for (int h = 0; h < n_heads; h++)
+                for (int t = 0; t < T_enc; t++)
+                    avg[t] += w[h * T_enc + t];
+
+            int peak = (int)(std::max_element(avg.begin(), avg.end()) - avg.begin());
+            tok_cs[j] = t_offset_cs + (int64_t)peak * CS_PER_FRAME;
         }
+
+        // Clamp so times are monotone non-decreasing (attn can jump around)
+        for (int j = 1; j < (int)tok_cs.size(); j++)
+            if (tok_cs[j] < tok_cs[j-1]) tok_cs[j] = tok_cs[j-1];
+
+        // Assign t0/t1: t1 of token j = t0 of token j+1; last token ends at seg_end
+        for (int j = 0; j < (int)tok_data.size(); j++) {
+            tok_data[j].t0 = tok_cs[j];
+            tok_data[j].t1 = (j + 1 < (int)tok_data.size()) ? tok_cs[j+1] : seg_end_cs;
+        }
+        COHERE_VLOG2(vb, "cohere: timestamps via cross-attention alignment (%d tokens)\n",
+                     (int)tok_data.size());
+    } else {
+        // Fallback: distribute segment duration proportional to character length
+        int total_chars = 0;
+        for (const auto & td : tok_data) total_chars += (int)strlen(td.text);
+        if (total_chars > 0) {
+            const int64_t seg_dur_cs = seg_end_cs - t_offset_cs;
+            int char_pos = 0;
+            for (auto & td : tok_data) {
+                int len = (int)strlen(td.text);
+                td.t0 = t_offset_cs + (int64_t)((double)char_pos / total_chars * seg_dur_cs);
+                char_pos += len;
+                td.t1 = t_offset_cs + (int64_t)((double)char_pos / total_chars * seg_dur_cs);
+            }
+        }
+        if (!have_attn)
+            COHERE_VLOG2(vb, "cohere: timestamps via linear interpolation (no attn weights)\n");
     }
 
     res->n_tokens = (int)tok_data.size();
