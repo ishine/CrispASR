@@ -83,6 +83,11 @@ int         parakeet_sample_rate (struct parakeet_context * ctx);
 // run it, and report the output T_enc. Returns T_enc on success or -1.
 int         parakeet_test_encoder(struct parakeet_context * ctx, int T_mel);
 
+// Internal smoke test: take raw 16 kHz mono PCM, run mel + encoder, print
+// encoder-output statistics. Returns T_enc on success or -1.
+int         parakeet_test_audio  (struct parakeet_context * ctx,
+                                  const float * samples, int n_samples);
+
 #ifdef __cplusplus
 }
 #endif

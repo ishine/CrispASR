@@ -5,11 +5,13 @@
 // greedy decode) lands in subsequent commits.
 
 #include "parakeet.h"
+#include "common-whisper.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 static void print_usage(const char * prog) {
     fprintf(stderr,
@@ -83,7 +85,23 @@ int main(int argc, char ** argv) {
     }
 
     if (!audio_path.empty()) {
-        fprintf(stderr, "%s: transcription not yet implemented (audio path ignored)\n", argv[0]);
+        std::vector<float> pcm;
+        std::vector<std::vector<float>> stereo;
+        if (!read_audio_data(audio_path, pcm, stereo, /*stereo=*/false)) {
+            fprintf(stderr, "%s: failed to read audio '%s'\n", argv[0], audio_path.c_str());
+            parakeet_free(ctx);
+            return 3;
+        }
+        fprintf(stderr, "%s: audio loaded — %d samples (%.2fs) @ %d Hz\n",
+                argv[0], (int)pcm.size(),
+                (double)pcm.size() / parakeet_sample_rate(ctx),
+                parakeet_sample_rate(ctx));
+
+        if (parakeet_test_audio(ctx, pcm.data(), (int)pcm.size()) < 0) {
+            fprintf(stderr, "%s: audio encode test FAILED\n", argv[0]);
+            parakeet_free(ctx);
+            return 4;
+        }
     }
 
     parakeet_free(ctx);

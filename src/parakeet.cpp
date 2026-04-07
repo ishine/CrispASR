@@ -418,6 +418,149 @@ static bool parakeet_load_model(parakeet_model & model,
 }
 
 // ===========================================================================
+// FFT (iterative Cooley-Tukey, real-input, N must be a power of 2)
+// ===========================================================================
+
+static void parakeet_fft_r2c(const float * in, int N, float * out) {
+    int bits = 0;
+    for (int n = N; n > 1; n >>= 1) bits++;
+
+    for (int i = 0; i < N; i++) {
+        int rev = 0;
+        for (int b = 0; b < bits; b++) rev = (rev << 1) | ((i >> b) & 1);
+        out[2*rev]   = in[i];
+        out[2*rev+1] = 0.0f;
+    }
+    for (int len = 2; len <= N; len <<= 1) {
+        float ang = -2.0f * (float)M_PI / (float)len;
+        float wre = cosf(ang), wim = sinf(ang);
+        for (int i = 0; i < N; i += len) {
+            float ure = 1.0f, uim = 0.0f;
+            for (int j = 0; j < len / 2; j++) {
+                int a = i + j, b = i + j + len / 2;
+                float are = out[2*a], aim = out[2*a+1];
+                float bre = out[2*b], bim = out[2*b+1];
+                float tre = ure*bre - uim*bim, tim = ure*bim + uim*bre;
+                out[2*a]   = are + tre; out[2*a+1] = aim + tim;
+                out[2*b]   = are - tre; out[2*b+1] = aim - tim;
+                float new_ure = ure*wre - uim*wim;
+                uim = ure*wim + uim*wre;
+                ure = new_ure;
+            }
+        }
+    }
+}
+
+// ===========================================================================
+// NeMo-style mel spectrogram
+//
+// AudioToMelSpectrogramPreprocessor defaults for parakeet-tdt-0.6b-v3:
+//   sample_rate=16000  features=128  n_fft=512
+//   window_size=0.025 (= 400 samples)  window_stride=0.010 (= 160 samples)
+//   window=hann  log=True  normalize=per_feature  dither=1e-5
+//   mag_power=2.0  log_zero_guard_value=2^-24 ≈ 5.96e-8
+//
+// No pre-emphasis (unlike Cohere). Window and mel filterbank are loaded
+// directly from the GGUF preprocessor.* tensors.
+//
+// Returns mel as a flat row-major [n_mels, T] (time-major).
+// ===========================================================================
+
+static std::vector<float> parakeet_compute_mel(parakeet_context * ctx,
+                                               const float * samples, int n_samples,
+                                               int & T_out) {
+    const auto & hp     = ctx->model.hparams;
+    const int n_fft     = (int)hp.n_fft;
+    const int hop       = (int)hp.hop_length;
+    const int win       = (int)hp.win_length;
+    const int n_freqs   = n_fft / 2 + 1;
+    const int n_mels    = (int)hp.n_mels;
+    const float log_eps = (float)(1.0 / (1 << 24));
+
+    if (!ctx->model.mel_fb || !ctx->model.mel_window) {
+        fprintf(stderr, "parakeet: missing preprocessor.fb or preprocessor.window in GGUF\n");
+        return {};
+    }
+
+    // Pull window and filterbank from GGUF
+    std::vector<float> window_raw((size_t)win);
+    ggml_backend_tensor_get(ctx->model.mel_window, window_raw.data(), 0,
+                            win * sizeof(float));
+
+    std::vector<float> mel_fb((size_t)n_mels * n_freqs);
+    // mel_fb tensor shape is [1, n_mels, n_freqs]; data is contiguous so we can read straight.
+    ggml_backend_tensor_get(ctx->model.mel_fb, mel_fb.data(), 0,
+                            mel_fb.size() * sizeof(float));
+
+    // Center-pad input by n_fft/2 (matches torchaudio / NeMo `pad_mode='reflect'`,
+    // but we use zero-pad which is what cohere.cpp uses; the difference is small).
+    const int pad = n_fft / 2;
+    std::vector<float> padded((size_t)(pad + n_samples + pad), 0.0f);
+    memcpy(padded.data() + pad, samples, n_samples * sizeof(float));
+
+    const int T = (int)((padded.size() - n_fft) / hop + 1);
+    T_out = T;
+
+    // Hann window padded to n_fft (centred)
+    std::vector<float> window(n_fft, 0.0f);
+    int lpad = (n_fft - win) / 2;
+    for (int i = 0; i < win; i++) window[lpad + i] = window_raw[i];
+
+    // STFT → power spectrum
+    std::vector<float> power((size_t)n_freqs * T, 0.0f);
+    {
+        std::vector<float> fft_in(n_fft);
+        std::vector<float> fft_out((size_t)n_fft * 2);
+        for (int t = 0; t < T; t++) {
+            const float * frame = padded.data() + (size_t)t * hop;
+            for (int n = 0; n < n_fft; n++) fft_in[n] = frame[n] * window[n];
+            parakeet_fft_r2c(fft_in.data(), n_fft, fft_out.data());
+            for (int k = 0; k < n_freqs; k++) {
+                float re = fft_out[2*k], im = fft_out[2*k+1];
+                power[(size_t)t * n_freqs + k] = re*re + im*im;
+            }
+        }
+    }
+
+    // mel = power [T, n_freqs] @ fb^T [n_freqs, n_mels] → [T, n_mels]
+    // Then transpose to [n_mels, T] for the encoder graph input.
+    std::vector<float> mel_tn((size_t)T * n_mels, 0.0f);
+    for (int t = 0; t < T; t++) {
+        const float * pp = power.data() + (size_t)t * n_freqs;
+        float * mp = mel_tn.data() + (size_t)t * n_mels;
+        for (int m = 0; m < n_mels; m++) {
+            const float * fb = mel_fb.data() + (size_t)m * n_freqs;
+            float s = 0.0f;
+            for (int k = 0; k < n_freqs; k++) s += pp[k] * fb[k];
+            mp[m] = s;
+        }
+    }
+
+    // log
+    for (size_t i = 0; i < mel_tn.size(); i++)
+        mel_tn[i] = logf(mel_tn[i] + log_eps);
+
+    // Per-feature normalisation (per-mel band, across time)
+    for (int m = 0; m < n_mels; m++) {
+        double sum = 0.0, sq = 0.0;
+        for (int t = 0; t < T; t++) sum += mel_tn[(size_t)t * n_mels + m];
+        double mean = sum / T;
+        for (int t = 0; t < T; t++) {
+            double d = mel_tn[(size_t)t * n_mels + m] - mean;
+            sq += d * d;
+        }
+        float inv_std = 1.0f / sqrtf((float)(sq / T) + 1e-5f);
+        for (int t = 0; t < T; t++)
+            mel_tn[(size_t)t * n_mels + m] = (float)(mel_tn[(size_t)t * n_mels + m] - mean) * inv_std;
+    }
+
+    // mel_tn is already [T, n_mels] row-major, which matches the encoder's
+    // ggml_new_tensor_2d(F32, n_mels, T_mel) layout (ne[0]=n_mels fastest =
+    // each frame's 128 mels contiguous, then next frame).
+    return mel_tn;
+}
+
+// ===========================================================================
 // BatchNorm folding (load-time, once)
 //
 // Inference-time BN: y = (x - mean) / sqrt(var + eps) * gamma + beta
@@ -808,6 +951,39 @@ extern "C" int parakeet_test_encoder(struct parakeet_context * ctx, int T_mel) {
     fprintf(stderr, "parakeet: encoder OK — T_mel=%d → T_enc=%d  d=%d  out[0..3]=%g %g %g %g\n",
             T_mel, T_enc, (int)ctx->model.hparams.d_model,
             (double)out[0], (double)out[1], (double)out[2], (double)out[3]);
+    return T_enc;
+}
+
+extern "C" int parakeet_test_audio(struct parakeet_context * ctx,
+                                   const float * samples, int n_samples) {
+    int T_mel = 0;
+    auto mel = parakeet_compute_mel(ctx, samples, n_samples, T_mel);
+    if (mel.empty()) return -1;
+
+    fprintf(stderr,
+        "parakeet: mel OK — n_samples=%d (%.2fs)  T_mel=%d  n_mels=%d  mel[0..3]=%g %g %g %g\n",
+        n_samples, (double)n_samples / ctx->model.hparams.sample_rate, T_mel,
+        (int)ctx->model.hparams.n_mels,
+        (double)mel[0], (double)mel[1], (double)mel[2], (double)mel[3]);
+
+    int T_enc = 0;
+    auto enc_out = parakeet_encode_mel(ctx, mel.data(),
+                                       (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
+    if (enc_out.empty()) return -1;
+
+    // Print a few summary stats over the encoder output
+    double sum = 0, sq = 0;
+    float mn = enc_out[0], mx = enc_out[0];
+    for (float v : enc_out) {
+        sum += v; sq += (double)v * v;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    double mean = sum / enc_out.size();
+    double var  = sq / enc_out.size() - mean * mean;
+    fprintf(stderr,
+        "parakeet: encoder OK — T_enc=%d  d=%d  mean=%.4f  std=%.4f  min=%.3f  max=%.3f\n",
+        T_enc, (int)ctx->model.hparams.d_model, mean, sqrt(var), (double)mn, (double)mx);
     return T_enc;
 }
 
