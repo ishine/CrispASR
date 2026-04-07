@@ -2350,6 +2350,26 @@ struct cohere_result * cohere_transcribe_ex(struct cohere_context * ctx,
         }
         COHERE_VLOG2(vb, "cohere: timestamps via DTW alignment (%d tokens, T_enc=%d)\n",
                      n_tok, T_enc);
+
+        // Optional: dump raw per-head attention for head-selection analysis.
+        // Set COHERE_DUMP_ATTN=/path/to/file.bin to activate.
+        // Format: int32 n_tok, int32 n_heads, int32 T_enc, then
+        //         n_tok × n_heads × T_enc float32 row-major.
+        if (const char * dump_path = getenv("COHERE_DUMP_ATTN")) {
+            if (FILE * fp = fopen(dump_path, "wb")) {
+                int32_t hdr[3] = { n_tok, n_heads, T_enc };
+                fwrite(hdr, sizeof(hdr), 1, fp);
+                // Write raw per-head weights (not averaged), using same gi_src shift
+                for (int i = 0; i < n_tok; i++) {
+                    int gi     = tok_to_gen_idx[i];
+                    int gi_src = (gi > 0) ? gi - 1 : 0;
+                    fwrite(ctx->step_attn[gi_src].data(), sizeof(float), T_enc * n_heads, fp);
+                }
+                fclose(fp);
+                fprintf(stderr, "cohere: attention dump written to %s "
+                        "(%d tok × %d heads × %d frames)\n", dump_path, n_tok, n_heads, T_enc);
+            }
+        }
     } else {
         // Fallback: distribute segment duration proportional to character length
         int total_chars = 0;
