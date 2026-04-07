@@ -59,7 +59,7 @@ RTFx > 1.0 means faster than real-time. Measured on an 11s clip with 8 CPU threa
 ./build/bin/cohere-main \
     -m cohere-transcribe-q4_k.gguf \
     -f audio.wav \
-    -t 8
+    -t 4
 ```
 
 Input must be 16 kHz mono WAV. Convert with ffmpeg:
@@ -67,9 +67,25 @@ Input must be 16 kHz mono WAV. Convert with ffmpeg:
 ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le audio.wav
 ```
 
-Environment variables:
+**CLI options:**
 ```
-COHERE_THREADS=8     # override thread count
+  -m FNAME,  --model FNAME      path to .gguf model file
+  -f FNAME,  --file FNAME       input audio (WAV 16 kHz mono)
+  -l LANG,   --language LANG    language code (default: en)
+  -t N,      --threads N        thread count (default: 4)
+  -ot,       --output-txt       write transcript to <audio>.txt
+  -npnc,     --no-punctuation   disable punctuation in output
+  -v,        --verbose          show timing info and per-step tokens
+  -np,       --no-prints        suppress all informational output
+  -d,        --debug            enable COHERE_DEBUG and COHERE_PROF
+  --flash                       enable flash attention in decoder
+```
+
+**Supported languages:** `ar de el en es fr it ja ko nl pl pt vi zh`
+
+**Environment variables:**
+```
+COHERE_THREADS=4     # override thread count
 COHERE_DEVICE=metal  # force backend: metal | cuda | cpu
 COHERE_DEBUG=1       # verbose tensor/graph logging
 COHERE_PROF=1        # per-op profiling (mul_mat, conv, etc.)
@@ -134,6 +150,29 @@ Uses `ggml_conv_2d_dw_direct` (`GGML_OP_CONV_2D_DW`) — a direct sliding-window
 
 **BatchNorm folding:**
 BatchNorm statistics are folded into the depthwise conv weights at model load time, eliminating 480 graph nodes and giving ~7% encoder speedup (F16) with no effect on accuracy.
+
+---
+
+## Performance
+
+RTFx > 1.0 = faster than real-time. Measured on an 11s clip, 4-thread CPU.
+
+| Model | Size | RTFx (CPU, 4t) | RTFx (Metal M1) |
+|-------|------|---------------|----------------|
+| F16 | 3.85 GB | 0.80× | ~11.9× |
+| Q8_0 | 2.05 GB | 1.03× | — |
+| Q4_K | 1.21 GB | **1.24×** | — |
+
+**vs ONNX (45s clip, 4-thread CPU):**
+
+| | Encoder | Decoder | Total | RTFx |
+|--|---------|---------|-------|------|
+| ONNX INT8 (DNNL AVX-512) | 19.5s | 11.7s | 31.2s | 1.44× |
+| **Ours Q4_K** | 42.1s | **3.1s** | 45.4s | 0.99× |
+
+Our decoder is 3–4× faster than ONNX because ggml's in-place KV cache moves zero data between steps, vs ~45 GB of KV array shuffling through Python→ONNX→Python in the reference implementation. On Metal/GPU the encoder gap closes and real-time inference is easily achievable.
+
+See [PERFORMANCE.md](PERFORMANCE.md) for per-op profiler output, optimization history, and detailed analysis.
 
 ---
 

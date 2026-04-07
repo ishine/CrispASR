@@ -11,8 +11,9 @@ extern "C" {
 struct cohere_context;
 
 struct cohere_context_params {
-    int   n_threads;   // default: number of physical cores
-    bool  use_flash;   // flash attention in decoder (default: false for now)
+    int   n_threads;        // default: number of physical cores
+    bool  use_flash;        // flash attention in decoder (default: false for now)
+    bool  no_punctuation;   // use <|nopnc|> instead of <|pnc|> in prompt (default: false)
     // Output verbosity:
     //   0 = silent  — only hard errors (failed/cannot) go to stderr
     //   1 = normal  — model loading info printed (default)

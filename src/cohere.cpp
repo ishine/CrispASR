@@ -1473,7 +1473,7 @@ static void cohere_model_warm_cache(const cohere_model & m) {
 }
 
 struct cohere_context_params cohere_context_default_params(void) {
-    return { .n_threads = 4, .use_flash = false, .verbosity = 1 };
+    return { .n_threads = 4, .use_flash = false, .no_punctuation = false, .verbosity = 1 };
 }
 
 struct cohere_context * cohere_init_from_file(const char * path_model,
@@ -1983,10 +1983,11 @@ char * cohere_transcribe(struct cohere_context * ctx,
     char lang_tok_str[32];
     snprintf(lang_tok_str, sizeof(lang_tok_str), "<|%s|>", lang_tok);
 
+    const char * pnc_tok = ctx->params.no_punctuation ? "<|nopnc|>" : "<|pnc|>";
     std::vector<int> prompt = {
         tid("<|startofcontext|>"), tid("<|startoftranscript|>"), tid("<|emo:undefined|>"),
         tid(lang_tok_str), tid(lang_tok_str),
-        tid("<|pnc|>"), tid("<|noitn|>"), tid("<|notimestamp|>"), tid("<|nodiarize|>"),
+        tid(pnc_tok), tid("<|noitn|>"), tid("<|notimestamp|>"), tid("<|nodiarize|>"),
     };
     prompt.erase(std::remove_if(prompt.begin(), prompt.end(),
                                 [](int t){ return t == -1; }), prompt.end());
