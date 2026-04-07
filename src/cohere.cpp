@@ -86,9 +86,9 @@ static void cohere_log_tensor(const char * name, const struct ggml_tensor * t) {
 // vlog2: shown at verbosity >= 2 (per-inference timing, steps, perf report)
 // Always print errors/warnings regardless of verbosity.
 #define COHERE_VLOG(v, fmt, ...) \
-    do { if ((v) >= 1) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+    do { if ((v) >= 1) fprintf(stderr, fmt __VA_OPT__(,) __VA_ARGS__); } while (0)
 #define COHERE_VLOG2(v, fmt, ...) \
-    do { if ((v) >= 2) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
+    do { if ((v) >= 2) fprintf(stderr, fmt __VA_OPT__(,) __VA_ARGS__); } while (0)
 
 // ---------------------------------------------------------------------------
 // Performance counters — accumulated per cohere_transcribe() call
