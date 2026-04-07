@@ -156,6 +156,27 @@ if(GGML_CUDA)
     target_link_libraries(cohere PUBLIC ggml-cuda)
 endif()
 
+# ---------------------------------------------------------------------------
+# wav2vec2-ggml — Wav2Vec2ForCTC encoder (GGUF, ggml-based)
+# ---------------------------------------------------------------------------
+add_library(wav2vec2-ggml STATIC wav2vec2-ggml.h wav2vec2-ggml.cpp)
+target_include_directories(wav2vec2-ggml PUBLIC .)
+target_compile_features   (wav2vec2-ggml PUBLIC cxx_std_17)
+target_link_libraries     (wav2vec2-ggml PUBLIC ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(wav2vec2-ggml PRIVATE -O3 -march=native)
+endif()
+
+# ---------------------------------------------------------------------------
+# ctc-align — CTC forced alignment (Viterbi DP, CPU-only, no ggml dependency)
+# ---------------------------------------------------------------------------
+add_library(ctc-align STATIC align.h align.cpp)
+target_include_directories(ctc-align PUBLIC .)
+target_compile_features   (ctc-align PUBLIC cxx_std_17)
+if(NOT MSVC)
+    target_compile_options(ctc-align PRIVATE -O3)
+endif()
+
 # Set the version numbers
 set_target_properties(whisper PROPERTIES
     VERSION ${PROJECT_VERSION}
