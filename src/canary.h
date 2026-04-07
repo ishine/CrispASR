@@ -96,6 +96,10 @@ int         canary_sample_rate (struct canary_context * ctx);
 // Internal smoke test: load and report all hparams. Returns 0 on success.
 int         canary_test_load   (struct canary_context * ctx);
 
+// Internal smoke test: build encoder graph on a zero mel of `T_mel` frames,
+// run it, and report the output T_enc. Returns T_enc on success or -1.
+int         canary_test_encoder(struct canary_context * ctx, int T_mel);
+
 #ifdef __cplusplus
 }
 #endif
