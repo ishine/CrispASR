@@ -167,6 +167,28 @@ if(GGML_CUDA)
 endif()
 
 # ---------------------------------------------------------------------------
+# Parakeet TDT — nvidia/parakeet-tdt-0.6b-v3 (FastConformer encoder + TDT decoder)
+# ---------------------------------------------------------------------------
+add_library(parakeet
+            parakeet.h
+            parakeet.cpp
+            )
+target_include_directories(parakeet PUBLIC . ../include)
+target_compile_features   (parakeet PUBLIC cxx_std_17)
+target_link_libraries     (parakeet PUBLIC ggml ggml-base Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(parakeet PRIVATE -O3 -march=native)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(parakeet PRIVATE GGML_USE_METAL)
+    target_link_libraries(parakeet PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(parakeet PRIVATE GGML_USE_CUDA)
+    target_link_libraries(parakeet PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # wav2vec2-ggml — Wav2Vec2ForCTC encoder (GGUF, ggml-based)
 # ---------------------------------------------------------------------------
 add_library(wav2vec2-ggml STATIC wav2vec2-ggml.h wav2vec2-ggml.cpp)
