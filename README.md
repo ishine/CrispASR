@@ -81,6 +81,7 @@ ffmpeg -i input.mp3 -ar 16000 -ac 1 -c:a pcm_s16le audio.wav
   -ovtt,     --output-vtt       write WebVTT subtitle file (<audio>.vtt)
   -vad-model FNAME              path to ggml-silero-vad.bin for VAD segmentation
   -vad-thold F                  VAD speech threshold (default: 0.5)
+  -tdrz,     --diarize          speaker diarization (experimental, see note)
   -npnc,     --no-punctuation   disable punctuation in output
   -v,        --verbose          show timing info and per-step tokens
   -np,       --no-prints        suppress all informational output
@@ -140,6 +141,16 @@ Confidence color-coding (red = low confidence → green = high):
 ```
 
 **Timestamp note:** The Cohere model v1 does not output timestamp tokens (Cohere Labs confirmed native timestamps are planned for a future version). Within each VAD segment, token timestamps are linearly interpolated from character counts — accurate at segment level, approximate at word level. VAD boundary accuracy depends on the Silero model.
+
+### Speaker diarization (experimental)
+
+```bash
+./build/bin/cohere-main -m cohere-transcribe-q4_k.gguf -f audio.wav -tdrz
+```
+
+The `-tdrz` flag passes `<|diarize|>` to the decoder prompt instead of `<|nodiarize|>`. The vocabulary contains the full diarization token set — `<|spkchange|>` (speaker turn marker) and `<|spk0|>`…`<|spk15|>` (named speakers) — and the runtime renders them as `[SPEAKER_TURN]` and `[Speaker N]` when emitted.
+
+**Model v1 does not generate these tokens in practice.** Cohere Labs has confirmed diarization is planned for a future model version. This is the same situation as whisper's tinydiarize, which requires a specially fine-tuned checkpoint (`ggml-small.en-tdrz.bin`). The `-tdrz` flag is a no-op today but the rendering infrastructure is ready for when a diarization-capable GGUF is released.
 
 ### 5. Quantize your own model
 
