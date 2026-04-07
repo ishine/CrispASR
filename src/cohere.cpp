@@ -424,6 +424,9 @@ struct cohere_context {
     struct ggml_tensor  * kv_k    = nullptr;
     struct ggml_tensor  * kv_v    = nullptr;
 
+    // Self-attention KV cache buffer (decoder).
+    struct ggml_backend_buffer * kv_buf = nullptr;
+
     // Cross-attention KV cache: computed once per utterance from encoder output.
     // Shape per layer: (dec_d_model, T_enc)
     struct ggml_context * cross_kv_ctx = nullptr;
@@ -1545,8 +1548,9 @@ struct cohere_context * cohere_init_from_file(const char * path_model,
         ctx->kv_ctx = ggml_init(kv_params);
         ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
         ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
-        ggml_backend_buffer_t kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend,
+        ctx->kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend,
                                            ggml_nbytes(ctx->kv_k) + ggml_nbytes(ctx->kv_v));
+        ggml_backend_buffer_t kv_buf = ctx->kv_buf;
         char * base = (char *)ggml_backend_buffer_get_base(kv_buf);
         ggml_backend_tensor_alloc(kv_buf, ctx->kv_k, (void *)(base));
         ggml_backend_tensor_alloc(kv_buf, ctx->kv_v, (void *)(base + ggml_nbytes(ctx->kv_k)));
@@ -1588,15 +1592,17 @@ struct cohere_context * cohere_init_from_file(const char * path_model,
 
 void cohere_free(struct cohere_context * ctx) {
     if (!ctx) return;
+    // Free scheduler first (releases gallocr-owned buffer views), then backend buffers, then backends.
     if (ctx->ggml_alloc)        ggml_backend_sched_free(ctx->ggml_alloc);
+    if (ctx->cross_kv_buf)  ggml_backend_buffer_free(ctx->cross_kv_buf);
+    if (ctx->kv_buf)        ggml_backend_buffer_free(ctx->kv_buf);
+    if (ctx->model.buf)     ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->ggml_backend)      ggml_backend_free(ctx->ggml_backend);
     if (ctx->ggml_backend_cpu && ctx->ggml_backend_cpu != ctx->ggml_backend)
         ggml_backend_free(ctx->ggml_backend_cpu);
     if (ctx->kv_ctx)        ggml_free(ctx->kv_ctx);
     if (ctx->ctx_const)     ggml_free(ctx->ctx_const);
     if (ctx->cross_kv_ctx)  ggml_free(ctx->cross_kv_ctx);
-    if (ctx->cross_kv_buf)  ggml_backend_buffer_free(ctx->cross_kv_buf);
-    if (ctx->model.buf)     ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)     ggml_free(ctx->model.ctx);
     delete ctx;
 }
