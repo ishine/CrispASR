@@ -96,7 +96,7 @@ static bool cohere_model_quantize(const std::string & fname_inp, const std::stri
         const int64_t qk_k = ggml_blck_size(qtype);
 
         if (quantize && ncols % qk_k != 0) {
-            printf("warning: ncols %ld not divisible by %ld, skipping quantization for this tensor\n", ncols, qk_k);
+            printf("warning: ncols %lld not divisible by %lld, skipping quantization for this tensor\n", (long long)ncols, (long long)qk_k);
             quantize = false;
         }
 
