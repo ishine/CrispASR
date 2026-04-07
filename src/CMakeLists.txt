@@ -116,14 +116,15 @@ add_library(cohere
             cohere.cpp
             )
 target_include_directories(cohere PUBLIC . ../include)
-target_compile_features   (cohere PUBLIC cxx_std_17)
+target_compile_features   (cohere PUBLIC cxx_std_20)
 find_package(OpenMP)
 # BLAS for mel filterbank SGEMM (cblas_sgemm)
 if(APPLE)
-    # Accelerate framework provides cblas and vDSP; no external deps needed
+    # Accelerate framework provides cblas and vDSP; no external deps needed.
+    # ACCELERATE_NEW_LAPACK silences the macOS 13.3+ cblas_sgemm deprecation warning.
     find_library(ACCELERATE_LIB Accelerate REQUIRED)
     target_link_libraries(cohere PUBLIC ${ACCELERATE_LIB})
-    target_compile_definitions(cohere PRIVATE HAVE_BLAS)
+    target_compile_definitions(cohere PRIVATE HAVE_BLAS ACCELERATE_NEW_LAPACK)
 else()
     find_package(BLAS)
     if(BLAS_FOUND)

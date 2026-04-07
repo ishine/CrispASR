@@ -463,7 +463,7 @@ struct cohere_context {
 
 static void cohere_log_tensor(const char * name, const struct ggml_tensor * t);
 static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * ctx, int T_mel);
-static struct ggml_cgraph * cohere_build_graph_decoder(struct cohere_context * ctx, const int * tokens, int n_tokens, int offset);
+static struct ggml_cgraph * cohere_build_graph_decoder(struct cohere_context * ctx, const int * /*tokens*/, int n_tokens, int offset);
 static void cohere_fold_batchnorm(cohere_model & model);
 
 // ---------------------------------------------------------------------------
@@ -687,7 +687,7 @@ static struct ggml_cgraph * cohere_build_graph_encoder(struct cohere_context * c
 }
 
 
-static struct ggml_cgraph * cohere_build_graph_decoder(struct cohere_context * ctx, const int * tokens, int n_tokens, int offset);
+static struct ggml_cgraph * cohere_build_graph_decoder(struct cohere_context * ctx, const int * /*tokens*/, int n_tokens, int offset);
 
 #define CT_CHECK(x) do { if (!(x)) { fprintf(stderr, "CT_CHECK failed: %s (%s:%d)\n", #x, __FILE__, __LINE__); abort(); } } while(0)
 
@@ -1182,7 +1182,7 @@ static std::vector<float> ct_rel_pos_enc(int T, int d_model) {
 
 static struct ggml_cgraph * cohere_build_graph_decoder(
     struct cohere_context * ctx,
-    const int * tokens, int n_tokens, int offset
+    const int * /*tokens*/, int n_tokens, int offset
 ) {
     const auto & model = ctx->model;
     const auto & hp    = model.hparams;
