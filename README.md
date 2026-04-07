@@ -250,6 +250,97 @@ Convert from the original HF checkpoint first (see `export_gguf.py`), then quant
 
 ---
 
+## Parakeet TDT 0.6B v3 (multilingual + free word timestamps)
+
+In addition to Cohere Transcribe, this fork includes a full ggml runtime for **[nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)** — NVIDIA's 600M-parameter FastConformer encoder + Token-and-Duration Transducer (TDT) decoder. Multilingual (25 European languages, automatic language detection), CC-BY-4.0, and **word-level timestamps come for free** from the duration head — no separate CTC alignment model needed.
+
+Pre-converted GGUF weights: **[cstr/parakeet-tdt-0.6b-v3-GGUF](https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF)** (F16 ~1.3 GB, Q4_K ~400 MB).
+
+### 1. Build
+
+```bash
+cmake --build build -j$(nproc) --target parakeet-main
+```
+
+### 2. Get a model
+
+Either download a pre-quantised one:
+```bash
+huggingface-cli download cstr/parakeet-tdt-0.6b-v3-GGUF \
+    parakeet-tdt-0.6b-v3-q4_k.gguf --local-dir .
+```
+
+Or convert from the original `.nemo` checkpoint yourself:
+```bash
+pip install gguf torch sentencepiece huggingface_hub
+
+python -c "from huggingface_hub import snapshot_download; \
+  print(snapshot_download('nvidia/parakeet-tdt-0.6b-v3'))"
+
+python models/convert-parakeet-to-gguf.py \
+    --nemo  <snapshot-path>/parakeet-tdt-0.6b-v3.nemo \
+    --output parakeet-tdt-0.6b-v3.gguf
+
+# Optional: quantize
+./build/bin/cohere-quantize parakeet-tdt-0.6b-v3.gguf parakeet-tdt-0.6b-v3-q4_k.gguf q4_k
+```
+
+### 3. Transcribe
+
+```bash
+./build/bin/parakeet-main \
+    -m parakeet-tdt-0.6b-v3-q4_k.gguf \
+    -f samples/jfk.wav -t 8
+# And so my fellow Americans. Ask not what your country can do for you.
+# Ask what you can do for your country.
+```
+
+With per-token timestamps (`-v`):
+```bash
+./build/bin/parakeet-main -m parakeet-tdt-0.6b-v3.gguf -f samples/jfk.wav -t 8 -v
+#   [    0.32s →     0.64s]  ' And'
+#   [    0.64s →     0.88s]  ' so'
+#   [    1.04s →     1.28s]  ' my'
+#   [    1.28s →     1.76s]  ' fellow'   ← f + ell + ow grouped
+#   [    1.76s →     2.56s]  ' Americans'
+#   [    2.96s →     3.28s]  '.'
+#   [    3.28s →     3.84s]  ' Ask'
+#   ...
+```
+
+Each token boundary is one encoder frame = **80 ms**, accurate to within that quantum. Multilingual works automatically — pass any of the 25 supported languages with no `-l` flag (the model auto-detects).
+
+### Why parakeet over cohere-main + cohere-align?
+
+| | `cohere-main` | `cohere-align` | **`parakeet-main`** |
+| --- | --- | --- | --- |
+| Model size (Q4_K) | 1.2 GB | 1.2 GB + 1.0 GB CTC | **400 MB** |
+| Languages | 14 | 14 (+matching CTC needed) | **25 EU languages, auto-detect** |
+| Word timestamp accuracy | ~360 ms (cross-attn DTW) | ~30-50 ms (CTC Viterbi) | **~80 ms (TDT durations)** |
+| Extra alignment model? | — | yes (wav2vec2) | **none** |
+| Wall time on 11 s clip | ~15 s (Q4_K) | ~80 s | ~11 s (F16) |
+| Licence | Apache 2.0 | + MIT (wav2vec2.cpp) | **CC-BY-4.0** |
+
+Use `cohere-main` when you specifically need the Cohere model (Open ASR Leaderboard #1 WER) and don't care about word timestamps. Use `cohere-align` if you need 30 ms-accurate word timestamps from Cohere. Use `parakeet-main` for multilingual ASR with one tight binary, especially when word timestamps matter and you don't need the absolute lowest WER.
+
+### Architecture
+
+| Component | Details |
+| --- | --- |
+| **Encoder** | 24-layer FastConformer, d=1024, 8 heads, head_dim=128, FFN=4096, conv kernel=9 |
+| **Subsampling** | Conv2d dw_striding stack, 8× temporal (50 → 12.5 fps) |
+| **Predictor** | 2-layer LSTM, hidden 640, embed 8193×640 |
+| **Joint head** | enc(1024→640) + pred(640→640) → ReLU → linear(640→8198 = 8192 vocab + 1 blank + 5 TDT durations) |
+| **Vocab** | 8192 SentencePiece tokens (multilingual) |
+| **Audio** | 16 kHz mono, 128 mel bins, n_fft=512, hop=160, win=400 |
+| **Parameters** | ~600M |
+
+The mel filterbank and Hann window are baked into the GGUF (`preprocessor.fb` and `preprocessor.window` from the original `.nemo` checkpoint), so no recomputation at runtime. BatchNorm in the convolution module is folded into the depthwise conv weights at load time.
+
+**License note.** The code in `src/parakeet.{h,cpp}` is original to this fork; the model itself is CC-BY-4.0 from NVIDIA. Use of the model must comply with the CC-BY-4.0 license including attribution.
+
+---
+
 ## Architecture
 
 The Cohere Transcribe model is a Conformer-encoder / Transformer-decoder architecture, distinct from the Whisper encoder-decoder used in the original whisper.cpp.
