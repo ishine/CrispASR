@@ -195,6 +195,15 @@ struct canary_context {
     std::vector<ggml_tensor *> cross_k;
     std::vector<ggml_tensor *> cross_v;
 
+    // Per-step cross-attention weights from the last decoder layer, captured
+    // when collect_attn=true and n_tokens==1. Used for DTW timestamp alignment.
+    // step_attn[step_idx] has T_enc * n_heads floats (head h occupies the
+    // contiguous slice [h*T_enc, h*T_enc + T_enc)).
+    bool collect_attn = false;
+    int  attn_T_enc   = 0;
+    int  attn_n_heads = 0;
+    std::vector<std::vector<float>> step_attn;
+
     int n_threads = 4;
 };
 
@@ -1050,6 +1059,20 @@ static ggml_cgraph * canary_build_graph_decoder(canary_context * ctx,
 
         ggml_tensor * ca_out = ggml_flash_attn_ext(ctx0, CQ, CK, CV, nullptr,
                                                     1.0f / sqrtf((float)head_dim), 0.0f, 0.0f);
+
+        // Capture cross-attention weights for the last decoder layer in
+        // single-token generation mode. Used by the DTW timestamp pass.
+        // CK shape: [head_dim, T_enc, n_heads] (F16)
+        // CQ shape: [head_dim, n_tokens=1, n_heads]
+        // ca_w = softmax( CK^T @ CQ / sqrt(head_dim) ) → [T_enc, 1, n_heads]
+        if (ctx->collect_attn && (int)il == (int)hp.dec_n_layers - 1 && n_tokens == 1) {
+            ggml_tensor * ca_w = ggml_mul_mat(ctx0, CK, CQ);   // [T_enc, 1, n_heads]
+            ca_w = ggml_scale(ctx0, ca_w, 1.0f / sqrtf((float)head_dim));
+            ca_w = ggml_soft_max(ctx0, ca_w);
+            ggml_set_name(ca_w, "ca_attn_w");
+            ggml_build_forward_expand(gf, ca_w);
+        }
+
         cur = ggml_reshape_2d(ctx0, ca_out, d, n_tokens);
 
         cur = ggml_add(ctx0, ggml_mul_mat(ctx0, dl.ca_out_w, cur), dl.ca_out_b);
@@ -1104,6 +1127,20 @@ static std::vector<float> canary_decode_step(canary_context * ctx,
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "canary: decoder compute failed\n");
         return {};
+    }
+
+    // Capture cross-attention for DTW (only on single-token generation steps).
+    if (ctx->collect_attn && n_tokens == 1) {
+        ggml_tensor * ca_w_t = ggml_graph_get_tensor(gf, "ca_attn_w");
+        if (ca_w_t) {
+            const int T_enc   = (int)ca_w_t->ne[0];
+            const int n_heads = (int)ca_w_t->ne[2];
+            ctx->attn_T_enc   = T_enc;
+            ctx->attn_n_heads = n_heads;
+            std::vector<float> w((size_t)T_enc * n_heads);
+            ggml_backend_tensor_get(ca_w_t, w.data(), 0, w.size() * sizeof(float));
+            ctx->step_attn.push_back(std::move(w));
+        }
     }
 
     ggml_tensor * logits = ggml_graph_get_tensor(gf, "logits");
@@ -1370,6 +1407,12 @@ extern "C" struct canary_result * canary_transcribe_ex(
     std::vector<int> prompt = canary_build_prompt(ctx, source_lang, target_lang, punctuation);
     if (prompt.empty()) return nullptr;
 
+    // Reset DTW state and enable cross-attn capture for the upcoming greedy loop.
+    // Each per-step decode call will append one entry to ctx->step_attn (one
+    // T_enc * n_heads vector per emitted token).
+    ctx->collect_attn = true;
+    ctx->step_attn.clear();
+
     // 5. Greedy decode
     const int eos = canary_str_to_token(ctx, "<|endoftext|>");
     const int max_steps = 256;
@@ -1418,9 +1461,85 @@ extern "C" struct canary_result * canary_transcribe_ex(
     r->n_tokens = n_emitted;
     r->tokens = (canary_token_data *)calloc(n_emitted > 0 ? n_emitted : 1, sizeof(canary_token_data));
 
-    // Approximate per-token timing: linearly distribute across [0, T_enc * frame_dur_cs]
+    // ----- Per-token timestamps via cross-attention DTW -----
+    //
+    // For each emitted token we have ctx->step_attn[i] = cross-attn weights from
+    // the LAST decoder layer, layout [T_enc * n_heads]. We:
+    //   1. Average across heads → A[n_emitted × T_enc]
+    //   2. Subtract per-frame mean (column normalisation) so globally "hot"
+    //      frames don't dominate
+    //   3. Run prefix-max DTW: D[i][j] = A[i][j] + max_{k≤j} D[i-1][k]
+    //   4. Traceback from argmax of last row → path[i] = best frame for token i
+    //   5. t0/t1 from path[i] × frame_dur_cs
+    //
+    // Same approach as cohere-main, gives ~360 ms MAE on word boundaries.
+    // (Approach copied from src/cohere.cpp; see that file for the discussion of
+    // hot-frame collapse and the column-normalisation fix.)
     const int frame_dur_cs = (int)ctx->model.hparams.frame_dur_cs;
     const int64_t total_cs = (int64_t)T_enc * frame_dur_cs;
+    const int64_t seg_end_cs = t_offset_cs + total_cs;
+
+    const bool have_attn =
+        n_emitted > 0 &&
+        ctx->step_attn.size() == (size_t)n_emitted &&
+        ctx->attn_T_enc > 0 &&
+        ctx->attn_n_heads > 0;
+
+    std::vector<int> path;
+    if (have_attn) {
+        const int T_e   = ctx->attn_T_enc;
+        const int n_h   = ctx->attn_n_heads;
+
+        // Step 1 + temporal offset correction (same trick as cohere): use
+        // step_attn[i-1] for token i because the attention is collected while
+        // the decoder processes generated[i] as input to predict generated[i+1].
+        std::vector<float> A((size_t)n_emitted * T_e, 0.0f);
+        for (int i = 0; i < n_emitted; i++) {
+            int src = (i > 0) ? i - 1 : 0;
+            const float * w = ctx->step_attn[src].data();
+            float * Ai = A.data() + (size_t)i * T_e;
+            for (int h = 0; h < n_h; h++)
+                for (int t = 0; t < T_e; t++)
+                    Ai[t] += w[h * T_e + t];
+            for (int t = 0; t < T_e; t++) Ai[t] /= n_h;
+        }
+
+        // Step 2: column normalisation
+        {
+            std::vector<float> col_mean(T_e, 0.f);
+            for (int i = 0; i < n_emitted; i++)
+                for (int t = 0; t < T_e; t++)
+                    col_mean[t] += A[(size_t)i * T_e + t];
+            for (int t = 0; t < T_e; t++) col_mean[t] /= n_emitted;
+            for (int i = 0; i < n_emitted; i++)
+                for (int t = 0; t < T_e; t++)
+                    A[(size_t)i * T_e + t] -= col_mean[t];
+        }
+
+        // Step 3: forward DP with prefix-max predecessors
+        std::vector<float> D((size_t)n_emitted * T_e);
+        std::vector<int>   P((size_t)n_emitted * T_e);
+        for (int j = 0; j < T_e; j++) D[j] = A[j];
+        for (int i = 1; i < n_emitted; i++) {
+            const float * Di_1 = D.data() + (size_t)(i-1) * T_e;
+            const float * Ai   = A.data() + (size_t)i     * T_e;
+            float       * Di   = D.data() + (size_t)i     * T_e;
+            int         * Pi   = P.data() + (size_t)i     * T_e;
+            float pm_val = Di_1[0]; int pm_idx = 0;
+            for (int j = 0; j < T_e; j++) {
+                if (Di_1[j] > pm_val) { pm_val = Di_1[j]; pm_idx = j; }
+                Di[j] = Ai[j] + pm_val;
+                Pi[j] = pm_idx;
+            }
+        }
+
+        // Step 4: traceback
+        path.resize(n_emitted);
+        const float * Dlast = D.data() + (size_t)(n_emitted-1) * T_e;
+        path[n_emitted-1] = (int)(std::max_element(Dlast, Dlast + T_e) - Dlast);
+        for (int i = n_emitted-2; i >= 0; i--)
+            path[i] = P[(size_t)(i+1) * T_e + path[i+1]];
+    }
 
     std::string text;
     for (int i = 0; i < n_emitted; i++) {
@@ -1431,9 +1550,16 @@ extern "C" struct canary_result * canary_transcribe_ex(
 
         canary_token_data & td = r->tokens[i];
         td.id  = tid;
-        // Linear interpolation over emitted tokens
-        td.t0  = t_offset_cs + (int64_t)((double)i       / std::max(1, n_emitted) * total_cs);
-        td.t1  = t_offset_cs + (int64_t)((double)(i + 1) / std::max(1, n_emitted) * total_cs);
+        if (have_attn) {
+            td.t0 = t_offset_cs + (int64_t)path[i] * frame_dur_cs;
+            td.t1 = (i+1 < n_emitted)
+                ? (t_offset_cs + (int64_t)path[i+1] * frame_dur_cs)
+                : seg_end_cs;
+        } else {
+            // Fallback: linear interpolation
+            td.t0 = t_offset_cs + (int64_t)((double)i       / std::max(1, n_emitted) * total_cs);
+            td.t1 = t_offset_cs + (int64_t)((double)(i + 1) / std::max(1, n_emitted) * total_cs);
+        }
         size_t n = std::min(vis.size(), sizeof(td.text) - 1);
         memcpy(td.text, vis.data(), n);
         td.text[n] = '\0';
@@ -1441,6 +1567,9 @@ extern "C" struct canary_result * canary_transcribe_ex(
     }
     if (!text.empty() && text[0] == ' ') text = text.substr(1);
     r->text = strdup(text.c_str());
+
+    // Disable attn collection so the next call starts fresh
+    ctx->collect_attn = false;
 
     // Word grouping (same as parakeet's)
     {
