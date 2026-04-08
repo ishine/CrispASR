@@ -86,25 +86,46 @@ static bool cohere_model_quantize(const std::string & fname_inp, const std::stri
 
         printf("[%3d/%3d] %-40s - %10s, ", i + 1, n_tensors, name, ggml_type_name(type));
 
-        bool quantize = ggml_is_quantized(qtype) && 
+        bool quantize = ggml_is_quantized(qtype) &&
                         (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) &&
                         (ggml_n_dims(t) == 2) && // Quantize only 2D matrices
                         (std::string(name).find("weight") != std::string::npos) &&
                         (std::string(name).find("norm") == std::string::npos);
 
         const int64_t ncols = t->ne[0];
-        const int64_t qk_k = ggml_blck_size(qtype);
+        ggml_type qtype_used = qtype;
+        int64_t qk_k = ggml_blck_size(qtype_used);
 
+        // Fallback chain for tensors whose row size doesn't divide the
+        // requested quant's block size. K-quants need 256-aligned rows;
+        // legacy Q4_0/Q5_0/Q8_0 use block 32 and accept any 32-aligned
+        // row, which covers the qwen3-asr audio encoder's 896-wide tensors
+        // that K-quants would otherwise leave as F16.
         if (quantize && ncols % qk_k != 0) {
-            printf("warning: ncols %lld not divisible by %lld, skipping quantization for this tensor\n", (long long)ncols, (long long)qk_k);
-            quantize = false;
+            ggml_type fallback = GGML_TYPE_COUNT;
+            switch (qtype) {
+                case GGML_TYPE_Q2_K:
+                case GGML_TYPE_Q3_K:
+                case GGML_TYPE_Q4_K: fallback = GGML_TYPE_Q4_0; break;
+                case GGML_TYPE_Q5_K: fallback = GGML_TYPE_Q5_0; break;
+                case GGML_TYPE_Q6_K: fallback = GGML_TYPE_Q8_0; break;
+                default: break;
+            }
+            if (fallback != GGML_TYPE_COUNT && ncols % ggml_blck_size(fallback) == 0) {
+                qtype_used = fallback;
+                qk_k = ggml_blck_size(qtype_used);
+                printf("(fallback %s) ", ggml_type_name(qtype_used));
+            } else {
+                printf("warning: ncols %lld not divisible by %lld, skipping quantization for this tensor\n", (long long)ncols, (long long)qk_k);
+                quantize = false;
+            }
         }
 
         fseek(fin, offset, SEEK_SET);
 
         if (quantize) {
-            printf("quantizing to %s... ", ggml_type_name(qtype));
-            
+            printf("quantizing to %s... ", ggml_type_name(qtype_used));
+
             const int64_t nelements = ggml_nelements(t);
             f32_data.resize(nelements);
 
@@ -122,14 +143,14 @@ static bool cohere_model_quantize(const std::string & fname_inp, const std::stri
                 for (int j = 0; j < nelements; j++) f32_data[j] = ggml_fp16_to_fp32(f16_data[j]);
             }
 
-            const size_t max_q_size = ggml_row_size(qtype, t->ne[0]) * (nelements / t->ne[0]);
+            const size_t max_q_size = ggml_row_size(qtype_used, t->ne[0]) * (nelements / t->ne[0]);
             q_data.resize(max_q_size);
 
-            size_t q_size = ggml_quantize_chunk(qtype, f32_data.data(), q_data.data(), 0, nelements / t->ne[0], t->ne[0], nullptr);
-            
+            size_t q_size = ggml_quantize_chunk(qtype_used, f32_data.data(), q_data.data(), 0, nelements / t->ne[0], t->ne[0], nullptr);
+
             fwrite(q_data.data(), 1, q_size, fout);
-            gguf_set_tensor_type(ctx_out, name, qtype);
-            
+            gguf_set_tensor_type(ctx_out, name, qtype_used);
+
             // Padding
             size_t pad = GGML_PAD(q_size, GGUF_DEFAULT_ALIGNMENT) - q_size;
             for (size_t j = 0; j < pad; j++) fputc(0, fout);
