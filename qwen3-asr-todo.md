@@ -293,13 +293,49 @@ trickiest part of the C++ port.
       bottlenecks being the encoder (constant per utterance) and the
       lm_head matmul (constant per token).
 
+#### Stage 5d — comparison benchmark + multilingual + GGML_BLAS ✅ DONE (2026-04-08)
+
+- [x] **Comparison benchmark vs predict-woo + Python baseline**
+      (`qwen3-asr-benchmark.md`):
+      - CrispASR Q4_K is **2.96× faster than predict-woo F16** on jfk.wav
+        compute (6.6 s vs 19.5 s) — wins on mel (10.4×, baked filterbank
+        vs runtime Slaney), encoder (1.66×, F16 KV cache + lm_head slice),
+        and decode (3.13×, KV cache + flash-attn + Q4_K + last-token lm_head).
+      - Python baseline (transformers + MKL) wins on long-audio prefill
+        by ~10% because of MKL-tuned F32 GEMM kernels; we win on short
+        audio (jfk: 10s vs 13s) where the per-call PyTorch warmup tax
+        dominates.
+- [x] **German / multilingual smoke test** on six Wikimedia clips
+      spanning 0.7s to 207s. CrispASR correctly detects German on every
+      clip, transcribes single words and phrases perfectly, and handles
+      full Wikipedia article-length transcripts.
+      **Important correction**: the 58.7s `merkel.wav` from Wikimedia
+      Commons (`Angela_Merkel_voice.ogg`) is NOT German — it's actually
+      Russian. Verified independently with whisper-cli auto language
+      detect (`ru` p=0.85). All three speech-LLMs (Qwen3-ASR, parakeet,
+      whisper) agree it's Russian. The earlier `test_german.md` analysis
+      treating Russian output on this clip as a parakeet bug was
+      incorrect.
+- [x] **GGML_BLAS=ON build experiment** — negative finding documented.
+      MKL via CMake's FindBLAS gives essentially no speedup (~3% on Q4_K,
+      slightly slower on F16) because:
+      - most matmuls go through Q4_K k-quant kernels that skip BLAS
+      - F32 matmuls are batch-1, where per-call BLAS overhead eats the gain
+      - ggml's CPU kernels are competitive with MKL at our matmul sizes
+- [x] **PR'd predict-woo/qwen3-asr.cpp build fixes upstream**:
+      https://github.com/predict-woo/qwen3-asr.cpp/pull/7
+      Two fixes packaged together:
+        1. find_package(OpenMP) + qwen3_link_openmp() helper for
+           transitive OpenMP linkage (was failing with undefined
+           GOMP_parallel/barrier on every Linux build)
+        2. add_subdirectory(${GGML_DIR}) auto-build of the ggml submodule
+           so users don't have to manually `cd ggml && cmake -B build`
+           before the parent build
+
 #### Remaining (low-priority polish)
 - [ ] BPE encoder for arbitrary text input — not needed for ASR (the chat
       template prompt is fixed) but enables few-shot prompting / language
       hints in the future
-- [ ] Multi-language smoke tests — no non-English samples available
-      locally; needs a Chinese / German / Japanese clip to verify the
-      pipeline picks up the right language tag from the model
 - [ ] Quantize the encoder weights too (currently F32 because cohere-quantize
       auto-skips them as conv4D, but the linear projector heads could
       benefit). Would need a small filter tweak.
