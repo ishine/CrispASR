@@ -12,8 +12,9 @@ A fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) that adds full 
 | **`nfa-align`** | Auxiliary CTC model from canary-1b-v2's `.nemo` — **universal multilingual forced aligner** (25 languages, ~78 ms MAE) | [`cstr/canary-ctc-aligner-GGUF`](https://huggingface.co/cstr/canary-ctc-aligner-GGUF) |
 | `cohere-main` | [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 2B Conformer + Transformer. Lowest English WER on Open ASR Leaderboard | [`cstr/cohere-transcribe-03-2026-GGUF`](https://huggingface.co/cstr/cohere-transcribe-03-2026-GGUF) |
 | `cohere-align` | wav2vec2 character CTC forced aligner (English-only, 30-50 ms MAE) | uses [`jonatasgrosman/wav2vec2-large-xlsr-53-english`](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-english) |
+| **`qwen3-asr-main`** | [`Qwen/Qwen3-ASR-0.6B`](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) — 900M speech-LLM (Whisper-style audio encoder + Qwen3 0.6B LLM with audio-token injection). 30 languages + 22 Chinese dialects, Open ASR avg WER 6.42, persistent KV cache | [`cstr/qwen3-asr-0.6b-GGUF`](https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF) |
 
-All five runtimes share the same NeMo-style mel preprocessor and (mostly) the same FastConformer encoder family — that's how we ported each new model in days rather than weeks.
+All six runtimes share the same NeMo-/Whisper-style mel preprocessor family — that's how we ported each new model in days rather than weeks. Qwen3-ASR is the first speech-**LLM** in the set: instead of a dedicated CTC/transducer/seq2seq decoder, the audio encoder output frames are spliced into the input embeddings of a stock Qwen3 0.6B LLM at `<|audio_pad|>` placeholder positions, and the LLM autoregressively generates the transcript.
 
 > **Branch state.** Everything lives on `main` as of April 2026. The original cohere-only history is preserved at the [`archive/cohere-only`](https://github.com/CrispStrobe/CrispASR/tree/archive/cohere-only) branch as a historical reference.
 
@@ -30,6 +31,8 @@ All five runtimes share the same NeMo-style mel preprocessor and (mostly) the sa
 | Multilingual + **explicit language control** (no auto-detect) | **`canary-main`** |
 | **Speech translation** (X→En or En→X) | **`canary-main`** |
 | 30 ms-accurate word stamps via CTC forced alignment | `cohere-align` (ggml branch) |
+| **30 languages + 22 Chinese dialects** | **`qwen3-asr-main`** |
+| Speech-LLM with persistent KV cache (faster than realtime at Q4_K) | **`qwen3-asr-main`** |
 
 | | parakeet-tdt-0.6b-v3 | canary-1b-v2 |
 | --- | --- | --- |
