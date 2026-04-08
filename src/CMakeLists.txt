@@ -189,6 +189,21 @@ if(GGML_CUDA)
 endif()
 
 # ---------------------------------------------------------------------------
+# Canary CTC aligner — auxiliary CTC model from inside canary-1b-v2.nemo,
+# used for SentencePiece subword forced alignment of any transcript text.
+# ---------------------------------------------------------------------------
+add_library(canary_ctc
+            canary_ctc.h
+            canary_ctc.cpp
+            )
+target_include_directories(canary_ctc PUBLIC . ../include)
+target_compile_features   (canary_ctc PUBLIC cxx_std_17)
+target_link_libraries     (canary_ctc PUBLIC ggml ggml-base Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(canary_ctc PRIVATE -O3 -march=native)
+endif()
+
+# ---------------------------------------------------------------------------
 # Parakeet TDT — nvidia/parakeet-tdt-0.6b-v3 (FastConformer encoder + TDT decoder)
 # ---------------------------------------------------------------------------
 add_library(parakeet
