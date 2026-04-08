@@ -1,4 +1,4 @@
-set(TARGET canary-align)
+set(TARGET nfa-align)
 add_executable(${TARGET} main.cpp)
 include(DefaultTargetOptions)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/src)

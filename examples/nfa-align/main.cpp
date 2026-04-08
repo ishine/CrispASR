@@ -1,4 +1,8 @@
-// canary-align — universal subword CTC forced alignment CLI.
+// nfa-align — universal multilingual subword CTC forced alignment CLI.
+//
+// Named after NeMo Forced Aligner (NFA), the official NVIDIA tool that uses
+// the same auxiliary CTC model the same way to recover word-level timestamps
+// for canary's transcripts.
 //
 // Takes an audio clip + a transcript and produces per-word timestamps using
 // the auxiliary CTC alignment model that ships inside nvidia/canary-1b-v2.
@@ -7,9 +11,9 @@
 // SentencePiece vocabulary and runs Viterbi to find the optimal alignment.
 //
 // Usage:
-//   canary-align -m canary-ctc-aligner.gguf -f audio.wav -tt "transcript text"
-//   canary-align -m canary-ctc-aligner.gguf -f audio.wav -tf transcript.txt
-//   canary-align -m canary-ctc-aligner.gguf -f audio.wav -decode    # greedy CTC
+//   nfa-align -m canary-ctc-aligner.gguf -f audio.wav -tt "transcript text"
+//   nfa-align -m canary-ctc-aligner.gguf -f audio.wav -tf transcript.txt
+//   nfa-align -m canary-ctc-aligner.gguf -f audio.wav -decode    # greedy CTC
 
 #include "canary_ctc.h"
 #include "common-whisper.h"

@@ -1,6 +1,6 @@
 # Cohere Transcribe Optimization Plan
 
-This document tracks the progress of porting `cohere-whisper.cpp` to a full `ggml` compute graph (Priority 2B).
+This document tracks the progress of porting `CrispASR` to a full `ggml` compute graph (Priority 2B).
 
 ## Progress Tracker
 

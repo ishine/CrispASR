@@ -1,4 +1,45 @@
-# Renaming proposal
+# Renaming — DONE for the repo + CTC aligner binary
+
+**Status update (2026-04-08).** The rename has been executed:
+
+- ✅ GitHub repo: `CrispStrobe/cohere-whisper.cpp` → **`CrispStrobe/CrispASR`**
+  - GitHub keeps a permanent redirect from the old URL, so existing
+    clones / external links / `git remote` configs continue to work
+- ✅ CLI binary: `canary-align` → **`nfa-align`**
+  - Mirrors NVIDIA's NeMo Forced Aligner terminology
+  - Honest about scope: the tool is universal, not canary-specific
+- ⏳ HF model repos: NOT renamed (intentional — keeps download counts +
+  external links intact). The aligner stays at
+  `cstr/canary-ctc-aligner-GGUF`.
+- ⏳ Other CLI binaries (`cohere-main`, `cohere-align`, `parakeet-main`,
+  `canary-main`): NOT renamed — they're model-specific and that's correct.
+
+## Future direction (deferred)
+
+Long-term plan, deferred to a separate session:
+
+- Fold the per-model `*-main` binaries into a single subcommand-driven
+  `crispasr` binary:
+  ```
+  crispasr cohere   -m cohere-q4_k.gguf   -f audio.wav -l en
+  crispasr parakeet -m parakeet-q4_k.gguf -f audio.wav
+  crispasr canary   -m canary-q4_k.gguf   -f audio.wav -sl en -tl en
+  ```
+- Fold `cohere-align` + `nfa-align` into a single `crispalign`:
+  ```
+  crispalign cohere -m wav2vec2-en.gguf  -f audio.wav -tt "transcript"
+  crispalign nfa    -m canary-ctc.gguf   -f audio.wav -tt "transcript"
+  ```
+- Keep the per-model binaries as thin shims (or symlinks) for backward
+  compatibility with anyone who scripted against them.
+
+This refactor is purely cosmetic + ergonomic; no model code changes.
+
+---
+
+## Original proposal (kept for context)
+
+The text below is what was discussed before the rename was executed.
 
 Right now this fork is called `cohere-whisper.cpp` because it started as a
 Cohere Transcribe port of `whisper.cpp`. It has since grown into a hub for

@@ -1,4 +1,4 @@
-# Performance — cohere-whisper.cpp
+# Performance — CrispASR
 
 ## Real-Time Factor (RTFx)
 

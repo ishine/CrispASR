@@ -1,15 +1,23 @@
-# parakeet-whisper.cpp
+# CrispASR
 
-A fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) that adds full C++ ggml runtimes for two NVIDIA NeMo speech models, both released August 2025:
+> **Note:** this repo was previously called `cohere-whisper.cpp`. GitHub keeps a permanent redirect from the old URL, so existing links/clones still work.
 
-- **[nvidia/parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)** — 600M-parameter FastConformer + Token-and-Duration Transducer. Multilingual ASR (25 European languages, auto-detect), **built-in word timestamps**, runs at ~1× realtime CPU.
-- **[nvidia/canary-1b-v2](https://huggingface.co/nvidia/canary-1b-v2)** — 978M-parameter FastConformer + Transformer encoder-decoder. Multilingual ASR + **speech translation** (X→En, En→X) across 25 languages, with **explicit `source_lang` / `target_lang` task tokens** (no auto-detect ambiguity).
+A fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) that adds full C++ ggml runtimes for **multiple multilingual ASR models** plus a universal multilingual forced aligner:
 
-Both work end-to-end on CPU via ggml. Pre-converted GGUF weights:
-- **[cstr/parakeet-tdt-0.6b-v3-GGUF](https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF)** — F16, Q8_0, Q5_0, Q4_K
-- **[cstr/canary-1b-v2-GGUF](https://huggingface.co/cstr/canary-1b-v2-GGUF)** — coming soon
+| Runtime | What it is | HF release |
+| --- | --- | --- |
+| **`parakeet-main`** | [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) — 600M FastConformer + TDT. Fastest multilingual ASR + **free word timestamps** | [`cstr/parakeet-tdt-0.6b-v3-GGUF`](https://huggingface.co/cstr/parakeet-tdt-0.6b-v3-GGUF) |
+| `parakeet-main` (DE) | [`johannhartmann/parakeet_de_med`](https://huggingface.co/johannhartmann/parakeet_de_med) — German medical PEFT fine-tune | [`cstr/parakeet_de_med-GGUF`](https://huggingface.co/cstr/parakeet_de_med-GGUF) |
+| **`canary-main`** | [`nvidia/canary-1b-v2`](https://huggingface.co/nvidia/canary-1b-v2) — 978M FastConformer + Transformer. Multilingual ASR + **speech translation** with explicit `-sl/-tl` flags | [`cstr/canary-1b-v2-GGUF`](https://huggingface.co/cstr/canary-1b-v2-GGUF) |
+| **`nfa-align`** | Auxiliary CTC model from canary-1b-v2's `.nemo` — **universal multilingual forced aligner** (25 languages, ~78 ms MAE) | [`cstr/canary-ctc-aligner-GGUF`](https://huggingface.co/cstr/canary-ctc-aligner-GGUF) |
+| `cohere-main` | [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) — 2B Conformer + Transformer. Lowest English WER on Open ASR Leaderboard | [`cstr/cohere-transcribe-03-2026-GGUF`](https://huggingface.co/cstr/cohere-transcribe-03-2026-GGUF) |
+| `cohere-align` | wav2vec2 character CTC forced aligner (English-only, 30-50 ms MAE) | uses [`jonatasgrosman/wav2vec2-large-xlsr-53-english`](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-english) |
 
-> **Looking for the Cohere Transcribe runtime?** It lives on the **[`ggml`](https://github.com/CrispStrobe/cohere-whisper.cpp/tree/ggml)** branch of the same repo. This branch (`parakeet`) is a strict superset that adds parakeet + canary on top of the cohere infrastructure.
+All five runtimes share the same NeMo-style mel preprocessor and (mostly) the same FastConformer encoder family — that's how we ported each new model in days rather than weeks.
+
+> **Looking for just the Cohere Transcribe runtime?** It still lives on the **[`ggml`](https://github.com/CrispStrobe/CrispASR/tree/ggml)** branch. This `parakeet` branch is a strict superset that adds parakeet + canary + nfa-align on top of the cohere infrastructure. The `parakeet` branch will become `main` once the rename + CI shake-out settle.
+
+> **Future direction.** The plan is to fold the per-model `*-main` binaries into a single subcommand-driven `crispasr` binary, and `cohere-align` + `nfa-align` into a single `crispalign` binary. The current per-model binaries will remain as thin shims for backward compat. See `RENAMING.md` for the plan.
 
 ## Which runtime should I use?
 
@@ -39,8 +47,8 @@ Both share the same FastConformer encoder code and the same NeMo-style mel prepr
 ## Quick start — parakeet (fastest, multilingual ASR)
 
 ```bash
-git clone -b parakeet https://github.com/CrispStrobe/cohere-whisper.cpp
-cd cohere-whisper.cpp
+git clone -b parakeet https://github.com/CrispStrobe/CrispASR
+cd CrispASR
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc) --target parakeet-main
 
@@ -150,22 +158,22 @@ The full VAD / chunking / SRT / VTT / TXT plumbing matches `parakeet-main` and i
 
 The Conformer encoder is identical in structure to parakeet's (we share the encoder code). The decoder block is pre-LN with three sub-layers: `LN → SA → +residual → LN → CA → +residual → LN → FFN → +residual`, FFN activation is ReLU (per NeMo's `PositionWiseFF` default). Self-attention KV cache lives on a backend buffer for fast autoregressive generation. Cross-attention K/V is pre-computed once per audio slice from the encoder output.
 
-### `canary-align` — universal multilingual subword forced alignment
+### `nfa-align` — universal multilingual subword forced alignment
 
 `canary-1b-v2.nemo` actually ships with **two** weight files inside the tarball: the main encoder–decoder model AND a separate 600 M-parameter Parakeet-style FastConformer + CTC head trained with the same SentencePiece vocab. NVIDIA uses the latter inside [NeMo Forced Aligner](https://github.com/NVIDIA-NeMo/NeMo) (NFA) to compute reliable word-level timestamps for canary's transcripts.
 
-We extract that auxiliary model as a standalone GGUF and expose it via `canary-align` — a **universal multilingual forced aligner** that works on **any transcript text** in the 25 supported languages.
+We extract that auxiliary model as a standalone GGUF and expose it via `nfa-align` — a **universal multilingual forced aligner** that works on **any transcript text** in the 25 supported languages.
 
 ```bash
 # Build
-cmake --build build -j$(nproc) --target canary-align
+cmake --build build -j$(nproc) --target nfa-align
 
 # Download the aligner model
 huggingface-cli download cstr/canary-ctc-aligner-GGUF \
     canary-ctc-aligner-q4_k.gguf --local-dir .
 
 # Forced-align an existing transcript (any source: canary, parakeet, cohere, whisper, hand-typed)
-./build/bin/canary-align \
+./build/bin/nfa-align \
     -m canary-ctc-aligner-q4_k.gguf \
     -f samples/jfk.wav \
     -tt "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
@@ -189,7 +197,7 @@ Output:
 | Method | MAE | Notes |
 | --- | ---: | --- |
 | `cohere-align` (wav2vec2 char CTC) | ~30-50 ms | English only, 1 model per language |
-| **`canary-align` (subword CTC, this fork)** | **78 ms** | **All 25 EU languages in one model** |
+| **`nfa-align` (subword CTC, this fork)** | **78 ms** | **All 25 EU languages in one model** |
 | `canary-main` cross-attention DTW | ~414 ms | Built into canary-main, no extra model |
 
 **5.3× tighter** than canary's built-in DTW path, and the **first multilingual forced aligner** in this fork. Works as a drop-in replacement for `cohere-align` with broader language coverage but slightly looser per-word boundaries (subword vs character granularity). For 24 of the 25 supported languages there is no comparable wav2vec2 model, so this is the only option at this accuracy.
@@ -197,7 +205,7 @@ Output:
 It also doubles as a standalone CTC ASR via `-decode`:
 
 ```bash
-$ ./build/bin/canary-align -m canary-ctc-aligner-q4_k.gguf -f samples/jfk.wav -decode
+$ ./build/bin/nfa-align -m canary-ctc-aligner-q4_k.gguf -f samples/jfk.wav -decode
 And so, my fellow Americans, ask not what your country can do for you. Ask what you can do for your country.
 ```
 
@@ -265,7 +273,7 @@ The src/tgt language tokens explicitly tell the decoder what language to expect 
 ## Attribution
 
 - **Parakeet TDT 0.6B v3** and **Canary 1B v2**: NVIDIA NeMo team (CC-BY-4.0). Use must comply with the CC-BY-4.0 license including attribution.
-- **Encoder graph patterns**: shared between cohere/parakeet/canary, originally adapted from the cohere-whisper.cpp ggml branch.
+- **Encoder graph patterns**: shared between cohere/parakeet/canary, originally adapted from the CrispASR ggml branch.
 - **Decoder pattern (canary)**: cross-checked against NeMo's `transformer_decoders.py` and `transformer_modules.py` source.
 - **Underlying runtime**: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) / [ggml](https://github.com/ggerganov/ggml).
 

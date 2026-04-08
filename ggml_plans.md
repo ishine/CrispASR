@@ -1,4 +1,4 @@
-# Closing the gap to ONNX INT8 in cohere-whisper.cpp
+# Closing the gap to ONNX INT8 in CrispASR
 
 ## Current state (5.4 s clip, 8 threads, Cascade Lake-class CPU)
 
