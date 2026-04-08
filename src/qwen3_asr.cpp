@@ -1424,17 +1424,13 @@ extern "C" float * qwen3_asr_run_encoder(qwen3_asr_context * ctx,
         return nullptr;
     }
 
-    // Chunking (same as Stage 1).
+    // Chunking. Round T_mel up to the nearest multiple of chunk_T = 100 and
+    // zero-pad the trailing partial chunk. The padding shows up as "silence"
+    // encoder frames at the end of the sequence; the LLM handles them
+    // naturally (it's trained on audio with silence). For long audio there
+    // are typically only 0..99 padding frames out of thousands.
     const int chunk_T    = (int)hp.n_window * 2;
     const int num_chunks = (T_mel + chunk_T - 1) / chunk_T;
-    // Stage 2 simplification: assume the input is an exact multiple of chunk_T,
-    // so all chunks are full and there's no per-chunk padding to mask out. The
-    // jfk fixture (1100 mel frames, 11 chunks of 100) satisfies this.
-    if (T_mel % chunk_T != 0) {
-        fprintf(stderr, "qwen3_asr: stage-2 requires T_mel %% %d == 0 (got %d)\n",
-                chunk_T, T_mel);
-        return nullptr;
-    }
 
     // After three stride-2 convs the time dim shrinks by 8 (with rounding).
     // Reference: 100 → 50 → 25 → 13.
@@ -1449,11 +1445,15 @@ extern "C" float * qwen3_asr_run_encoder(qwen3_asr_context * ctx,
     std::vector<float> mel_padded((size_t)chunk_T * n_mels * num_chunks, 0.0f);
     for (int chunk = 0; chunk < num_chunks; chunk++) {
         const int t_start = chunk * chunk_T;
+        const int t_end   = std::min(t_start + chunk_T, T_mel);
+        const int t_len   = t_end - t_start;  // valid (non-padded) frames in this chunk
         for (int f = 0; f < n_mels; f++) {
-            for (int t = 0; t < chunk_T; t++) {
+            for (int t = 0; t < t_len; t++) {
                 mel_padded[(size_t)t + chunk_T*((size_t)f + n_mels*(size_t)chunk)]
                     = mel_features[(size_t)f * T_mel + (size_t)(t_start + t)];
             }
+            // remaining (chunk_T - t_len) entries are already zero from the
+            // initial assignment — silence padding for the trailing partial chunk.
         }
     }
 
