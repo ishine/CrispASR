@@ -250,8 +250,19 @@ print("4. HF Processor mel features")
 print("=" * 60)
 
 inputs = processor(audio, return_tensors="pt")
-# Move inputs to model device
-inputs = {k: v.to(_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+# Move inputs to model device AND cast float tensors to model dtype
+def move_inputs(d, device, dtype):
+    out = {}
+    for k, v in d.items():
+        if hasattr(v, 'to'):
+            if v.is_floating_point():
+                out[k] = v.to(device=device, dtype=dtype)
+            else:
+                out[k] = v.to(device=device)
+        else:
+            out[k] = v
+    return out
+inputs = move_inputs(inputs, _device, _dtype)
 
 # Debug: print all input shapes
 print("  Input keys and shapes:")
@@ -309,6 +320,11 @@ with torch.no_grad():
         save_result(f"ada_scale_layer{il}", one_plus,
                     f"1 + ada_rms_norm(t_cond) for layer {il}")
 
+def gpu_cleanup():
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    import gc; gc.collect()
+
 # ============================================================
 # 7. Encoder output (after projector)
 # ============================================================
@@ -316,21 +332,23 @@ print("\n" + "=" * 60)
 print("7. Encoder output")
 print("=" * 60)
 
-with torch.no_grad():
-    audio_outputs = model.get_audio_features(
-        input_features=inputs["input_features"],
-        return_dict=True,
-    )
-    encoder_out = audio_outputs.pooler_output[0]  # (N, 3072)
-    save_result("encoder_out", to_np(encoder_out),
-                f"encoder output after projector, shape {encoder_out.shape}")
-
-    # Also get the raw encoder hidden state (before projector)
-    encoder_hidden = audio_outputs.last_hidden_state
-    # The last_hidden_state is BEFORE reshape+projector
-    # After projector: reshape to (-1, 1280*4=5120) then linear_1 -> gelu -> linear_2
-    save_result("encoder_hidden_pre_proj", to_np(encoder_hidden[0]),
-                f"encoder hidden before projector, shape {encoder_hidden[0].shape}")
+try:
+    with torch.no_grad():
+        audio_outputs = model.get_audio_features(
+            input_features=inputs["input_features"],
+            return_dict=True,
+        )
+        encoder_out = audio_outputs.pooler_output[0]
+        save_result("encoder_out", to_np(encoder_out),
+                    f"encoder output after projector, shape {encoder_out.shape}")
+        encoder_hidden = audio_outputs.last_hidden_state
+        save_result("encoder_hidden_pre_proj", to_np(encoder_hidden[0]),
+                    f"encoder hidden before projector, shape {encoder_hidden[0].shape}")
+        del audio_outputs, encoder_out, encoder_hidden
+        gpu_cleanup()
+except Exception as e:
+    print(f"  Encoder output failed: {e}")
+    import traceback; traceback.print_exc()
 
 # ============================================================
 # 8. Full generation
@@ -339,15 +357,21 @@ print("\n" + "=" * 60)
 print("8. Full generation (50 tokens)")
 print("=" * 60)
 
-with torch.no_grad():
-    outputs = model.generate(**inputs, max_new_tokens=50)
-    gen_ids = outputs[0].tolist()
-    decoded = processor.batch_decode(outputs, skip_special_tokens=True)
-    save_result("gen_ids", np.array(gen_ids, dtype=np.float32),
-                f"generated token IDs: {gen_ids[:30]}...")
-    results["gen_text"] = decoded[0]
-    print(f"  Generated text: {decoded[0]!r}")
-    print(f"  Token IDs: {gen_ids[:30]}...")
+try:
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=50)
+        gen_ids = outputs[0].tolist()
+        decoded = processor.batch_decode(outputs, skip_special_tokens=True)
+        save_result("gen_ids", np.array(gen_ids, dtype=np.float32),
+                    f"generated token IDs: {gen_ids[:30]}...")
+        results["gen_text"] = decoded[0]
+        print(f"  Generated text: {decoded[0]!r}")
+        print(f"  Token IDs: {gen_ids[:30]}...")
+        del outputs
+        gpu_cleanup()
+except Exception as e:
+    print(f"  Generation failed: {e}")
+    import traceback; traceback.print_exc()
 
 # ============================================================
 # 9. First-token logits from prefill
@@ -367,7 +391,8 @@ try:
                     f"top-10 token IDs: {top_k.indices.tolist()}")
         print(f"  Top-10 tokens: {[(processor.decode([tid]), float(val)) for tid, val in zip(top_k.indices.tolist(), top_k.values.tolist())]}")
 except Exception as e:
-    print(f"  Prefill logits failed: {e} (expected — inputs_embeds/audio shape mismatch in forward mode)")
+    print(f"  Prefill logits failed: {e}")
+    gpu_cleanup()
 
 # ============================================================
 # 10. Conv stem output (first few frames)
@@ -376,11 +401,16 @@ print("\n" + "=" * 60)
 print("10. Conv stem output")
 print("=" * 60)
 
-with torch.no_grad():
-    # Run just the embedder (conv stem)
-    conv_out = model.audio_tower.embedder(inputs["input_features"])
-    save_result("conv_stem_out", to_np(conv_out[0, :10, :]),
-                f"conv stem output (first 10 frames), full shape {conv_out.shape}")
+try:
+    with torch.no_grad():
+        conv_out = model.audio_tower.embedder(inputs["input_features"])
+        save_result("conv_stem_out", to_np(conv_out[0, :10, :]),
+                    f"conv stem output (first 10 frames), full shape {conv_out.shape}")
+        del conv_out
+        gpu_cleanup()
+except Exception as e:
+    print(f"  Conv stem failed: {e}")
+    import traceback; traceback.print_exc()
 
 # ============================================================
 # Upload to GitHub Gist

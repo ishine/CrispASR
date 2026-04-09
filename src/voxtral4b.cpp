@@ -574,9 +574,9 @@ static ggml_cgraph * voxtral4b_build_graph_encoder(voxtral4b_context * ctx, int 
         V = ggml_reshape_3d(ctx0, V, head_dim, n_heads, T_enc);
 
         // Apply RoPE to Q and K
-        Q = ggml_rope_ext(ctx0, Q, pos_enc, nullptr, head_dim, 0, 0,
+        Q = ggml_rope_ext(ctx0, Q, pos_enc, nullptr, head_dim, 2, 0,
                           hp.audio_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        K = ggml_rope_ext(ctx0, K, pos_enc, nullptr, head_dim, 0, 0,
+        K = ggml_rope_ext(ctx0, K, pos_enc, nullptr, head_dim, 2, 0,
                           hp.audio_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         // Permute for attention: (hd, T, n_h)
@@ -762,9 +762,9 @@ static ggml_cgraph * voxtral4b_build_graph_llm_kv(voxtral4b_context * ctx,
         V = ggml_reshape_3d(ctx0, V, hd, n_kv, n_tokens);
 
         // RoPE
-        Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, 0, 0,
+        Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, 2, 0,
                           hp.llm_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, 0, 0,
+        K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, 2, 0,
                           hp.llm_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
         // KV cache write
