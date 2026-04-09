@@ -378,53 +378,47 @@ huggingface-cli download cstr/voxtral-mini-3b-2507-GGUF \
 
 ## Current status
 
-| Component | parakeet | canary |
-| --- | --- | --- |
-| GGUF converter | ✅ | ✅ |
-| Loader | ✅ | ✅ |
-| Encoder forward | ✅ | ✅ |
-| Decoder forward | ✅ | ✅ |
-| Mel STFT | ✅ | ✅ (shared) |
-| Greedy decode | ✅ TDT | ✅ Transformer |
-| Word timestamps | ✅ from TDT durations | ⏳ scaffold (linear) |
-| CLI: -sl/-tl | n/a | ✅ |
-| CLI: VAD + chunking | ✅ | ⏳ |
-| CLI: SRT/VTT/TXT | ✅ | ⏳ |
-| Quantisation | ✅ Q4_K/Q5_0/Q8_0 | ⏳ |
-| HF release | ✅ | ⏳ |
+| Component | parakeet | canary | cohere | qwen3-asr | voxtral 3B | voxtral 4B |
+| --- | --- | --- | --- | --- | --- | --- |
+| GGUF converter | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Encoder forward | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Decoder/LLM forward | ✅ TDT | ✅ Transformer | ✅ Transformer | ✅ Qwen3 LLM | ✅ Llama 3B | ✅ Llama 3.4B |
+| Word timestamps | ✅ TDT native | ✅ CTC re-align | ✅ cross-attn DTW | ✅ CTC 2nd pass | ✅ CTC 2nd pass | ✅ CTC 2nd pass |
+| SRT/VTT output | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| `--flash` attention | ✅ | ✅ | ✅ | always on | always on | always on |
+| VAD segmentation | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| GPU auto-detect | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Quantization | ✅ Q4_K-Q8_0 | ✅ | ✅ | ✅ | ✅ | ❌ pending |
+| HF release | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ pending |
 
-`canary-todo.md` tracks the remaining items in detail. The encoder, decoder, prompt builder, and end-to-end ASR + translation are all proven working — what's left is mostly CLI polish and quantisation.
-
-## Key bug fixes in this branch
-
-- **Transposed positional encoding** in `parakeet_make_pos_enc` / `canary_make_pos_enc` — the function wrote `pe[(2*i)*K + j]` (positions fast, dims slow) but the ggml tensor was `(d, 2T-1)` with dims fast. The correct layout is `pe[dim + pos*d]`. Parakeet's TDT decoder was robust enough to mostly recover; canary's encoder-decoder cross-attention exposed the bug immediately. Both runtimes now use the corrected layout. JFK output went from `"And so my fellow Americans. Ask not..."` (periods, parakeet pre-fix) to `"And so, my fellow Americans, ask not..."` (commas, canonical).
+See `TODO.md` for the full feature roadmap.
 
 ## Repository layout
 
 | Path | Description |
 | --- | --- |
-| `src/parakeet.{h,cpp}`                    | Public C API + ggml runtime for parakeet TDT |
-| `src/canary.{h,cpp}`                      | Public C API + ggml runtime for canary 1B v2 |
-| `src/cohere.{h,cpp}`                      | Cohere Transcribe runtime (from the ggml branch) |
-| `src/wav2vec2-ggml.{h,cpp}` + `src/align.{h,cpp}` | wav2vec2 CTC forced alignment for `cohere-align` |
-| `models/convert-parakeet-to-gguf.py`      | `.nemo → GGUF` for parakeet |
-| `models/convert-canary-to-gguf.py`        | `.nemo → GGUF` for canary |
-| `examples/parakeet-main/main.cpp`         | parakeet CLI (full: VAD, chunking, SRT/VTT/TXT) |
-| `examples/canary-main/main.cpp`           | canary CLI (basic: ASR + translation, polish ongoing) |
-| `examples/cohere-main/`, `examples/cohere-align/` | cohere CLIs |
-| `parakeet-todo.md`                        | parakeet implementation plan (mostly complete) |
-| `canary-todo.md`                          | canary implementation plan (encoder + decoder + prompt done) |
-| `benchmark_cohere.md`                     | Cross-runtime benchmark numbers |
-| `test_german.md`                          | German audio comparison: parakeet's auto-detect failure modes |
-| `ggml_plans.md`                           | VNNI Q8_0 plan to close the ONNX inference gap |
+| `src/parakeet.{h,cpp}` | Parakeet TDT 0.6B — FastConformer + TDT transducer |
+| `src/canary.{h,cpp}` | Canary 1B v2 — FastConformer + Transformer decoder |
+| `src/canary_ctc.{h,cpp}` | CTC forced aligner (from canary's auxiliary model) |
+| `src/cohere.{h,cpp}` | Cohere Transcribe 2B — Conformer + Transformer |
+| `src/qwen3_asr.{h,cpp}` | Qwen3-ASR 0.6B — Whisper encoder + Qwen3 LLM |
+| `src/voxtral.{h,cpp}` | Voxtral-Mini 3B — Whisper-large-v3 encoder + Llama 3B |
+| `src/voxtral4b.{h,cpp}` | Voxtral-Mini 4B Realtime — causal encoder + Llama 3.4B |
+| `src/wav2vec2-ggml.{h,cpp}` | wav2vec2 CTC for `cohere-align` |
+| `examples/*/main.cpp` | CLI entry points for each runtime |
+| `models/convert-*-to-gguf.py` | Model converters (HF/NeMo → GGUF) |
 
 ## Attribution
 
-- **Parakeet TDT 0.6B v3** and **Canary 1B v2**: NVIDIA NeMo team (CC-BY-4.0). Use must comply with the CC-BY-4.0 license including attribution.
-- **Encoder graph patterns**: shared between cohere/parakeet/canary, originally adapted from the CrispASR ggml branch.
-- **Decoder pattern (canary)**: cross-checked against NeMo's `transformer_decoders.py` and `transformer_modules.py` source.
-- **Underlying runtime**: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) / [ggml](https://github.com/ggerganov/ggml).
+- **Parakeet TDT** and **Canary 1B v2**: NVIDIA NeMo team (CC-BY-4.0)
+- **Cohere Transcribe**: Cohere Labs (Apache-2.0)
+- **Qwen3-ASR**: Qwen team / Alibaba (Apache-2.0)
+- **Voxtral-Mini 3B** and **Voxtral-Mini 4B Realtime**: Mistral AI (Apache-2.0)
+- **wav2vec2 weights**: Jonatas Grosman (Apache-2.0)
+- **Underlying runtime**: [whisper.cpp](https://github.com/ggml-org/whisper.cpp) / [ggml](https://github.com/ggerganov/ggml) (MIT)
+
+Voxtral 4B Realtime port cross-referenced against [antirez/voxtral.c](https://github.com/antirez/voxtral.c), [awni/voxmlx](https://github.com/awni/voxmlx), and [TrevorS/voxtral-mini-realtime-rs](https://github.com/TrevorS/voxtral-mini-realtime-rs).
 
 ## License
 
-The fork code is MIT (matching whisper.cpp). The parakeet and canary models themselves are **CC-BY-4.0**, inherited from NVIDIA. Use of the GGUF files must comply with CC-BY-4.0 including attribution.
+The fork code is MIT (matching whisper.cpp). Individual models have their own licenses — see the links above. Use of GGUF files must comply with each model's upstream license.
