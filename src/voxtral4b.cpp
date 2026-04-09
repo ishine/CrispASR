@@ -535,6 +535,10 @@ static ggml_cgraph * voxtral4b_build_graph_encoder(voxtral4b_context * ctx, int 
     cur = ggml_reshape_2d(ctx0, cur, T_enc, d);
     cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));  // (d, T_enc)
 
+    // Debug: name the conv stem output for extraction
+    ggml_set_name(cur, "conv_stem_out");
+    ggml_build_forward_expand(gf, cur);  // ensure it's computed
+
     // RoPE positions for encoder
     ggml_tensor * pos_enc = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_enc);
     ggml_set_name(pos_enc, "enc_positions");
