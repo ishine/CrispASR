@@ -544,13 +544,11 @@ static ggml_cgraph * voxtral4b_build_graph_encoder(voxtral4b_context * ctx, int 
     ggml_set_name(pos_enc, "enc_positions");
     ggml_set_input(pos_enc);
 
-    // Sliding window attention mask (optional — only if swa < T_enc)
-    ggml_tensor * swa_mask = nullptr;
-    if (swa > 0 && swa < T_enc) {
-        swa_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T_enc, T_enc);
-        ggml_set_name(swa_mask, "swa_mask");
-        ggml_set_input(swa_mask);
-    }
+    // Causal attention mask (ALWAYS required — encoder is causal, not bidirectional).
+    // When T_enc > swa, also apply sliding window restriction.
+    ggml_tensor * swa_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T_enc, T_enc);
+    ggml_set_name(swa_mask, "swa_mask");
+    ggml_set_input(swa_mask);
 
     // 32 × encoder blocks
     for (int il = 0; il < n_layers; il++) {
