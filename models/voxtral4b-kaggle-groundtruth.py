@@ -34,12 +34,21 @@ import sys
 def install(pkg):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
 
-install("transformers>=5.2.0")
+# Install ALL dependencies FIRST, before any transformers import.
+# mistral-common MUST be installed before transformers tries to load
+# VoxtralRealtimeProcessor, otherwise you get ImportError.
+install("mistral-common[audio]")
+install("librosa")
 install("safetensors")
 install("scipy")
 install("huggingface_hub")
-install("mistral-common[audio]")
-install("librosa")
+install("transformers>=5.2.0")
+
+# Force reimport after installs (Kaggle/Jupyter caches old import state)
+import importlib
+for mod_name in list(sys.modules.keys()):
+    if 'mistral' in mod_name or 'transformers' in mod_name:
+        del sys.modules[mod_name]
 
 # Try to get GH_TOKEN from Kaggle secrets
 GH_TOKEN = None
@@ -180,9 +189,37 @@ print("\n" + "=" * 60)
 print("3. Loading model...")
 print("=" * 60)
 
-from transformers import VoxtralRealtimeForConditionalGeneration, AutoProcessor
+from transformers import VoxtralRealtimeForConditionalGeneration
 
-processor = AutoProcessor.from_pretrained(model_dir)
+# Load processor — try AutoProcessor first, fall back to manual construction
+try:
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(model_dir)
+    print("  Loaded processor via AutoProcessor")
+except (ImportError, Exception) as e:
+    print(f"  AutoProcessor failed ({e}), building processor manually...")
+    # Manually build feature extractor + tokenizer
+    from transformers import AutoFeatureExtractor, AutoTokenizer
+    feature_extractor = AutoFeatureExtractor.from_pretrained(model_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    # Create a minimal processor-like object
+    class MinimalProcessor:
+        def __init__(self, fe, tok):
+            self.feature_extractor = fe
+            self.tokenizer = tok
+        def __call__(self, audio, **kwargs):
+            feats = self.feature_extractor(audio, sampling_rate=16000, **kwargs)
+            # Build default input_ids: BOS + STREAMING_PAD * 38
+            input_ids = torch.tensor([[1] + [32] * 38])
+            feats["input_ids"] = input_ids
+            return feats
+        def batch_decode(self, ids, **kwargs):
+            return self.tokenizer.batch_decode(ids, **kwargs)
+        def decode(self, ids, **kwargs):
+            return self.tokenizer.decode(ids, **kwargs)
+    processor = MinimalProcessor(feature_extractor, tokenizer)
+    print("  Built minimal processor")
+
 model = VoxtralRealtimeForConditionalGeneration.from_pretrained(
     model_dir, torch_dtype=torch.float32, device_map="cpu"
 )
