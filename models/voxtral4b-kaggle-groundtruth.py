@@ -102,9 +102,21 @@ print(f"Audio: {len(audio)} samples, {len(audio)/16000:.2f}s")
 
 results = {}  # name -> {"shape": ..., "dtype": ..., "data": base64, "stats": ...}
 
+def to_np(x):
+    """Convert tensor or array to numpy float32, handling GPU tensors."""
+    if hasattr(x, 'cpu'):
+        x = x.cpu()
+    if hasattr(x, 'detach'):
+        x = x.detach()
+    if hasattr(x, 'float'):
+        x = x.float()
+    if hasattr(x, 'numpy'):
+        x = x.numpy()
+    return np.asarray(x, dtype=np.float32)
+
 def save_result(name, arr, desc=""):
     """Save a numpy array to results dict."""
-    arr = np.asarray(arr, dtype=np.float32)
+    arr = to_np(arr)
     results[name] = {
         "shape": list(arr.shape),
         "desc": desc,
@@ -220,8 +232,12 @@ except (ImportError, Exception) as e:
     processor = MinimalProcessor(feature_extractor, tokenizer)
     print("  Built minimal processor")
 
+import torch
+_device = "cuda" if torch.cuda.is_available() else "cpu"
+_dtype = torch.float16 if _device == "cuda" else torch.float32
+print(f"  Loading model on {_device} with {_dtype}")
 model = VoxtralRealtimeForConditionalGeneration.from_pretrained(
-    model_dir, torch_dtype=torch.float32, device_map="cpu"
+    model_dir, torch_dtype=_dtype, device_map=_device
 )
 model.eval()
 print("Model loaded!")
@@ -234,6 +250,8 @@ print("4. HF Processor mel features")
 print("=" * 60)
 
 inputs = processor(audio, return_tensors="pt")
+# Move inputs to model device
+inputs = {k: v.to(_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
 
 # Debug: print all input shapes
 print("  Input keys and shapes:")
@@ -253,14 +271,14 @@ elif raw_mel.dim() == 2:
 else:
     hf_mel = raw_mel.squeeze()
 print(f"  hf_mel shape after squeeze: {hf_mel.shape}")
-save_result("mel_hf", hf_mel.numpy(), f"mel from HF processor, raw shape was {list(raw_mel.shape)}")
+save_result("mel_hf", to_np(hf_mel), f"mel from HF processor, raw shape was {list(raw_mel.shape)}")
 
 # Also save the mel transposed if it looks like (T, n_mels)
 if hf_mel.shape[0] > hf_mel.shape[-1] if hf_mel.dim() >= 2 else False:
     save_result("mel_hf_transposed", hf_mel.T.numpy(), "mel_hf transposed (might be correct orientation)")
 
 hf_input_ids = inputs["input_ids"][0]
-save_result("input_ids_hf", hf_input_ids.numpy().astype(np.float32),
+save_result("input_ids_hf", to_np(hf_input_ids),
             f"HF processor input_ids (first 20: {hf_input_ids[:20].tolist()})")
 
 # ============================================================
@@ -273,7 +291,7 @@ print("=" * 60)
 with torch.no_grad():
     time_tensor = torch.full((1,), float(delay_tokens))
     t_cond_model = model.time_embedding(time_tensor)
-    save_result("t_cond_model", t_cond_model.numpy(), "t_cond from model.time_embedding(6)")
+    save_result("t_cond_model", to_np(t_cond_model), "t_cond from model.time_embedding(6)")
 
 # ============================================================
 # 6. Ada-norm scales per layer
@@ -287,7 +305,7 @@ with torch.no_grad():
     for il in range(min(3, len(model.language_model.model.layers))):  # first 3 layers
         layer = model.language_model.model.layers[il]
         ada_out = layer.ada_rms_norm(t_cond_torch)  # (1, 3072)
-        one_plus = (1 + ada_out).squeeze(0).numpy()
+        one_plus = to_np((1 + ada_out).squeeze(0))
         save_result(f"ada_scale_layer{il}", one_plus,
                     f"1 + ada_rms_norm(t_cond) for layer {il}")
 
@@ -304,14 +322,14 @@ with torch.no_grad():
         return_dict=True,
     )
     encoder_out = audio_outputs.pooler_output[0]  # (N, 3072)
-    save_result("encoder_out", encoder_out.numpy(),
+    save_result("encoder_out", to_np(encoder_out),
                 f"encoder output after projector, shape {encoder_out.shape}")
 
     # Also get the raw encoder hidden state (before projector)
     encoder_hidden = audio_outputs.last_hidden_state
     # The last_hidden_state is BEFORE reshape+projector
     # After projector: reshape to (-1, 1280*4=5120) then linear_1 -> gelu -> linear_2
-    save_result("encoder_hidden_pre_proj", encoder_hidden[0].numpy(),
+    save_result("encoder_hidden_pre_proj", to_np(encoder_hidden[0]),
                 f"encoder hidden before projector, shape {encoder_hidden[0].shape}")
 
 # ============================================================
@@ -343,9 +361,9 @@ try:
         fwd_out = model(**inputs)
         logits = fwd_out.logits[0, -1]
         top_k = torch.topk(logits, 10)
-        save_result("prefill_logits_top10_vals", top_k.values.numpy(),
+        save_result("prefill_logits_top10_vals", to_np(top_k.values),
                     f"top-10 logit values from prefill")
-        save_result("prefill_logits_top10_ids", top_k.indices.numpy().astype(np.float32),
+        save_result("prefill_logits_top10_ids", to_np(top_k.indices),
                     f"top-10 token IDs: {top_k.indices.tolist()}")
         print(f"  Top-10 tokens: {[(processor.decode([tid]), float(val)) for tid, val in zip(top_k.indices.tolist(), top_k.values.tolist())]}")
 except Exception as e:
@@ -361,7 +379,7 @@ print("=" * 60)
 with torch.no_grad():
     # Run just the embedder (conv stem)
     conv_out = model.audio_tower.embedder(inputs["input_features"])
-    save_result("conv_stem_out", conv_out[0, :10, :].numpy(),
+    save_result("conv_stem_out", to_np(conv_out[0, :10, :]),
                 f"conv stem output (first 10 frames), full shape {conv_out.shape}")
 
 # ============================================================
