@@ -1,5 +1,10 @@
 # Parakeet TDT 0.6B v3 — ggml port plan
 
+> **STATUS (2026-04-09): ✅ MOSTLY COMPLETE.** Encoder (ggml graph), TDT
+> decoder (CPU), word timestamps, --flash, GPU auto-detect, HF release
+> shipped. Remaining: decoder LSTM+Joint still runs raw CPU float* loops
+> (see TODO.md P1). See `TODO.md` for current task list.
+
 Goal: a `parakeet-main` CLI in `whisper.cpp` that runs `nvidia/parakeet-tdt-0.6b-v3`
 on CPU via ggml, with built-in word-level timestamps.
 

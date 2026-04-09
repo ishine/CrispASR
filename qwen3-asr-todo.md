@@ -1,5 +1,10 @@
 # Qwen3-ASR-0.6B port plan (CrispASR)
 
+> **STATUS (2026-04-09): ✅ COMPLETE.** Full pipeline shipped. BPE tokenizer,
+> flash-attn, F16 KV cache, GPU auto-detect, word timestamps via CTC aligner,
+> SRT/VTT output, HF release shipped. Remaining: VAD for long audio,
+> temperature/sampling, streaming. See `TODO.md` for current task list.
+
 Hybrid plan (option A) confirmed 2026-04-08. Reuses our existing whisper
 mel + parakeet-style 2D subsampler + new Qwen3 LLM forward. Reference
 implementation: github.com/predict-woo/qwen3-asr.cpp (MIT) — used for

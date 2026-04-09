@@ -1,5 +1,10 @@
 # Canary 1B v2 — ggml port plan
 
+> **STATUS (2026-04-09): ✅ COMPLETE.** ASR + speech translation working.
+> --flash flag, CTC re-alignment via -am, GPU auto-detect, word timestamps,
+> SRT/VTT, HF release shipped. Remaining: translation quality validation.
+> See `TODO.md` for current task list.
+
 Goal: a `canary-main` CLI that runs `nvidia/canary-1b-v2` on CPU via ggml,
 with explicit `-sl SRC` / `-tl TGT` language flags for both ASR and speech
 translation, plus native word-level timestamps from the model's auxiliary

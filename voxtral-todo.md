@@ -1,5 +1,11 @@
 # Voxtral-Mini-3B-2507 port plan
 
+> **STATUS (2026-04-09): ✅ COMPLETE.** All stages (V1-V4) shipped. Tekken
+> tokenizer implemented. GPU auto-detect via `ggml_backend_init_best()`.
+> Word timestamps via CTC aligner. SRT/VTT output. HF release shipped.
+> Remaining: audio understanding mode, long-audio >30s, Voxtral 4B variant.
+> See `TODO.md` for current task list.
+
 `mistralai/Voxtral-Mini-3B-2507` is Mistral's audio-LLM, structurally
 similar to Qwen3-ASR but with cleaner reuse of existing code in this fork.
 

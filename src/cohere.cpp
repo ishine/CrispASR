@@ -1595,8 +1595,8 @@ struct cohere_context * cohere_init_from_file(const char * path_model,
             .no_alloc   = true,
         };
         ctx->kv_ctx = ggml_init(kv_params);
-        ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
-        ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
+        ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
+        ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hp.dec_head_dim, hp.dec_max_ctx, hp.dec_n_heads, hp.dec_n_layers);
         ctx->kv_buf = ggml_backend_alloc_buffer(ctx->ggml_backend,
                                            ggml_nbytes(ctx->kv_k) + ggml_nbytes(ctx->kv_v));
         ggml_backend_buffer_t kv_buf = ctx->kv_buf;

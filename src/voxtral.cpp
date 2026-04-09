@@ -853,6 +853,19 @@ extern "C" voxtral_context * voxtral_init_from_file(const char * path,
         delete ctx;
         return nullptr;
     }
+
+    // Create backend scheduler once with worst-case node budget.
+    {
+        int n_be = 0;
+        ggml_backend_t backends[2];
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+            backends[n_be++] = ctx->backend_cpu;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    }
+    ctx->compute_meta.resize(
+        ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
+
     if (params.verbosity >= 1) {
         fprintf(stderr,
                 "voxtral: loaded %s  (audio %u layers, llm %u layers, vocab %u, "
@@ -1067,11 +1080,6 @@ extern "C" float * voxtral_embed_tokens(voxtral_context * ctx,
                                         const int32_t * input_ids, int n_tokens) {
     if (!ctx || !input_ids || n_tokens <= 0) return nullptr;
     const int d = (int)ctx->model.hparams.llm_d_model;
-    if (ctx->sched) { ggml_backend_sched_free(ctx->sched); ctx->sched = nullptr; }
-    ctx->compute_meta.assign(ggml_tensor_overhead()*64+ggml_graph_overhead_custom(64,false), 0);
-    ggml_backend_t be[2] = { ctx->backend, ctx->backend_cpu };
-    int nb = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(be, nullptr, nb, 64, false, false);
     ggml_cgraph * gf = voxtral_build_graph_embed(ctx, n_tokens);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return nullptr;
@@ -1102,12 +1110,6 @@ extern "C" float * voxtral_run_llm_kv(voxtral_context * ctx,
             for (int k = n_past+q+1; k < Lk; k++)
                 mask[(size_t)q*Lk+k] = neg_inf;
     }
-
-    if (ctx->sched) { ggml_backend_sched_free(ctx->sched); ctx->sched = nullptr; }
-    ctx->compute_meta.assign(ggml_tensor_overhead()*16384+ggml_graph_overhead_custom(16384,false), 0);
-    ggml_backend_t be[2] = { ctx->backend, ctx->backend_cpu };
-    int nb = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(be, nullptr, nb, 16384, false, false);
 
     ggml_cgraph * gf = voxtral_build_graph_llm_kv(ctx, n_past, n_tokens);
     ggml_backend_sched_reset(ctx->sched);
@@ -1146,13 +1148,6 @@ extern "C" float * voxtral_run_encoder(voxtral_context * ctx,
                 n_mels, T_mel);
         return nullptr;
     }
-
-    if (ctx->sched) { ggml_backend_sched_free(ctx->sched); ctx->sched = nullptr; }
-    ctx->compute_meta.assign(
-        ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false), 0);
-    ggml_backend_t backends[2] = { ctx->backend, ctx->backend_cpu };
-    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
 
     ggml_cgraph * gf = voxtral_build_graph_encoder(ctx);
     ggml_backend_sched_reset(ctx->sched);
@@ -1374,17 +1369,6 @@ extern "C" float * voxtral_run_llm(voxtral_context * ctx,
             mask[(size_t)q * n_tokens + k] = neg_inf;
         }
     }
-
-    // Lazy sched + compute_meta init
-    if (ctx->sched) {
-        ggml_backend_sched_free(ctx->sched);
-        ctx->sched = nullptr;
-    }
-    ctx->compute_meta.assign(
-        ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false), 0);
-    ggml_backend_t backends[2] = { ctx->backend, ctx->backend_cpu };
-    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
 
     ggml_cgraph * gf = voxtral_build_graph_llm(ctx, n_tokens);
     ggml_backend_sched_reset(ctx->sched);

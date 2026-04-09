@@ -1603,6 +1603,20 @@ extern "C" qwen3_asr_context * qwen3_asr_init_from_file(const char * path,
         delete ctx;
         return nullptr;
     }
+
+    // Create the backend scheduler once with the worst-case node budget.
+    // All compute functions reuse this scheduler via ggml_backend_sched_reset().
+    {
+        int n_be = 0;
+        ggml_backend_t backends[2];
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+            backends[n_be++] = ctx->backend_cpu;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
+    }
+    ctx->compute_meta.resize(
+        ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
+
     if (params.verbosity >= 1) {
         fprintf(stderr, "qwen3_asr: loaded %s  (audio %u layers, llm %u layers, vocab %u)\n",
                 path, ctx->model.hparams.audio_n_layers, ctx->model.hparams.llm_n_layers,
@@ -1665,17 +1679,6 @@ extern "C" float * qwen3_asr_run_conv(qwen3_asr_context * ctx,
                     = mel_features[(size_t)f * T_mel + (size_t)(t_start + t)];
             }
         }
-    }
-
-    // Lazy sched + compute_meta init
-    if (!ctx->sched) {
-        ggml_backend_t backends[2] = { ctx->backend, ctx->backend_cpu };
-        int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 4096, false, false);
-    }
-    if (ctx->compute_meta.empty()) {
-        ctx->compute_meta.resize(
-            ggml_tensor_overhead() * 4096 + ggml_graph_overhead_custom(4096, false));
     }
 
     ggml_cgraph * gf = qwen3_asr_build_graph_conv(ctx, chunk_T, num_chunks);
@@ -1763,18 +1766,6 @@ extern "C" float * qwen3_asr_run_encoder(qwen3_asr_context * ctx,
     // zero mask. (We keep the input tensor in the graph so the structure
     // is ready when we add real per-chunk padding masking later.)
     std::vector<float> mask((size_t)N_padded * N_padded, 0.0f);
-
-    // Lazy sched + compute_meta init (encoder graph is much bigger than conv-only,
-    // bump the meta budget for the 18 layers).
-    if (ctx->sched) {
-        ggml_backend_sched_free(ctx->sched);
-        ctx->sched = nullptr;
-    }
-    ctx->compute_meta.assign(
-        ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(8192, false), 0);
-    ggml_backend_t backends[2] = { ctx->backend, ctx->backend_cpu };
-    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 8192, false, false);
 
     ggml_cgraph * gf = qwen3_asr_build_graph_encoder(ctx, chunk_T, num_chunks, T_chunk_out);
     ggml_backend_sched_reset(ctx->sched);
@@ -1909,14 +1900,6 @@ extern "C" float * qwen3_asr_run_llm_kv(qwen3_asr_context * ctx,
         }
     }
 
-    // Reset sched + compute_meta with bigger budget for KV graph
-    if (ctx->sched) { ggml_backend_sched_free(ctx->sched); ctx->sched = nullptr; }
-    ctx->compute_meta.assign(
-        ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false), 0);
-    ggml_backend_t backends[2] = { ctx->backend, ctx->backend_cpu };
-    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
-
     ggml_cgraph * gf = qwen3_asr_build_graph_llm_kv(ctx, n_past, n_tokens);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1953,16 +1936,6 @@ extern "C" float * qwen3_asr_embed_tokens(qwen3_asr_context * ctx,
     if (!ctx || !input_ids || n_tokens <= 0) return nullptr;
     const int d = (int)ctx->model.hparams.llm_d_model;
 
-    if (ctx->sched) {
-        ggml_backend_sched_free(ctx->sched);
-        ctx->sched = nullptr;
-    }
-    ctx->compute_meta.assign(
-        ggml_tensor_overhead() * 64 + ggml_graph_overhead_custom(64, false), 0);
-    ggml_backend_t backends[2] = { ctx->backend, ctx->backend_cpu };
-    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 64, false, false);
-
     ggml_cgraph * gf = qwen3_asr_build_graph_embed(ctx, n_tokens);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
@@ -1996,13 +1969,6 @@ extern "C" float * qwen3_asr_run_llm_from_embeds(qwen3_asr_context * ctx,
     for (int i = 0; i < n_tokens; i++)
         for (int j = i + 1; j < n_tokens; j++)
             mask[(size_t)i * n_tokens + j] = -INFINITY;
-
-    if (ctx->sched) { ggml_backend_sched_free(ctx->sched); ctx->sched = nullptr; }
-    ctx->compute_meta.assign(
-        ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false), 0);
-    ggml_backend_t backends[2] = { ctx->backend, ctx->backend_cpu };
-    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
 
     ggml_cgraph * gf = qwen3_asr_build_graph_llm_from_embeds(ctx, n_tokens);
     ggml_backend_sched_reset(ctx->sched);
@@ -2056,17 +2022,6 @@ extern "C" float * qwen3_asr_run_llm(qwen3_asr_context * ctx,
             if (j > i) mask[(size_t)i * n_tokens + j] = -INFINITY;
         }
     }
-
-    // Lazy sched + compute_meta init (LLM graph is bigger than encoder)
-    if (ctx->sched) {
-        ggml_backend_sched_free(ctx->sched);
-        ctx->sched = nullptr;
-    }
-    ctx->compute_meta.assign(
-        ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false), 0);
-    ggml_backend_t backends[2] = { ctx->backend, ctx->backend_cpu };
-    int n_be = (ctx->backend != ctx->backend_cpu) ? 2 : 1;
-    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 16384, false, false);
 
     ggml_cgraph * gf = qwen3_asr_build_graph_llm(ctx, n_tokens);
     ggml_backend_sched_reset(ctx->sched);

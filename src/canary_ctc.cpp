@@ -672,8 +672,15 @@ extern "C" struct canary_ctc_context * canary_ctc_init_from_file(
     ctx->params    = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
 
-    ctx->backend     = cc_pick_backend();
-    ctx->backend_cpu = ctx->backend;     // single CPU instance — avoids the cross-instance bug
+    ctx->backend = cc_pick_backend();
+    // Always have a CPU fallback backend for ops the primary doesn't support.
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ctx->backend_cpu = ctx->backend;
+        ggml_backend_cpu_set_n_threads(ctx->backend, ctx->n_threads);
+    } else {
+        ctx->backend_cpu = ggml_backend_cpu_init();
+        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, ctx->n_threads);
+    }
 
     if (!cc_load_model(ctx->model, ctx->vocab, path_model, ctx->backend)) {
         canary_ctc_free(ctx);
@@ -688,6 +695,8 @@ extern "C" void canary_ctc_free(struct canary_ctc_context * ctx) {
     if (ctx->sched)             ggml_backend_sched_free(ctx->sched);
     if (ctx->model.buf)         ggml_backend_buffer_free(ctx->model.buf);
     if (ctx->model.ctx)         ggml_free(ctx->model.ctx);
+    if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+        ggml_backend_free(ctx->backend_cpu);
     if (ctx->backend)           ggml_backend_free(ctx->backend);
     delete ctx;
 }
@@ -709,8 +718,13 @@ extern "C" int canary_ctc_compute_logits(struct canary_ctc_context * ctx,
     if (mel.empty()) return -1;
 
     if (!ctx->sched) {
-        ggml_backend_t backends[1] = { ctx->backend };
-        ctx->sched = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
+        int n_backends = 1;
+        ggml_backend_t backends[2] = { ctx->backend, nullptr };
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend) {
+            backends[1] = ctx->backend_cpu;
+            n_backends = 2;
+        }
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_backends, 16384, false, false);
     }
     if (ctx->compute_meta.empty()) {
         ctx->compute_meta.resize(
