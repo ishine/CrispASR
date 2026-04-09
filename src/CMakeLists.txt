@@ -248,6 +248,28 @@ if(GGML_CUDA)
 endif()
 
 # ---------------------------------------------------------------------------
+# Voxtral — mistralai/Voxtral-Mini-3B-2507 (Whisper encoder + Llama 3 LLM)
+# ---------------------------------------------------------------------------
+add_library(voxtral
+            voxtral.h
+            voxtral.cpp
+            )
+target_include_directories(voxtral PUBLIC . ../include)
+target_compile_features   (voxtral PUBLIC cxx_std_17)
+target_link_libraries     (voxtral PUBLIC ggml ggml-base Threads::Threads)
+if(NOT MSVC)
+    target_compile_options(voxtral PRIVATE -O3 -march=native)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(voxtral PRIVATE GGML_USE_METAL)
+    target_link_libraries(voxtral PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(voxtral PRIVATE GGML_USE_CUDA)
+    target_link_libraries(voxtral PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # wav2vec2-ggml — Wav2Vec2ForCTC encoder (GGUF, ggml-based)
 # ---------------------------------------------------------------------------
 add_library(wav2vec2-ggml STATIC wav2vec2-ggml.h wav2vec2-ggml.cpp)
