@@ -14,8 +14,9 @@ A fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) that adds full 
 | `cohere-align` | wav2vec2 character CTC forced aligner (English-only, 30-50 ms MAE) | uses [`jonatasgrosman/wav2vec2-large-xlsr-53-english`](https://huggingface.co/jonatasgrosman/wav2vec2-large-xlsr-53-english) |
 | **`qwen3-asr-main`** | [`Qwen/Qwen3-ASR-0.6B`](https://huggingface.co/Qwen/Qwen3-ASR-0.6B) — 900M speech-LLM (Whisper-style audio encoder + Qwen3 0.6B LLM with audio-token injection). 30 languages + 22 Chinese dialects, Open ASR avg WER 6.42, persistent KV cache | [`cstr/qwen3-asr-0.6b-GGUF`](https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF) |
 | **`voxtral-main`** | [`mistralai/Voxtral-Mini-3B-2507`](https://huggingface.co/mistralai/Voxtral-Mini-3B-2507) — 3B speech-LLM (Whisper-large-v3 encoder + Mistral/Llama 3B LLM). ASR + audio understanding + text Q&A, 8 languages, function calling from voice. Best-in-class text performance retained | [`cstr/voxtral-mini-3b-2507-GGUF`](https://huggingface.co/cstr/voxtral-mini-3b-2507-GGUF) |
+| **`voxtral4b-main`** | [`mistralai/Voxtral-Mini-4B-Realtime-2602`](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) — 4.4B **realtime streaming** speech-LLM (causal RoPE+SwiGLU encoder + Mistral 3.4B LLM with adaptive RMSNorm). 13 languages, <500ms latency, competitive with offline models | `cstr/voxtral-mini-4b-realtime-GGUF` (pending) |
 
-All seven runtimes share the same Whisper-style mel preprocessor — that's how we ported each new model in days rather than weeks. Qwen3-ASR and Voxtral are **speech-LLMs**: instead of dedicated CTC/transducer/seq2seq decoders, the audio encoder output frames are spliced into the input embeddings of a stock LLM at placeholder positions, and the LLM autoregressively generates the transcript. Voxtral additionally supports audio understanding (Q&A about audio content), function calling from voice, and retains the text-only capabilities of its Ministral 3B backbone.
+All eight runtimes share ggml-based inference — that's how we ported each new model in days rather than weeks. Qwen3-ASR, Voxtral 3B, and Voxtral 4B Realtime are **speech-LLMs**: instead of dedicated CTC/transducer/seq2seq decoders, the audio encoder output frames are injected into the input embeddings of a stock LLM, and the LLM autoregressively generates the transcript. Voxtral 3B additionally supports audio understanding (Q&A about audio content) and function calling from voice. Voxtral 4B Realtime is a **natively streaming** model with a causal audio encoder and configurable transcription delay (240ms-2.4s), designed for on-device real-time ASR.
 
 > **Branch state.** Everything lives on `main` as of April 2026. The original cohere-only history is preserved at the [`archive/cohere-only`](https://github.com/CrispStrobe/CrispASR/tree/archive/cohere-only) branch as a historical reference.
 
@@ -34,6 +35,8 @@ All seven runtimes share the same Whisper-style mel preprocessor — that's how 
 | 30 ms-accurate word stamps via CTC forced alignment | `cohere-align` (ggml branch) |
 | **30 languages + 22 Chinese dialects** | **`qwen3-asr-main`** |
 | Speech-LLM with persistent KV cache (faster than realtime at Q4_K) | **`qwen3-asr-main`** |
+| **Realtime streaming** ASR (low latency, on-device) | **`voxtral4b-main`** |
+| Highest-quality offline speech-LLM (3B backbone) | **`voxtral-main`** |
 
 | | parakeet-tdt-0.6b-v3 | canary-1b-v2 |
 | --- | --- | --- |
@@ -309,7 +312,71 @@ The src/tgt language tokens explicitly tell the decoder what language to expect 
 
 ---
 
-## Current status (parakeet branch)
+## Quick start — Voxtral 4B Realtime (streaming speech-LLM)
+
+```bash
+cmake --build build -j$(nproc) --target voxtral4b-main
+
+# Convert from HuggingFace (or download pre-converted GGUF when available)
+python models/convert-voxtral4b-to-gguf.py \
+    --input /path/to/Voxtral-Mini-4B-Realtime-2602 \
+    --output voxtral-4b-realtime.gguf
+
+./build/bin/voxtral4b-main -m voxtral-4b-realtime.gguf -f samples/jfk.wav
+# And so, my fellow Americans, ask not what your country can do for you.
+# Ask what you can do for your country.
+```
+
+The 4B Realtime model is a **natively streaming** architecture with a causal audio encoder (RoPE + SwiGLU + sliding window attention). It produces text interleaved with streaming control tokens — the CLI filters these automatically for clean output. Key features:
+
+- **13 languages** (en, fr, es, de, ru, zh, ja, it, pt, nl, ar, hi, ko)
+- **Configurable delay**: 480ms default (6 tokens), tunable from 240ms to 2.4s
+- **4.4B parameters** (970M encoder + 3.4B LLM), ~8.9 GB F16 GGUF
+- **Apache 2.0** license
+- Optional word timestamps via CTC aligner: `-am aligner.gguf -timestamps`
+
+---
+
+## Quick start — Qwen3-ASR (30+ languages, speech-LLM)
+
+```bash
+cmake --build build -j$(nproc) --target qwen3-asr-main
+
+huggingface-cli download cstr/qwen3-asr-0.6b-GGUF \
+    qwen3-asr-0.6b-q4_k.gguf --local-dir .
+
+./build/bin/qwen3-asr-main -m qwen3-asr-0.6b-q4_k.gguf -f samples/jfk.wav
+# And so, my fellow Americans, ask not what your country can do for you,
+# ask what you can do for your country.
+```
+
+900M speech-LLM (Whisper encoder + Qwen3 0.6B LLM). Auto-detects language from audio. Supports 30 languages + 22 Chinese dialects. Optional word timestamps via CTC aligner:
+
+```bash
+./build/bin/qwen3-asr-main -m qwen3-asr-0.6b-q4_k.gguf -f audio.wav \
+    -am canary-ctc-aligner-q4_k.gguf -timestamps
+```
+
+---
+
+## Quick start — Voxtral 3B (offline speech-LLM)
+
+```bash
+cmake --build build -j$(nproc) --target voxtral-main
+
+huggingface-cli download cstr/voxtral-mini-3b-2507-GGUF \
+    voxtral-mini-3b-2507-q4_k.gguf --local-dir .
+
+./build/bin/voxtral-main -m voxtral-mini-3b-2507-q4_k.gguf -f samples/jfk.wav -l en
+# And so, my fellow Americans, ask not what your country can do for you,
+# ask what you can do for your country.
+```
+
+3B speech-LLM (Whisper-large-v3 encoder + Mistral/Llama 3B). Supports 8 languages (`-l en/de/fr/es/it/pt/nl/hi`). Full Tekken tokenizer for audio understanding and function calling.
+
+---
+
+## Current status
 
 | Component | parakeet | canary |
 | --- | --- | --- |
