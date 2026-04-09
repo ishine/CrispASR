@@ -174,21 +174,24 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "encoder: %d frames × %d dim  (%.0f ms)\n", N_enc, pdim,
                 std::chrono::duration<double, std::milli>(t_enc - t_mel).count());
 
-    // Build prompt: <s> [INST] [BEGIN_AUDIO] <audio_pad>×N [/INST] lang:LANG [TRANSCRIBE]
+    // Build prompt via the Tekken tokenizer — handles any language naturally.
+    // Template: <s>[INST][BEGIN_AUDIO] <audio_pad>×N [/INST]lang:LANG[TRANSCRIBE]
     std::vector<int32_t> ids;
-    ids.push_back(1); ids.push_back(3); ids.push_back(25);
-    for (int i = 0; i < N_enc; i++) ids.push_back(24);
-    ids.push_back(4); ids.push_back(9909); ids.push_back(1058);
-    if      (lang == "en") ids.push_back(1262);
-    else if (lang == "de") ids.push_back(1005);
-    else if (lang == "fr") ids.push_back(3288);
-    else if (lang == "es") ids.push_back(1050);
-    else if (lang == "it") ids.push_back(2285);
-    else if (lang == "pt") ids.push_back(10804);
-    else if (lang == "nl") ids.push_back(5825);
-    else if (lang == "hi") ids.push_back(4979);
-    else                    ids.push_back(1262);
-    ids.push_back(34);
+    {
+        std::string prefix = "<s>[INST][BEGIN_AUDIO]";
+        std::string suffix = "[/INST]lang:" + lang + "[TRANSCRIBE]";
+
+        int n_prefix = 0, n_suffix = 0;
+        int32_t * pid = voxtral_tokenize(ctx, prefix.c_str(), &n_prefix);
+        int32_t * sid = voxtral_tokenize(ctx, suffix.c_str(), &n_suffix);
+
+        ids.insert(ids.end(), pid, pid + n_prefix);
+        for (int i = 0; i < N_enc; i++) ids.push_back(24);  // <audio_pad>
+        ids.insert(ids.end(), sid, sid + n_suffix);
+
+        free(pid);
+        free(sid);
+    }
     int T_prompt = (int)ids.size();
     if (!no_prints)
         fprintf(stderr, "prompt: %d tokens (incl. %d audio_pad)\n", T_prompt, N_enc);

@@ -8,6 +8,7 @@
 // Translation:     -sl de -tl en (German speech → English text), etc.
 
 #include "canary.h"
+#include "canary_ctc.h"
 #include "common-whisper.h"
 #include "whisper.h"
 
@@ -43,6 +44,7 @@ struct canary_params {
     int         vad_min_silence_ms = 100;
     float       vad_speech_pad_ms  = 30.0f;
     bool        use_flash          = false;
+    std::string aligner_model;             // -am FNAME for CTC word timestamps
 };
 
 static void print_usage(const char * prog) {
@@ -63,6 +65,7 @@ static void print_usage(const char * prog) {
         "  -vad-model FNAME         Silero VAD model (recommended for long audio)\n"
         "  -vad-thold F             VAD threshold (default: 0.5)\n"
         "  -npnc, --no-punctuation  disable punctuation in the output\n"
+        "  -am FNAME                CTC aligner GGUF for improved word timestamps\n"
         "  --flash                  enable flash attention in encoder/decoder\n"
         "  -v,  --verbose           dump per-token decoder steps for debugging\n"
         "  -np, --no-prints         suppress informational output\n\n"
@@ -91,6 +94,7 @@ static bool parse_args(int argc, char ** argv, canary_params & p) {
         else if (a == "-ot"   || a == "--output-txt")   p.output_txt    = true;
         else if (a == "-osrt" || a == "--output-srt")   p.output_srt    = true;
         else if (a == "-ovtt" || a == "--output-vtt")   p.output_vtt    = true;
+        else if (a == "-am"   && i+1 < argc)               p.aligner_model = argv[++i];
         else if (a == "-npnc" || a == "--no-punctuation") p.punctuation = false;
         else if (a == "--flash")                        p.use_flash     = true;
         else if (a == "-v"    || a == "--verbose")      p.verbosity     = 2;
@@ -359,8 +363,56 @@ int main(int argc, char ** argv) {
         canary_result_free(r);
     }
 
+    // ---- optional: CTC aligner re-alignment for better word timestamps ----
+    if (!p.aligner_model.empty() && !plain_text.empty()) {
+        canary_ctc_context_params acp = canary_ctc_context_default_params();
+        acp.n_threads = p.n_threads;
+        canary_ctc_context * actx = canary_ctc_init_from_file(p.aligner_model.c_str(), acp);
+        if (actx) {
+            float * ctc_logits = nullptr;
+            int T_ctc = 0, V_ctc = 0;
+            int rc = canary_ctc_compute_logits(actx, samples.data(), (int)samples.size(),
+                                               &ctc_logits, &T_ctc, &V_ctc);
+            if (rc == 0) {
+                // Tokenize words from plain_text
+                std::vector<std::string> words;
+                {
+                    std::string cur;
+                    for (char c : plain_text) {
+                        if (c == ' ' || c == '\n' || c == '\t') {
+                            if (!cur.empty()) { words.push_back(cur); cur.clear(); }
+                        } else cur += c;
+                    }
+                    if (!cur.empty()) words.push_back(cur);
+                }
+                if (!words.empty()) {
+                    std::vector<canary_ctc_word> aw(words.size());
+                    std::vector<const char *> wp(words.size());
+                    for (size_t i = 0; i < words.size(); i++) wp[i] = words[i].c_str();
+                    rc = canary_ctc_align_words(actx, ctc_logits, T_ctc, V_ctc,
+                                                wp.data(), (int)words.size(), aw.data());
+                    if (rc == 0) {
+                        // Replace all_segs with CTC-aligned word segments
+                        all_segs.clear();
+                        for (const auto & w : aw) {
+                            all_segs.push_back({w.t0, w.t1, w.text});
+                        }
+                        if (p.verbosity >= 1)
+                            fprintf(stderr, "%s: CTC re-aligned %zu words\n", argv[0], words.size());
+                    }
+                }
+                free(ctc_logits);
+            }
+            canary_ctc_free(actx);
+        } else {
+            fprintf(stderr, "%s: warning: failed to load aligner '%s'\n",
+                    argv[0], p.aligner_model.c_str());
+        }
+    }
+
     // ---- output ----
-    const bool show_timestamps = p.output_srt || p.output_vtt || p.max_len > 0 || p.verbosity >= 2;
+    const bool show_timestamps = p.output_srt || p.output_vtt || p.max_len > 0 || p.verbosity >= 2
+                               || !p.aligner_model.empty();
 
     if (show_timestamps) {
         for (const auto & s : all_segs) {

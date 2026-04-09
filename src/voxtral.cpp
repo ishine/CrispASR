@@ -157,6 +157,10 @@ struct voxtral_vocab {
     int n_vocab    = 0;
 
     std::string pre_pattern;  // tiktoken-style pre-tokenizer regex
+
+    // Reverse lookup: byte_sequence → rank (built lazily on first tokenize call)
+    std::unordered_map<std::string, int32_t> bytes_to_rank;
+    bool reverse_built = false;
 };
 
 struct voxtral_context {
@@ -1176,13 +1180,177 @@ extern "C" float * voxtral_run_encoder(voxtral_context * ctx,
     return result;
 }
 
-extern "C" int32_t * voxtral_tokenize(voxtral_context * /*ctx*/,
-                                      const char * /*text*/, int * out_n_tokens) {
-    // Stage V3: not yet implemented. The Tekken vocab blobs are loaded into
-    // ctx->vocab but the encode logic (rank-based byte BPE + tiktoken-style
-    // pre-tokenizer regex with Unicode property classes) is deferred.
-    if (out_n_tokens) *out_n_tokens = 0;
-    return nullptr;
+// ---------------------------------------------------------------------------
+// Tekken BPE encoder (tiktoken-style rank-based byte BPE)
+// ---------------------------------------------------------------------------
+
+// Build reverse lookup table on first use.
+static void tekken_build_reverse(voxtral_vocab & v) {
+    if (v.reverse_built) return;
+    v.bytes_to_rank.reserve(v.rank_offset.size());
+    for (size_t r = 0; r < v.rank_offset.size(); r++) {
+        std::string key((const char *)v.tekken_vocab_blob.data() + v.rank_offset[r],
+                        v.rank_length[r]);
+        v.bytes_to_rank[key] = (int32_t)r;
+    }
+    v.reverse_built = true;
+}
+
+// Look up rank for a byte sequence. Returns -1 if not found.
+static int32_t tekken_rank(const voxtral_vocab & v, const uint8_t * data, size_t len) {
+    auto it = v.bytes_to_rank.find(std::string((const char *)data, len));
+    return it != v.bytes_to_rank.end() ? it->second : -1;
+}
+
+// Encode a single pre-token (byte sequence) into BPE token IDs.
+// tiktoken algorithm: start with individual bytes, repeatedly merge the
+// adjacent pair with the lowest rank until no more merges are possible.
+static void tekken_bpe_encode(const voxtral_vocab & v,
+                              const uint8_t * data, size_t len,
+                              std::vector<int32_t> & out) {
+    if (len == 0) return;
+    if (len == 1) {
+        int32_t r = tekken_rank(v, data, 1);
+        out.push_back(r >= 0 ? r + v.n_specials : 0);
+        return;
+    }
+
+    // Start with individual bytes as "pieces"
+    struct piece { size_t start; size_t len; };
+    std::vector<piece> pieces(len);
+    for (size_t i = 0; i < len; i++) pieces[i] = {i, 1};
+
+    while (pieces.size() > 1) {
+        // Find the pair with the lowest merge rank
+        int32_t best_rank = INT32_MAX;
+        size_t best_idx = SIZE_MAX;
+        for (size_t i = 0; i + 1 < pieces.size(); i++) {
+            size_t merged_len = pieces[i].len + pieces[i+1].len;
+            int32_t r = tekken_rank(v, data + pieces[i].start, merged_len);
+            if (r >= 0 && r < best_rank) {
+                best_rank = r;
+                best_idx = i;
+            }
+        }
+        if (best_idx == SIZE_MAX) break;  // no more merges
+        // Merge pieces[best_idx] and pieces[best_idx+1]
+        pieces[best_idx].len += pieces[best_idx+1].len;
+        pieces.erase(pieces.begin() + best_idx + 1);
+    }
+
+    // Convert pieces to token IDs
+    for (const auto & p : pieces) {
+        int32_t r = tekken_rank(v, data + p.start, p.len);
+        out.push_back(r >= 0 ? r + v.n_specials : 0);
+    }
+}
+
+// Simple pre-tokenizer: split on whitespace boundaries in a way compatible
+// with tiktoken's regex. For the transcription use case we primarily need to
+// handle special tokens like [INST], [BEGIN_AUDIO] and simple text.
+// This is a simplified version that handles: letters+digits as words,
+// whitespace chunks, punctuation individually, and special bracket tokens.
+static std::vector<std::string> tekken_pre_tokenize(const std::string & text) {
+    std::vector<std::string> out;
+    size_t i = 0;
+    while (i < text.size()) {
+        unsigned char c = text[i];
+        // Whitespace: group consecutive whitespace
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            size_t j = i;
+            while (j < text.size() && (text[j] == ' ' || text[j] == '\t' ||
+                                       text[j] == '\n' || text[j] == '\r')) j++;
+            out.push_back(text.substr(i, j - i));
+            i = j;
+        }
+        // ASCII letter or digit: group with following letters/digits
+        else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                 (c >= '0' && c <= '9')) {
+            // Prepend leading space if previous char was space (tiktoken style)
+            size_t j = i;
+            while (j < text.size()) {
+                unsigned char d = text[j];
+                if ((d >= 'A' && d <= 'Z') || (d >= 'a' && d <= 'z') ||
+                    (d >= '0' && d <= '9')) j++;
+                else break;
+            }
+            out.push_back(text.substr(i, j - i));
+            i = j;
+        }
+        // UTF-8 multibyte: group entire codepoint
+        else if (c >= 0x80) {
+            size_t j = i + 1;
+            while (j < text.size() && (text[j] & 0xC0) == 0x80) j++;
+            // Keep grouping continuation letters (for CJK, accented, etc.)
+            while (j < text.size() && ((unsigned char)text[j]) >= 0x80) {
+                size_t k = j + 1;
+                while (k < text.size() && (text[k] & 0xC0) == 0x80) k++;
+                j = k;
+            }
+            out.push_back(text.substr(i, j - i));
+            i = j;
+        }
+        // Other (punctuation): single char
+        else {
+            out.push_back(text.substr(i, 1));
+            i++;
+        }
+    }
+    return out;
+}
+
+extern "C" int32_t * voxtral_tokenize(voxtral_context * ctx,
+                                      const char * text, int * out_n_tokens) {
+    if (!ctx || !text) { if (out_n_tokens) *out_n_tokens = 0; return nullptr; }
+    auto & v = ctx->vocab;
+    tekken_build_reverse(v);
+
+    std::string input(text);
+    std::vector<int32_t> ids;
+
+    // Check for special tokens first — scan for exact matches
+    size_t pos = 0;
+    while (pos < input.size()) {
+        // Try to match a special token at this position
+        bool found_special = false;
+        for (int si = 0; si < (int)v.specials.size(); si++) {
+            const auto & sp = v.specials[si];
+            if (sp.empty()) continue;
+            if (pos + sp.size() <= input.size() &&
+                input.compare(pos, sp.size(), sp) == 0) {
+                ids.push_back(si);
+                pos += sp.size();
+                found_special = true;
+                break;
+            }
+        }
+        if (found_special) continue;
+
+        // Find the next special token position (or end of string)
+        size_t next_special = input.size();
+        for (int si = 0; si < (int)v.specials.size(); si++) {
+            const auto & sp = v.specials[si];
+            if (sp.empty()) continue;
+            size_t f = input.find(sp, pos);
+            if (f != std::string::npos && f < next_special)
+                next_special = f;
+        }
+
+        // Pre-tokenize + BPE the non-special text segment
+        std::string segment = input.substr(pos, next_special - pos);
+        auto pre_tokens = tekken_pre_tokenize(segment);
+        for (const auto & pt : pre_tokens) {
+            tekken_bpe_encode(v, (const uint8_t *)pt.data(), pt.size(), ids);
+        }
+        pos = next_special;
+    }
+
+    if (ids.empty()) { if (out_n_tokens) *out_n_tokens = 0; return nullptr; }
+
+    int32_t * result = (int32_t *)malloc(ids.size() * sizeof(int32_t));
+    std::memcpy(result, ids.data(), ids.size() * sizeof(int32_t));
+    if (out_n_tokens) *out_n_tokens = (int)ids.size();
+    return result;
 }
 
 extern "C" float * voxtral_run_llm(voxtral_context * ctx,
