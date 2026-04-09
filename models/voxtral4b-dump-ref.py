@@ -5,7 +5,7 @@ comparison with the C++ runtime."""
 import sys
 import numpy as np
 import torch
-import torchaudio
+import scipy.io.wavfile as wavfile
 
 model_dir = "/mnt/akademie_storage/voxtral-4b-realtime"
 audio_path = "samples/jfk.wav"
@@ -23,12 +23,16 @@ model.eval()
 
 # Load audio
 print(f"Loading audio: {audio_path}")
-waveform, sr = torchaudio.load(audio_path)
-if sr != 16000:
-    waveform = torchaudio.functional.resample(waveform, sr, 16000)
-if waveform.shape[0] > 1:
-    waveform = waveform.mean(0, keepdim=True)
-audio_array = waveform.squeeze().numpy()
+sr, data = wavfile.read(audio_path)
+if data.dtype == np.int16:
+    audio_array = data.astype(np.float32) / 32768.0
+elif data.dtype == np.float32:
+    audio_array = data
+else:
+    audio_array = data.astype(np.float32) / np.iinfo(data.dtype).max
+if len(audio_array.shape) > 1:
+    audio_array = audio_array.mean(axis=1)
+assert sr == 16000, f"Expected 16kHz, got {sr}"
 print(f"  audio: {len(audio_array)} samples, {len(audio_array)/16000:.2f}s")
 
 # Process through processor
