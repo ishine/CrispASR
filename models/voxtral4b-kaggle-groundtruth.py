@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""
+Voxtral-Mini-4B-Realtime ground truth dump — designed for Kaggle (16GB+ RAM).
+
+Dumps all intermediate activations to compare with C++ runtime.
+Uploads results as a GitHub Gist automatically.
+
+Setup in Kaggle:
+  1. Add secret: GH_TOKEN = your GitHub personal access token (gist scope)
+  2. Enable internet access
+  3. Select GPU T4 or CPU (16GB RAM minimum)
+  4. Paste this entire script into a notebook cell and run
+
+What it dumps:
+  - Mel features (our Whisper-style + correct VoxtralRealtime-style)
+  - t_cond (time embedding for delay=6)
+  - Ada-norm scales per layer (from actual model weights)
+  - Encoder output (after projector)
+  - Conv stem output (after conv1, conv2)
+  - First token logits from prefill
+  - Full generation output (50 tokens)
+  - Token IDs for the prompt
+"""
+
+import json
+import math
+import os
+import subprocess
+import sys
+
+# ============================================================
+# Install dependencies
+# ============================================================
+def install(pkg):
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
+install("transformers>=5.2.0")
+install("safetensors")
+install("scipy")
+install("huggingface_hub")
+
+# Try to get GH_TOKEN from Kaggle secrets
+GH_TOKEN = None
+try:
+    from kaggle_secrets import UserSecretsClient
+    GH_TOKEN = UserSecretsClient().get_secret("GH_TOKEN")
+except Exception:
+    GH_TOKEN = os.environ.get("GH_TOKEN", None)
+
+if not GH_TOKEN:
+    print("WARNING: GH_TOKEN not found — will save locally only, no gist upload")
+
+import numpy as np
+import torch
+import json
+import io
+import requests
+
+# ============================================================
+# Download model + audio
+# ============================================================
+print("=" * 60)
+print("Downloading model and audio...")
+print("=" * 60)
+
+from huggingface_hub import snapshot_download
+
+model_dir = snapshot_download(
+    "mistralai/Voxtral-Mini-4B-Realtime-2602",
+    local_dir="/tmp/voxtral-4b",
+    ignore_patterns=["consolidated.safetensors"],  # skip the duplicate
+)
+print(f"Model downloaded to: {model_dir}")
+
+# Download jfk.wav (the standard Whisper test audio)
+audio_url = "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav"
+audio_path = "/tmp/jfk.wav"
+if not os.path.exists(audio_path):
+    import urllib.request
+    urllib.request.urlretrieve(audio_url, audio_path)
+print(f"Audio: {audio_path}")
+
+# ============================================================
+# Load audio
+# ============================================================
+import scipy.io.wavfile as wavfile
+sr, data = wavfile.read(audio_path)
+assert sr == 16000, f"Expected 16kHz, got {sr}"
+audio = data.astype(np.float32) / 32768.0 if data.dtype == np.int16 else data.astype(np.float32)
+print(f"Audio: {len(audio)} samples, {len(audio)/16000:.2f}s")
+
+results = {}  # name -> {"shape": ..., "dtype": ..., "data": base64, "stats": ...}
+
+def save_result(name, arr, desc=""):
+    """Save a numpy array to results dict."""
+    arr = np.asarray(arr, dtype=np.float32)
+    results[name] = {
+        "shape": list(arr.shape),
+        "desc": desc,
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+        "mean": float(arr.mean()),
+        "std": float(arr.std()),
+        "first_8": arr.flatten()[:8].tolist(),
+        "last_8": arr.flatten()[-8:].tolist(),
+    }
+    np.save(f"/tmp/v4b-{name}.npy", arr)
+    print(f"  {name}: shape={arr.shape} min={arr.min():.6f} max={arr.max():.6f} mean={arr.mean():.6f}")
+
+# ============================================================
+# 1. Time embedding (t_cond) — pure math
+# ============================================================
+print("\n" + "=" * 60)
+print("1. Time embedding (t_cond)")
+print("=" * 60)
+
+dim = 3072
+delay_tokens = 6
+theta = 10000.0
+inv_freq = np.exp(-math.log(theta) * np.arange(dim // 2, dtype=np.float32) / (dim // 2))
+emb = delay_tokens * inv_freq
+t_cond_np = np.concatenate([np.cos(emb), np.sin(emb)]).astype(np.float32)
+save_result("t_cond", t_cond_np, "sinusoidal time embedding for delay=6")
+
+# ============================================================
+# 2. Mel features (both Whisper-style and VoxtralRealtime-style)
+# ============================================================
+print("\n" + "=" * 60)
+print("2. Mel features")
+print("=" * 60)
+
+try:
+    from librosa.filters import mel as librosa_mel
+    mel_filters = librosa_mel(sr=16000, n_fft=400, n_mels=128).T  # (201, 128)
+except ImportError:
+    install("librosa")
+    from librosa.filters import mel as librosa_mel
+    mel_filters = librosa_mel(sr=16000, n_fft=400, n_mels=128).T
+
+from scipy.signal import get_window
+from scipy.fft import rfft
+
+n_fft, hop, n_mels, n_freqs = 400, 160, 128, 201
+hann = get_window('hann', n_fft, fftbins=True).astype(np.float32)
+
+pad = n_fft // 2
+padded = np.pad(audio, (pad, pad), mode='constant')
+T = (len(padded) - n_fft) // hop + 1 - 1  # Whisper drops last frame
+
+power = np.zeros((n_freqs, T), dtype=np.float32)
+for t in range(T):
+    frame = padded[t * hop : t * hop + n_fft] * hann
+    spectrum = rfft(frame)
+    power[:, t] = np.abs(spectrum) ** 2
+
+mel = np.zeros((n_mels, T), dtype=np.float32)
+for m in range(n_mels):
+    for t in range(T):
+        mel[m, t] = np.log10(max(np.dot(mel_filters[:, m], power[:, t]), 1e-10))
+
+# VoxtralRealtime normalization (global_log_mel_max=1.5)
+global_log_mel_max = 1.5
+floor_v = global_log_mel_max - 8.0
+mel_fixed = np.clip(mel, floor_v, None)
+mel_fixed = (mel_fixed + 4.0) / 4.0
+
+# Pad to 3000
+T_out = 3000
+mel_padded = np.full((n_mels, T_out), (floor_v + 4.0) / 4.0, dtype=np.float32)
+mel_padded[:, :min(T, T_out)] = mel_fixed[:, :min(T, T_out)]
+
+save_result("mel_voxtral", mel_padded, "mel with global_log_mel_max=1.5, padded to 3000")
+
+# ============================================================
+# 3. Load model and dump intermediates
+# ============================================================
+print("\n" + "=" * 60)
+print("3. Loading model...")
+print("=" * 60)
+
+from transformers import VoxtralRealtimeForConditionalGeneration, AutoProcessor
+
+processor = AutoProcessor.from_pretrained(model_dir)
+model = VoxtralRealtimeForConditionalGeneration.from_pretrained(
+    model_dir, torch_dtype=torch.float32, device_map="cpu"
+)
+model.eval()
+print("Model loaded!")
+
+# ============================================================
+# 4. Processor mel (ground truth from HF)
+# ============================================================
+print("\n" + "=" * 60)
+print("4. HF Processor mel features")
+print("=" * 60)
+
+inputs = processor(audio, return_tensors="pt")
+hf_mel = inputs["input_features"][0, 0]  # (n_mels, T)
+save_result("mel_hf", hf_mel.numpy(), "mel from HF VoxtralRealtimeFeatureExtractor")
+
+hf_input_ids = inputs["input_ids"][0]
+save_result("input_ids_hf", hf_input_ids.numpy().astype(np.float32),
+            f"HF processor input_ids (first 20: {hf_input_ids[:20].tolist()})")
+
+# ============================================================
+# 5. Model t_cond (from model's time_embedding module)
+# ============================================================
+print("\n" + "=" * 60)
+print("5. Model time embedding")
+print("=" * 60)
+
+with torch.no_grad():
+    time_tensor = torch.full((1,), float(delay_tokens))
+    t_cond_model = model.time_embedding(time_tensor)
+    save_result("t_cond_model", t_cond_model.numpy(), "t_cond from model.time_embedding(6)")
+
+# ============================================================
+# 6. Ada-norm scales per layer
+# ============================================================
+print("\n" + "=" * 60)
+print("6. Ada-norm scales")
+print("=" * 60)
+
+with torch.no_grad():
+    t_cond_torch = torch.from_numpy(t_cond_np).unsqueeze(0)  # (1, 3072)
+    for il in range(min(3, len(model.language_model.model.layers))):  # first 3 layers
+        layer = model.language_model.model.layers[il]
+        ada_out = layer.ada_rms_norm(t_cond_torch)  # (1, 3072)
+        one_plus = (1 + ada_out).squeeze(0).numpy()
+        save_result(f"ada_scale_layer{il}", one_plus,
+                    f"1 + ada_rms_norm(t_cond) for layer {il}")
+
+# ============================================================
+# 7. Encoder output (after projector)
+# ============================================================
+print("\n" + "=" * 60)
+print("7. Encoder output")
+print("=" * 60)
+
+with torch.no_grad():
+    audio_outputs = model.get_audio_features(
+        input_features=inputs["input_features"],
+        return_dict=True,
+    )
+    encoder_out = audio_outputs.pooler_output[0]  # (N, 3072)
+    save_result("encoder_out", encoder_out.numpy(),
+                f"encoder output after projector, shape {encoder_out.shape}")
+
+    # Also get the raw encoder hidden state (before projector)
+    encoder_hidden = audio_outputs.last_hidden_state
+    # The last_hidden_state is BEFORE reshape+projector
+    # After projector: reshape to (-1, 1280*4=5120) then linear_1 -> gelu -> linear_2
+    save_result("encoder_hidden_pre_proj", encoder_hidden[0].numpy(),
+                f"encoder hidden before projector, shape {encoder_hidden[0].shape}")
+
+# ============================================================
+# 8. Full generation
+# ============================================================
+print("\n" + "=" * 60)
+print("8. Full generation (50 tokens)")
+print("=" * 60)
+
+with torch.no_grad():
+    outputs = model.generate(**inputs, max_new_tokens=50)
+    gen_ids = outputs[0].tolist()
+    decoded = processor.batch_decode(outputs, skip_special_tokens=True)
+    save_result("gen_ids", np.array(gen_ids, dtype=np.float32),
+                f"generated token IDs: {gen_ids[:30]}...")
+    results["gen_text"] = decoded[0]
+    print(f"  Generated text: {decoded[0]!r}")
+    print(f"  Token IDs: {gen_ids[:30]}...")
+
+# ============================================================
+# 9. First-token logits from prefill
+# ============================================================
+print("\n" + "=" * 60)
+print("9. First-token logits")
+print("=" * 60)
+
+with torch.no_grad():
+    # Run the model forward (not generate) to get logits
+    fwd_out = model(**inputs)
+    logits = fwd_out.logits[0, -1]  # last position logits
+    top_k = torch.topk(logits, 10)
+    save_result("prefill_logits_top10_vals", top_k.values.numpy(),
+                f"top-10 logit values from prefill")
+    save_result("prefill_logits_top10_ids", top_k.indices.numpy().astype(np.float32),
+                f"top-10 token IDs: {top_k.indices.tolist()}")
+    print(f"  Top-10 tokens: {[(processor.decode([tid]), float(val)) for tid, val in zip(top_k.indices.tolist(), top_k.values.tolist())]}")
+
+# ============================================================
+# 10. Conv stem output (first few frames)
+# ============================================================
+print("\n" + "=" * 60)
+print("10. Conv stem output")
+print("=" * 60)
+
+with torch.no_grad():
+    # Run just the embedder (conv stem)
+    conv_out = model.audio_tower.embedder(inputs["input_features"])
+    save_result("conv_stem_out", conv_out[0, :10, :].numpy(),
+                f"conv stem output (first 10 frames), full shape {conv_out.shape}")
+
+# ============================================================
+# Upload to GitHub Gist
+# ============================================================
+print("\n" + "=" * 60)
+print("Uploading to GitHub Gist...")
+print("=" * 60)
+
+# Build a summary JSON
+summary = json.dumps(results, indent=2, default=str)
+
+# Also save the raw numpy arrays in a compact format
+npy_files = {}
+for name in results:
+    npy_path = f"/tmp/v4b-{name}.npy"
+    if os.path.exists(npy_path):
+        import base64
+        with open(npy_path, "rb") as f:
+            npy_files[f"v4b-{name}.npy.b64"] = base64.b64encode(f.read()).decode("ascii")
+
+if GH_TOKEN:
+    gist_files = {
+        "voxtral4b-groundtruth.json": {"content": summary},
+    }
+    # Add npy files as base64 (gist has a size limit, so only add the small ones)
+    for fname, b64data in npy_files.items():
+        if len(b64data) < 500000:  # skip files > 500KB
+            gist_files[fname] = {"content": b64data}
+        else:
+            print(f"  Skipping {fname} ({len(b64data)//1024}KB > 500KB limit)")
+
+    resp = requests.post(
+        "https://api.github.com/gists",
+        headers={
+            "Authorization": f"token {GH_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+        },
+        json={
+            "description": "Voxtral-Mini-4B-Realtime ground truth activations (jfk.wav, delay=6)",
+            "public": False,
+            "files": gist_files,
+        },
+    )
+    if resp.status_code == 201:
+        gist_url = resp.json()["html_url"]
+        print(f"\n  *** GIST CREATED: {gist_url} ***\n")
+    else:
+        print(f"  Gist creation failed: {resp.status_code} {resp.text[:500]}")
+else:
+    # Save locally
+    with open("/tmp/voxtral4b-groundtruth.json", "w") as f:
+        f.write(summary)
+    print("  Saved to /tmp/voxtral4b-groundtruth.json")
+
+print("\n" + "=" * 60)
+print("DONE! All ground truth activations dumped.")
+print("=" * 60)
+print(f"\nKey results:")
+print(f"  Generated text: {results.get('gen_text', 'N/A')!r}")
+print(f"  Encoder out shape: {results.get('encoder_out', {}).get('shape', 'N/A')}")
+print(f"  HF mel shape: {results.get('mel_hf', {}).get('shape', 'N/A')}")
