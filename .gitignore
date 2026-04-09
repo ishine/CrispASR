@@ -17,6 +17,19 @@ build-*/
 build_*/
 tmp/
 
+# In-source cmake artifacts (from accidental in-source cmake runs)
+CMakeCache.txt
+**/CMakeFiles/
+**/CTestTestfile.cmake
+DartConfiguration.tcl
+**/cmake_install.cmake
+**/Makefile
+whisper-config.cmake
+whisper-version.cmake
+whisper.pc
+ggml/ggml-config.cmake
+ggml/ggml-version.cmake
+
 # SPM
 .build/
 .swiftpm
