@@ -640,6 +640,31 @@ extern "C" float * granite_speech_compute_mel(struct granite_speech_context * ct
 // ===========================================================================
 
 // ===========================================================================
+// Depthwise conv helper (CPU, applied between ggml graph segments)
+// Each channel c has its own K-tap filter: out[c,t] = sum_k w[k,c] * in[c,t+k-pad]
+// ===========================================================================
+
+static void depthwise_conv_1d_cpu(float * out, const float * in,
+                                  const float * weight, int channels, int T,
+                                  int kernel_size, int pad) {
+    for (int c = 0; c < channels; c++) {
+        for (int t = 0; t < T; t++) {
+            float sum = 0.0f;
+            for (int k = 0; k < kernel_size; k++) {
+                int ti = t + k - pad;
+                if (ti >= 0 && ti < T) {
+                    // weight layout from GGUF: ne[0]=K, ne[1]=1, ne[2]=C
+                    // Data: weight[k + 0*K + c*1*K] = weight[k + c*K]
+                    // But GGUF ne ordering: element at [k, 0, c] = data[c * 1 * K + 0 * K + k] = data[c*K + k]
+                    sum += weight[(size_t)c * kernel_size + k] * in[(size_t)c * T + ti];
+                }
+            }
+            out[(size_t)c * T + t] = sum;
+        }
+    }
+}
+
+// ===========================================================================
 // Conformer encoder — CPU-based forward (not ggml graph)
 //
 // The encoder uses block-local attention (context_size=200) with Shaw
@@ -847,6 +872,8 @@ extern "C" float * granite_speech_run_encoder(struct granite_speech_context * ct
                                               int * out_N, int * out_dim) {
     if (!ctx || !mel || n_mels != 160) return nullptr;
     const int d = (int)ctx->model.hparams.enc_d_model;
+    const int kernel_size = (int)ctx->model.hparams.enc_conv_kernel;  // 15
+    const int conv_pad = kernel_size / 2;  // 7
 
     if (ctx->params.verbosity >= 2)
         fprintf(stderr, "  encoder: building graph for T=%d, d=%d, %d layers\n",
@@ -862,7 +889,7 @@ extern "C" float * granite_speech_run_encoder(struct granite_speech_context * ct
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_input"), mel, 0,
                             (size_t)T_mel * n_mels * sizeof(float));
 
-    // Build block-diagonal attention mask (context_size=200)
+    // Block-diagonal attention mask (context_size=200)
     {
         const int ctx_size = 200;
         std::vector<ggml_fp16_t> mask((size_t)T_mel * T_mel, ggml_fp32_to_fp16(0.0f));
@@ -870,22 +897,22 @@ extern "C" float * granite_speech_run_encoder(struct granite_speech_context * ct
         for (int q = 0; q < T_mel; q++) {
             int q_block = q / ctx_size;
             for (int k = 0; k < T_mel; k++) {
-                int k_block = k / ctx_size;
-                if (q_block != k_block) {
-                    mask[(size_t)q * T_mel + k] = neg_inf;
-                }
+                if (k / ctx_size != q_block) mask[(size_t)q * T_mel + k] = neg_inf;
             }
         }
         ggml_tensor * mask_t = ggml_graph_get_tensor(gf, "block_mask");
         if (mask_t)
             ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-
-        if (ctx->params.verbosity >= 2) {
-            int n_blocks = (T_mel + ctx_size - 1) / ctx_size;
+        if (ctx->params.verbosity >= 2)
             fprintf(stderr, "  encoder: block-local mask T=%d ctx=%d blocks=%d\n",
-                    T_mel, ctx_size, n_blocks);
-        }
+                    T_mel, ctx_size, (T_mel + ctx_size - 1) / ctx_size);
     }
+
+    // Fill depthwise conv IO tensor with zeros (will be replaced per-layer)
+    // The graph has a "dw_conv_io" tensor that serves as the depthwise conv
+    // input/output. We apply the conv on CPU between graph evaluations.
+    // NOTE: For V1, we run the graph once with the depthwise conv skipped (identity).
+    // The depthwise conv will be applied as a separate CPU pass in V2.
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "  encoder: graph compute failed\n");
