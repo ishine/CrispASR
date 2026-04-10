@@ -647,6 +647,13 @@ static ggml_cgraph * granite_build_encoder(granite_speech_context * ctx, int T) 
     ggml_tensor * cur = ggml_mul_mat(ctx0, m.encoder.input_w, inp);
     if (m.encoder.input_b) cur = ggml_add(ctx0, cur, m.encoder.input_b);
 
+    // Block-diagonal attention mask for block-local attention (context_size=200)
+    // mask[q][k] = 0 if same block, -inf if different blocks
+    const int ctx_size = 200;  // context_size from config
+    ggml_tensor * block_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
+    ggml_set_name(block_mask, "block_mask");
+    ggml_set_input(block_mask);
+
     // 16 × Conformer blocks
     for (int il = 0; il < n_layers; il++) {
         const auto & b = m.encoder.blocks[il];
@@ -664,7 +671,7 @@ static ggml_cgraph * granite_build_encoder(granite_speech_context * ctx, int T) 
             cur = ggml_add(ctx0, cur, ggml_scale(ctx0, x, 0.5f));  // half-step residual
         }
 
-        // --- MHSA (Multi-Head Self-Attention with relative position) ---
+        // --- MHSA (Block-local attention, context_size=200, Shaw rel pos) ---
         {
             ggml_tensor * x = ggml_norm(ctx0, cur, 1e-5f);
             if (b.attn_norm_w) x = ggml_mul(ctx0, x, b.attn_norm_w);
@@ -672,15 +679,15 @@ static ggml_cgraph * granite_build_encoder(granite_speech_context * ctx, int T) 
 
             // Q: (d → d), KV: (d → 2d) combined
             ggml_tensor * Q = ggml_mul_mat(ctx0, b.attn_q_w, x);   // (d, T)
-            ggml_tensor * KV = ggml_mul_mat(ctx0, b.attn_kv_w, x); // (2*hd*nh, T)
+            ggml_tensor * KV = ggml_mul_mat(ctx0, b.attn_kv_w, x); // (2*d, T)
 
-            // Split KV (need ggml_cont because views are non-contiguous)
+            // Split KV
             int kv_dim = n_heads * hd;
             ggml_tensor * K = ggml_cont(ctx0, ggml_view_2d(ctx0, KV, kv_dim, T, KV->nb[1], 0));
             ggml_tensor * V = ggml_cont(ctx0, ggml_view_2d(ctx0, KV, kv_dim, T, KV->nb[1],
                                            kv_dim * ggml_type_size(KV->type)));
 
-            // Reshape to (hd, nh, T) for attention
+            // Reshape to (hd, nh, T)
             Q = ggml_reshape_3d(ctx0, Q, hd, n_heads, T);
             K = ggml_reshape_3d(ctx0, K, hd, n_heads, T);
             V = ggml_reshape_3d(ctx0, V, hd, n_heads, T);
@@ -690,8 +697,9 @@ static ggml_cgraph * granite_build_encoder(granite_speech_context * ctx, int T) 
             K = ggml_permute(ctx0, K, 0, 2, 1, 3);
             V = ggml_permute(ctx0, V, 0, 2, 1, 3);
 
-            // Flash attention (no mask — encoder is bidirectional in Granite)
-            ggml_tensor * attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr,
+            // Block-diagonal attention mask: each 200-frame block attends within itself
+            // mask[q][k] = -inf if q and k are in different blocks
+            ggml_tensor * attn = ggml_flash_attn_ext(ctx0, Q, K, V, block_mask,
                                                       attn_scale, 0.0f, 0.0f);
             attn = ggml_reshape_2d(ctx0, attn, n_heads * hd, T);
 
@@ -724,9 +732,23 @@ static ggml_cgraph * granite_build_encoder(granite_speech_context * ctx, int T) 
                                             half_dim * ggml_type_size(x->type)));
             x = ggml_mul(ctx0, x1, ggml_sigmoid(ctx0, x2));
 
-            // TODO: depthwise conv (kernel=15) + batch norm
-            // For now, skip conv and just apply the down projection
-            // This is a simplification that will affect accuracy but lets us test the pipeline
+            // Depthwise conv (kernel=15, groups=2048, pad=7)
+            // conv_dw_w ne=(15, 1, 2048) — depthwise: each channel has its own 15-tap filter
+            // ggml_conv_1d with groups is not directly supported, so we use a per-channel approach
+            // For now, use ggml_conv_1d which treats it as a standard conv
+            // TODO: verify this produces correct output for depthwise (groups=channels)
+            if (b.conv_dw_w) {
+                // x is (2048, T) — need to transpose to (T, 2048) for conv_1d
+                // Actually conv_1d in ggml: kernel(K, C_in, C_out), input(T, C_in)
+                // For depthwise: C_in=1, C_out=2048, K=15, applied per-channel
+                // But our weight is (15, 1, 2048) which is already (K, C_in=1, C_out=2048)
+                // This won't work as depthwise — it's a regular 1×1 → 2048 conv
+                //
+                // SKIP depthwise conv for now — it needs a custom implementation
+                // The batch norm after it is also skipped
+                // Instead just apply SiLU activation
+                x = ggml_silu(ctx0, x);
+            }
 
             // Pointwise down: conv_down_w ne=(1, 2048, 1024)
             if (b.conv_down_w) {
@@ -796,6 +818,31 @@ extern "C" float * granite_speech_run_encoder(struct granite_speech_context * ct
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_input"), mel, 0,
                             (size_t)T_mel * n_mels * sizeof(float));
+
+    // Build block-diagonal attention mask (context_size=200)
+    {
+        const int ctx_size = 200;
+        std::vector<ggml_fp16_t> mask((size_t)T_mel * T_mel, ggml_fp32_to_fp16(0.0f));
+        ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < T_mel; q++) {
+            int q_block = q / ctx_size;
+            for (int k = 0; k < T_mel; k++) {
+                int k_block = k / ctx_size;
+                if (q_block != k_block) {
+                    mask[(size_t)q * T_mel + k] = neg_inf;
+                }
+            }
+        }
+        ggml_tensor * mask_t = ggml_graph_get_tensor(gf, "block_mask");
+        if (mask_t)
+            ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+
+        if (ctx->params.verbosity >= 2) {
+            int n_blocks = (T_mel + ctx_size - 1) / ctx_size;
+            fprintf(stderr, "  encoder: block-local mask T=%d ctx=%d blocks=%d\n",
+                    T_mel, ctx_size, n_blocks);
+        }
+    }
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "  encoder: graph compute failed\n");
