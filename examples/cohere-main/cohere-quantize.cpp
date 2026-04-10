@@ -90,7 +90,10 @@ static bool cohere_model_quantize(const std::string & fname_inp, const std::stri
                         (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) &&
                         (ggml_n_dims(t) == 2) && // Quantize only 2D matrices
                         (std::string(name).find("weight") != std::string::npos) &&
-                        (std::string(name).find("norm") == std::string::npos);
+                        (std::string(name).find("norm") == std::string::npos) &&
+                        // Skip encoder/projector tensors (Granite Speech: precision-sensitive)
+                        (std::string(name).find("enc.") != 0) &&
+                        (std::string(name).find("proj.") != 0);
 
         const int64_t ncols = t->ne[0];
         ggml_type qtype_used = qtype;

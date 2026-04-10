@@ -1,5 +1,10 @@
 > **STATUS (2026-04-10): COMPLETE.** Working transcription matching HF ground truth.
-> All 6 bugs found and fixed. See TODO.md for remaining tasks (quantize, upload, CLI).
+> CLI (`granite-main`) with built-in GPT-2 BPE detokenizer. See TODO.md for remaining tasks.
+
+> **Critical ggml RoPE lesson:** HF's `rotate_half` (which pairs dim i with dim i+d/2)
+> maps to `GGML_ROPE_TYPE_NEOX` (mode=2) in ggml. Mode 0 (`GGML_ROPE_TYPE_NORMAL`)
+> pairs adjacent dims (0,1), (2,3)... — almost no modern model uses this. When porting
+> any HF model that uses `rotate_half`, always use mode=2.
 
 # ibm-granite/granite-4.0-1b-speech — port plan
 

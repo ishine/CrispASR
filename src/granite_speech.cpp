@@ -522,8 +522,24 @@ extern "C" struct granite_speech_context * granite_speech_init_from_file(
         // rel_pos_emb.weight: ne[0]=128 (head_dim), ne[1]=1025 (2*max_pos+1)
         ggml_tensor * rpe_w = ctx->model.encoder.blocks[0].attn_rel_pos_w;
         if (rpe_w) {
+            // Read RPE weights (may be quantized — dequantize via ggml)
             std::vector<float> emb_table((size_t)emb_size * hd);
-            ggml_backend_tensor_get(rpe_w, emb_table.data(), 0, emb_table.size() * sizeof(float));
+            if (rpe_w->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(rpe_w, emb_table.data(), 0, emb_table.size() * sizeof(float));
+            } else {
+                // Dequantize: build a tiny graph that casts to F32
+                ggml_init_params tip = { 2 * ggml_tensor_overhead(), nullptr, true };
+                ggml_context * tctx = ggml_init(tip);
+                ggml_tensor * f32 = ggml_cast(tctx, rpe_w, GGML_TYPE_F32);
+                ggml_set_name(f32, "rpe_f32"); ggml_set_output(f32);
+                ggml_cgraph * tgf = ggml_new_graph(tctx);
+                ggml_build_forward_expand(tgf, f32);
+                ggml_backend_sched_reset(ctx->sched);
+                ggml_backend_sched_alloc_graph(ctx->sched, tgf);
+                ggml_backend_sched_graph_compute(ctx->sched, tgf);
+                ggml_backend_tensor_get(f32, emb_table.data(), 0, emb_table.size() * sizeof(float));
+                ggml_free(tctx);
+            }
 
             // Build lookup: rpe_lookup[c * C * hd + r * hd + d] = emb_table[dists[c,r] * hd + d]
             ctx->rpe_lookup.resize((size_t)C * C * hd);

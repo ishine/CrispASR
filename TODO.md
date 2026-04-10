@@ -210,6 +210,15 @@ English + German verified. 13 languages supported.
 
 ---
 
+## Porting notes
+
+**RoPE mode mapping (ggml ↔ HF):**
+- `GGML_ROPE_TYPE_NEOX` (mode=2): pairs (i, i+d/2) — used by HF `rotate_half`. **This is what almost every modern model uses** (Llama, Granite, Qwen, GPT-NeoX, etc.)
+- `GGML_ROPE_TYPE_NORMAL` (mode=0): pairs (i, i+1) adjacent — very few models use this
+- When porting any HF model with `rotate_half` RoPE, always use mode=2
+
+---
+
 ## Code quality (deferred until consolidated CLI)
 
 - [ ] Factor out shared mel compute (~150 LOC)
