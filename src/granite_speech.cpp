@@ -1068,57 +1068,292 @@ static ggml_cgraph * granite_build_encoder(granite_speech_context * ctx, int T) 
     return gf;
 }
 
+// Build a tiny ggml graph for a single matmul: out = W @ x [+ bias]
+// x: (d_in, T), W: ggml tensor, out: (d_out, T)
+static bool run_matmul(granite_speech_context * ctx, float * out,
+                       const float * x, int d_in, int T,
+                       ggml_tensor * W, ggml_tensor * bias, int d_out) {
+    ggml_init_params ip = { ctx->compute_meta.size(), ctx->compute_meta.data(), true };
+    ggml_context * ctx0 = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 64, false);
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_in, T);
+    ggml_set_name(inp, "mm_in"); ggml_set_input(inp);
+
+    ggml_tensor * r = ggml_mul_mat(ctx0, W, inp);
+    if (bias) r = ggml_add(ctx0, r, bias);
+    ggml_set_name(r, "mm_out");
+    ggml_build_forward_expand(gf, r);
+    ggml_free(ctx0);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return false;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mm_in"), x, 0, (size_t)d_in * T * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) return false;
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "mm_out"), out, 0, (size_t)d_out * T * sizeof(float));
+    return true;
+}
+
+// Build and run the conv module as a ggml graph
+static bool run_conv_module(granite_speech_context * ctx, float * out,
+                            const float * x, int d, int T,
+                            const granite_enc_block & b) {
+    const int inner = d * 2;  // conv_expansion_factor = 2
+    ggml_init_params ip = { ctx->compute_meta.size(), ctx->compute_meta.data(), true };
+    ggml_context * ctx0 = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 256, false);
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
+    ggml_set_name(inp, "conv_in"); ggml_set_input(inp);
+
+    // LayerNorm
+    ggml_tensor * cur = ggml_norm(ctx0, inp, 1e-5f);
+    if (b.conv_norm_w) cur = ggml_mul(ctx0, cur, b.conv_norm_w);
+    if (b.conv_norm_b) cur = ggml_add(ctx0, cur, b.conv_norm_b);
+
+    // Pointwise up
+    if (b.conv_up_w) {
+        int in_ch = (int)b.conv_up_w->ne[1], out_ch = (int)b.conv_up_w->ne[2];
+        cur = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, b.conv_up_w, in_ch, out_ch), cur);
+        if (b.conv_up_b) cur = ggml_add(ctx0, cur, b.conv_up_b);
+    }
+
+    // GLU
+    int half = (int)cur->ne[0] / 2;
+    ggml_tensor * x1 = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, half, T, cur->nb[1], 0));
+    ggml_tensor * x2 = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, half, T, cur->nb[1], half * sizeof(float)));
+    cur = ggml_mul(ctx0, x1, ggml_sigmoid(ctx0, x2));
+
+    // Depthwise conv
+    if (b.conv_dw_w) {
+        int K = (int)b.conv_dw_w->ne[0];
+        ggml_tensor * dw_w = ggml_cast(ctx0, b.conv_dw_w, GGML_TYPE_F32);
+        ggml_tensor * dw_w_4d = ggml_reshape_4d(ctx0, dw_w, K, 1, 1, inner);
+        ggml_tensor * x_t = ggml_cont(ctx0, ggml_transpose(ctx0, cur));
+        x_t = ggml_reshape_4d(ctx0, x_t, T, 1, inner, 1);
+        x_t = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, x_t, 1, 1, K/2, 0, 1, 1);
+        cur = ggml_cont(ctx0, ggml_permute(ctx0, x_t, 1, 2, 0, 3));
+        cur = ggml_reshape_2d(ctx0, cur, inner, T);
+    }
+
+    // BN (folded) + SiLU
+    if (b.conv_bn_w && b.conv_bn_b) {
+        cur = ggml_mul(ctx0, cur, b.conv_bn_w);
+        cur = ggml_add(ctx0, cur, b.conv_bn_b);
+    }
+    cur = ggml_silu(ctx0, cur);
+
+    // Pointwise down
+    if (b.conv_down_w) {
+        int in_ch = (int)b.conv_down_w->ne[1], out_ch = (int)b.conv_down_w->ne[2];
+        cur = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, b.conv_down_w, in_ch, out_ch), cur);
+        if (b.conv_down_b) cur = ggml_add(ctx0, cur, b.conv_down_b);
+    }
+
+    ggml_set_name(cur, "conv_out");
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx0);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return false;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "conv_in"), x, 0, (size_t)d * T * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) return false;
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "conv_out"), out, 0, (size_t)d * T * sizeof(float));
+    return true;
+}
+
+// Build and run FFN as a ggml graph: LayerNorm → up → SiLU → down
+static bool run_ffn(granite_speech_context * ctx, float * out,
+                    const float * x, int d, int T,
+                    ggml_tensor * norm_w, ggml_tensor * norm_b,
+                    ggml_tensor * up_w, ggml_tensor * up_b,
+                    ggml_tensor * down_w, ggml_tensor * down_b) {
+    ggml_init_params ip = { ctx->compute_meta.size(), ctx->compute_meta.data(), true };
+    ggml_context * ctx0 = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 64, false);
+
+    ggml_tensor * inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
+    ggml_set_name(inp, "ffn_in"); ggml_set_input(inp);
+
+    ggml_tensor * cur = ggml_norm(ctx0, inp, 1e-5f);
+    if (norm_w) cur = ggml_mul(ctx0, cur, norm_w);
+    if (norm_b) cur = ggml_add(ctx0, cur, norm_b);
+    cur = ggml_mul_mat(ctx0, up_w, cur);
+    if (up_b) cur = ggml_add(ctx0, cur, up_b);
+    cur = ggml_silu(ctx0, cur);
+    cur = ggml_mul_mat(ctx0, down_w, cur);
+    if (down_b) cur = ggml_add(ctx0, cur, down_b);
+
+    ggml_set_name(cur, "ffn_out");
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx0);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return false;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "ffn_in"), x, 0, (size_t)d * T * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) return false;
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "ffn_out"), out, 0, (size_t)d * T * sizeof(float));
+    return true;
+}
+
+// CPU LayerNorm: out = (x - mean) / sqrt(var + eps) * w + b
+static void cpu_layernorm(float * out, const float * x, const float * w, const float * b,
+                          int d, int T, float eps) {
+    for (int t = 0; t < T; t++) {
+        const float * xt = x + (size_t)t * d;
+        float * ot = out + (size_t)t * d;
+        float mean = 0, var = 0;
+        for (int i = 0; i < d; i++) mean += xt[i];
+        mean /= d;
+        for (int i = 0; i < d; i++) { float v = xt[i] - mean; var += v * v; }
+        var /= d;
+        float inv = 1.0f / std::sqrt(var + eps);
+        for (int i = 0; i < d; i++)
+            ot[i] = (xt[i] - mean) * inv * (w ? w[i] : 1.0f) + (b ? b[i] : 0.0f);
+    }
+}
+
 extern "C" float * granite_speech_run_encoder(struct granite_speech_context * ctx,
                                               const float * mel, int n_mels, int T_mel,
                                               int * out_N, int * out_dim) {
     if (!ctx || !mel || n_mels != 160) return nullptr;
     const auto & hp = ctx->model.hparams;
-    const int d = (int)hp.enc_d_model;
-    const int n_heads = (int)hp.enc_n_heads;
-    const int hd = (int)hp.enc_head_dim;
-    const int n_layers = (int)hp.enc_n_layers;
+    const int d = (int)hp.enc_d_model;        // 1024
+    const int n_heads = (int)hp.enc_n_heads;  // 8
+    const int hd = (int)hp.enc_head_dim;      // 128
+    const int n_layers = (int)hp.enc_n_layers; // 16
     const int ctx_size = 200;
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int T = T_mel;
+    const int remainder = T % ctx_size;
 
-    if (ctx->params.verbosity >= 2)
-        fprintf(stderr, "  encoder: building graph for T=%d, d=%d, %d layers\n",
-                T_mel, d, n_layers);
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "  encoder: per-layer processing T=%d d=%d layers=%d ctx=%d\n",
+                T, d, n_layers, ctx_size);
 
-    // Run the full encoder ggml graph (with flash_attn block mask, no RPE)
-    ggml_cgraph * gf = granite_build_encoder(ctx, T_mel);
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        fprintf(stderr, "  encoder: failed to alloc graph\n");
-        return nullptr;
-    }
+    // Input linear: mel (160, T) → hidden (d, T)
+    std::vector<float> hidden((size_t)d * T);
+    run_matmul(ctx, hidden.data(), mel, n_mels, T,
+               ctx->model.encoder.input_w, ctx->model.encoder.input_b, d);
 
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_input"), mel, 0,
-                            (size_t)T_mel * n_mels * sizeof(float));
+    // Buffers
+    std::vector<float> ffn_out((size_t)d * T);
+    std::vector<float> Q((size_t)d * T), KV((size_t)d * 2 * T);
+    std::vector<float> attn_out((size_t)d * T);
+    std::vector<float> conv_out((size_t)d * T);
 
-    // Block-diagonal attention mask
+    // Precompute per-layer RPE lookups
+    std::vector<std::vector<float>> rpe_per_layer(n_layers);
     {
-        std::vector<ggml_fp16_t> mask((size_t)T_mel * T_mel, ggml_fp32_to_fp16(0.0f));
-        ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
-        for (int q = 0; q < T_mel; q++)
-            for (int k = 0; k < T_mel; k++)
-                if (k / ctx_size != q / ctx_size)
-                    mask[(size_t)q * T_mel + k] = neg_inf;
-        ggml_tensor * mask_t = ggml_graph_get_tensor(gf, "block_mask");
-        if (mask_t)
-            ggml_backend_tensor_set(mask_t, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
-        if (ctx->params.verbosity >= 2)
-            fprintf(stderr, "  encoder: block-local mask T=%d ctx=%d blocks=%d\n",
-                    T_mel, ctx_size, (T_mel + ctx_size - 1) / ctx_size);
+        const int max_pos = 512;
+        std::vector<int> dists(ctx_size * ctx_size);
+        for (int c = 0; c < ctx_size; c++)
+            for (int r = 0; r < ctx_size; r++) {
+                int dd = std::max(-ctx_size, std::min(ctx_size, c - r));
+                dists[c * ctx_size + r] = dd + max_pos;
+            }
+        for (int il = 0; il < n_layers; il++) {
+            ggml_tensor * rpe_w = ctx->model.encoder.blocks[il].attn_rel_pos_w;
+            if (!rpe_w) continue;
+            std::vector<float> emb((size_t)(2 * max_pos + 1) * hd);
+            ggml_backend_tensor_get(rpe_w, emb.data(), 0, emb.size() * sizeof(float));
+            rpe_per_layer[il].resize((size_t)ctx_size * ctx_size * hd);
+            for (int c = 0; c < ctx_size; c++)
+                for (int r = 0; r < ctx_size; r++) {
+                    int idx = dists[c * ctx_size + r];
+                    for (int dd = 0; dd < hd; dd++)
+                        rpe_per_layer[il][(size_t)(c * ctx_size + r) * hd + dd] = emb[(size_t)idx * hd + dd];
+                }
+        }
     }
 
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "  encoder: graph compute failed\n");
-        return nullptr;
+    for (int il = 0; il < n_layers; il++) {
+        const auto & b = ctx->model.encoder.blocks[il];
+
+        // --- FFN1 (Macaron half-step) ---
+        run_ffn(ctx, ffn_out.data(), hidden.data(), d, T,
+                b.ff1_norm_w, b.ff1_norm_b, b.ff1_up_w, b.ff1_up_b, b.ff1_down_w, b.ff1_down_b);
+        for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += 0.5f * ffn_out[i];
+
+        // --- Attention: norm → Q/KV projections → Shaw attention on CPU ---
+        // LayerNorm
+        std::vector<float> normed((size_t)d * T);
+        {
+            std::vector<float> nw(d), nb(d);
+            if (b.attn_norm_w) ggml_backend_tensor_get(b.attn_norm_w, nw.data(), 0, d * sizeof(float));
+            if (b.attn_norm_b) ggml_backend_tensor_get(b.attn_norm_b, nb.data(), 0, d * sizeof(float));
+            cpu_layernorm(normed.data(), hidden.data(), b.attn_norm_w ? nw.data() : nullptr,
+                          b.attn_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
+        }
+
+        // Q projection: (d → d)
+        run_matmul(ctx, Q.data(), normed.data(), d, T, b.attn_q_w, nullptr, d);
+
+        // KV projection: (d → 2d)
+        run_matmul(ctx, KV.data(), normed.data(), d, T, b.attn_kv_w, nullptr, d * 2);
+
+        // Split KV: KV layout is (2*d, T) — ne[0]=2*d per frame
+        // First d values = K, next d values = V
+        std::vector<float> K((size_t)d * T), V((size_t)d * T);
+        for (int t = 0; t < T; t++) {
+            std::memcpy(K.data() + (size_t)t * d, KV.data() + (size_t)t * 2 * d, d * sizeof(float));
+            std::memcpy(V.data() + (size_t)t * d, KV.data() + (size_t)t * 2 * d + d, d * sizeof(float));
+        }
+
+        // Shaw block attention on CPU
+        shaw_block_attention_cpu(attn_out.data(), Q.data(), K.data(), V.data(),
+                                 rpe_per_layer[il].empty() ? nullptr : rpe_per_layer[il].data(),
+                                 T, n_heads, hd, ctx_size, attn_scale, remainder);
+
+        // Output projection + residual
+        std::vector<float> proj_out((size_t)d * T);
+        run_matmul(ctx, proj_out.data(), attn_out.data(), d, T, b.attn_out_w, b.attn_out_b, d);
+        for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += proj_out[i];
+
+        // --- Conv module ---
+        run_conv_module(ctx, conv_out.data(), hidden.data(), d, T, b);
+        for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += conv_out[i];
+
+        // --- FFN2 (Macaron half-step) ---
+        run_ffn(ctx, ffn_out.data(), hidden.data(), d, T,
+                b.ff2_norm_w, b.ff2_norm_b, b.ff2_up_w, b.ff2_up_b, b.ff2_down_w, b.ff2_down_b);
+        for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += 0.5f * ffn_out[i];
+
+        // --- Post LayerNorm ---
+        {
+            std::vector<float> nw(d), nb(d);
+            if (b.post_norm_w) ggml_backend_tensor_get(b.post_norm_w, nw.data(), 0, d * sizeof(float));
+            if (b.post_norm_b) ggml_backend_tensor_get(b.post_norm_b, nb.data(), 0, d * sizeof(float));
+            cpu_layernorm(hidden.data(), hidden.data(), b.post_norm_w ? nw.data() : nullptr,
+                          b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
+        }
+
+        // --- Mid-CTC residual at layer 8 ---
+        if (il == n_layers / 2 - 1 && ctx->model.encoder.ctc_out_w && ctx->model.encoder.ctc_mid_w) {
+            std::vector<float> mid_out(348 * T), mid_back((size_t)d * T);
+            run_matmul(ctx, mid_out.data(), hidden.data(), d, T,
+                       ctx->model.encoder.ctc_out_w, ctx->model.encoder.ctc_out_b, 348);
+            // Softmax per frame
+            for (int t = 0; t < T; t++) {
+                float * row = mid_out.data() + t * 348;
+                float mx = -1e30f;
+                for (int i = 0; i < 348; i++) if (row[i] > mx) mx = row[i];
+                float sum = 0;
+                for (int i = 0; i < 348; i++) { row[i] = std::exp(row[i] - mx); sum += row[i]; }
+                for (int i = 0; i < 348; i++) row[i] /= sum;
+            }
+            run_matmul(ctx, mid_back.data(), mid_out.data(), 348, T,
+                       ctx->model.encoder.ctc_mid_w, ctx->model.encoder.ctc_mid_b, d);
+            for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += mid_back[i];
+        }
+
+        if (ctx->params.verbosity >= 2 && (il % 4 == 3 || il == n_layers - 1))
+            fprintf(stderr, "  encoder layer %d/%d\n", il + 1, n_layers);
     }
 
-    ggml_tensor * out = ggml_graph_get_tensor(gf, "enc_output");
-    size_t total = (size_t)T_mel * d;
+    size_t total = (size_t)T * d;
     float * result = (float *)malloc(total * sizeof(float));
-    ggml_backend_tensor_get(out, result, 0, total * sizeof(float));
+    std::memcpy(result, hidden.data(), total * sizeof(float));
 
     if (ctx->params.verbosity >= 2) {
         float mn = 1e30f, mx = -1e30f, sum = 0;
