@@ -465,17 +465,206 @@ extern "C" void granite_speech_free(struct granite_speech_context * ctx) {
     delete ctx;
 }
 
-// TODO: Implement compute_mel, run_encoder, run_projector, run_llm_kv, embed_tokens, transcribe
-// These follow the same patterns as voxtral4b.cpp but with:
-//   - Conformer encoder (Macaron FFN + depthwise conv + batch norm + rel pos emb)
-//   - Q-Former projector (self-attn + cross-attn + FFN per layer)
-//   - Granite LLM (standard Llama-style but with μP multiplier scalars)
+// ===========================================================================
+// Mel spectrogram (80 bins, n_fft=512, hop=160, per-utterance max norm)
+// ===========================================================================
 
-extern "C" float * granite_speech_compute_mel(struct granite_speech_context *, const float *, int, int *, int *) { return nullptr; }
-extern "C" float * granite_speech_run_encoder(struct granite_speech_context *, const float *, int, int, int *, int *) { return nullptr; }
-extern "C" float * granite_speech_run_projector(struct granite_speech_context *, const float *, int, int, int *, int *) { return nullptr; }
-extern "C" bool granite_speech_kv_init(struct granite_speech_context *, int) { return false; }
-extern "C" void granite_speech_kv_reset(struct granite_speech_context *) {}
-extern "C" float * granite_speech_run_llm_kv(struct granite_speech_context *, const float *, int, int, int *, int *) { return nullptr; }
-extern "C" float * granite_speech_embed_tokens(struct granite_speech_context *, const int32_t *, int) { return nullptr; }
-extern "C" char * granite_speech_transcribe(struct granite_speech_context *, const float *, int) { return nullptr; }
+static void granite_fft(float * in, int N, float * out) {
+    if (N <= 1) { out[0] = in[0]; out[1] = 0; return; }
+    if (N % 2 != 0) {
+        // DFT fallback for odd sizes
+        for (int k = 0; k < N; k++) {
+            double re = 0, im = 0;
+            for (int n = 0; n < N; n++) {
+                double a = -2.0 * M_PI * k * n / N;
+                re += in[n] * cos(a); im += in[n] * sin(a);
+            }
+            out[2*k] = (float)re; out[2*k+1] = (float)im;
+        }
+        return;
+    }
+    int half = N / 2;
+    std::vector<float> even(half), odd(half);
+    for (int i = 0; i < half; i++) { even[i] = in[2*i]; odd[i] = in[2*i+1]; }
+    std::vector<float> E(2*half), O(2*half);
+    granite_fft(even.data(), half, E.data());
+    granite_fft(odd.data(), half, O.data());
+    for (int k = 0; k < half; k++) {
+        double a = -2.0 * M_PI * k / N;
+        float wr = (float)cos(a), wi = (float)sin(a);
+        float tre = wr*O[2*k] - wi*O[2*k+1];
+        float tim = wr*O[2*k+1] + wi*O[2*k];
+        out[2*k] = E[2*k] + tre; out[2*k+1] = E[2*k+1] + tim;
+        out[2*(k+half)] = E[2*k] - tre; out[2*(k+half)+1] = E[2*k+1] - tim;
+    }
+}
+
+extern "C" float * granite_speech_compute_mel(struct granite_speech_context * ctx,
+                                              const float * samples, int n_samples,
+                                              int * out_n_mels, int * out_T_mel) {
+    if (!ctx || !samples || n_samples <= 0) return nullptr;
+    const int n_fft = 512, hop = 160, n_mels = 80, n_freqs = n_fft / 2 + 1;
+
+    // Load mel filters from GGUF (or build Slaney if not baked)
+    std::vector<float> filt((size_t)n_freqs * n_mels);
+    if (ctx->model.encoder.mel_filters) {
+        ggml_backend_tensor_get(ctx->model.encoder.mel_filters, filt.data(), 0,
+                                filt.size() * sizeof(float));
+    } else {
+        return nullptr;
+    }
+
+    // Hann window
+    std::vector<float> hann(n_fft);
+    if (ctx->model.encoder.mel_window) {
+        ggml_backend_tensor_get(ctx->model.encoder.mel_window, hann.data(), 0,
+                                n_fft * sizeof(float));
+    } else {
+        for (int i = 0; i < n_fft; i++)
+            hann[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / n_fft));
+    }
+
+    // Center-pad (zero padding)
+    const int pad = n_fft / 2;
+    std::vector<float> padded((size_t)n_samples + 2 * pad, 0.0f);
+    std::memcpy(padded.data() + pad, samples, n_samples * sizeof(float));
+
+    int T_full = (int)((padded.size() - n_fft) / hop + 1);
+    // torchaudio MelSpectrogram does NOT drop the last frame
+    int T = T_full;
+    if (T <= 0) return nullptr;
+
+    // STFT → power → mel → log10
+    std::vector<float> mel((size_t)n_mels * T, 0.0f);
+    float mel_max = -1e30f;
+    {
+        std::vector<float> fi(n_fft * 4, 0.0f), fo(n_fft * 8, 0.0f);
+        std::vector<float> power(n_freqs);
+        for (int t = 0; t < T; t++) {
+            const float * frame = padded.data() + (size_t)t * hop;
+            for (int n = 0; n < n_fft; n++) fi[n] = frame[n] * hann[n];
+            granite_fft(fi.data(), n_fft, fo.data());
+            for (int k = 0; k < n_freqs; k++) {
+                float re = fo[2*k], im = fo[2*k+1];
+                power[k] = re * re + im * im;
+            }
+            // mel @ power → log10
+            for (int m = 0; m < n_mels; m++) {
+                double s = 0.0;
+                for (int k = 0; k < n_freqs; k++)
+                    s += (double)filt[(size_t)k * n_mels + m] * power[k];
+                float lv = std::log10(std::max((float)s, 1e-10f));
+                mel[(size_t)t * n_mels + m] = lv;  // (T, n_mels) layout for stacking
+                if (lv > mel_max) mel_max = lv;
+            }
+        }
+    }
+
+    // Normalize: max(logmel, mx - 8) / 4 + 1
+    const float floor_v = mel_max - 8.0f;
+    for (size_t i = 0; i < mel.size(); i++) {
+        float v = mel[i];
+        if (v < floor_v) v = floor_v;
+        mel[i] = v / 4.0f + 1.0f;
+    }
+
+    // Drop last frame if odd
+    if (T % 2 == 1) T--;
+
+    // Stack 2 adjacent frames: (T, 80) → (T/2, 160)
+    int T_stacked = T / 2;
+    std::vector<float> stacked((size_t)T_stacked * 160);
+    for (int t = 0; t < T_stacked; t++) {
+        std::memcpy(stacked.data() + (size_t)t * 160,
+                     mel.data() + (size_t)(2*t) * n_mels, n_mels * sizeof(float));
+        std::memcpy(stacked.data() + (size_t)t * 160 + n_mels,
+                     mel.data() + (size_t)(2*t+1) * n_mels, n_mels * sizeof(float));
+    }
+
+    if (out_n_mels) *out_n_mels = 160;  // stacked: 80*2
+    if (out_T_mel)  *out_T_mel  = T_stacked;
+
+    float * result = (float *)malloc(stacked.size() * sizeof(float));
+    std::memcpy(result, stacked.data(), stacked.size() * sizeof(float));
+    return result;
+}
+
+// ===========================================================================
+// Encoder, Projector, LLM — stubs (to be implemented in next step)
+// ===========================================================================
+
+extern "C" float * granite_speech_run_encoder(struct granite_speech_context *, const float *, int, int, int *, int *) {
+    fprintf(stderr, "granite_speech: encoder not yet implemented\n");
+    return nullptr;
+}
+
+extern "C" float * granite_speech_run_projector(struct granite_speech_context *, const float *, int, int, int *, int *) {
+    fprintf(stderr, "granite_speech: projector not yet implemented\n");
+    return nullptr;
+}
+
+extern "C" bool granite_speech_kv_init(struct granite_speech_context * ctx, int max_ctx) {
+    if (!ctx || max_ctx <= 0) return false;
+    const auto & hp = ctx->model.hparams;
+    const int hd = (int)hp.llm_head_dim;
+    const int n_kv = (int)hp.llm_n_kv_heads;
+    const int nl = (int)hp.llm_n_layers;
+    size_t k_size = (size_t)ggml_type_size(GGML_TYPE_F16) * hd * max_ctx * n_kv * nl;
+
+    ggml_init_params ip = { 2 * ggml_tensor_overhead(), nullptr, true };
+    ctx->kv_ctx = ggml_init(ip);
+    ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd, max_ctx, n_kv, nl);
+    ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd, max_ctx, n_kv, nl);
+    ctx->kv_buf = ggml_backend_alloc_buffer(ctx->backend, k_size * 2);
+    char * base = (char *)ggml_backend_buffer_get_base(ctx->kv_buf);
+    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
+    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + ggml_nbytes(ctx->kv_k));
+
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "granite_speech: kv cache %.0f MiB\n", (k_size * 2) / 1048576.0);
+    return true;
+}
+
+extern "C" void granite_speech_kv_reset(struct granite_speech_context * ctx) {
+    if (ctx && ctx->kv_buf) ggml_backend_buffer_clear(ctx->kv_buf, 0);
+}
+
+extern "C" float * granite_speech_run_llm_kv(struct granite_speech_context *, const float *, int, int, int *, int *) {
+    fprintf(stderr, "granite_speech: LLM not yet implemented\n");
+    return nullptr;
+}
+
+extern "C" float * granite_speech_embed_tokens(struct granite_speech_context * ctx,
+                                               const int32_t * input_ids, int n_tokens) {
+    if (!ctx || !input_ids || n_tokens <= 0) return nullptr;
+    const int d = (int)ctx->model.hparams.llm_d_model;
+
+    ggml_init_params ip = { ctx->compute_meta.size(), ctx->compute_meta.data(), true };
+    ggml_context * ctx0 = ggml_init(ip);
+    ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 64, false);
+    ggml_tensor * ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(ids, "input_ids"); ggml_set_input(ids);
+    ggml_tensor * out = ggml_get_rows(ctx0, ctx->model.llm.token_embd_w, ids);
+
+    // Apply embedding multiplier (μP)
+    out = ggml_scale(ctx0, out, ctx->model.hparams.embedding_multiplier);
+
+    ggml_set_name(out, "embeds");
+    ggml_build_forward_expand(gf, out);
+    ggml_free(ctx0);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return nullptr;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), input_ids, 0,
+                            (size_t)n_tokens * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) return nullptr;
+    ggml_tensor * emb = ggml_graph_get_tensor(gf, "embeds");
+    float * result = (float *)malloc((size_t)n_tokens * d * sizeof(float));
+    ggml_backend_tensor_get(emb, result, 0, (size_t)n_tokens * d * sizeof(float));
+    return result;
+}
+
+extern "C" char * granite_speech_transcribe(struct granite_speech_context *, const float *, int) {
+    fprintf(stderr, "granite_speech: full transcribe not yet implemented\n");
+    return nullptr;
+}
