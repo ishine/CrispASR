@@ -577,10 +577,10 @@ static ggml_cgraph * voxtral4b_build_graph_encoder(voxtral4b_context * ctx, int 
         K = ggml_rope_ext(ctx0, K, pos_enc, nullptr, head_dim, 2, 0,
                           hp.audio_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
 
-        // Permute for attention: (hd, T, n_h)
-        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
-        K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
-        V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+        // Permute for attention: (hd, T, n_h) — flash_attn handles non-contiguous
+        Q = ggml_permute(ctx0, Q, 0, 2, 1, 3);
+        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
 
         // Flash attention with optional SWA mask
         ggml_tensor * attn = ggml_flash_attn_ext(ctx0, Q, K, V, swa_mask,
@@ -791,15 +791,14 @@ static ggml_cgraph * voxtral4b_build_graph_llm_kv(voxtral4b_context * ctx,
                                         (size_t)il * ctx->kv_v->nb[3]));
 
         // GQA expansion: repeat KV heads to match Q heads (32/8=4× repeat)
-        // Explicit expansion is faster than native GQA in flash_attn_ext on CPU
         const int n_kv_grp = n_q / n_kv;
         if (n_kv_grp > 1) {
             ggml_tensor * K4 = ggml_reshape_4d(ctx0, Kfull, hd, Lk, 1, n_kv);
             ggml_tensor * V4 = ggml_reshape_4d(ctx0, Vfull, hd, Lk, 1, n_kv);
             K4 = ggml_repeat_4d(ctx0, K4, hd, Lk, n_kv_grp, n_kv);
             V4 = ggml_repeat_4d(ctx0, V4, hd, Lk, n_kv_grp, n_kv);
-            Kfull = ggml_cont(ctx0, ggml_reshape_3d(ctx0, K4, hd, Lk, n_q));
-            Vfull = ggml_cont(ctx0, ggml_reshape_3d(ctx0, V4, hd, Lk, n_q));
+            Kfull = ggml_reshape_3d(ctx0, K4, hd, Lk, n_q);
+            Vfull = ggml_reshape_3d(ctx0, V4, hd, Lk, n_q);
         }
 
         // Flash attention
