@@ -220,9 +220,7 @@ def build_htk_mel_filters(sr=16000, n_fft=512, n_mels=80, f_min=0.0, f_max=8000.
     down = -slopes[:, :-2] / filt_diff[:-1]
     up = slopes[:, 2:] / filt_diff[1:]
     fb = np.maximum(0, np.minimum(down, up))
-    # torchaudio uses "slaney" norm by default — normalize area to 1
-    enorm = 2.0 / (filt_freqs[2:n_mels+2] - filt_freqs[:n_mels])
-    fb *= enorm[None, :]
+    # torchaudio default: norm=None (no area normalization)
     return fb.astype(np.float32)
 
 
