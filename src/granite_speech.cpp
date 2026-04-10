@@ -441,6 +441,39 @@ extern "C" struct granite_speech_context * granite_speech_init_from_file(
         return nullptr;
     }
 
+    // Fold batch norm into scale+shift tensors (load-time, once)
+    // BN: y = gamma * (x - mean) / sqrt(var + eps) + beta
+    //       = x * scale + shift
+    // where scale = gamma/sqrt(var+eps), shift = beta - mean*scale
+    {
+        const float eps = 1e-5f;
+        const int inner = 2048;  // conv expansion = 2 * d_model
+        int folded = 0;
+        for (uint32_t il = 0; il < ctx->model.hparams.enc_n_layers; il++) {
+            auto & b = ctx->model.encoder.blocks[il];
+            if (!b.conv_bn_w || !b.conv_bn_b || !b.conv_bn_mean || !b.conv_bn_var) continue;
+
+            std::vector<float> gamma(inner), beta(inner), mean(inner), var(inner);
+            ggml_backend_tensor_get(b.conv_bn_w, gamma.data(), 0, inner * sizeof(float));
+            ggml_backend_tensor_get(b.conv_bn_b, beta.data(), 0, inner * sizeof(float));
+            ggml_backend_tensor_get(b.conv_bn_mean, mean.data(), 0, inner * sizeof(float));
+            ggml_backend_tensor_get(b.conv_bn_var, var.data(), 0, inner * sizeof(float));
+
+            std::vector<float> scale(inner), shift(inner);
+            for (int c = 0; c < inner; c++) {
+                scale[c] = gamma[c] / std::sqrt(var[c] + eps);
+                shift[c] = beta[c] - mean[c] * scale[c];
+            }
+
+            // Write precomputed scale/shift back into bn_w/bn_b tensors
+            ggml_backend_tensor_set(b.conv_bn_w, scale.data(), 0, inner * sizeof(float));
+            ggml_backend_tensor_set(b.conv_bn_b, shift.data(), 0, inner * sizeof(float));
+            folded++;
+        }
+        if (params.verbosity >= 1)
+            fprintf(stderr, "granite_speech: BN folded for %d encoder layers\n", folded);
+    }
+
     // Create scheduler
     {
         int n_be = 0;
@@ -747,19 +780,18 @@ static ggml_cgraph * granite_build_encoder(granite_speech_context * ctx, int T) 
             // For true depthwise, we'd need to loop over channels or use a diagonal weight.
             // WORKAROUND: skip the depthwise conv and just apply batch_norm + SiLU.
             // The batch norm at least preserves the per-channel statistics.
-            if (b.conv_bn_w && b.conv_bn_b && b.conv_bn_mean && b.conv_bn_var) {
-                // Fold batch norm: x = (x - mean) / sqrt(var + eps) * gamma + beta
-                // For inference, mean and var are the running statistics
-                // x is (2048, T) in ggml ne[0]=2048
-                // BN operates per-channel (ne[0] dim)
-                // ggml doesn't have BN op, but we can express it as:
-                //   x_norm = (x - mean) * (gamma / sqrt(var + eps)) + beta
-                // which is mul + add with precomputed scale/shift
-                // For now just apply SiLU (the BN folding is a TODO)
-                x = ggml_silu(ctx0, x);
-            } else {
-                x = ggml_silu(ctx0, x);
+            // Batch norm (applied to x of shape (inner_dim=2048, T)):
+            // BN: y = gamma * (x - mean) / sqrt(var + eps) + beta
+            //       = x * scale + shift
+            // where scale = gamma / sqrt(var + eps), shift = beta - gamma * mean / sqrt(var + eps)
+            // These 1D (2048,) tensors broadcast over T via ggml_mul/ggml_add
+            // BN (precomputed at load time): bn_w = scale, bn_b = shift
+            // x = x * scale + shift (scale = gamma/sqrt(var+eps), shift = beta - mean*scale)
+            if (b.conv_bn_w && b.conv_bn_b) {
+                x = ggml_mul(ctx0, x, b.conv_bn_w);
+                x = ggml_add(ctx0, x, b.conv_bn_b);
             }
+            x = ggml_silu(ctx0, x);
 
             // Pointwise down: conv_down_w ne=(1, 2048, 1024)
             if (b.conv_down_w) {
