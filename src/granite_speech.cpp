@@ -512,9 +512,9 @@ extern "C" float * granite_speech_compute_mel(struct granite_speech_context * ct
                                               const float * samples, int n_samples,
                                               int * out_n_mels, int * out_T_mel) {
     if (!ctx || !samples || n_samples <= 0) return nullptr;
-    const int n_fft = 512, hop = 160, n_mels = 80, n_freqs = n_fft / 2 + 1;
+    const int n_fft = 512, win_length = 400, hop = 160, n_mels = 80, n_freqs = n_fft / 2 + 1;
 
-    // Load mel filters from GGUF (or build Slaney if not baked)
+    // Load mel filters from GGUF
     std::vector<float> filt((size_t)n_freqs * n_mels);
     if (ctx->model.encoder.mel_filters) {
         ggml_backend_tensor_get(ctx->model.encoder.mel_filters, filt.data(), 0,
@@ -523,15 +523,12 @@ extern "C" float * granite_speech_compute_mel(struct granite_speech_context * ct
         return nullptr;
     }
 
-    // Hann window
-    std::vector<float> hann(n_fft);
-    if (ctx->model.encoder.mel_window) {
-        ggml_backend_tensor_get(ctx->model.encoder.mel_window, hann.data(), 0,
-                                n_fft * sizeof(float));
-    } else {
-        for (int i = 0; i < n_fft; i++)
-            hann[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / n_fft));
-    }
+    // Hann window: win_length=400, zero-padded to n_fft=512
+    // torchaudio uses periodic Hann window of length win_length
+    std::vector<float> hann(n_fft, 0.0f);
+    for (int i = 0; i < win_length; i++)
+        hann[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / win_length));
+    // Remaining n_fft - win_length = 112 entries stay zero (zero-padding)
 
     // Center-pad (zero padding)
     const int pad = n_fft / 2;

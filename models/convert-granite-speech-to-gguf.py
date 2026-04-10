@@ -203,23 +203,16 @@ def is_f32_tensor(name: str, shape: tuple) -> bool:
 # Mel filter bank (80 bins, Slaney-style)
 # ---------------------------------------------------------------------------
 
-def build_slaney_mel_filters(sr=16000, n_fft=512, n_mels=80, f_min=0.0, f_max=8000.0):
+def build_htk_mel_filters(sr=16000, n_fft=512, n_mels=80, f_min=0.0, f_max=8000.0):
+    """HTK mel filter bank matching torchaudio.transforms.MelSpectrogram defaults."""
     n_freqs = n_fft // 2 + 1
     def hz_to_mel(f):
-        f = np.asarray(f, dtype=np.float64)
-        mels = 3.0 * f / 200.0
-        mask = f >= 1000.0
-        mels[mask] = 15.0 + np.log(f[mask] / 1000.0) * 27.0 / np.log(6.4)
-        return mels
+        return 2595.0 * np.log10(1.0 + np.asarray(f, dtype=np.float64) / 700.0)
     def mel_to_hz(m):
-        m = np.asarray(m, dtype=np.float64)
-        freq = 200.0 * m / 3.0
-        mask = m >= 15.0
-        freq[mask] = 1000.0 * np.exp(np.log(6.4) / 27.0 * (m[mask] - 15.0))
-        return freq
+        return 700.0 * (10.0 ** (np.asarray(m, dtype=np.float64) / 2595.0) - 1.0)
     fft_freqs = np.linspace(0, sr / 2, n_freqs)
-    mel_min = hz_to_mel(np.array([f_min]))[0]
-    mel_max = hz_to_mel(np.array([f_max]))[0]
+    mel_min = hz_to_mel(f_min)
+    mel_max = hz_to_mel(f_max)
     mel_freqs = np.linspace(mel_min, mel_max, n_mels + 2)
     filt_freqs = mel_to_hz(mel_freqs)
     filt_diff = np.diff(filt_freqs)
@@ -227,6 +220,7 @@ def build_slaney_mel_filters(sr=16000, n_fft=512, n_mels=80, f_min=0.0, f_max=80
     down = -slopes[:, :-2] / filt_diff[:-1]
     up = slopes[:, 2:] / filt_diff[1:]
     fb = np.maximum(0, np.minimum(down, up))
+    # torchaudio uses "slaney" norm by default — normalize area to 1
     enorm = 2.0 / (filt_freqs[2:n_mels+2] - filt_freqs[:n_mels])
     fb *= enorm[None, :]
     return fb.astype(np.float32)
@@ -290,10 +284,13 @@ def convert(input_dir: Path, out_path: Path) -> None:
     writer.add_uint32("granite_speech.audio_token_index", cfg.get("audio_token_index", 100352))
 
     # Mel filterbank (80 bins)
-    mel_filters = build_slaney_mel_filters(sr=16000, n_fft=512, n_mels=80)
+    mel_filters = build_htk_mel_filters(sr=16000, n_fft=512, n_mels=80)
     writer.add_tensor("audio.mel_filters", mel_filters)
+    # Hann window: win_length=400, zero-padded to n_fft=512
+    win_length = 400
     n_fft = 512
-    win = (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n_fft) / n_fft)).astype(np.float32)
+    win = np.zeros(n_fft, dtype=np.float32)
+    win[:win_length] = (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(win_length) / win_length)).astype(np.float32)
     writer.add_tensor("audio.mel_window", win)
 
     # Tensors
