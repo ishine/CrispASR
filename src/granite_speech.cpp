@@ -600,12 +600,12 @@ extern "C" float * granite_speech_compute_mel(struct granite_speech_context * ct
         return nullptr;
     }
 
-    // Hann window: win_length=400, zero-padded to n_fft=512
-    // torchaudio uses periodic Hann window of length win_length
+    // Hann window: win_length=400, center-padded to n_fft=512
+    // torchaudio/torch.stft center-pads when win_length < n_fft
     std::vector<float> hann(n_fft, 0.0f);
+    const int pad_left = (n_fft - win_length) / 2;  // 56
     for (int i = 0; i < win_length; i++)
-        hann[i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / win_length));
-    // Remaining n_fft - win_length = 112 entries stay zero (zero-padding)
+        hann[pad_left + i] = 0.5f * (1.0f - std::cos(2.0f * (float)M_PI * i / win_length));
 
     // Center-pad (zero padding)
     const int pad = n_fft / 2;
@@ -1644,7 +1644,9 @@ static ggml_cgraph * granite_build_llm_kv(granite_speech_context * ctx,
         ggml_set_name(causal_mask, "causal_mask"); ggml_set_input(causal_mask);
     }
 
-    ggml_tensor * cur = embeds;
+    // Apply μP embedding multiplier to ALL inputs (text + audio) uniformly
+    // This matches HF/mlx: h = h * embedding_multiplier after splicing audio features
+    ggml_tensor * cur = ggml_scale(ctx0, embeds, hp.embedding_multiplier);
 
     for (int il = 0; il < n_layers; il++) {
         const auto & b = m.llm.blocks[il];
@@ -1800,8 +1802,8 @@ extern "C" float * granite_speech_embed_tokens(struct granite_speech_context * c
     ggml_set_name(ids, "input_ids"); ggml_set_input(ids);
     ggml_tensor * out = ggml_get_rows(ctx0, ctx->model.llm.token_embd_w, ids);
 
-    // Apply embedding multiplier (μP)
-    out = ggml_scale(ctx0, out, ctx->model.hparams.embedding_multiplier);
+    // NOTE: embedding_multiplier (μP) is NOT applied here — it's applied in
+    // granite_build_llm_kv to ALL inputs (text + audio) uniformly, matching HF/mlx.
 
     ggml_set_name(out, "embeds");
     ggml_build_forward_expand(gf, out);
