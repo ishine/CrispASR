@@ -196,6 +196,12 @@ def is_f32_tensor(name: str, shape: tuple) -> bool:
         return True
     if len(shape) <= 1:
         return True
+    # Keep encoder weights as F32 to avoid precision loss across 16 layers
+    if name.startswith("enc."):
+        return True
+    # Keep projector weights as F32 (small, precision-sensitive)
+    if name.startswith("proj."):
+        return True
     return False
 
 

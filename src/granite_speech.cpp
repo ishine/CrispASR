@@ -1049,7 +1049,7 @@ static ggml_cgraph * granite_build_encoder(granite_speech_context * ctx, int T) 
 
         // Mid-CTC residual at layer 8 (after 8th layer = index 7)
         if (il == n_layers / 2 - 1 && m.encoder.ctc_out_w && m.encoder.ctc_mid_w) {
-            // out: (1024 → 348) → softmax → out_mid: (348 → 1024) → add to hidden
+            // out: (d → ctc_dim) → softmax → out_mid: (ctc_dim → d) → add to hidden
             ggml_tensor * mid = ggml_mul_mat(ctx0, m.encoder.ctc_out_w, cur);
             if (m.encoder.ctc_out_b) mid = ggml_add(ctx0, mid, m.encoder.ctc_out_b);
             mid = ggml_soft_max(ctx0, mid);  // softmax over last dim (348)
@@ -1279,6 +1279,10 @@ extern "C" float * granite_speech_run_encoder(struct granite_speech_context * ct
                 b.ff1_norm_w, b.ff1_norm_b, b.ff1_up_w, b.ff1_up_b, b.ff1_down_w, b.ff1_down_b);
         for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += 0.5f * ffn_out[i];
 
+        if (ctx->params.verbosity >= 2 && il == 0)
+            fprintf(stderr, "  L0 after FFN1: [%.4f,%.4f,%.4f,%.4f]\n",
+                    hidden[0], hidden[1], hidden[2], hidden[3]);
+
         // --- Attention: norm → Q/KV projections → Shaw attention on CPU ---
         // LayerNorm
         std::vector<float> normed((size_t)d * T);
@@ -1319,9 +1323,17 @@ extern "C" float * granite_speech_run_encoder(struct granite_speech_context * ct
         run_matmul(ctx, proj_out.data(), attn_out.data(), d, T, b.attn_out_w, b.attn_out_b, d);
         for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += proj_out[i];
 
+        if (ctx->params.verbosity >= 2 && il == 0)
+            fprintf(stderr, "  L0 after attn: [%.4f,%.4f,%.4f,%.4f]\n",
+                    hidden[0], hidden[1], hidden[2], hidden[3]);
+
         // --- Conv module ---
         run_conv_module(ctx, conv_out.data(), hidden.data(), d, T, b);
         for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += conv_out[i];
+
+        if (ctx->params.verbosity >= 2 && il == 0)
+            fprintf(stderr, "  L0 after conv: [%.4f,%.4f,%.4f,%.4f]\n",
+                    hidden[0], hidden[1], hidden[2], hidden[3]);
 
         // --- FFN2 (Macaron half-step) ---
         run_ffn(ctx, ffn_out.data(), hidden.data(), d, T,
@@ -1339,19 +1351,20 @@ extern "C" float * granite_speech_run_encoder(struct granite_speech_context * ct
 
         // --- Mid-CTC residual at layer 8 ---
         if (il == n_layers / 2 - 1 && ctx->model.encoder.ctc_out_w && ctx->model.encoder.ctc_mid_w) {
-            std::vector<float> mid_out(348 * T), mid_back((size_t)d * T);
+            const int ctc_dim = (int)ctx->model.encoder.ctc_out_w->ne[1]; // output_dim from tensor shape
+            std::vector<float> mid_out((size_t)ctc_dim * T), mid_back((size_t)d * T);
             run_matmul(ctx, mid_out.data(), hidden.data(), d, T,
-                       ctx->model.encoder.ctc_out_w, ctx->model.encoder.ctc_out_b, 348);
+                       ctx->model.encoder.ctc_out_w, ctx->model.encoder.ctc_out_b, ctc_dim);
             // Softmax per frame
             for (int t = 0; t < T; t++) {
-                float * row = mid_out.data() + t * 348;
+                float * row = mid_out.data() + t * ctc_dim;
                 float mx = -1e30f;
-                for (int i = 0; i < 348; i++) if (row[i] > mx) mx = row[i];
+                for (int i = 0; i < ctc_dim; i++) if (row[i] > mx) mx = row[i];
                 float sum = 0;
-                for (int i = 0; i < 348; i++) { row[i] = std::exp(row[i] - mx); sum += row[i]; }
-                for (int i = 0; i < 348; i++) row[i] /= sum;
+                for (int i = 0; i < ctc_dim; i++) { row[i] = std::exp(row[i] - mx); sum += row[i]; }
+                for (int i = 0; i < ctc_dim; i++) row[i] /= sum;
             }
-            run_matmul(ctx, mid_back.data(), mid_out.data(), 348, T,
+            run_matmul(ctx, mid_back.data(), mid_out.data(), ctc_dim, T,
                        ctx->model.encoder.ctc_mid_w, ctx->model.encoder.ctc_mid_b, d);
             for (size_t i = 0; i < (size_t)d * T; i++) hidden[i] += mid_back[i];
         }
@@ -1412,15 +1425,14 @@ static ggml_cgraph * granite_build_projector(granite_speech_context * ctx, int e
     // Learned query tokens: extract from (1, n_query, d) → (d, n_query)
     ggml_tensor * query = ggml_reshape_2d(ctx0, m.projector.query, d, n_query);
 
-    // Apply input LayerNorm to encoder features
-    ggml_tensor * enc_normed = enc;
-    if (m.projector.ln_w) {
-        enc_normed = ggml_norm(ctx0, enc, 1e-12f);
-        enc_normed = ggml_mul(ctx0, enc_normed, m.projector.ln_w);
-        if (m.projector.ln_b) enc_normed = ggml_add(ctx0, enc_normed, m.projector.ln_b);
-    }
-
+    // Apply input LayerNorm to query embeddings (NOT encoder features)
+    // This matches HF BLIP-2 QFormer: self.layernorm(query_embeds)
     ggml_tensor * cur = query;  // (d, n_query)
+    if (m.projector.ln_w) {
+        cur = ggml_norm(ctx0, cur, 1e-12f);
+        cur = ggml_mul(ctx0, cur, m.projector.ln_w);
+        if (m.projector.ln_b) cur = ggml_add(ctx0, cur, m.projector.ln_b);
+    }
 
     for (int il = 0; il < n_layers; il++) {
         const auto & b = m.projector.blocks[il];
@@ -1460,9 +1472,9 @@ static ggml_cgraph * granite_build_projector(granite_speech_context * ctx, int e
         {
             ggml_tensor * Q = ggml_mul_mat(ctx0, b.ca_q_w, cur);
             if (b.ca_q_b) Q = ggml_add(ctx0, Q, b.ca_q_b);
-            ggml_tensor * K = ggml_mul_mat(ctx0, b.ca_k_w, enc_normed);
+            ggml_tensor * K = ggml_mul_mat(ctx0, b.ca_k_w, enc);
             if (b.ca_k_b) K = ggml_add(ctx0, K, b.ca_k_b);
-            ggml_tensor * V = ggml_mul_mat(ctx0, b.ca_v_w, enc_normed);
+            ggml_tensor * V = ggml_mul_mat(ctx0, b.ca_v_w, enc);
             if (b.ca_v_b) V = ggml_add(ctx0, V, b.ca_v_b);
 
             Q = ggml_reshape_3d(ctx0, Q, hd, n_heads, n_query);
@@ -1558,6 +1570,15 @@ extern "C" float * granite_speech_run_projector(struct granite_speech_context * 
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "  projector: %d windows × %d queries = %d audio tokens (dim=%d)\n",
                 nblocks, n_query, total_tokens, llm_d);
+
+    if (ctx->params.verbosity >= 2) {
+        float mn=1e30f, mx=-1e30f, s=0;
+        for (size_t i = 0; i < all_proj.size(); i++) {
+            if(all_proj[i]<mn)mn=all_proj[i]; if(all_proj[i]>mx)mx=all_proj[i]; s+=all_proj[i];
+        }
+        fprintf(stderr, "  projector out: min=%.6f max=%.6f mean=%.6f first_4=[%.6f,%.6f,%.6f,%.6f]\n",
+                mn, mx, s/all_proj.size(), all_proj[0], all_proj[1], all_proj[2], all_proj[3]);
+    }
 
     float * result = (float *)malloc(all_proj.size() * sizeof(float));
     std::memcpy(result, all_proj.data(), all_proj.size() * sizeof(float));
