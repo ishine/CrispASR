@@ -1,3 +1,6 @@
+> **STATUS (2026-04-10): ✅ COMPLETE.** Port working, producing correct transcriptions.
+> See TODO.md for remaining work (quantization, HF release).
+
 # Voxtral-Mini-4B-Realtime-2602 port plan
 
 Substantially different architecture from the 3B — not just a dim swap.

@@ -1,3 +1,6 @@
+> **STATUS (2026-04-10): HISTORICAL.** These optimization plans were implemented.
+> See TODO.md for current performance work.
+
 # Closing the gap to ONNX INT8 in CrispASR
 
 ## Current state (5.4 s clip, 8 threads, Cascade Lake-class CPU)

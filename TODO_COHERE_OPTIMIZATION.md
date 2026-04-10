@@ -1,3 +1,5 @@
+> **STATUS (2026-04-10): ✅ COMPLETE.** All 5 phases done. See TODO.md.
+
 # Cohere Transcribe Optimization Plan
 
 This document tracks the progress of porting `CrispASR` to a full `ggml` compute graph (Priority 2B).
