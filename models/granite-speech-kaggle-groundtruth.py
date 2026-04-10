@@ -104,14 +104,26 @@ if "input_ids" in inputs:
     print(f"  audio tokens in prompt: {n_audio}")
     print(f"  total tokens: {len(ids)}")
 
-# Encoder output
+# Encoder output with per-layer intermediates
 print("\n=== Encoder output ===")
 with torch.no_grad():
-    # Run just the encoder
     feats = inputs.get("input_features", inputs.get("input_values"))
     if feats is not None:
-        enc_out = model.encoder(feats)
-        save("encoder_out", enc_out.last_hidden_state[0], f"encoder output")
+        # Run encoder manually to get per-layer intermediates
+        encoder = model.encoder
+        h = encoder.input_linear(feats)
+        save("enc_after_input_linear", h[0], "after input_linear")
+
+        for idx, layer in enumerate(encoder.layers, start=1):
+            h = layer(h, attention_dists=encoder.attention_dists)
+            if idx == encoder.num_layers // 2:
+                h_mid = h.clone()
+                h_mid = encoder.out(h_mid)
+                h += encoder.out_mid(torch.nn.Softmax(dim=-1)(h_mid))
+            if idx in [1, 4, 8, 16]:
+                save(f"enc_after_layer{idx}", h[0], f"encoder hidden after layer {idx}")
+
+        save("encoder_out", h[0], "final encoder output")
 
         # Projector output
         print("\n=== Projector output ===")
