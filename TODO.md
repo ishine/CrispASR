@@ -162,6 +162,7 @@ English + German verified. 13 languages supported.
 - [ ] Test more languages
 
 ### Voxtral 3B
+- [ ] Variable-length mel (currently pads to 3000=30s; needs encoder to handle variable T)
 - [ ] Audio understanding mode (Q&A)
 - [ ] Long audio >30s chunking
 - [ ] Temperature/sampling controls
