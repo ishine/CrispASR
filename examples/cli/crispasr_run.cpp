@@ -18,11 +18,14 @@
 
 #include "common-whisper.h" // read_audio_data
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -76,6 +79,184 @@ std::vector<crispasr_segment> merge_segments(
     return out;
 }
 
+// Stdout serialization mutex. Used by the parallel-processors path to
+// keep stdout transcript lines from interleaving across worker threads.
+// The single-threaded path acquires it too — no measurable cost since
+// it's an uncontended lock when n_processors == 1.
+std::mutex g_stdout_mutex;
+
+// Process a single input file end-to-end with the given backend instance.
+// Pulled out of the main loop so the parallel-processors path can call
+// it from worker threads. Each call holds its own audio buffers + segment
+// state, so multiple workers can run concurrently against pre-loaded
+// per-thread backend instances. Returns 0 on success, non-zero on
+// failure.
+int process_one_input(CrispasrBackend & backend,
+                      const std::string & fname_inp,
+                      whisper_params params)
+{
+    std::vector<float> samples;
+    std::vector<std::vector<float>> stereo;
+    const bool want_stereo = params.diarize;
+    if (!read_audio_data(fname_inp, samples, stereo, want_stereo)) {
+        fprintf(stderr, "crispasr: error: failed to read audio '%s'\n",
+                fname_inp.c_str());
+        return 20;
+    }
+    bool have_stereo = want_stereo &&
+        stereo.size() == 2 &&
+        !stereo[0].empty() &&
+        stereo[0].size() == stereo[1].size();
+    if (have_stereo) {
+        const size_t n = stereo[0].size();
+        const size_t check = std::min<size_t>(n, 4096);
+        bool channels_equal = true;
+        for (size_t i = 0; i < check; i++) {
+            if (stereo[0][i] != stereo[1][i]) { channels_equal = false; break; }
+        }
+        if (channels_equal) have_stereo = false;
+    }
+
+    constexpr int SR = 16000;
+    if (!params.no_prints) {
+        fprintf(stderr,
+                "crispasr: audio: %d samples (%.1f s) @ %d Hz, %d threads\n",
+                (int)samples.size(),
+                (double)samples.size() / SR, SR, params.n_threads);
+    }
+
+    // Optional language-identification pre-step.
+    const bool want_auto_lang = params.detect_language ||
+                                params.language == "auto";
+    const bool has_native_lid = (backend.capabilities() & CAP_LANGUAGE_DETECT) != 0;
+    const bool lid_disabled   = params.lid_backend == "off" ||
+                                params.lid_backend == "none";
+    if (want_auto_lang && !has_native_lid && !lid_disabled) {
+        crispasr_lid_result lid;
+        if (crispasr_detect_language(samples.data(), (int)samples.size(),
+                                      params, lid)) {
+            params.language = lid.lang_code;
+            if (params.source_lang.empty()) {
+                params.source_lang = lid.lang_code;
+            }
+            if (!params.no_prints) {
+                fprintf(stderr,
+                        "crispasr: LID -> language = '%s' (%s, p=%.3f)\n",
+                        lid.lang_code.c_str(), lid.source.c_str(),
+                        lid.confidence);
+            }
+        } else if (!params.no_prints) {
+            fprintf(stderr,
+                    "crispasr: LID failed, falling back to params.language='%s'\n",
+                    params.language.c_str());
+        }
+    }
+
+    const auto slices = crispasr_compute_audio_slices(
+        samples.data(), (int)samples.size(), SR,
+        params.chunk_seconds, params);
+
+    if (slices.empty()) {
+        fprintf(stderr, "crispasr: warning: no speech detected in '%s'\n",
+                fname_inp.c_str());
+        return 0;
+    }
+
+    if (!params.no_prints && slices.size() > 1) {
+        fprintf(stderr, "crispasr: processing %zu slice(s)\n", slices.size());
+    }
+
+    std::vector<std::vector<crispasr_segment>> per_slice;
+    per_slice.reserve(slices.size());
+    for (size_t i = 0; i < slices.size(); i++) {
+        const auto & sl = slices[i];
+        std::vector<crispasr_segment> segs = backend.transcribe(
+            samples.data() + sl.start,
+            sl.end - sl.start,
+            sl.t0_cs,
+            params);
+
+        if (params.diarize && !segs.empty()) {
+            if (have_stereo) {
+                std::vector<float> sl_l(stereo[0].begin() + sl.start,
+                                        stereo[0].begin() + sl.end);
+                std::vector<float> sl_r(stereo[1].begin() + sl.start,
+                                        stereo[1].begin() + sl.end);
+                crispasr_apply_diarize(sl_l, sl_r, /*is_stereo=*/true,
+                                       sl.t0_cs, segs, params);
+            } else {
+                std::vector<float> mono_slice(samples.begin() + sl.start,
+                                              samples.begin() + sl.end);
+                crispasr_apply_diarize(mono_slice, mono_slice,
+                                       /*is_stereo=*/false,
+                                       sl.t0_cs, segs, params);
+            }
+        }
+
+        const bool want_align =
+            !params.aligner_model.empty() &&
+            (backend.capabilities() & CAP_TIMESTAMPS_CTC);
+        if (want_align) {
+            for (auto & seg : segs) {
+                if (!seg.words.empty()) continue;
+                auto words = crispasr_ctc_align(
+                    params.aligner_model,
+                    seg.text,
+                    samples.data() + sl.start,
+                    sl.end - sl.start,
+                    sl.t0_cs,
+                    params.n_threads);
+                if (!words.empty()) {
+                    seg.t0 = words.front().t0;
+                    seg.t1 = words.back().t1;
+                    seg.words = std::move(words);
+                }
+            }
+        }
+
+        per_slice.push_back(std::move(segs));
+    }
+    auto all_segs = merge_segments(std::move(per_slice));
+
+    if (!params.punctuation) {
+        for (auto & seg : all_segs) {
+            crispasr_strip_punctuation(seg);
+        }
+    }
+
+    const auto disp = crispasr_make_disp_segments(all_segs, params.max_len);
+
+    const bool show_timestamps =
+        !params.no_timestamps &&
+        (params.output_srt || params.output_vtt ||
+         params.max_len > 0  || params.print_colors ||
+         params.diarize);
+    {
+        // Serialize stdout across parallel workers so multi-file
+        // transcripts don't interleave line-by-line.
+        std::lock_guard<std::mutex> lock(g_stdout_mutex);
+        crispasr_print_stdout(disp, show_timestamps);
+    }
+
+    if (params.output_txt)
+        crispasr_write_txt(crispasr_make_out_path(fname_inp, ".txt"), disp);
+    if (params.output_srt)
+        crispasr_write_srt(crispasr_make_out_path(fname_inp, ".srt"), disp);
+    if (params.output_vtt)
+        crispasr_write_vtt(crispasr_make_out_path(fname_inp, ".vtt"), disp);
+    if (params.output_csv)
+        crispasr_write_csv(crispasr_make_out_path(fname_inp, ".csv"), disp);
+    if (params.output_lrc)
+        crispasr_write_lrc(crispasr_make_out_path(fname_inp, ".lrc"), disp);
+    if (params.output_jsn)
+        crispasr_write_json(
+            crispasr_make_out_path(fname_inp, ".json"),
+            all_segs, backend.name(), params.model, params.language,
+            params.output_jsn_full);
+
+    return 0;
+}
+
 } // namespace
 
 int crispasr_run_backend(const whisper_params & params_in) {
@@ -124,10 +305,84 @@ int crispasr_run_backend(const whisper_params & params_in) {
     }
 
     // Process every input file.
+    //
+    // n_processors == 1 (default): sequential, single backend instance.
+    // Bit-identical with the historical CrispASR behaviour.
+    //
+    // n_processors > 1: spawn N-1 EXTRA backend instances (model-load
+    //                   cost paid N times — beware), then dispatch
+    //                   files across N worker threads. Best when you
+    //                   have many independent input files; useless on
+    //                   single-file runs because both workers would
+    //                   race on the same audio.
     int rc = 0;
+    const int nproc = std::max(1, params.n_processors);
+    if (nproc > 1 && params.fname_inp.size() > 1) {
+        // Pre-load N-1 EXTRA backend instances (we already have one).
+        // Failure to load any worker is fatal — better to bail than to
+        // silently fall back to single-thread, which would surprise
+        // batch users with much slower runs.
+        std::vector<std::unique_ptr<CrispasrBackend>> pool;
+        pool.reserve(nproc);
+        pool.emplace_back(std::move(backend));
+        for (int i = 1; i < nproc; i++) {
+            auto extra = crispasr_create_backend(backend_name);
+            if (!extra || !extra->init(params)) {
+                fprintf(stderr,
+                        "crispasr: error: failed to spin up worker %d/%d "
+                        "(extra backend init failed). Try fewer --processors.\n",
+                        i + 1, nproc);
+                return 14;
+            }
+            pool.emplace_back(std::move(extra));
+        }
+        if (!params.no_prints) {
+            fprintf(stderr,
+                    "crispasr: parallel mode: %d worker(s), %zu input file(s)\n",
+                    nproc, params.fname_inp.size());
+        }
+
+        // Shared work queue: index into params.fname_inp. std::atomic
+        // counter is enough — no need for a real queue since each
+        // worker just claims the next index.
+        std::atomic<int> next_idx{0};
+        std::atomic<int> agg_rc{0};
+        const int n_files = (int)params.fname_inp.size();
+        std::vector<std::thread> workers;
+        workers.reserve((size_t)nproc);
+        for (int w = 0; w < nproc; w++) {
+            workers.emplace_back([&, w]() {
+                CrispasrBackend & be = *pool[w];
+                while (true) {
+                    const int idx = next_idx.fetch_add(1);
+                    if (idx >= n_files) break;
+                    const int file_rc = process_one_input(
+                        be, params.fname_inp[idx], params);
+                    if (file_rc != 0) agg_rc.store(file_rc);
+                }
+            });
+        }
+        for (auto & t : workers) t.join();
+
+        for (auto & be : pool) be->shutdown();
+        return agg_rc.load();
+    }
+
     for (const auto & fname_inp : params.fname_inp) {
-        std::vector<float> samples;
-        std::vector<std::vector<float>> stereo;
+        const int file_rc = process_one_input(*backend, fname_inp, params);
+        if (file_rc != 0) rc = file_rc;
+    }
+    backend->shutdown();
+    return rc;
+}
+
+#if 0
+// Legacy in-place per-file loop body. Moved into process_one_input()
+// above. Kept here under #if 0 only for diff/blame archaeology — the
+// linker drops it.
+{
+    std::vector<float> samples;
+    std::vector<std::vector<float>> stereo;
         // Request stereo split when --diarize is set. Diarize is now
         // a generic dispatcher post-step (crispasr_diarize.cpp), so we
         // try it for every backend rather than only those that
@@ -323,7 +578,5 @@ int crispasr_run_backend(const whisper_params & params_in) {
                 all_segs, backend->name(), params.model, params.language,
                 params.output_jsn_full);
     }
-
-    backend->shutdown();
-    return rc;
 }
+#endif

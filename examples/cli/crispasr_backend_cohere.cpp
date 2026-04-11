@@ -34,6 +34,7 @@ public:
              | CAP_PUNCTUATION_TOGGLE
              | CAP_FLASH_ATTN
              | CAP_TEMPERATURE
+             | CAP_PARALLEL_PROCESSORS
              | CAP_AUTO_DOWNLOAD;
     }
 

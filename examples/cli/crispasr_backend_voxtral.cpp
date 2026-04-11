@@ -107,7 +107,7 @@ public:
         return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE
              | CAP_PUNCTUATION_TOGGLE | CAP_FLASH_ATTN | CAP_TOKEN_CONFIDENCE
              | CAP_TRANSLATE | CAP_SRC_TGT_LANGUAGE | CAP_BEAM_SEARCH
-             | CAP_DIARIZE;
+             | CAP_DIARIZE | CAP_PARALLEL_PROCESSORS;
     }
 
     bool init(const whisper_params & p) override {

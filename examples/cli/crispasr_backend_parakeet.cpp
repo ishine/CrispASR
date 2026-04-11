@@ -31,6 +31,7 @@ public:
              | CAP_PUNCTUATION_TOGGLE
              | CAP_TEMPERATURE
              | CAP_DIARIZE
+             | CAP_PARALLEL_PROCESSORS
              | CAP_AUTO_DOWNLOAD;
     }
 
