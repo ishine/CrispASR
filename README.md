@@ -524,6 +524,46 @@ cmake --build build --target whisper-cli
 diff before.txt after.txt && echo BIT-IDENTICAL
 ```
 
+### Debug a new backend against PyTorch ground truth
+
+Bit-identical regression against the previous C++ version proves the
+change was neutral, but it doesn't tell you the C++ forward pass is
+correct in the first place. For that, use the ground-truth tools:
+
+```bash
+# 1. Capture PyTorch reference activations at every named stage
+python tools/dump_reference.py --backend voxtral \
+    --model-dir /path/to/hf/voxtral-mini-3b-2507 \
+    --audio samples/jfk.wav \
+    --output /tmp/voxtral-ref.gguf
+
+# 2. Compare your C++ forward pass against the reference, stage by stage
+./build/bin/crispasr-diff voxtral \
+    voxtral-mini-3b-2507-q4_k.gguf \
+    /tmp/voxtral-ref.gguf \
+    samples/jfk.wav
+#
+# [PASS] mel_spectrogram    shape=[128,3000]  cos_min=0.99998  max_abs=3e-5
+# [PASS] projector_output   shape=[375,3072]  cos_min=0.99985  max_abs=4e-4
+# summary: 2 pass, 0 fail, 0 skip (cos threshold 0.999)
+```
+
+The Python dumper uses PyTorch forward hooks to capture intermediate
+activations (mel, per-encoder-layer output, projector, LLM block output,
+logits, argmax) and writes them to a single **GGUF tensor archive**.
+The C++ side loads the archive via `core_gguf::load_weights` and runs
+the backend's public stage helpers (`*_compute_mel`, `*_run_encoder`,
+etc.) to produce the same tensors, then the shared `crispasr_diff::Ref`
+compares them with **cosine similarity per row**, **max-abs error**,
+**RMS**, and — for logits — **top-1 argmax match rate**.
+
+Adding a new backend to the dumper is a ~60-line file in
+`tools/reference_backends/<name>.py` that registers PyTorch forward
+hooks and returns a dict `{stage_name: ndarray}`. See
+`tools/reference_backends/qwen3.py` and `voxtral.py` for worked
+examples; `voxtral4b.py` and `granite.py` are stubs with inline notes
+on what to port from the legacy `models/*-dump-*.py` scripts.
+
 ---
 
 ## Branch state & roadmap

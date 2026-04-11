@@ -78,13 +78,15 @@ minimal pilot. The remaining pieces are documented below.
 
 ## CLI + examples cleanup
 
-- **[next]** Delete the per-model `examples/*-main/` directories once
-  `crispasr --backend X` has shipped and regression-tested in CI.
-  Candidates: `parakeet-main`, `canary-main`, `cohere-main`,
-  `qwen3-asr-main`, `voxtral-main`, `voxtral4b-main`, `granite-main`,
-  `nfa-align`, `cohere-align`. Update `examples/CMakeLists.txt`.
-  Add deprecation-warning stubs under `examples/deprecation-warning/`
-  for one release cycle before full removal.
+- **[done]** ~~Delete the per-model `examples/*-main/` directories
+  once `crispasr --backend X` has shipped.~~ **Done.** 7 user-facing
+  CLIs (cohere-main, parakeet-main, canary-main, qwen3-asr-main,
+  voxtral-main, voxtral4b-main, granite-main) removed. The
+  `cohere-quantize.cpp` tool was rescued into
+  `examples/crispasr-quantize/` as a standalone GGUF quantizer.
+  Kept: `cohere-align` / `nfa-align` (standalone forced-alignment
+  tools, still useful when the transcript is pre-existing) and the
+  `{qwen3,voxtral}-test-*` differential fixtures.
 
 - **[later]** `tests/CMakeLists.txt` uses `whisper-cli` as the test
   target. Keep that target name (we already preserve it) but move the
@@ -188,6 +190,41 @@ Remove after consolidation: `canary-todo.md`, `parakeet-todo.md`,
 Keep: `README.md`, `TODO.md`, `LEARNINGS.md`, `HISTORY.md`, `UPSTREAM.md`,
 `README_sycl.md`, `ci/README.md`, `models/README.md`, `samples/README.md`,
 `hf_readmes/*.md`.
+
+---
+
+## Ground-truth diff infrastructure (new in this session)
+
+The `tools/dump_reference.py` + `crispasr-diff` pair is the new
+contributor-facing path for adding backends with confidence. Status:
+
+- **[done]** Unified Python dumper (`tools/dump_reference.py`) with
+  plug-in backend modules under `tools/reference_backends/`. Writes
+  a single GGUF tensor archive per dump (not scattered `.npy` files).
+- **[done]** Shared C++ diff harness (`examples/cli/crispasr_diff.{h,cpp}`)
+  loading the archive via `core_gguf::load_weights` and exposing
+  `compare(name, data, n)` with cosine sim / max-abs / RMS / top-1
+  argmax metrics.
+- **[done]** `crispasr-diff` CLI binary built alongside `crispasr`.
+  Currently wires up mel-stage comparison for voxtral / voxtral4b /
+  qwen3 / granite (the stages their public C API exposes). Parakeet /
+  canary / cohere only have all-in-one `transcribe()` entry points so
+  they're reported as unsupported.
+- **[done]** Worked-example Python backend modules:
+  `tools/reference_backends/qwen3.py` and `voxtral.py` are fully
+  ported from the legacy `models/*-dump-*.py` scripts.
+- **[next]** Port `models/voxtral4b-dump-ref.py` into
+  `tools/reference_backends/voxtral4b.py` (stub ready with inline notes).
+- **[next]** Port `models/granite-speech-kaggle-groundtruth.py` into
+  `tools/reference_backends/granite.py` (stub ready).
+- **[later]** Expose `audio_encoder`-only and `run_llm_kv`-only
+  standalone entry points in `parakeet` / `canary` / `cohere` C headers
+  so `crispasr-diff` can do stage-by-stage comparison for them too
+  (currently the encoder/decoder is entangled with the full transcribe).
+- **[later]** Once `tools/reference_backends/*.py` fully cover every
+  backend, delete the legacy `models/*-reference-dump.py` /
+  `models/*-dump-ref.py` / `models/*-llm-dump.py` scripts — they're
+  superseded by the plug-in architecture.
 
 ---
 

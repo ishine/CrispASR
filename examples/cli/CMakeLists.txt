@@ -30,6 +30,31 @@ add_executable(${TARGET}
     crispasr_run.cpp
 )
 
+# ---------------------------------------------------------------------------
+# crispasr-diff — ground-truth diff harness (companion to
+# tools/dump_reference.py). Separate binary so downstream users who don't
+# care about differential testing don't pay the extra link time.
+# ---------------------------------------------------------------------------
+add_executable(crispasr-diff
+    crispasr_diff_main.cpp
+    crispasr_diff.cpp
+)
+target_link_libraries(crispasr-diff PRIVATE
+    common
+    whisper
+    parakeet
+    canary
+    cohere
+    granite_speech
+    voxtral
+    voxtral4b
+    qwen3_asr
+    crispasr-core
+    ${FFMPEG_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
+install(TARGETS crispasr-diff RUNTIME)
+
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
 
 include(DefaultTargetOptions)
