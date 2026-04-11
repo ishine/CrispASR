@@ -58,18 +58,18 @@ Run `crispasr --list-backends` to see it live. Each backend declares capabilitie
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | Native timestamps | ✔ | ✔ | ✔ | ✔ | | | | |
 | CTC forced timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ |
-| Word-level timing | ✔ | ✔ | ✔ | | via `-am` | via `-am` | via `-am` | via `-am` |
+| Word-level timing | ✔ | ✔ | ✔ | ✔ | via `-am` | via `-am` | via `-am` | via `-am` |
 | Per-token confidence | ✔ | | | ✔ | | | | |
 | Language auto-detect | ✔ | ✔ | | | | | | ✔ |
 | Speech translation | ✔ | | ✔ | | | | | |
 | Speaker diarization | ✔ | | | ✔ | | | | |
 | Grammar constraints (GBNF) | ✔ | | | | | | | |
-| Temperature sampling | ✔ | | | | | | | |
+| Temperature sampling | ✔ | | | | ✔ | ✔ | ✔ | ✔ |
 | Beam search | ✔ | | | | | | | |
-| Flash attention | ✔ | ✔ | ✔ | ✔ | always on | always on | always on | always on |
-| Punctuation toggle | | | ✔ | ✔ | | | | |
+| Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Punctuation toggle | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
 | Source / target language | | | ✔ | | | | | |
-| Auto-download | | | | | ✔ | ✔ | ✔ | ✔ |
+| Auto-download | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
 
 ### Which backend should I pick?
 
