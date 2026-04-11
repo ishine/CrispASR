@@ -153,38 +153,13 @@ void crispasr_print_backend_matrix() {
 std::string crispasr_detect_backend_from_gguf(const std::string & model_path) {
     if (model_path.empty()) return "";
 
-    struct gguf_init_params gip = { /*.no_alloc=*/true, /*.ctx=*/nullptr };
-    gguf_context * gctx = gguf_init_from_file(model_path.c_str(), gip);
-
-    if (gctx) {
-        const int key = gguf_find_key(gctx, "general.architecture");
-        if (key >= 0) {
-            const char * arch = gguf_get_val_str(gctx, key);
-            if (arch) {
-                const std::string a = arch;
-                gguf_free(gctx);
-
-                if (a == "whisper")        return "whisper";
-                if (a == "parakeet")       return "parakeet";
-                if (a == "parakeet-tdt")   return "parakeet";
-                if (a == "canary")         return "canary";
-                if (a == "canary-ctc")     return "canary";
-                if (a == "cohere")         return "cohere";
-                if (a == "cohere-transcribe") return "cohere";
-                if (a == "qwen3-asr")      return "qwen3";
-                if (a == "qwen3_asr")      return "qwen3";
-                if (a == "voxtral")        return "voxtral";
-                if (a == "voxtral4b")      return "voxtral4b";
-                if (a == "voxtral-4b")     return "voxtral4b";
-                if (a == "granite-speech") return "granite";
-                if (a == "granite_speech") return "granite";
-                // Unknown arch; fall through to filename heuristics.
-            }
-        }
-        gguf_free(gctx);
-    }
-
-    // Filename heuristics as a fallback. Case-insensitive substring match.
+    // ---- Pass 1: filename heuristics ----
+    //
+    // Try filename matching first. This avoids two problems:
+    //   1. Whisper's legacy ggml-*.bin files are not GGUF; calling
+    //      gguf_init_from_file() on them prints a confusing stderr warning.
+    //   2. It's a fast path that covers nearly every real-world case
+    //      (users consistently name their models after the architecture).
     auto contains_ci = [&](const char * needle) {
         std::string lo;
         lo.reserve(model_path.size());
@@ -201,5 +176,36 @@ std::string crispasr_detect_backend_from_gguf(const std::string & model_path) {
     if (contains_ci("granite") && contains_ci("speech")) return "granite";
     if (contains_ci("ggml-") && contains_ci(".bin"))     return "whisper";
 
-    return "";
+    // ---- Pass 2: GGUF metadata ----
+    //
+    // Only reached when the filename didn't clearly identify a backend.
+    // Reads just the "general.architecture" key; no weight tensors.
+    struct gguf_init_params gip = { /*.no_alloc=*/true, /*.ctx=*/nullptr };
+    gguf_context * gctx = gguf_init_from_file(model_path.c_str(), gip);
+    if (!gctx) return "";
+
+    std::string result;
+    const int key = gguf_find_key(gctx, "general.architecture");
+    if (key >= 0) {
+        const char * arch = gguf_get_val_str(gctx, key);
+        if (arch) {
+            const std::string a = arch;
+            if      (a == "whisper")           result = "whisper";
+            else if (a == "parakeet")          result = "parakeet";
+            else if (a == "parakeet-tdt")      result = "parakeet";
+            else if (a == "canary")            result = "canary";
+            else if (a == "canary-ctc")        result = "canary";
+            else if (a == "cohere")            result = "cohere";
+            else if (a == "cohere-transcribe") result = "cohere";
+            else if (a == "qwen3-asr")         result = "qwen3";
+            else if (a == "qwen3_asr")         result = "qwen3";
+            else if (a == "voxtral")           result = "voxtral";
+            else if (a == "voxtral4b")         result = "voxtral4b";
+            else if (a == "voxtral-4b")        result = "voxtral4b";
+            else if (a == "granite-speech")    result = "granite";
+            else if (a == "granite_speech")    result = "granite";
+        }
+    }
+    gguf_free(gctx);
+    return result;
 }
