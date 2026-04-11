@@ -1,0 +1,131 @@
+// whisper_params.h — command-line parameter struct shared between the
+// original whisper CLI code in cli.cpp and the new crispasr backend
+// dispatch layer (crispasr_backend.*, crispasr_run.cpp).
+//
+// This struct was historically defined inline in cli.cpp. Extracting it to a
+// header lets the new backend modules read parameters directly without
+// duplicating fields or introducing a parallel params type. The unified CLI
+// continues to feel like whisper-cli because it literally is — the same
+// struct, the same arg parser, just with a few extra fields at the bottom.
+
+#pragma once
+
+#include "whisper.h" // for whisper_full_default_params used in defaults
+
+#include <cfloat>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "grammar-parser.h"
+
+struct whisper_params {
+    int32_t n_threads     = std::min(4, (int32_t) std::thread::hardware_concurrency());
+    int32_t n_processors  = 1;
+    int32_t offset_t_ms   = 0;
+    int32_t offset_n      = 0;
+    int32_t duration_ms   = 0;
+    int32_t progress_step = 5;
+    int32_t max_context   = -1;
+    int32_t max_len       = 0;
+    int32_t best_of       = whisper_full_default_params(WHISPER_SAMPLING_GREEDY).greedy.best_of;
+    int32_t beam_size     = whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH).beam_search.beam_size;
+    int32_t audio_ctx     = 0;
+
+    float word_thold      =  0.01f;
+    float entropy_thold   =  2.40f;
+    float logprob_thold   = -1.00f;
+    float no_speech_thold =  0.6f;
+    float grammar_penalty = 100.0f;
+    float temperature     = 0.0f;
+    float temperature_inc = 0.2f;
+
+    bool debug_mode      = false;
+    bool translate       = false;
+    bool detect_language = false;
+    bool diarize         = false;
+    bool tinydiarize     = false;
+    bool split_on_word   = false;
+    bool no_fallback     = false;
+    bool output_txt      = false;
+    bool output_vtt      = false;
+    bool output_srt      = false;
+    bool output_wts      = false;
+    bool output_csv      = false;
+    bool output_jsn      = false;
+    bool output_jsn_full = false;
+    bool output_lrc      = false;
+    bool no_prints       = false;
+    bool print_special   = false;
+    bool print_colors    = false;
+    bool print_confidence= false;
+    bool print_progress  = false;
+    bool no_timestamps   = false;
+    bool log_score       = false;
+    bool use_gpu         = true;
+    bool flash_attn      = true;
+    int32_t gpu_device   = 0;
+    bool suppress_nst    = false;
+    bool carry_initial_prompt = false;
+
+    std::string language  = "en";
+    std::string prompt;
+    std::string font_path = "/System/Library/Fonts/Supplemental/Courier New Bold.ttf";
+    std::string model     = "models/ggml-base.en.bin";
+    std::string grammar;
+    std::string grammar_rule;
+
+    // [TDRZ] speaker turn string
+    std::string tdrz_speaker_turn = " [SPEAKER_TURN]";
+
+    // A regular expression that matches tokens to suppress
+    std::string suppress_regex;
+
+    std::string openvino_encode_device = "CPU";
+
+    std::string dtw = "";
+
+    std::vector<std::string> fname_inp = {};
+    std::vector<std::string> fname_out = {};
+
+    grammar_parser::parse_state grammar_parsed;
+
+    // Voice Activity Detection (VAD) parameters
+    bool        vad           = false;
+    std::string vad_model     = "";
+    float       vad_threshold = 0.5f;
+    int         vad_min_speech_duration_ms = 250;
+    int         vad_min_silence_duration_ms = 100;
+    float       vad_max_speech_duration_s = FLT_MAX;
+    int         vad_speech_pad_ms = 30;
+    float       vad_samples_overlap = 0.1f;
+
+    // -----------------------------------------------------------------
+    // crispasr extensions: fields used only by non-whisper backends.
+    // The whisper code path ignores these; the backend dispatch layer
+    // in crispasr_run.cpp reads them when params.backend != "whisper".
+    // -----------------------------------------------------------------
+
+    // Backend selector: "", "whisper", "parakeet", "canary", "cohere",
+    // "qwen3", "voxtral", "voxtral4b", "granite". Empty or "whisper" =>
+    // use the historical whisper code path unchanged.
+    std::string backend;
+
+    // Canary needs separate source and target languages (ASR vs AST).
+    // When empty, they fall back to `language`.
+    std::string source_lang;
+    std::string target_lang;
+
+    // Punctuation toggle (canary, cohere). Default on.
+    bool        punctuation      = true;
+
+    // Path to a CTC aligner model (canary_ctc.gguf) used by LLM-based
+    // backends to produce word-level timestamps via a second pass.
+    std::string aligner_model;
+
+    // Maximum new tokens to generate for LLM-based backends.
+    int32_t     max_new_tokens   = 512;
+
+    // Fallback chunk size for long audio when VAD is not enabled.
+    int32_t     chunk_seconds    = 30;
+};

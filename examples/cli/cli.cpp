@@ -3,6 +3,8 @@
 
 #include "whisper.h"
 #include "grammar-parser.h"
+#include "whisper_params.h"      // struct whisper_params (shared with crispasr_*)
+#include "crispasr_backend.h"    // crispasr_run_backend() dispatch entry point
 
 #include <cmath>
 #include <algorithm>
@@ -31,6 +33,7 @@ static void replace_all(std::string & s, const std::string & search, const std::
     }
 }
 
+#if 0 // Moved to whisper_params.h for sharing with crispasr backend dispatch.
 // command-line parameters
 struct whisper_params {
     int32_t n_threads     = std::min(4, (int32_t) std::thread::hardware_concurrency());
@@ -113,6 +116,7 @@ struct whisper_params {
     int         vad_speech_pad_ms = 30;
     float       vad_samples_overlap = 0.1f;
 };
+#endif // moved to whisper_params.h
 
 static void whisper_print_usage(int argc, char ** argv, const whisper_params & params);
 
@@ -208,6 +212,18 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (                  arg == "--grammar")              { params.grammar         = ARGV_NEXT; }
         else if (                  arg == "--grammar-rule")         { params.grammar_rule    = ARGV_NEXT; }
         else if (                  arg == "--grammar-penalty")      { params.grammar_penalty = std::stof(ARGV_NEXT); }
+        // crispasr backend dispatch
+        else if (                  arg == "--backend")              { params.backend         = ARGV_NEXT; }
+        else if (arg == "-sl"   || arg == "--source-lang")          { params.source_lang     = whisper_param_turn_lowercase(ARGV_NEXT); }
+        else if (arg == "-tl"   || arg == "--target-lang")          { params.target_lang     = whisper_param_turn_lowercase(ARGV_NEXT); }
+        else if (                  arg == "--no-punctuation")       { params.punctuation     = false; }
+        else if (arg == "-am"   || arg == "--aligner-model")        { params.aligner_model   = ARGV_NEXT; }
+        else if (arg == "-n"    || arg == "--max-new-tokens")       { params.max_new_tokens  = std::stoi(ARGV_NEXT); }
+        else if (arg == "-ck"   || arg == "--chunk-seconds")        { params.chunk_seconds   = std::stoi(ARGV_NEXT); }
+        else if (                  arg == "--list-backends")        {
+            for (const auto & b : crispasr_list_backends()) printf("%s\n", b.c_str());
+            exit(0);
+        }
         // Voice Activity Detection (VAD)
         else if (                  arg == "--vad")                         { params.vad                         = true; }
         else if (arg == "-vm"   || arg == "--vad-model")                   { params.vad_model                   = ARGV_NEXT; }
@@ -290,6 +306,17 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  --grammar GRAMMAR                 [%-7s] GBNF grammar to guide decoding\n",                 params.grammar.c_str());
     fprintf(stderr, "  --grammar-rule RULE               [%-7s] top-level GBNF grammar rule name\n",               params.grammar_rule.c_str());
     fprintf(stderr, "  --grammar-penalty N               [%-7.1f] scales down logits of nongrammar tokens\n",      params.grammar_penalty);
+    // crispasr backend dispatch
+    fprintf(stderr, "\ncrispasr backend options (select a non-whisper model):\n");
+    fprintf(stderr, "  --backend NAME                    [%-7s] backend: whisper|parakeet|canary|cohere|qwen3|voxtral|voxtral4b|granite\n", params.backend.c_str());
+    fprintf(stderr, "  --list-backends                   list backends compiled into this binary and exit\n");
+    fprintf(stderr, "  -sl LANG,  --source-lang LANG     [%-7s] source language (canary AST)\n",                   params.source_lang.c_str());
+    fprintf(stderr, "  -tl LANG,  --target-lang LANG     [%-7s] target language (canary AST)\n",                   params.target_lang.c_str());
+    fprintf(stderr, "             --no-punctuation       [%-7s] disable punctuation (canary, cohere)\n",           params.punctuation ? "false" : "true");
+    fprintf(stderr, "  -am FNAME, --aligner-model FNAME  [%-7s] CTC aligner GGUF (LLM backends word timestamps)\n",params.aligner_model.c_str());
+    fprintf(stderr, "  -n N,      --max-new-tokens N     [%-7d] max new tokens for LLM backends\n",                params.max_new_tokens);
+    fprintf(stderr, "  -ck N,     --chunk-seconds N      [%-7d] fallback chunk size when VAD is disabled\n",       params.chunk_seconds);
+    fprintf(stderr, "             -m auto                        download a default model for the chosen backend\n");
     // Voice Activity Detection (VAD) parameters
     fprintf(stderr, "\nVoice Activity Detection (VAD) options:\n");
     fprintf(stderr, "             --vad                           [%-7s] enable Voice Activity Detection (VAD)\n",            params.vad ? "true" : "false");
@@ -989,6 +1016,36 @@ int main(int argc, char ** argv) {
         whisper_print_usage(argc, argv, params);
         return 2;
     }
+
+    // crispasr backend dispatch ---------------------------------------------
+    // When --backend is set to a non-whisper backend, when the model path is
+    // "auto", or when GGUF metadata identifies a non-whisper architecture,
+    // hand off to the unified dispatch layer. The whisper code path below
+    // stays byte-identical to the historical CLI.
+    {
+        const bool explicit_non_whisper =
+            !params.backend.empty() && params.backend != "whisper";
+        const bool model_is_auto =
+            params.model == "auto" || params.model == "default";
+
+        bool auto_detected_non_whisper = false;
+        if (!explicit_non_whisper && !model_is_auto && params.backend.empty()) {
+            const std::string detected = crispasr_detect_backend_from_gguf(params.model);
+            if (!detected.empty() && detected != "whisper") {
+                if (!params.no_prints) {
+                    fprintf(stderr, "crispasr: auto-detected backend '%s' from '%s'\n",
+                            detected.c_str(), params.model.c_str());
+                }
+                params.backend = detected;
+                auto_detected_non_whisper = true;
+            }
+        }
+
+        if (explicit_non_whisper || model_is_auto || auto_detected_non_whisper) {
+            return crispasr_run_backend(params);
+        }
+    }
+    // -----------------------------------------------------------------------
 
     if (params.language != "auto" && whisper_lang_id(params.language.c_str()) == -1) {
         fprintf(stderr, "error: unknown language '%s'\n", params.language.c_str());
