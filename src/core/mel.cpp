@@ -25,10 +25,7 @@ std::vector<float> compute(
     const int nmels = p.n_mels;
 
     // -----------------------------------------------------------------
-    // 1. Optional center-pad of the input by n_fft/2 on each side (this
-    //    matches torchaudio / NeMo center=True). Zero-pad is used rather
-    //    than reflect; the numerical difference is negligible for real
-    //    audio and several existing models already use zero-pad.
+    // 1. Optional center-pad of the input by n_fft/2 on each side.
     // -----------------------------------------------------------------
     std::vector<float> padded_in;
     const float * in_ptr;
@@ -45,8 +42,10 @@ std::vector<float> compute(
     }
 
     // -----------------------------------------------------------------
-    // 2. Center-pad the window to n_fft (if win_length < n_fft). This
-    //    mirrors what the legacy mel functions did inline.
+    // 2. Build the STFT window, center-padded to n_fft if win_length is
+    //    shorter. NeMo cluster stores a win_length-sized window; the
+    //    HF cluster stores it already padded to n_fft. Both work: the
+    //    center-pad is a no-op when win_length == n_fft.
     // -----------------------------------------------------------------
     std::vector<float> window(n_fft, 0.0f);
     {
@@ -56,18 +55,12 @@ std::vector<float> compute(
     }
 
     // -----------------------------------------------------------------
-    // 3. STFT → power spectrum
+    // 3. STFT → power spectrum (stored [T, n_freqs] row-major).
     // -----------------------------------------------------------------
-    const int T = in_len >= n_fft ? (in_len - n_fft) / hop + 1 : 0;
-    T_out = T;
-    if (T <= 0) return {};
+    int T = in_len >= n_fft ? (in_len - n_fft) / hop + 1 : 0;
+    if (p.drop_last_frame && T > 0) T -= 1;
+    if (T <= 0) { T_out = 0; return {}; }
 
-    // Power is stored (n_freqs, T) row-major to make the mel matmul
-    // column-contiguous. (The legacy code stored (T, n_freqs); both work
-    // but this lets us share the matmul path with the MelsTime layout.)
-    // We'll keep the legacy (T, n_freqs) layout to preserve bit-exact
-    // numerical behaviour for the NeMo cluster, then choose the output
-    // layout at the end.
     std::vector<float> power((size_t)T * n_freqs, 0.0f);
     {
         std::vector<float> fft_in((size_t)n_fft);
@@ -86,50 +79,92 @@ std::vector<float> compute(
 
     // -----------------------------------------------------------------
     // 4. Mel projection: mel[t, m] = sum_k power[t, k] * fb[m, k]
-    //    Legacy layout is (T, n_mels); we'll transpose at the end if the
-    //    caller wants (n_mels, T).
+    //    (or fb[k, m] if fb_layout == FreqsMels).
+    //    Two accumulator precisions.
     // -----------------------------------------------------------------
     std::vector<float> mel_tn((size_t)T * nmels, 0.0f);
-    for (int t = 0; t < T; t++) {
-        const float * pp = power.data() + (size_t)t * n_freqs;
-        float * mp = mel_tn.data() + (size_t)t * nmels;
-        for (int m = 0; m < nmels; m++) {
-            const float * fb = mel_fb + (size_t)m * n_freqs;
-            float s = 0.0f;
-            for (int k = 0; k < n_freqs; k++) s += pp[k] * fb[k];
-            mp[m] = s;
+
+    auto do_matmul = [&](auto acc_zero) {
+        using Acc = decltype(acc_zero);
+        for (int t = 0; t < T; t++) {
+            const float * pp = power.data() + (size_t)t * n_freqs;
+            float * mp = mel_tn.data() + (size_t)t * nmels;
+            for (int m = 0; m < nmels; m++) {
+                Acc s = 0;
+                if (p.fb_layout == FbLayout::MelsFreqs) {
+                    const float * fb = mel_fb + (size_t)m * n_freqs;
+                    for (int k = 0; k < n_freqs; k++) {
+                        s += static_cast<Acc>(pp[k]) * static_cast<Acc>(fb[k]);
+                    }
+                } else {
+                    // FreqsMels: fb[k * nmels + m]
+                    for (int k = 0; k < n_freqs; k++) {
+                        s += static_cast<Acc>(pp[k]) *
+                             static_cast<Acc>(mel_fb[(size_t)k * nmels + m]);
+                    }
+                }
+                mp[m] = (float)s;
+            }
         }
+    };
+    if (p.matmul == MatmulPrecision::Double) do_matmul(double{0});
+    else                                     do_matmul(float{0.0f});
+
+    // -----------------------------------------------------------------
+    // 5. log with guard
+    // -----------------------------------------------------------------
+    auto apply_log = [&](float v) -> float {
+        if (p.log_guard == LogGuard::MaxClip) {
+            if (v < p.log_eps) v = p.log_eps;
+            return (p.log_base == LogBase::Log10) ? std::log10(v) : std::log(v);
+        } else { // AddEpsilon
+            const float vv = v + p.log_eps;
+            return (p.log_base == LogBase::Log10) ? std::log10(vv) : std::log(vv);
+        }
+    };
+    for (size_t i = 0; i < mel_tn.size(); i++) {
+        mel_tn[i] = apply_log(mel_tn[i]);
     }
 
     // -----------------------------------------------------------------
-    // 5. log
+    // 6. Optional right-pad in LOG space with log_guard(0).
+    //    Padding here (before normalization) lets the padded frames
+    //    participate correctly in the GlobalClipMax mean/max step.
+    //    Voxtral relies on this.
     // -----------------------------------------------------------------
-    if (p.log_base == LogBase::Ln) {
-        for (size_t i = 0; i < mel_tn.size(); i++) {
-            mel_tn[i] = std::log(mel_tn[i] + p.log_eps);
+    const int T_final = (p.pad_to_T > 0 && p.pad_to_T > T) ? p.pad_to_T : T;
+
+    if (T_final > T) {
+        const float pad_val = apply_log(0.0f);
+        std::vector<float> ext((size_t)T_final * nmels, 0.0f);
+        // Copy existing [T, n_mels] into leading [T, n_mels] slot.
+        std::memcpy(ext.data(), mel_tn.data(),
+                    (size_t)T * nmels * sizeof(float));
+        // Fill trailing frames with pad_val.
+        for (int t = T; t < T_final; t++) {
+            for (int m = 0; m < nmels; m++) ext[(size_t)t * nmels + m] = pad_val;
         }
-    } else { // Log10
-        for (size_t i = 0; i < mel_tn.size(); i++) {
-            mel_tn[i] = std::log10(mel_tn[i] + p.log_eps);
-        }
+        mel_tn = std::move(ext);
     }
+    T_out = T_final;
 
     // -----------------------------------------------------------------
-    // 6. Normalization
+    // 7. Normalization
     // -----------------------------------------------------------------
     switch (p.norm) {
         case Normalization::PerFeatureZ: {
-            // Per-mel band z-score across time. NeMo cluster.
+            // Per-mel band z-score across time.
             for (int m = 0; m < nmels; m++) {
                 double sum = 0.0, sq = 0.0;
-                for (int t = 0; t < T; t++) sum += mel_tn[(size_t)t * nmels + m];
-                const double mean = sum / T;
-                for (int t = 0; t < T; t++) {
+                for (int t = 0; t < T_final; t++)
+                    sum += mel_tn[(size_t)t * nmels + m];
+                const double mean = sum / T_final;
+                for (int t = 0; t < T_final; t++) {
                     const double d = mel_tn[(size_t)t * nmels + m] - mean;
                     sq += d * d;
                 }
-                const float inv_std = 1.0f / std::sqrt((float)(sq / T) + 1e-5f);
-                for (int t = 0; t < T; t++) {
+                const float inv_std = 1.0f / std::sqrt((float)(sq / T_final) + 1e-5f);
+                for (int t = 0; t < T_final; t++) {
                     mel_tn[(size_t)t * nmels + m] =
                         (float)(mel_tn[(size_t)t * nmels + m] - mean) * inv_std;
                 }
@@ -137,11 +172,9 @@ std::vector<float> compute(
             break;
         }
         case Normalization::GlobalClipMax: {
-            // HF / Whisper style: (max(x, max(x)-8) + 4) / 4
             float mx = -1e30f;
-            for (size_t i = 0; i < mel_tn.size(); i++) {
+            for (size_t i = 0; i < mel_tn.size(); i++)
                 if (mel_tn[i] > mx) mx = mel_tn[i];
-            }
             const float floor_v = mx - 8.0f;
             for (size_t i = 0; i < mel_tn.size(); i++) {
                 float v = mel_tn[i];
@@ -151,7 +184,6 @@ std::vector<float> compute(
             break;
         }
         case Normalization::GlobalClipFixed: {
-            // Voxtral4b: use a fixed max instead of computing it.
             const float floor_v = p.fixed_max - 8.0f;
             for (size_t i = 0; i < mel_tn.size(); i++) {
                 float v = mel_tn[i];
@@ -163,24 +195,15 @@ std::vector<float> compute(
     }
 
     // -----------------------------------------------------------------
-    // 7. Output layout + optional right-pad to p.pad_to_T frames.
+    // 8. Output layout
     // -----------------------------------------------------------------
-    const int T_final = (p.pad_to_T > 0 && p.pad_to_T > T) ? p.pad_to_T : T;
-    T_out = T_final;
-
     if (p.layout == Layout::TimeMels) {
-        // Legacy NeMo layout: (T, n_mels), row-major.
-        if (T_final > T) {
-            std::vector<float> out((size_t)T_final * nmels, 0.0f);
-            std::memcpy(out.data(), mel_tn.data(), (size_t)T * nmels * sizeof(float));
-            return out;
-        }
         return mel_tn;
     }
 
-    // Layout::MelsTime — transpose to (n_mels, T_final), optionally padded.
+    // Transpose to (n_mels, T_final) row-major.
     std::vector<float> out((size_t)nmels * T_final, 0.0f);
-    for (int t = 0; t < T; t++) {
+    for (int t = 0; t < T_final; t++) {
         for (int m = 0; m < nmels; m++) {
             out[(size_t)m * T_final + t] = mel_tn[(size_t)t * nmels + m];
         }

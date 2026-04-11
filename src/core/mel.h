@@ -62,17 +62,50 @@ enum class Layout {
     MelsTime,
 };
 
+enum class LogGuard {
+    // log(x + log_eps): NeMo convention (parakeet, canary, canary_ctc, cohere).
+    AddEpsilon,
+
+    // log(max(x, log_eps)): HF / Whisper convention.
+    MaxClip,
+};
+
+enum class MatmulPrecision {
+    // Float32 accumulator. Fastest, matches NeMo numerical path.
+    Float,
+
+    // Float64 accumulator, promoted before multiply-add. Matches the
+    // HF / Whisper / Qwen3 / Voxtral numerical path which explicitly
+    // uses double for the mel projection.
+    Double,
+};
+
+// Filterbank storage layout in memory. Both are row-major floats.
+enum class FbLayout {
+    // [n_mels, n_freqs]: fb[m * n_freqs + k]. NeMo cluster.
+    MelsFreqs,
+
+    // [n_freqs, n_mels]: fb[k * n_mels + m]. HF / Whisper cluster
+    // (WhisperFeatureExtractor.mel_filters).
+    FreqsMels,
+};
+
 struct Params {
     int n_fft       = 400;  // power-of-two FFT size
     int hop_length  = 160;  // frame stride in samples
     int win_length  = 400;  // window length, must be <= n_fft
     int n_mels      = 128;
 
-    LogBase       log_base  = LogBase::Log10;
-    Normalization norm      = Normalization::GlobalClipMax;
-    Layout        layout    = Layout::MelsTime;
+    LogBase         log_base   = LogBase::Log10;
+    LogGuard        log_guard  = LogGuard::AddEpsilon;
+    Normalization   norm       = Normalization::GlobalClipMax;
+    Layout          layout     = Layout::MelsTime;
+    FbLayout        fb_layout  = FbLayout::MelsFreqs;
+    MatmulPrecision matmul     = MatmulPrecision::Float;
 
-    // Small positive constant added before log() to avoid log(0).
+    // Small positive constant used in the log guard:
+    //   AddEpsilon -> log(x + log_eps)
+    //   MaxClip    -> log(max(x, log_eps))
     // NeMo uses 2^-24; Whisper uses 1e-10. Pass what the model originally used.
     float log_eps = 1e-10f;
 
@@ -85,8 +118,19 @@ struct Params {
     // already padded the input.
     bool center_pad = true;
 
-    // Pad the output to exactly this many frames (zero-padding on the right).
-    // Set to 0 for "don't pad". Voxtral 3B uses 3000 (= 30s at hop=160).
+    // Drop the last STFT frame. Matches Whisper / HF feature extractor
+    // convention that produces floor((n - n_fft) / hop + 1) - 1 frames
+    // instead of the full count.
+    bool drop_last_frame = false;
+
+    // Pad the mel output on the right so the final length is exactly this
+    // many frames. 0 disables. Voxtral 3B pads to 3000 (= 30s at hop=160).
+    //
+    // Padding happens AFTER the log step but BEFORE normalization, so the
+    // padded positions are filled with the log of log_eps (i.e. the value
+    // the log guard would produce for a zero-energy frame) rather than
+    // plain zero. This matches voxtral's behaviour where padded frames
+    // participate in the global-max calculation at a sensible floor.
     int pad_to_T = 0;
 };
 
