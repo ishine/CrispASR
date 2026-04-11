@@ -113,6 +113,11 @@ void crispasr_print_backend_matrix() {
     }
     printf("\nUse --backend NAME to force a specific backend. When omitted, the\n");
     printf("backend is auto-detected from GGUF metadata or the filename.\n");
+    printf("\n");
+    printf("Language detection: backends that don't advertise lang-detect\n");
+    printf("natively (cohere, canary, granite, voxtral, voxtral4b) can still\n");
+    printf("accept `-l auto` via the LID pre-step. Pick the provider with\n");
+    printf("--lid-backend whisper|silero (whisper-tiny is the default).\n");
 }
 
 // ---------------------------------------------------------------------------
