@@ -406,6 +406,7 @@ static void voxtral_fft(float * in, int N, float * out) {
 
 #include "core/mel.h"
 #include "core/ffn.h"
+#include "core/attention.h"
 
 // core_mel::FftR2C expects a const-input function and passes a buffer of
 // exactly N floats. voxtral_fft() uses `in` as scratch during recursion
@@ -695,49 +696,21 @@ static ggml_cgraph * voxtral_build_graph_llm(voxtral_context * ctx, int n_tokens
         ggml_tensor * x = ggml_rms_norm(ctx0, cur, eps);
         x = ggml_mul(ctx0, x, b.attn_norm_w);
 
-        // ---- Q, K, V projections (no biases) ----
-        ggml_tensor * Q = ggml_mul_mat(ctx0, b.attn_q_w, x);
-        ggml_tensor * K = ggml_mul_mat(ctx0, b.attn_k_w, x);
-        ggml_tensor * V = ggml_mul_mat(ctx0, b.attn_v_w, x);
-        Q = ggml_reshape_3d(ctx0, Q, hd, n_q,  T);
-        K = ggml_reshape_3d(ctx0, K, hd, n_kv, T);
-        V = ggml_reshape_3d(ctx0, V, hd, n_kv, T);
-
-        // (No Q-norm/K-norm — that's the Qwen3-specific bit we drop)
-
-        // ---- RoPE (NEOX style: rotate first/second half along head_dim) ----
-        Q = ggml_rope_ext(ctx0, Q, positions, /*freq_factors*/nullptr,
-                          hd, GGML_ROPE_TYPE_NEOX, /*n_ctx_orig*/(int)hp.llm_max_pos,
-                          theta, /*freq_scale*/1.0f, /*ext_factor*/0.0f,
-                          /*attn_factor*/1.0f, /*beta_fast*/32.0f, /*beta_slow*/1.0f);
-        K = ggml_rope_ext(ctx0, K, positions, nullptr,
-                          hd, GGML_ROPE_TYPE_NEOX, (int)hp.llm_max_pos,
-                          theta, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f);
-
-        // ---- GQA: repeat each KV head n_kv_grp=4 times to match n_q=32 ----
-        if (n_kv_grp > 1) {
-            ggml_tensor * K4 = ggml_reshape_4d(ctx0, K, hd, 1, n_kv, T);
-            ggml_tensor * V4 = ggml_reshape_4d(ctx0, V, hd, 1, n_kv, T);
-            K4 = ggml_repeat_4d(ctx0, K4, hd, n_kv_grp, n_kv, T);
-            V4 = ggml_repeat_4d(ctx0, V4, hd, n_kv_grp, n_kv, T);
-            K = ggml_cont(ctx0, ggml_reshape_3d(ctx0, K4, hd, n_q, T));
-            V = ggml_cont(ctx0, ggml_reshape_3d(ctx0, V4, hd, n_q, T));
-        }
-
-        // ---- Permute Q/K/V to (head_dim, T, n_heads) for flash-attn ----
-        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
-        K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
-        V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
-
-        // ---- Attention via ggml_flash_attn_ext (F16 mask) ----
-        // Output ne = (hd, n_q, T, 1) → reshape (hd*n_q, T) = (4096, T)
-        ggml_tensor * attn = ggml_flash_attn_ext(ctx0, Q, K, V, causal_mask,
-                                                  attn_scale, /*max_bias*/0.0f,
-                                                  /*logit_softcap*/0.0f);
-        attn = ggml_reshape_2d(ctx0, attn, hd * n_q, T);
-
-        // ---- O projection (no bias) — projects (4096, T) → (3072, T) ----
-        attn = ggml_mul_mat(ctx0, b.attn_output_w, attn);
+        // ---- Q/K/V projections + reshape + NEOX RoPE + GQA expand +
+        //      permute + flash-attn + output projection — all the
+        //      Llama / Mistral boilerplate lives in core_attn now. ----
+        core_attn::LlamaSelfAttnParams ap;
+        ap.n_heads    = n_q;
+        ap.n_kv_heads = n_kv;
+        ap.head_dim   = hd;
+        ap.n_kv_grp   = n_kv_grp;
+        ap.n_ctx_orig = (int)hp.llm_max_pos;
+        ap.rope_theta = theta;
+        ap.attn_scale = attn_scale;
+        ggml_tensor * attn = core_attn::llama_self_attn(
+            ctx0, x,
+            b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
+            positions, causal_mask, ap);
         cur = ggml_add(ctx0, residual, attn);
 
         // ---- FFN: down(silu(gate(x)) * up(x)) ----
