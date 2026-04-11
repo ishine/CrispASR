@@ -59,7 +59,7 @@ Run `crispasr --list-backends` to see it live. Each backend declares capabilitie
 | Native timestamps | ✔ | ✔ | ✔ | ✔ | | | | |
 | CTC forced timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ |
 | Word-level timing | ✔ | ✔ | ✔ | ✔ | via `-am` | via `-am` | via `-am` | via `-am` |
-| Per-token confidence | ✔ | | | ✔ | | | | |
+| Per-token confidence | ✔ | ✔ | ✔ | ✔ | | | | |
 | Language auto-detect | ✔ | ✔ | | | | | | ✔ |
 | Speech translation | ✔ | | ✔ | | | | | |
 | Speaker diarization | ✔ | | | ✔ | | | | |
