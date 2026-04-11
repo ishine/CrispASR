@@ -87,6 +87,14 @@ int canary_ctc_frame_dur_cs(struct canary_ctc_context * ctx);
 int canary_ctc_n_mels      (struct canary_ctc_context * ctx);
 int canary_ctc_sample_rate (struct canary_ctc_context * ctx);
 
+// Debug: compute the log-mel spectrogram the encoder would see, without
+// running the encoder graph. Returns a malloc'd row-major F32 buffer of
+// shape (n_mels, T_mel) — caller frees. Used for diffing our mel
+// pipeline against a PyTorch / NeMo reference.
+float * canary_ctc_compute_mel_debug(struct canary_ctc_context * ctx,
+                                     const float * samples, int n_samples,
+                                     int * out_n_mels, int * out_T_mel);
+
 #ifdef __cplusplus
 }
 #endif

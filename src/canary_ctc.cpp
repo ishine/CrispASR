@@ -506,6 +506,72 @@ extern "C" int canary_ctc_frame_dur_cs(struct canary_ctc_context * ctx) { return
 extern "C" int canary_ctc_n_mels(struct canary_ctc_context * ctx)       { return (int)ctx->model.hparams.n_mels; }
 extern "C" int canary_ctc_sample_rate(struct canary_ctc_context * ctx)  { return (int)ctx->model.hparams.sample_rate; }
 
+extern "C" float * canary_ctc_compute_mel_debug(
+    struct canary_ctc_context * ctx,
+    const float * samples, int n_samples,
+    int * out_n_mels, int * out_T_mel)
+{
+    int T_mel = 0;
+    auto mel = cc_compute_mel(ctx, samples, n_samples, T_mel);
+    if (mel.empty()) return nullptr;
+    const int n_mels = (int)ctx->model.hparams.n_mels;
+    float * out = (float *)std::malloc(mel.size() * sizeof(float));
+    if (!out) return nullptr;
+    std::memcpy(out, mel.data(), mel.size() * sizeof(float));
+    if (out_n_mels) *out_n_mels = n_mels;
+    if (out_T_mel)  *out_T_mel  = T_mel;
+    return out;
+}
+
+// Debug: feed a pre-computed mel spectrogram straight into the encoder
+// graph, bypassing cc_compute_mel. Used for diffing our mel pipeline
+// against a NeMo reference without changing the encoder graph.
+// `mel` is (n_mels, T_mel) row-major = TimeMels layout.
+extern "C" int canary_ctc_compute_logits_from_mel_debug(
+    struct canary_ctc_context * ctx,
+    const float * mel, int T_mel,
+    float ** out_logits, int * out_T_enc, int * out_vocab_total)
+{
+    if (!ctx->sched) {
+        int n_backends = 1;
+        ggml_backend_t backends[2] = { ctx->backend, nullptr };
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend) {
+            backends[1] = ctx->backend_cpu;
+            n_backends = 2;
+        }
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_backends, 16384, false, false);
+    }
+    if (ctx->compute_meta.empty()) {
+        ctx->compute_meta.resize(
+            ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false));
+    }
+    ggml_cgraph * gf = cc_build_graph(ctx, T_mel);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return -2;
+
+    ggml_tensor * mel_in = ggml_graph_get_tensor(gf, "mel");
+    ggml_backend_tensor_set(mel_in, mel, 0,
+                            (size_t)ctx->model.hparams.n_mels * T_mel * sizeof(float));
+
+    ggml_tensor * pos_in = ggml_graph_get_tensor(gf, "pos_enc");
+    int T_enc = (int)pos_in->ne[1];
+    T_enc = (T_enc + 1) / 2;
+    auto pe = core_conformer::make_pos_enc((int)ctx->model.hparams.d_model, T_enc);
+    ggml_backend_tensor_set(pos_in, pe.data(), 0, pe.size() * sizeof(float));
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) return -3;
+
+    ggml_tensor * out = ggml_graph_get_tensor(gf, "ctc_logits");
+    if (!out) return -4;
+    const int V  = (int)out->ne[0];
+    const int Te = (int)out->ne[1];
+    *out_T_enc       = Te;
+    *out_vocab_total = V;
+    *out_logits      = (float *)malloc((size_t)V * Te * sizeof(float));
+    ggml_backend_tensor_get(out, *out_logits, 0, (size_t)V * Te * sizeof(float));
+    return 0;
+}
+
 extern "C" int canary_ctc_compute_logits(struct canary_ctc_context * ctx,
                                          const float * samples, int n_samples,
                                          float ** out_logits,
