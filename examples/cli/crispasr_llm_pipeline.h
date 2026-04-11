@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -154,18 +155,28 @@ std::vector<crispasr_segment> crispasr_run_voxtral_style_pipeline(
         return out;
     }
 
-    int next = 0;
-    {
-        float mx = -1e30f;
-        for (int k = 0; k < vocab; k++) if (logits[k] > mx) { mx = logits[k]; next = k; }
-    }
-    free(logits);
-
-    // ---- Greedy decode loop (shared src/core/greedy_decode.h) ----
+    // ---- First-token selection ----
+    // Pure greedy (temperature <= 0) is the historical bit-identical path.
+    // When --temperature > 0 we draw the first token too, so the whole
+    // decode run is seeded from params.temperature consistently.
     core_greedy_decode::Config dec_cfg;
     dec_cfg.max_new_tokens = params.max_new_tokens > 0 ? params.max_new_tokens : 512;
     dec_cfg.eos_id         = Ops::eos_id;
     dec_cfg.vocab_size     = vocab;
+    dec_cfg.temperature    = params.temperature;
+
+    int next = 0;
+    if (dec_cfg.temperature > 0.0f) {
+        std::mt19937_64 seed_rng(dec_cfg.seed != 0 ? dec_cfg.seed
+                                  : (uint64_t)std::random_device{}());
+        next = core_greedy_decode::sample_temp(
+            logits, vocab, dec_cfg.temperature, seed_rng);
+    } else {
+        next = core_greedy_decode::argmax(logits, vocab);
+    }
+    free(logits);
+
+    // ---- Greedy / temperature-sampled decode loop ----
     auto gen = core_greedy_decode::run(
         ctx,
         /*first_token=*/next,

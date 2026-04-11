@@ -57,16 +57,26 @@
 
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <random>
 #include <vector>
 
 namespace core_greedy_decode {
 
 struct Config {
-    int max_new_tokens = 512;  // hard cap on generated tokens
-    int eos_id         = 2;    // stop as soon as this token is produced
-    int vocab_size     = 0;    // required — use the value from prefill
+    int   max_new_tokens = 512;    // hard cap on generated tokens
+    int   eos_id         = 2;      // stop as soon as this token is produced
+    int   vocab_size     = 0;      // required — use the value from prefill
+
+    // Sampling knobs. temperature <= 0 gives pure argmax (the historical
+    // greedy path). temperature > 0 draws from softmax(logits / temperature);
+    // callers should pass whisper_params.temperature through. seed controls
+    // the RNG; pass 0 for "non-deterministic" (time-based) or any non-zero
+    // value for reproducibility.
+    float temperature    = 0.0f;
+    uint64_t seed        = 0;
 };
 
 // Greedy argmax over a vocab-sized float logit vector.
@@ -77,6 +87,37 @@ static inline int argmax(const float * logits, int vocab) {
         if (logits[k] > mx) { mx = logits[k]; best = k; }
     }
     return best;
+}
+
+// Temperature sampling over a vocab-sized float logit vector. Computes the
+// numerically stable softmax of logits/temperature and draws one token via
+// std::discrete_distribution. Caller owns the rng state.
+static inline int sample_temp(const float * logits, int vocab,
+                              float temperature, std::mt19937_64 & rng) {
+    const float inv_t = 1.0f / temperature;
+    float mx = logits[0] * inv_t;
+    for (int k = 1; k < vocab; k++) {
+        const float s = logits[k] * inv_t;
+        if (s > mx) mx = s;
+    }
+    std::vector<double> probs((size_t)vocab);
+    double sum = 0.0;
+    for (int k = 0; k < vocab; k++) {
+        const double e = std::exp((double)(logits[k] * inv_t - mx));
+        probs[(size_t)k] = e;
+        sum += e;
+    }
+    if (sum <= 0.0) return argmax(logits, vocab);
+    // Inverse-CDF sampling — faster than discrete_distribution when vocab
+    // is large because we avoid an extra normalize step inside the STL impl.
+    std::uniform_real_distribution<double> unif(0.0, sum);
+    const double r = unif(rng);
+    double acc = 0.0;
+    for (int k = 0; k < vocab; k++) {
+        acc += probs[(size_t)k];
+        if (r <= acc) return k;
+    }
+    return vocab - 1;
 }
 
 // Default "no-op" pre-forward hook. The compiler inlines and prunes
@@ -122,6 +163,13 @@ std::vector<int32_t> run(
     // Early-exit when the prefill already predicted EOS.
     if (first_token == cfg.eos_id) return gen;
 
+    // RNG state is only touched on the sampling path. Seeding is cheap
+    // compared to a single vocab-sized softmax, so we always seed even
+    // when we won't sample.
+    std::mt19937_64 rng(cfg.seed != 0 ? cfg.seed
+                        : (uint64_t)std::random_device{}());
+    const bool sampling = cfg.temperature > 0.0f;
+
     int n_past = initial_n_past;
     while ((int)gen.size() < cfg.max_new_tokens && gen.back() != cfg.eos_id) {
         const int step = (int)gen.size() - 1;     // 0 = first decoded step
@@ -142,7 +190,9 @@ std::vector<int32_t> run(
         if (!lg) break;
         n_past++;
 
-        const int nx = argmax(lg, cfg.vocab_size);
+        const int nx = sampling
+            ? sample_temp(lg, cfg.vocab_size, cfg.temperature, rng)
+            : argmax(lg, cfg.vocab_size);
         std::free(lg);
         gen.push_back(nx);
     }

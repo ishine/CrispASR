@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <vector>
 
 namespace {
@@ -48,7 +49,7 @@ public:
     const char * name() const override { return "granite"; }
 
     uint32_t capabilities() const override {
-        return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD;
+        return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE;
     }
 
     bool init(const whisper_params & p) override {
@@ -139,21 +140,26 @@ public:
             return out;
         }
 
-        // Greedy argmax over the final token.
-        int next = 0;
-        {
-            float mx = -1e30f;
-            for (int k = 0; k < vocab; k++) {
-                if (logits[k] > mx) { mx = logits[k]; next = k; }
-            }
-        }
-        free(logits);
-
         // ---- Decode loop via src/core/greedy_decode.h ----
+        // Temperature sampling kicks in when --temperature > 0; otherwise
+        // we stay on the historical bit-identical greedy path.
         core_greedy_decode::Config dec_cfg;
         dec_cfg.max_new_tokens = params.max_new_tokens > 0 ? params.max_new_tokens : 200;
         dec_cfg.eos_id         = kEos;
         dec_cfg.vocab_size     = vocab;
+        dec_cfg.temperature    = params.temperature;
+
+        int next = 0;
+        if (dec_cfg.temperature > 0.0f) {
+            std::mt19937_64 seed_rng(dec_cfg.seed != 0 ? dec_cfg.seed
+                                       : (uint64_t)std::random_device{}());
+            next = core_greedy_decode::sample_temp(
+                logits, vocab, dec_cfg.temperature, seed_rng);
+        } else {
+            next = core_greedy_decode::argmax(logits, vocab);
+        }
+        free(logits);
+
         auto gen_ids = core_greedy_decode::run(
             ctx_,
             /*first_token=*/next,

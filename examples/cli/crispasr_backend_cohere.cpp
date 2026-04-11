@@ -28,6 +28,7 @@ public:
 
     uint32_t capabilities() const override {
         return CAP_TIMESTAMPS_NATIVE
+             | CAP_WORD_TIMESTAMPS
              | CAP_TOKEN_CONFIDENCE
              | CAP_DIARIZE
              | CAP_PUNCTUATION_TOGGLE
@@ -85,6 +86,36 @@ public:
         if (!seg.tokens.empty()) {
             seg.t0 = seg.tokens.front().t0;
             seg.t1 = seg.tokens.back().t1;
+        }
+
+        // Synthesize word-level timestamps by grouping adjacent tokens on
+        // leading-space boundaries. Cohere's tokenizer already converts the
+        // SentencePiece '▁' marker into a literal space in token.text, so a
+        // token that starts with ' ' is the first sub-word of a new word.
+        {
+            crispasr_word w;
+            bool have = false;
+            for (const auto & t : seg.tokens) {
+                const bool starts_word = !t.text.empty() && t.text[0] == ' ';
+                if (starts_word && have) {
+                    seg.words.push_back(std::move(w));
+                    w = {};
+                    have = false;
+                }
+                if (!have) {
+                    w.t0 = t.t0;
+                    have = true;
+                }
+                w.text += t.text;
+                w.t1 = t.t1;
+            }
+            if (have) seg.words.push_back(std::move(w));
+            // Trim leading whitespace off each word text (cosmetic — the
+            // space sat there as the word-start marker).
+            for (auto & word : seg.words) {
+                while (!word.text.empty() && word.text.front() == ' ')
+                    word.text.erase(word.text.begin());
+            }
         }
 
         cohere_result_free(r);

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -81,7 +82,8 @@ public:
     const char * name() const override { return "qwen3"; }
 
     uint32_t capabilities() const override {
-        return CAP_TIMESTAMPS_CTC | CAP_LANGUAGE_DETECT | CAP_AUTO_DOWNLOAD;
+        return CAP_TIMESTAMPS_CTC | CAP_LANGUAGE_DETECT | CAP_AUTO_DOWNLOAD
+             | CAP_TEMPERATURE;
     }
 
     bool init(const whisper_params & p) override {
@@ -190,18 +192,7 @@ public:
             return out;
         }
 
-        // Last-token logits argmax.
-        const int last_off = (n_t - 1) * vocab;
-        int next = 0;
-        {
-            float mx = -1e30f;
-            for (int k = 0; k < vocab; k++) {
-                if (logits[last_off + k] > mx) { mx = logits[last_off + k]; next = k; }
-            }
-        }
-        free(logits);
-
-        // ---- Greedy decode via src/core/greedy_decode.h ----
+        // ---- First token selection (argmax or temperature sample) ----
         // Qwen3 EOS tokens: <|im_end|> (id unknown — look up via tokenize).
         int eos_id = -1;
         int n_eos = 0;
@@ -213,6 +204,20 @@ public:
         dec_cfg.max_new_tokens = params.max_new_tokens > 0 ? params.max_new_tokens : 256;
         dec_cfg.eos_id         = eos_id;
         dec_cfg.vocab_size     = vocab;
+        dec_cfg.temperature    = params.temperature;
+
+        const int last_off = (n_t - 1) * vocab;
+        int next = 0;
+        if (dec_cfg.temperature > 0.0f) {
+            std::mt19937_64 seed_rng(dec_cfg.seed != 0 ? dec_cfg.seed
+                                       : (uint64_t)std::random_device{}());
+            next = core_greedy_decode::sample_temp(
+                logits + last_off, vocab, dec_cfg.temperature, seed_rng);
+        } else {
+            next = core_greedy_decode::argmax(logits + last_off, vocab);
+        }
+        free(logits);
+
         auto gen = core_greedy_decode::run(
             ctx_,
             /*first_token=*/next,

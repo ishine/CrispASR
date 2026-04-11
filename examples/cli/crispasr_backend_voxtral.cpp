@@ -76,7 +76,7 @@ public:
     const char * name() const override { return "voxtral"; }
 
     uint32_t capabilities() const override {
-        return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD;
+        return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE;
     }
 
     bool init(const whisper_params & p) override {
