@@ -198,7 +198,7 @@ add_library(canary_ctc
             )
 target_include_directories(canary_ctc PUBLIC . ../include)
 target_compile_features   (canary_ctc PUBLIC cxx_std_17)
-target_link_libraries     (canary_ctc PUBLIC ggml ggml-base Threads::Threads)
+target_link_libraries     (canary_ctc PUBLIC ggml ggml-base Threads::Threads crispasr-core)
 if(NOT MSVC)
     target_compile_options(canary_ctc PRIVATE -O3 -march=native)
 endif()
