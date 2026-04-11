@@ -42,7 +42,7 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 | **whisper** | [`ggml-base.en.bin`](https://huggingface.co/ggerganov/whisper.cpp/) and all OpenAI Whisper variants | Encoder-decoder transformer | 99 | MIT |
 | **parakeet** | [`nvidia/parakeet-tdt-0.6b-v3`](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) | FastConformer + TDT | 25 EU (auto-detect) | CC-BY-4.0 |
 | **canary** | [`nvidia/canary-1b-v2`](https://huggingface.co/nvidia/canary-1b-v2) | FastConformer + Transformer decoder | 25 EU (explicit `-sl/-tl`) | CC-BY-4.0 |
-| **cohere** | [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | Conformer + Transformer | 13 | CC-BY-NC-4.0 |
+| **cohere** | [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | Conformer + Transformer | 13 | Apache-2.0 |
 | **granite** | [`ibm-granite/granite-4.0-1b-speech`](https://huggingface.co/ibm-granite/granite-4.0-1b-speech) | Conformer + BLIP-2 Q-Former + Granite LLM (μP) | en fr de es pt ja | Apache-2.0 |
 | **voxtral** | [`mistralai/Voxtral-Mini-3B-2507`](https://huggingface.co/mistralai/Voxtral-Mini-3B-2507) | Whisper encoder + Mistral 3B LLM, audio-token injection | 8 | Apache-2.0 |
 | **voxtral4b** | [`mistralai/Voxtral-Mini-4B-Realtime-2602`](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) | Causal RoPE+SwiGLU encoder + 3.4B LLM with adaptive RMSNorm + sliding window | 13, realtime streaming | Apache-2.0 |
@@ -572,11 +572,13 @@ on what to port from the legacy `models/*-dump-*.py` scripts.
 
 - **Phase 1** — Unified CLI with backend dispatch, VAD, common output writers, CTC alignment, auto-download. 7 non-whisper backends wired (parakeet, canary, cohere, granite, voxtral, voxtral4b, qwen3). Whisper code path unchanged and byte-identical to upstream.
 - **Phase 0** — `src/core/` shared library (`crispasr-core`):
-  - `core/mel` ✅ 7 of 8 non-whisper models migrated
+  - `core/mel` ✅ **all 8** non-whisper models migrated (including granite's stacked-2-frame variant)
   - `core/ffn` ✅ 4 of 4 SwiGLU consumers migrated
   - `core/gguf_loader` ✅ all 8 non-whisper models migrated
   - `core/attention` ✅ 1 of ~6 LLM attention blocks migrated (voxtral)
-- **Bit-identical regression** on `samples/jfk.wav` is the gate for every commit. ~877 lines of duplicated boilerplate removed from `src/`.
+  - `core/greedy_decode` ✅ **all 4** LLM backends migrated (voxtral, voxtral4b, qwen3, granite)
+- **Ground-truth diff infrastructure** — `tools/dump_reference.py` with plug-in per-backend Python modules + `crispasr_diff::Ref` C++ loader + `crispasr-diff` CLI. Runs the C++ forward pass against PyTorch-dumped reference activations and reports cosine-similarity / max-abs / RMS / top-1-argmax at every named stage. Plug-in modules: qwen3, voxtral, voxtral4b, granite (all 4 LLM backends).
+- **Bit-identical regression** on `samples/jfk.wav` is the gate for every commit, and the ground-truth gate is the gate for every new backend. ~1,000 lines of duplicated boilerplate removed from `src/`.
 
 ### Near-term (next sessions)
 
