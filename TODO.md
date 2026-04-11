@@ -246,6 +246,18 @@ contributor-facing path for adding backends with confidence. Status:
 - **[later]** Mirror the same for `tools/reference_backends/voxtral.py`
   so `voxtral-test-llm` stops reporting `[SKIP]`. Needs the Voxtral
   apply_chat_template → processor → embed → splice → forward path.
+- **[rejected]** Vosk as a third `--lid-backend` provider. Vosk's
+  C++ API exists and would fit the "no Python" constraint, but it's
+  an ASR toolkit, not a language detector — standalone LID means
+  running the full Kaldi decoder with each candidate language model
+  and comparing likelihoods, which is slow and memory-heavy. It also
+  drags in Kaldi + OpenFST + BLAS as build dependencies, ~50-100 MB
+  of binary and a non-ggml runtime path that would be the first of
+  its kind in this repo. If someone still wants it, the dispatcher
+  in crispasr_lid.cpp::crispasr_detect_language() has an easy
+  extension point — just another `if (be == "vosk")` branch. For
+  now we stick with whisper-tiny (shipping) and the future native
+  Silero GGUF port.
 - **[later]** Native GGUF port of Silero's language detector. Wire the
   `--lid-backend silero` flag up to a real implementation so the LID
   pre-step has a second provider besides whisper-tiny. Needs:
