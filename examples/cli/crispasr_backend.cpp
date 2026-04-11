@@ -14,6 +14,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_granite_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_voxtral4b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_fastconformer_ctc_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -29,14 +30,15 @@ std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend();
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string & name) {
-    if (name == "whisper")   return crispasr_make_whisper_backend();
-    if (name == "parakeet")  return crispasr_make_parakeet_backend();
-    if (name == "canary")    return crispasr_make_canary_backend();
-    if (name == "cohere")    return crispasr_make_cohere_backend();
-    if (name == "granite")   return crispasr_make_granite_backend();
-    if (name == "voxtral")   return crispasr_make_voxtral_backend();
-    if (name == "voxtral4b") return crispasr_make_voxtral4b_backend();
-    if (name == "qwen3")     return crispasr_make_qwen3_backend();
+    if (name == "whisper")           return crispasr_make_whisper_backend();
+    if (name == "parakeet")          return crispasr_make_parakeet_backend();
+    if (name == "canary")            return crispasr_make_canary_backend();
+    if (name == "cohere")            return crispasr_make_cohere_backend();
+    if (name == "granite")           return crispasr_make_granite_backend();
+    if (name == "voxtral")           return crispasr_make_voxtral_backend();
+    if (name == "voxtral4b")         return crispasr_make_voxtral4b_backend();
+    if (name == "qwen3")             return crispasr_make_qwen3_backend();
+    if (name == "fastconformer-ctc") return crispasr_make_fastconformer_ctc_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -52,6 +54,7 @@ std::vector<std::string> crispasr_list_backends() {
         "voxtral",
         "voxtral4b",
         "qwen3",
+        "fastconformer-ctc",
     };
 }
 
@@ -151,6 +154,10 @@ std::string crispasr_detect_backend_from_gguf(const std::string & model_path) {
     if (contains_ci("voxtral") && contains_ci("4b"))    return "voxtral4b";
     if (contains_ci("voxtral"))                          return "voxtral";
     if (contains_ci("parakeet"))                         return "parakeet";
+    // Check "fastconformer-ctc" / "stt_en_fc_ctc" style filenames before
+    // the broader "canary" match so users who drop a NeMo standalone
+    // model next to a canary aligner pick the right backend.
+    if (contains_ci("fastconformer") && contains_ci("ctc")) return "fastconformer-ctc";
     if (contains_ci("canary"))                           return "canary";
     if (contains_ci("cohere"))                           return "cohere";
     if (contains_ci("qwen3") && contains_ci("asr"))      return "qwen3";

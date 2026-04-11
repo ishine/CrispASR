@@ -55,6 +55,16 @@ struct canary_ctc_hparams {
     uint32_t vocab_size           = 16384;   // 16384 SentencePiece pieces
     uint32_t blank_id             = 16384;   // last index = blank
     uint32_t frame_dur_cs         = 8;
+    // NeMo ConformerEncoder "xscaling": when true, the encoder input is
+    // multiplied by sqrt(d_model) AFTER the conv subsampling / pre_encode
+    // projection and BEFORE the first Conformer block. This scales the
+    // residual stream (the Macaron FFN's residual connection carries the
+    // scaled value forward) and is a trained part of several NeMo
+    // releases — e.g. the stt_en_fastconformer_ctc_large standalones
+    // have xscaling=true, while canary-1b-v2 / its aligner have
+    // xscaling=false. Default false preserves canary_ctc's existing
+    // bit-identical path; the stt converter sets this to 1 in the GGUF.
+    uint32_t xscaling             = 0;
 };
 
 // ===========================================================================
@@ -233,12 +243,25 @@ static ggml_cgraph * cc_build_graph(canary_ctc_context * ctx, int T_mel) {
     ggml_tensor * cur = core_conformer::build_pre_encode(
         ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T);
 
+    // ----- Optional xscaling (NeMo standalone FastConformer-CTC) -----
+    // When xscaling is set in the GGUF, multiply the pre-encoder output
+    // by sqrt(d_model) before feeding it to the first Conformer block.
+    // This matches the NeMo `self.xscaling` path that ships with
+    // stt_*_fastconformer_ctc_* releases. canary_ctc aligner has this
+    // flag cleared, so the op is elided and the bit-identical legacy
+    // path is preserved.
+    if (hp.xscaling) {
+        const float xscale = std::sqrt((float)hp.d_model);
+        cur = ggml_scale(ctx0, cur, xscale);
+    }
+
     // ----- Sinusoidal rel-pos table -----
     ggml_tensor * pos_enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int)hp.d_model, 2 * T - 1);
     ggml_set_name(pos_enc, "pos_enc");
     ggml_set_input(pos_enc);
 
-    // ----- 24× FastConformer block (no biases, matches parakeet) -----
+    // ----- N × FastConformer block (biases optional — nullptr bias
+    // fields skip the ggml_add inside core_conformer::build_block) -----
     core_conformer::BlockParams bp = {
         (int)hp.d_model, (int)hp.n_heads, (int)hp.head_dim,
         (int)hp.conv_kernel, kLayerNormEps,
@@ -325,6 +348,7 @@ static bool cc_load_model(cc_model & model, canary_ctc_vocab & vocab,
         hp.vocab_size           = core_gguf::kv_u32(gctx, "canary_ctc.vocab_size",           hp.vocab_size);
         hp.blank_id             = core_gguf::kv_u32(gctx, "canary_ctc.blank_id",             hp.blank_id);
         hp.frame_dur_cs         = core_gguf::kv_u32(gctx, "canary_ctc.frame_dur_cs",         hp.frame_dur_cs);
+        hp.xscaling             = core_gguf::kv_u32(gctx, "canary_ctc.xscaling",             hp.xscaling);
 
         auto tokens = core_gguf::kv_str_array(gctx, "tokenizer.ggml.tokens");
         if (!tokens.empty()) {
@@ -370,29 +394,43 @@ static bool cc_load_model(cc_model & model, canary_ctc_vocab & vocab,
             snprintf(buf, sizeof(buf), "encoder.layers.%u.%s", i, suf);
             return cc_require(model, buf);
         };
+        auto get_opt = [&](const char * suf) {
+            snprintf(buf, sizeof(buf), "encoder.layers.%u.%s", i, suf);
+            return cc_try_get(model, buf);
+        };
 
         e.norm_ff1_w  = get("norm_ff1.weight"); e.norm_ff1_b = get("norm_ff1.bias");
         e.ff1_l1_w    = get("ff1.linear1.weight");
+        e.ff1_l1_b    = get_opt("ff1.linear1.bias");  // optional — present for canary/stt, absent for canary_ctc aligner
         e.ff1_l2_w    = get("ff1.linear2.weight");
+        e.ff1_l2_b    = get_opt("ff1.linear2.bias");
         e.norm_attn_w = get("norm_attn.weight"); e.norm_attn_b = get("norm_attn.bias");
         e.attn_q_w    = get("attn.q.weight");
+        e.attn_q_b    = get_opt("attn.q.bias");
         e.attn_k_w    = get("attn.k.weight");
+        e.attn_k_b    = get_opt("attn.k.bias");
         e.attn_v_w    = get("attn.v.weight");
+        e.attn_v_b    = get_opt("attn.v.bias");
         e.attn_out_w  = get("attn.out.weight");
+        e.attn_out_b  = get_opt("attn.out.bias");
         e.attn_pos_w  = get("attn.pos.weight");
         e.pos_bias_u  = get("attn.pos_bias_u");
         e.pos_bias_v  = get("attn.pos_bias_v");
         e.norm_conv_w = get("norm_conv.weight"); e.norm_conv_b = get("norm_conv.bias");
         e.conv_pw1_w  = get("conv.pw1.weight");
+        e.conv_pw1_b  = get_opt("conv.pw1.bias");
         e.conv_dw_w   = get("conv.dw.weight");
         e.conv_dw_b   = get("conv.dw.bias");
         e.conv_pw2_w  = get("conv.pw2.weight");
+        e.conv_pw2_b  = get_opt("conv.pw2.bias");
         e.conv_bn_w   = get("conv.bn.weight"); e.conv_bn_b = get("conv.bn.bias");
         e.conv_bn_rm  = get("conv.bn.running_mean");
         e.conv_bn_rv  = get("conv.bn.running_var");
         e.norm_ff2_w  = get("norm_ff2.weight"); e.norm_ff2_b = get("norm_ff2.bias");
         e.ff2_l1_w    = get("ff2.linear1.weight");
+        e.ff2_l1_b    = get_opt("ff2.linear1.bias");
         e.ff2_l2_w    = get("ff2.linear2.weight");
+        e.ff2_l2_b    = get_opt("ff2.linear2.bias");
         e.norm_out_w  = get("norm_out.weight"); e.norm_out_b = get("norm_out.bias");
     }
 

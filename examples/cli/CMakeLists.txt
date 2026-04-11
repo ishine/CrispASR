@@ -24,6 +24,7 @@ add_executable(${TARGET}
     crispasr_backend_voxtral.cpp
     crispasr_backend_voxtral4b.cpp
     crispasr_backend_qwen3.cpp
+    crispasr_backend_fastconformer_ctc.cpp
     crispasr_aligner.cpp
     crispasr_vad.cpp
     crispasr_lid.cpp
