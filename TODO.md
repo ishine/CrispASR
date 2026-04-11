@@ -46,13 +46,14 @@ minimal pilot. The remaining pieces are documented below.
   residual add. Parameterise via `Config::attn_scale` and
   `Config::residual_scale` in the helper.
 
-- **[next]** **`src/core/greedy_decode.h` — unified LLM decode loop.**
-  The voxtral/voxtral4b/qwen3/granite backends all duplicate the same
-  `greedy decode from last-token logits → embed → forward → argmax → append`
-  loop with minor variations in EOS handling and max-tokens. Should
-  replace the CLI-level `examples/cli/crispasr_llm_pipeline.h` template
-  so the decode loop lives next to the model code. ~80 LOC helper + 4
-  migrations, ~150 LOC saved across the models.
+- **[done]** ~~`src/core/greedy_decode.h` — unified LLM decode loop.~~
+  **Done.** Header-only `core_greedy_decode::run()` with an optional
+  `PreHook` callback (used by voxtral4b's streaming audio-frame-addition
+  path). All 4 LLM backends migrated bit-identically: voxtral (via the
+  crispasr_llm_pipeline.h template), voxtral4b (with the pre-hook for
+  streaming), qwen3 (with dynamic EOS lookup via tokenize), granite
+  (with EOS-filter post-step). Net: ~100 lines of duplicated decode
+  loops replaced with a single templated helper.
 
 - **[done]** ~~`src/core/mel::Params::stacked_frames`.~~ **Done
   differently.** Granite is now on `core_mel::compute` without a new
@@ -213,18 +214,25 @@ contributor-facing path for adding backends with confidence. Status:
 - **[done]** Worked-example Python backend modules:
   `tools/reference_backends/qwen3.py` and `voxtral.py` are fully
   ported from the legacy `models/*-dump-*.py` scripts.
-- **[next]** Port `models/voxtral4b-dump-ref.py` into
-  `tools/reference_backends/voxtral4b.py` (stub ready with inline notes).
-- **[next]** Port `models/granite-speech-kaggle-groundtruth.py` into
-  `tools/reference_backends/granite.py` (stub ready).
+- **[done]** ~~Port `models/voxtral4b-dump-ref.py` into
+  `tools/reference_backends/voxtral4b.py`~~ — done; captures mel,
+  encoder_output (post-projector), t_cond, llm_argmax, generated_text.
+- **[done]** ~~Port `models/granite-speech-kaggle-groundtruth.py` into
+  `tools/reference_backends/granite.py`~~ — done; captures mel,
+  per-layer encoder checkpoints, projector_out (Q-Former), llm_argmax,
+  text. Strips the Kaggle-specific HF_TOKEN / gist-upload plumbing.
 - **[later]** Expose `audio_encoder`-only and `run_llm_kv`-only
   standalone entry points in `parakeet` / `canary` / `cohere` C headers
   so `crispasr-diff` can do stage-by-stage comparison for them too
   (currently the encoder/decoder is entangled with the full transcribe).
-- **[later]** Once `tools/reference_backends/*.py` fully cover every
-  backend, delete the legacy `models/*-reference-dump.py` /
-  `models/*-dump-ref.py` / `models/*-llm-dump.py` scripts — they're
-  superseded by the plug-in architecture.
+- **[later]** Migrate `examples/{qwen3,voxtral}-test-*/main.cpp`
+  drivers to load their reference data from a crispasr-diff GGUF
+  archive via `crispasr_diff::Ref` instead of the inline NPY parser.
+  Once that lands, the legacy `models/*-dump-*.py` scripts can be
+  removed entirely — they're currently kept alongside the new
+  tools/reference_backends/ modules with a LEGACY header pointing at
+  the modular path, because the test drivers still consume the .npy
+  filenames only the legacy scripts produce.
 
 ---
 
