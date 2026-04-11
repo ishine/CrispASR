@@ -2,11 +2,17 @@
 //
 // See crispasr_lid.h for the interface contract.
 //
-// Runtime is 100% C++ — no Python, no shell-outs to torch, no ONNX
-// runtime dependency. The whisper-tiny path uses the whisper.cpp C API
-// directly. The silero path is a placeholder until a native GGUF port
-// of Silero's language detector lands (tracked in TODO.md): the flag is
-// accepted but currently errors out with an actionable message.
+// Two backends:
+//   * whisper — uses the whisper.cpp C API directly on a ggml-tiny.bin
+//               multilingual model. No extra deps. 99-language auto-detect.
+//               This is the default.
+//   * silero  — shells out to sherpa-onnx-offline-language-identification
+//               pointed at a user-supplied LID ONNX model. Same
+//               subprocess pattern as --diarize-method sherpa (see
+//               crispasr_diarize.cpp): avoids linking onnxruntime into
+//               crispasr while still letting users opt into Silero's
+//               95-lang classifier or sherpa's Whisper-based LID when
+//               the 75 MB whisper-tiny weights are too heavy.
 //
 // === whisper-tiny details ===
 //
@@ -27,7 +33,16 @@
 #include "whisper.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <memory>
+#include <sstream>
+#include <string>
+#include <unistd.h>
+#include <vector>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -186,42 +201,160 @@ bool detect_with_whisper_tiny(
 }
 
 // -----------------------------------------------------------------------
-// Backend 2: Silero LID — reserved slot for a future native GGUF port
+// Backend 2: Silero LID — via sherpa-onnx-offline-language-identification
 // -----------------------------------------------------------------------
 //
-// Silero publishes a ~5 MB language-classifier model (silero_lang_detector
-// / silero_lang_detector_95) as a TorchScript + ONNX bundle. To run it
-// inside crispasr without any Python or ONNX-runtime dependency we'd
-// need to:
+// Shell out to an externally-installed
+// `sherpa-onnx-offline-language-identification` binary (k2-fsa/sherpa-onnx)
+// that hosts either the Silero 95-language classifier or one of the
+// Whisper-based multilingual LID models. Same tradeoff as the sherpa
+// diarize wrapper in crispasr_diarize.cpp: we avoid linking onnxruntime
+// (a ~90 MB shared lib) into the crispasr binary while still letting
+// users opt into a much smaller, faster LID model than whisper-tiny.
 //
-//   1. Write a one-time converter (models/convert-silero-lid-to-gguf.py)
-//      that loads the TorchScript or ONNX export, extracts the weights
-//      and the language-id lookup table, and writes them as a GGUF
-//      tensor archive using the same gguf Python package we already use
-//      for the other converters.
+// CLI knobs in whisper_params:
+//   --lid-backend silero
+//   --lid-model   PATH     (path to the sherpa LID model, mandatory here)
 //
-//   2. Add a loader + inference wrapper that mirrors whisper_vad's
-//      ggml-based forward pass for Silero VAD — the VAD converter is
-//      already in tree (models/convert-silero-vad-to-ggml.py) and shows
-//      the pattern: load weights via core_gguf::load_weights, run a
-//      small ggml graph per chunk, softmax + argmax on the language
-//      logits.
-//
-// Until that lands, the flag is accepted but the handler returns false
-// with an actionable error so users don't wait on a stuck run. Track
-// progress in TODO.md under the "native Silero LID port" item.
+// The binary prints a single line like:
+//     "Detected language: English"
+// or an ISO code depending on the version. We parse a generous set of
+// formats and map common English-name → ISO-639-1 codes below.
 bool detect_with_silero(
-    const float * /*samples*/, int /*n_samples*/,
-    const whisper_params & /*p*/,
-    crispasr_lid_result & /*out*/)
+    const float * samples, int n_samples,
+    const whisper_params & p,
+    crispasr_lid_result & out)
 {
-    fprintf(stderr,
-            "crispasr[lid]: --lid-backend silero is not implemented yet.\n"
-            "               A native GGUF port of Silero's language detector\n"
-            "               is on the TODO. For now use --lid-backend whisper\n"
-            "               (the default) which ships a 75 MB ggml-tiny.bin\n"
-            "               multilingual model with 99-language auto-detect.\n");
-    return false;
+    if (p.lid_model.empty()) {
+        fprintf(stderr,
+            "crispasr[lid]: --lid-backend silero needs --lid-model PATH\n"
+            "               pointing at a sherpa-onnx LID model (download from\n"
+            "               https://github.com/k2-fsa/sherpa-onnx — e.g. the\n"
+            "               Whisper-tiny LID or silero-lang-95 ONNX bundles).\n");
+        return false;
+    }
+
+    // Default binary name; user can override via $CRISPASR_SHERPA_LID_BIN
+    // for installs that don't put sherpa on $PATH.
+    const char * env_bin = std::getenv("CRISPASR_SHERPA_LID_BIN");
+    const std::string bin = env_bin && *env_bin
+        ? std::string(env_bin)
+        : std::string("sherpa-onnx-offline-language-identification");
+
+    // Write a temp 16 kHz mono int16 WAV — sherpa reads a file path.
+    char tmpl[] = "/tmp/crispasr-lid-XXXXXX.wav";
+    int fd = mkstemps(tmpl, 4);
+    if (fd < 0) {
+        fprintf(stderr, "crispasr[lid]: mkstemps failed\n");
+        return false;
+    }
+    close(fd);
+    std::string wav_path = tmpl;
+    {
+        FILE * f = fopen(wav_path.c_str(), "wb");
+        if (!f) { std::remove(wav_path.c_str()); return false; }
+        const uint32_t sr = 16000;
+        const uint16_t ch = 1;
+        const uint16_t bps = 16;
+        const uint32_t byte_rate = sr * ch * bps / 8;
+        const uint16_t block_align = ch * bps / 8;
+        const uint32_t data_bytes = (uint32_t)n_samples * block_align;
+        const uint32_t riff_size = 36 + data_bytes;
+        auto w32 = [&](uint32_t v) { fwrite(&v, 4, 1, f); };
+        auto w16 = [&](uint16_t v) { fwrite(&v, 2, 1, f); };
+        fwrite("RIFF", 1, 4, f); w32(riff_size); fwrite("WAVE", 1, 4, f);
+        fwrite("fmt ", 1, 4, f); w32(16); w16(1); w16(ch);
+        w32(sr); w32(byte_rate); w16(block_align); w16(bps);
+        fwrite("data", 1, 4, f); w32(data_bytes);
+        std::vector<int16_t> pcm(n_samples);
+        for (int i = 0; i < n_samples; i++) {
+            float v = samples[i];
+            if (v >  1.0f) v =  1.0f;
+            if (v < -1.0f) v = -1.0f;
+            pcm[i] = (int16_t)(v * 32767.0f);
+        }
+        fwrite(pcm.data(), sizeof(int16_t), pcm.size(), f);
+        fclose(f);
+    }
+
+    std::ostringstream cmd;
+    cmd << bin
+        << " --whisper-model='" << p.lid_model << "'"
+        << " '" << wav_path << "' 2>&1";
+    if (!p.no_prints) {
+        fprintf(stderr, "crispasr[lid]: %s\n", cmd.str().c_str());
+    }
+
+    std::unique_ptr<FILE, int(*)(FILE*)> pipe(popen(cmd.str().c_str(), "r"), pclose);
+    if (!pipe) {
+        fprintf(stderr, "crispasr[lid]: failed to spawn sherpa LID subprocess\n");
+        std::remove(wav_path.c_str());
+        return false;
+    }
+    char linebuf[512];
+    std::string detected;
+    while (fgets(linebuf, sizeof(linebuf), pipe.get())) {
+        std::string line = linebuf;
+        // Strip trailing whitespace.
+        while (!line.empty() &&
+               (line.back() == '\n' || line.back() == '\r' || line.back() == ' '))
+            line.pop_back();
+        // Accept either: "Detected language: English"
+        // or a plain ISO/English name on its own line.
+        auto pos = line.find("Detected language:");
+        if (pos != std::string::npos) {
+            detected = line.substr(pos + std::string("Detected language:").size());
+            // Trim leading spaces
+            size_t s = 0;
+            while (s < detected.size() && detected[s] == ' ') s++;
+            detected = detected.substr(s);
+            break;
+        }
+    }
+    std::remove(wav_path.c_str());
+
+    if (detected.empty()) {
+        fprintf(stderr,
+            "crispasr[lid]: sherpa subprocess produced no 'Detected language:' line\n"
+            "               (check that sherpa-onnx-offline-language-identification\n"
+            "               is installed and the --lid-model path is correct)\n");
+        return false;
+    }
+
+    // Map common English names → ISO 639-1. Sherpa sometimes prints the
+    // 2-letter code directly (e.g. "en"), in which case we pass through.
+    auto to_iso = [](const std::string & s) -> std::string {
+        static const std::pair<const char *, const char *> map[] = {
+            {"english", "en"}, {"german", "de"}, {"french", "fr"},
+            {"spanish", "es"}, {"italian", "it"}, {"portuguese", "pt"},
+            {"dutch", "nl"},   {"russian", "ru"}, {"polish", "pl"},
+            {"czech", "cs"},   {"turkish", "tr"}, {"arabic", "ar"},
+            {"hindi", "hi"},   {"japanese", "ja"}, {"korean", "ko"},
+            {"chinese", "zh"}, {"mandarin", "zh"},{"cantonese", "zh"},
+            {"ukrainian", "uk"}, {"swedish", "sv"}, {"norwegian", "no"},
+            {"danish", "da"}, {"finnish", "fi"}, {"greek", "el"},
+            {"hebrew", "he"}, {"thai", "th"}, {"vietnamese", "vi"},
+            {"indonesian", "id"}, {"malay", "ms"}, {"romanian", "ro"},
+            {"hungarian", "hu"}, {"bulgarian", "bg"}, {"serbian", "sr"},
+            {"slovak", "sk"}, {"slovenian", "sl"}, {"croatian", "hr"},
+        };
+        std::string lo = s;
+        for (char & c : lo) c = (char)std::tolower((unsigned char)c);
+        for (auto & p : map) if (lo == p.first) return p.second;
+        // If already ISO-ish (2 chars, lowercase), pass through.
+        if (lo.size() == 2) return lo;
+        return lo;
+    };
+
+    out.lang_code  = to_iso(detected);
+    out.confidence = 1.0f;  // sherpa only reports argmax, not a score
+    out.source     = "silero";
+    if (!p.no_prints) {
+        fprintf(stderr,
+                "crispasr[lid]: sherpa → %s (%s)\n",
+                detected.c_str(), out.lang_code.c_str());
+    }
+    return true;
 }
 
 } // namespace
