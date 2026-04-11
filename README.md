@@ -85,6 +85,29 @@ Run `crispasr --list-backends` to see it live. Each backend declares capabilitie
 | Highest-quality offline speech-LLM | **voxtral** |
 | Apache-licensed speech-LLM | **granite**, **voxtral**, **voxtral4b**, **qwen3** |
 
+### Language detection for backends that don't do it natively
+
+Cohere, canary, granite, voxtral and voxtral4b need an explicit
+language code up front. If you don't know the language, pass
+`-l auto` and crispasr runs an optional LID pre-step before the main
+transcribe() call:
+
+```bash
+# Downloads ggml-tiny.bin (75 MB, 99 languages) on first use
+crispasr --backend cohere -m $TC/cohere-transcribe-q5_0.gguf \
+         -f unknown.wav -l auto
+# crispasr[lid]: detected 'en' (p=0.977) via whisper-tiny
+# crispasr: LID -> language = 'en' (whisper, p=0.977)
+```
+
+The default provider (`--lid-backend whisper`) uses a small
+multilingual ggml-*.bin model via the whisper.cpp C API — pure C++,
+zero Python. A future commit will add `--lid-backend silero` on top
+of a native GGUF port of Silero's language classifier. The flag is
+already accepted but currently returns an actionable "not yet
+implemented" error. Pass `--lid-backend off` to skip the pre-step
+entirely.
+
 ---
 
 ## Install & build
