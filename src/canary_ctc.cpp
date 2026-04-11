@@ -311,9 +311,27 @@ static void cc_fold_batchnorm(cc_model & model) {
         for (size_t i = 0; i < w_f16.size(); i++) w_f16[i] = ggml_fp32_to_fp16(w_f32[i]);
         ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
 
+        // Read the original depthwise-conv bias (the pretrained value)
+        // BEFORE overwriting it — NeMo's FastConformer Conformer conv
+        // module learns a bias on the depthwise conv, so the pre-BN
+        // output is `conv(x) + orig_dw_b`. Folding BN into the conv
+        // gives:
+        //   y = scale * (conv(x) + orig_dw_b) + shift
+        //     = scale * conv(x) + (scale * orig_dw_b + shift)
+        //
+        // canary_ctc aligner has synthetic zero orig_dw_b so the term
+        // vanishes, but for stt_en_fastconformer_ctc_large (and any
+        // other NeMo FC-CTC release with biased conv.depthwise_conv)
+        // dropping the orig_dw_b contribution silently zeros a learned
+        // offset and collapses the encoder output across time.
+        std::vector<float> orig_dw_b(d);
+        ggml_backend_tensor_get(e.conv_dw_b, orig_dw_b.data(), 0, d * sizeof(float));
+
         std::vector<float> dw_b(d);
-        for (int c = 0; c < d; c++)
-            dw_b[c] = -bn_mean[c] * s[c] + bn_b[c];
+        for (int c = 0; c < d; c++) {
+            const float shift = -bn_mean[c] * s[c] + bn_b[c];
+            dw_b[c] = s[c] * orig_dw_b[c] + shift;
+        }
         ggml_backend_tensor_set(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
     }
     fprintf(stderr, "canary_ctc: BN folded into conv_dw weights for %u layers\n",
