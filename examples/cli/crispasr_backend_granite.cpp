@@ -49,7 +49,8 @@ public:
     const char * name() const override { return "granite"; }
 
     uint32_t capabilities() const override {
-        return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE;
+        return CAP_TIMESTAMPS_CTC | CAP_AUTO_DOWNLOAD | CAP_TEMPERATURE
+             | CAP_PUNCTUATION_TOGGLE;
     }
 
     bool init(const whisper_params & p) override {

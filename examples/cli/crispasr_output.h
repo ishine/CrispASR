@@ -81,3 +81,11 @@ bool crispasr_write_lrc(const std::string & path,
 // segment separated by spaces.
 void crispasr_print_stdout(const std::vector<crispasr_disp_segment> & segs,
                            bool show_timestamps);
+
+// Remove punctuation from a segment in-place: from seg.text, each
+// seg.words[i].text, and each seg.tokens[i].text. Called by the
+// dispatch layer when --no-punctuation is set and the backend didn't
+// strip punctuation natively. Targets ASCII punctuation plus a small
+// set of common Unicode marks the LLM backends emit (smart quotes, em
+// dash, ellipsis). Idempotent — running it twice is a no-op.
+void crispasr_strip_punctuation(crispasr_segment & seg);

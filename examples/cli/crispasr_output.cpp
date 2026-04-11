@@ -308,6 +308,91 @@ bool crispasr_write_lrc(const std::string & path,
 }
 
 // ---------------------------------------------------------------------------
+// Punctuation stripping
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Strip ASCII punctuation + a handful of common Unicode marks from the
+// input string. Collapses resulting double-spaces and trims the ends.
+// Not trying to be clever: the point is to give users a "give me the
+// words only" view of an LLM transcript, not a grammar-preserving edit.
+std::string strip_punct_str(const std::string & in) {
+    static const char * ASCII_DROP = ",.?!:;\"()[]{}<>/@#$%^&*=|\\~`";
+    std::string out;
+    out.reserve(in.size());
+    size_t i = 0;
+    while (i < in.size()) {
+        const unsigned char c = (unsigned char)in[i];
+        // Fast path: ASCII punctuation characters to drop.
+        if (c < 0x80) {
+            if (strchr(ASCII_DROP, (char)c)) { i++; continue; }
+            // Keep apostrophe-in-word ("don't") but drop leading/trailing.
+            if (c == '\'') {
+                const bool prev_alpha = !out.empty() &&
+                    ((out.back() >= 'a' && out.back() <= 'z') ||
+                     (out.back() >= 'A' && out.back() <= 'Z'));
+                const bool next_alpha = i + 1 < in.size() &&
+                    ((in[i+1] >= 'a' && in[i+1] <= 'z') ||
+                     (in[i+1] >= 'A' && in[i+1] <= 'Z'));
+                if (!(prev_alpha && next_alpha)) { i++; continue; }
+            }
+            out += (char)c; i++;
+            continue;
+        }
+        // Multi-byte UTF-8: decode just enough to recognise a few
+        // Unicode punctuation marks the LLM backends commonly emit.
+        //   U+2018 ' U+2019 ' (smart quotes)        -> drop
+        //   U+201C " U+201D "                       -> drop
+        //   U+2013 – U+2014 — (en/em dashes)         -> drop
+        //   U+2026 … (ellipsis)                     -> drop
+        //   U+00A0 nbsp                              -> space
+        //   U+00BF ¿ U+00A1 ¡                        -> drop
+        // Everything else is passed through untouched.
+        int cp = 0, len = 1;
+        if      ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        else                         { out += (char)c; i++; continue; }
+        if (i + len > in.size()) { out += (char)c; i++; continue; }
+        for (int k = 1; k < len; k++) cp = (cp << 6) | ((unsigned char)in[i+k] & 0x3F);
+
+        auto is_drop_cp = [](int p) {
+            return p == 0x2018 || p == 0x2019 || p == 0x201C || p == 0x201D ||
+                   p == 0x2013 || p == 0x2014 || p == 0x2026 ||
+                   p == 0x00BF || p == 0x00A1;
+        };
+        if (is_drop_cp(cp)) { i += (size_t)len; continue; }
+        if (cp == 0x00A0) { out += ' '; i += (size_t)len; continue; }
+        for (int k = 0; k < len; k++) out += in[i+k];
+        i += (size_t)len;
+    }
+
+    // Collapse runs of spaces and trim.
+    std::string final_out;
+    final_out.reserve(out.size());
+    bool last_space = true;
+    for (char c : out) {
+        if (c == ' ' || c == '\t' || c == '\n') {
+            if (!last_space) { final_out += ' '; last_space = true; }
+        } else {
+            final_out += c;
+            last_space = false;
+        }
+    }
+    while (!final_out.empty() && final_out.back() == ' ') final_out.pop_back();
+    return final_out;
+}
+
+} // namespace
+
+void crispasr_strip_punctuation(crispasr_segment & seg) {
+    seg.text = strip_punct_str(seg.text);
+    for (auto & w : seg.words)  w.text = strip_punct_str(w.text);
+    for (auto & t : seg.tokens) t.text = strip_punct_str(t.text);
+}
+
+// ---------------------------------------------------------------------------
 // Stdout printing
 // ---------------------------------------------------------------------------
 

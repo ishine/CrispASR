@@ -191,6 +191,20 @@ int crispasr_run_backend(const whisper_params & params_in) {
         }
         auto all_segs = merge_segments(std::move(per_slice));
 
+        // Optional post-processing: strip punctuation when --no-punctuation
+        // is set. Cohere and canary pass p.punctuation through to their C
+        // APIs natively and will usually return text that's already clean,
+        // but this second pass is idempotent so the double application is
+        // harmless. For the LLM backends (voxtral/voxtral4b/qwen3/granite)
+        // this is the only way punctuation control happens — the models
+        // don't take a "no punctuation" flag, they just generate whatever
+        // the prompt pushes them towards.
+        if (!params.punctuation) {
+            for (auto & seg : all_segs) {
+                crispasr_strip_punctuation(seg);
+            }
+        }
+
         // Build display segments.
         const auto disp = crispasr_make_disp_segments(all_segs, params.max_len);
 

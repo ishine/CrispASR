@@ -26,7 +26,8 @@ public:
         return CAP_TIMESTAMPS_NATIVE
              | CAP_WORD_TIMESTAMPS
              | CAP_FLASH_ATTN
-             | CAP_LANGUAGE_DETECT;
+             | CAP_LANGUAGE_DETECT
+             | CAP_PUNCTUATION_TOGGLE;
     }
 
     bool init(const whisper_params & p) override {
