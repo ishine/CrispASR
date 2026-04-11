@@ -747,15 +747,17 @@ static void shaw_block_attention_cpu(
     const int d = n_heads * hd;
     const int n_blocks = (T + ctx_size - 1) / ctx_size;
 
-    // Working buffers
-    std::vector<float> scores((size_t)ctx_size * ctx_size);
-    std::vector<float> attn_out((size_t)ctx_size * hd);
-
+    // Head-level parallelism across the (block, head) pairs. Each (blk, h)
+    // writes disjoint output positions and reads only shared read-only
+    // inputs, so there's no synchronization. `scores` is a per-thread
+    // working buffer declared inside the parallel region so each thread
+    // gets its own.
+#pragma omp parallel for collapse(2) schedule(static)
     for (int blk = 0; blk < n_blocks; blk++) {
-        int blk_start = blk * ctx_size;
-        int blk_len = (blk == n_blocks - 1 && remainder > 0) ? remainder : ctx_size;
-
         for (int h = 0; h < n_heads; h++) {
+            const int blk_start = blk * ctx_size;
+            const int blk_len = (blk == n_blocks - 1 && remainder > 0) ? remainder : ctx_size;
+            std::vector<float> scores((size_t)ctx_size * ctx_size);
             // Q_block[c, d] = Q_data[(h * hd + d) + (blk_start + c) * d_full]
             // where d_full = n_heads * hd
             // Layout: Q_data is (d, T) in ggml — element [dim, time] = Q_data[dim + time * d]
@@ -1212,8 +1214,12 @@ static bool run_ffn(granite_speech_context * ctx, float * out,
 }
 
 // CPU LayerNorm: out = (x - mean) / sqrt(var + eps) * w + b
+// Parallel over time frames — each frame's stats and output are independent.
+// Supports in-place operation (out == x) because each iteration reads and
+// writes disjoint rows.
 static void cpu_layernorm(float * out, const float * x, const float * w, const float * b,
                           int d, int T, float eps) {
+#pragma omp parallel for schedule(static)
     for (int t = 0; t < T; t++) {
         const float * xt = x + (size_t)t * d;
         float * ot = out + (size_t)t * d;
