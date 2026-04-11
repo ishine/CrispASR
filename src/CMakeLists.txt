@@ -296,7 +296,7 @@ add_library(voxtral4b
             )
 target_include_directories(voxtral4b PUBLIC . ../include)
 target_compile_features   (voxtral4b PUBLIC cxx_std_17)
-target_link_libraries     (voxtral4b PUBLIC ggml ggml-base Threads::Threads)
+target_link_libraries     (voxtral4b PUBLIC ggml ggml-base Threads::Threads crispasr-core)
 if(NOT MSVC)
     target_compile_options(voxtral4b PRIVATE -O3 -march=native)
 endif()

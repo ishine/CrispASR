@@ -123,6 +123,11 @@ struct Params {
     // instead of the full count.
     bool drop_last_frame = false;
 
+    // If (after drop_last_frame) the frame count is odd, also drop the
+    // first frame so the caller sees an even T. Used by voxtral4b, which
+    // feeds mel into a stride-2 conv and needs an even temporal length.
+    bool drop_first_frame_if_odd = false;
+
     // Pad the mel output on the right so the final length is exactly this
     // many frames. 0 disables. Voxtral 3B pads to 3000 (= 30s at hop=160).
     //

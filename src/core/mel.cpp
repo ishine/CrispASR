@@ -59,6 +59,14 @@ std::vector<float> compute(
     // -----------------------------------------------------------------
     int T = in_len >= n_fft ? (in_len - n_fft) / hop + 1 : 0;
     if (p.drop_last_frame && T > 0) T -= 1;
+    // Optional even-T guarantee: when the remaining frame count is odd,
+    // shift the window start by one hop to produce an even T. This is
+    // what voxtral4b needs (it feeds the mel into a stride-2 conv).
+    int t_start = 0;
+    if (p.drop_first_frame_if_odd && T > 0 && (T % 2 != 0)) {
+        T     -= 1;
+        t_start = 1;
+    }
     if (T <= 0) { T_out = 0; return {}; }
 
     std::vector<float> power((size_t)T * n_freqs, 0.0f);
@@ -66,7 +74,7 @@ std::vector<float> compute(
         std::vector<float> fft_in((size_t)n_fft);
         std::vector<float> fft_out((size_t)n_fft * 2);
         for (int t = 0; t < T; t++) {
-            const float * frame = in_ptr + (size_t)t * hop;
+            const float * frame = in_ptr + (size_t)(t + t_start) * hop;
             for (int n = 0; n < n_fft; n++) fft_in[n] = frame[n] * window[n];
             fft(fft_in.data(), n_fft, fft_out.data());
             for (int k = 0; k < n_freqs; k++) {
