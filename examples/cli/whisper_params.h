@@ -143,8 +143,19 @@ struct whisper_params {
 
     // Generic stereo diarize post-step. Empty = "energy" (default
     // method, same as historical whisper-cli). Other choices:
-    // "xcorr" (cross-correlation TDOA), "pyannote" / "ecapa" (TODO,
-    // pending native GGUF ports). Only fires when `diarize` is true
-    // and the input is stereo.
+    // "xcorr" (cross-correlation TDOA), "sherpa" / "sherpa-onnx"
+    // (external subprocess), "pyannote" / "ecapa" (TODO, pending
+    // native GGUF ports). Only fires when `diarize` is true.
     std::string diarize_method;
+
+    // sherpa-onnx configuration (only used when --diarize-method=sherpa).
+    // crispasr shells out to an externally-installed
+    // `sherpa-onnx-offline-speaker-diarization` binary; these paths are
+    // passed through to it. The binary discovers models at the paths
+    // given here, runs diarization on the input WAV, and returns a
+    // segment list that we merge with the ASR output by time overlap.
+    std::string sherpa_bin;               // default: "sherpa-onnx-offline-speaker-diarization"
+    std::string sherpa_segment_model;     // pyannote-style segmentation ONNX
+    std::string sherpa_embedding_model;   // speaker embedding ONNX (titanet / 3dspeaker)
+    int         sherpa_num_clusters = 0;  // 0 = auto-estimate (sherpa default)
 };

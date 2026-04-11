@@ -223,6 +223,10 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (                  arg == "--lid-backend")          { params.lid_backend     = ARGV_NEXT; }
         else if (                  arg == "--lid-model")            { params.lid_model       = ARGV_NEXT; }
         else if (                  arg == "--diarize-method")       { params.diarize_method  = ARGV_NEXT; }
+        else if (                  arg == "--sherpa-bin")           { params.sherpa_bin      = ARGV_NEXT; }
+        else if (                  arg == "--sherpa-segment-model") { params.sherpa_segment_model   = ARGV_NEXT; }
+        else if (                  arg == "--sherpa-embedding-model"){ params.sherpa_embedding_model = ARGV_NEXT; }
+        else if (                  arg == "--sherpa-num-clusters")  { params.sherpa_num_clusters    = std::stoi(ARGV_NEXT); }
         else if (                  arg == "--list-backends")        {
             crispasr_print_backend_matrix();
             exit(0);
@@ -319,7 +323,11 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  -am FNAME, --aligner-model FNAME  [%-7s] CTC aligner GGUF (LLM backends word timestamps)\n",params.aligner_model.c_str());
     fprintf(stderr, "  --lid-backend NAME                [%-7s] language-detect backend: whisper|silero (for non-native backends)\n", params.lid_backend.c_str());
     fprintf(stderr, "  --lid-model FNAME                 [%-7s] optional LID model path (default ggml-tiny.bin)\n", params.lid_model.c_str());
-    fprintf(stderr, "  --diarize-method NAME             [%-7s] diarize method: energy|xcorr|pyannote|ecapa (default energy)\n", params.diarize_method.c_str());
+    fprintf(stderr, "  --diarize-method NAME             [%-7s] diarize method: energy|xcorr|vad-turns|sherpa|pyannote (default energy)\n", params.diarize_method.c_str());
+    fprintf(stderr, "  --sherpa-bin PATH                 [%-7s] sherpa-onnx-offline-speaker-diarization binary (default: in PATH)\n", params.sherpa_bin.c_str());
+    fprintf(stderr, "  --sherpa-segment-model PATH       [%-7s] sherpa pyannote segmentation ONNX\n",                 params.sherpa_segment_model.c_str());
+    fprintf(stderr, "  --sherpa-embedding-model PATH     [%-7s] sherpa speaker embedding ONNX\n",                     params.sherpa_embedding_model.c_str());
+    fprintf(stderr, "  --sherpa-num-clusters N           [%-7d] sherpa cluster count (0 = auto)\n",                   params.sherpa_num_clusters);
     fprintf(stderr, "  -n N,      --max-new-tokens N     [%-7d] max new tokens for LLM backends\n",                params.max_new_tokens);
     fprintf(stderr, "  -ck N,     --chunk-seconds N      [%-7d] fallback chunk size when VAD is disabled\n",       params.chunk_seconds);
     fprintf(stderr, "             -m auto                        download a default model for the chosen backend\n");
