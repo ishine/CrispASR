@@ -153,6 +153,69 @@ float * qwen3_asr_run_llm_kv(struct qwen3_asr_context * ctx,
                              int * out_n_tokens,
                              int * out_vocab_size);
 
+// ---- Forced-alignment API (Qwen3-ForcedAligner-0.6B) ----------------------
+//
+// The Qwen3-ForcedAligner-0.6B variant has the same architecture as
+// Qwen3-ASR-0.6B (audio encoder + 28-layer Qwen3 LLM body) but its lm_head
+// outputs 5000 timestamp classes instead of the 152064 token vocab. Each
+// `<|timestamp|>` placeholder (token id 151705) the caller embeds in the
+// input gets a 5000-way softmax prediction; argmax * 80 ms = the timestamp
+// at that position.
+//
+// Use it for forced alignment by:
+//   1. Tokenizing the prompt with `<|timestamp|>` placeholders between
+//      each word (or character for CJK languages).
+//   2. Calling qwen3_asr_embed_tokens() + splicing audio embeds into
+//      `<|audio_pad|>` slots, same as the regular ASR path.
+//   3. Calling qwen3_asr_run_aligner() — ONE forward pass over the whole
+//      prompt, no autoregressive decoding. Returns the full
+//      (n_tokens, lm_head_dim) logits buffer so the caller can read out
+//      the timestamp class at each placeholder position.
+//
+// Use qwen3_asr_lm_head_dim() to find out whether a loaded model is the
+// FA variant (== 5000) or the regular ASR variant (== 152064 / 151936).
+
+// Returns the loaded model's lm_head output dimension. For Qwen3-ASR-*B
+// this equals the token vocab size (151936 / 152064). For
+// Qwen3-ForcedAligner-0.6B this is 5000 (timestamp classes).
+int qwen3_asr_lm_head_dim(struct qwen3_asr_context * ctx);
+
+// Run a single full-T forward pass through the LLM body (NOT autoregressive,
+// no KV cache) starting from already-embedded inputs. Returns the lm_head
+// logits at every position (not just last-token), shape
+// (lm_head_dim, n_tokens) row-major. *out_lm_head_dim and *out_n_tokens
+// filled in. Caller frees the returned buffer with free().
+float * qwen3_asr_run_aligner(struct qwen3_asr_context * ctx,
+                              const float * inputs_embeds,
+                              int n_tokens,
+                              int * out_n_tokens,
+                              int * out_lm_head_dim);
+
+// High-level forced-alignment entry point. Runs the whole pipeline:
+//   1. compute mel from raw 16 kHz mono PCM
+//   2. run audio encoder to get audio_embeds
+//   3. build the prompt: <|audio_start|> <|audio_pad|>×N <|audio_end|>
+//      word_1 <timestamp><timestamp> word_2 <timestamp><timestamp>
+//      ... word_M <timestamp><timestamp>
+//      Each word's two `<timestamp>` placeholders predict the start/end
+//      class respectively.
+//   4. embed the prompt token IDs and splice audio_embeds into the
+//      audio_pad slots
+//   5. run the FA forward (single pass via qwen3_asr_run_aligner)
+//   6. argmax over the 5000 lm_head_dim outputs at each <timestamp>
+//      position, multiply by `timestamp_segment_time_ms` (default 80 ms)
+//      to get ms.
+//
+// Outputs: parallel arrays `out_start_ms[M]` and `out_end_ms[M]` with
+// the per-word timestamps in milliseconds. The caller must allocate
+// these arrays with at least `n_words` int64_t entries each. Returns
+// 0 on success, non-zero on failure.
+int qwen3_asr_align_words(struct qwen3_asr_context * ctx,
+                          const float * samples, int n_samples,
+                          const char ** words, int n_words,
+                          int64_t * out_start_ms,
+                          int64_t * out_end_ms);
+
 #ifdef __cplusplus
 }
 #endif

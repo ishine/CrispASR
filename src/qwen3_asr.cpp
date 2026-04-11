@@ -72,6 +72,14 @@ struct qwen3_asr_hparams {
     uint32_t llm_vocab_size = 151936;
     uint32_t llm_max_pos    = 65536;
 
+    // The LM head's actual output dimension. For the standard ASR
+    // models this equals llm_vocab_size (152064 for 1.7B, 151936 for
+    // 0.6B). For the Qwen3-ForcedAligner-0.6B variant the head
+    // outputs 5000 timestamp classes instead — we read the real
+    // value from the loaded `output.weight` tensor's shape rather
+    // than asserting equality with vocab_size.
+    uint32_t llm_lm_head_dim = 0;  // 0 = "use vocab_size" sentinel
+
     // Special tokens
     uint32_t audio_start_token_id = 151669;
     uint32_t audio_end_token_id   = 151670;
@@ -363,6 +371,16 @@ static bool qwen3_asr_load_model(qwen3_asr_model & model,
     l.token_embd_w  = require(model, "token_embd.weight");
     l.output_norm_w = require(model, "output_norm.weight");
     l.output_w      = require(model, "output.weight");
+    // Read the actual lm_head output dimension from the loaded tensor
+    // shape rather than asserting it equals vocab_size. The standard
+    // Qwen3-ASR-{0.6B,1.7B} models have lm_head = (vocab, d), but the
+    // Qwen3-ForcedAligner variant has lm_head = (5000, d) — same body,
+    // different head. ne[1] is the row count after ggml's [in, out]
+    // storage convention.
+    model.hparams.llm_lm_head_dim = (uint32_t)l.output_w->ne[1];
+    if (model.hparams.llm_lm_head_dim == 0) {
+        model.hparams.llm_lm_head_dim = model.hparams.llm_vocab_size;
+    }
     l.blocks.resize(model.hparams.llm_n_layers);
     for (uint32_t i = 0; i < model.hparams.llm_n_layers; i++) {
         char buf[128];
@@ -1081,7 +1099,8 @@ static ggml_cgraph * qwen3_asr_build_graph_llm_from_embeds(qwen3_asr_context * c
 // Per layer, the new K/V are written into the persistent cache at positions
 // [n_past, n_past+n_tokens) and attention reads from [0, n_past+n_tokens).
 static ggml_cgraph * qwen3_asr_build_graph_llm_kv(qwen3_asr_context * ctx,
-                                                  int n_past, int n_tokens) {
+                                                  int n_past, int n_tokens,
+                                                  bool last_token_only = true) {
     const auto & m  = ctx->model;
     const auto & hp = m.hparams;
     const int d        = (int)hp.llm_d_model;
@@ -1176,14 +1195,21 @@ static ggml_cgraph * qwen3_asr_build_graph_llm_kv(qwen3_asr_context * ctx,
     cur = ggml_rms_norm(ctx0, cur, eps);
     cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
 
-    // Last-token-only lm_head: slice (d, T) → (d, 1) before the big matmul.
-    // We only ever need the next-token logits, never historical ones, so the
-    // (151936, 2048) lm_head matmul is run on a 1-column input instead of T.
-    if (T > 1) {
+    // Last-token-only lm_head (default): slice (d, T) → (d, 1) before
+    // the big matmul. The autoregressive decode loop only ever needs the
+    // next-token logits, so we save the (152064, 2048) matmul on T-1
+    // columns.
+    //
+    // Forced-alignment mode (last_token_only=false) keeps all T columns
+    // because the FA model needs the lm_head output at every position
+    // where input == <|timestamp|>. The lm_head shape itself is read
+    // from output_w (5000 for FA, vocab_size for ASR).
+    if (last_token_only && T > 1) {
         cur = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
     }
     cur = ggml_mul_mat(ctx0, m.llm.output_w, cur);
-    // logits ne = (vocab, 1)
+    // logits ne = (lm_head_dim, 1)        (decode / last-token mode)
+    //         or (lm_head_dim, T)         (FA / full-T mode)
 
     ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
@@ -1624,7 +1650,11 @@ extern "C" float * qwen3_asr_run_llm_kv(qwen3_asr_context * ctx,
     }
     const auto & hp = ctx->model.hparams;
     const int d     = (int)hp.llm_d_model;
-    const int vocab = (int)hp.llm_vocab_size;
+    // Use the LM head's actual output dim, not the token vocab size.
+    // For ASR models the two are equal; for the ForcedAligner variant
+    // the head is (5000, d) while vocab_size stays 152064.
+    const int vocab = (int)(hp.llm_lm_head_dim ? hp.llm_lm_head_dim
+                                              : hp.llm_vocab_size);
     const int Lk    = n_past + n_tokens;
 
     // Positions [n_past, n_past+T)
@@ -1708,7 +1738,8 @@ extern "C" float * qwen3_asr_run_llm_from_embeds(qwen3_asr_context * ctx,
     if (!ctx || !inputs_embeds || n_tokens <= 0) return nullptr;
     const auto & hp = ctx->model.hparams;
     const int d     = (int)hp.llm_d_model;
-    const int vocab = (int)hp.llm_vocab_size;
+    const int vocab = (int)(hp.llm_lm_head_dim ? hp.llm_lm_head_dim
+                                              : hp.llm_vocab_size);
 
     std::vector<int32_t> positions(n_tokens);
     for (int i = 0; i < n_tokens; i++) positions[i] = i;
@@ -1755,7 +1786,8 @@ extern "C" float * qwen3_asr_run_llm(qwen3_asr_context * ctx,
                                      int * out_vocab_size) {
     if (!ctx || !input_ids || n_tokens <= 0) return nullptr;
     const auto & hp = ctx->model.hparams;
-    const int vocab = (int)hp.llm_vocab_size;
+    const int vocab = (int)(hp.llm_lm_head_dim ? hp.llm_lm_head_dim
+                                              : hp.llm_vocab_size);
 
     // Build positions = [0, 1, ..., T-1]
     std::vector<int32_t> positions(n_tokens);
@@ -1798,6 +1830,243 @@ extern "C" float * qwen3_asr_run_llm(qwen3_asr_context * ctx,
 
     const size_t total = (size_t)vocab * n_tokens;
     float * result = (float *)malloc(total * sizeof(float));
+    ggml_backend_tensor_get(out, result, 0, total * sizeof(float));
+    return result;
+}
+
+extern "C" int qwen3_asr_lm_head_dim(struct qwen3_asr_context * ctx) {
+    if (!ctx) return 0;
+    const auto & hp = ctx->model.hparams;
+    return (int)(hp.llm_lm_head_dim ? hp.llm_lm_head_dim : hp.llm_vocab_size);
+}
+
+// High-level forced-alignment dispatch.
+//
+// Mirrors qwen_asr/inference/qwen3_forced_aligner.py::Qwen3ForcedAligner.align
+// minus the language-specific tokenizers (we whitespace-split words and let
+// each word go through the standard byte-level BPE encoder; CJK char-level
+// tokenization is a follow-up).
+extern "C" int qwen3_asr_align_words(struct qwen3_asr_context * ctx,
+                                     const float * samples, int n_samples,
+                                     const char ** words, int n_words,
+                                     int64_t * out_start_ms,
+                                     int64_t * out_end_ms)
+{
+    if (!ctx || !samples || n_samples <= 0 || !words || n_words <= 0
+        || !out_start_ms || !out_end_ms) return -1;
+
+    constexpr int TIMESTAMP_TOKEN_ID = 151705;
+    // Default ms-per-class. Forced-aligner config sets this to 80; the
+    // value isn't carried in the GGUF metadata yet, so we hardcode it
+    // for now and add a kv field on the next converter bump.
+    constexpr float TIMESTAMP_SEGMENT_TIME_MS = 80.0f;
+
+    // 1. Mel
+    int n_mels = 0, T_mel = 0;
+    float * mel = qwen3_asr_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
+    if (!mel) {
+        fprintf(stderr, "qwen3_asr[align]: mel failed\n");
+        return -2;
+    }
+
+    // 2. Audio encoder
+    int N_enc = 0, pdim = 0;
+    float * audio_embeds = qwen3_asr_run_encoder(ctx, mel, n_mels, T_mel,
+                                                 &N_enc, &pdim);
+    free(mel);
+    if (!audio_embeds) {
+        fprintf(stderr, "qwen3_asr[align]: encoder failed\n");
+        return -3;
+    }
+
+    // 3. Build the prompt token-id sequence:
+    //      <|audio_start|>  <|audio_pad|>×N_enc  <|audio_end|>
+    //      word_1 <timestamp> <timestamp>
+    //      word_2 <timestamp> <timestamp>
+    //      ...
+    //      word_M <timestamp> <timestamp>
+    const auto & hp = ctx->model.hparams;
+    const int audio_start_id = (int)hp.audio_start_token_id;
+    const int audio_end_id   = (int)hp.audio_end_token_id;
+    const int audio_pad_id   = (int)hp.audio_pad_token_id;
+
+    std::vector<int32_t> ids;
+    ids.reserve((size_t)(N_enc + n_words * 6 + 4));
+    ids.push_back(audio_start_id);
+    for (int i = 0; i < N_enc; i++) ids.push_back(audio_pad_id);
+    ids.push_back(audio_end_id);
+
+    // Tokenize each word separately and append two timestamp markers
+    // after it. Whitespace-split English / Latin scripts work fine
+    // through the standard BPE encoder; CJK languages need char-level
+    // pre-tokenization which is tracked as a follow-up. The leading
+    // space convention matches GPT-2 BPE: each non-first word starts
+    // with a space so the tokenizer recognises it as a word boundary.
+    for (int w = 0; w < n_words; w++) {
+        const std::string word = (w == 0) ? std::string(words[w])
+                                          : std::string(" ") + words[w];
+        int n = 0;
+        int32_t * arr = qwen3_asr_tokenize(ctx, word.c_str(), &n);
+        if (arr && n > 0) {
+            for (int i = 0; i < n; i++) ids.push_back(arr[i]);
+        }
+        free(arr);
+        ids.push_back(TIMESTAMP_TOKEN_ID);
+        ids.push_back(TIMESTAMP_TOKEN_ID);
+    }
+
+    const int T_prompt = (int)ids.size();
+
+    // 4. Embed and splice audio
+    float * text_embeds = qwen3_asr_embed_tokens(ctx, ids.data(), T_prompt);
+    if (!text_embeds) {
+        free(audio_embeds);
+        fprintf(stderr, "qwen3_asr[align]: embed failed\n");
+        return -4;
+    }
+    int spliced = 0;
+    for (int i = 0; i < T_prompt && spliced < N_enc; i++) {
+        if (ids[i] == audio_pad_id) {
+            std::memcpy(text_embeds + (size_t)i * pdim,
+                        audio_embeds + (size_t)spliced * pdim,
+                        pdim * sizeof(float));
+            spliced++;
+        }
+    }
+    free(audio_embeds);
+
+    // 5. KV cache + aligner forward
+    if (!qwen3_asr_kv_init(ctx, /*max_ctx*/ std::max(4096, T_prompt + 16))) {
+        free(text_embeds);
+        fprintf(stderr, "qwen3_asr[align]: kv_init failed\n");
+        return -5;
+    }
+    int n_t_out = 0, H = 0;
+    float * logits = qwen3_asr_run_aligner(ctx, text_embeds, T_prompt,
+                                           &n_t_out, &H);
+    free(text_embeds);
+    if (!logits) {
+        fprintf(stderr, "qwen3_asr[align]: aligner forward failed\n");
+        return -6;
+    }
+
+    // 6. argmax over the lm_head_dim classes at each <timestamp>
+    // position. The graph stores logits as ne[0]=H, ne[1]=T_prompt
+    // row-major, i.e. logits[t * H + k] = score(k, t).
+    std::vector<int> ts_classes;
+    ts_classes.reserve((size_t)(n_words * 2));
+    for (int t = 0; t < T_prompt; t++) {
+        if (ids[t] != TIMESTAMP_TOKEN_ID) continue;
+        const float * row = logits + (size_t)t * H;
+        int   best = 0;
+        float mx   = row[0];
+        for (int k = 1; k < H; k++) {
+            if (row[k] > mx) { mx = row[k]; best = k; }
+        }
+        ts_classes.push_back(best);
+    }
+    free(logits);
+
+    if ((int)ts_classes.size() != 2 * n_words) {
+        fprintf(stderr,
+                "qwen3_asr[align]: timestamp marker count mismatch — "
+                "got %zu placeholders, expected %d\n",
+                ts_classes.size(), 2 * n_words);
+        return -7;
+    }
+
+    // 7. Convert classes → ms and write into the caller's parallel arrays.
+    for (int w = 0; w < n_words; w++) {
+        out_start_ms[w] = (int64_t)((float)ts_classes[2 * w + 0] * TIMESTAMP_SEGMENT_TIME_MS);
+        out_end_ms  [w] = (int64_t)((float)ts_classes[2 * w + 1] * TIMESTAMP_SEGMENT_TIME_MS);
+    }
+    return 0;
+}
+
+// One full-T forward pass for the Qwen3-ForcedAligner. Same KV-cached
+// graph the ASR backend uses for prefill, but with last_token_only=false
+// so the lm_head sees every position. The KV cache is reset at the start
+// because forced alignment is one-shot — no autoregressive decode loop.
+extern "C" float * qwen3_asr_run_aligner(struct qwen3_asr_context * ctx,
+                                         const float * inputs_embeds,
+                                         int n_tokens,
+                                         int * out_n_tokens,
+                                         int * out_lm_head_dim)
+{
+    if (!ctx || !inputs_embeds || n_tokens <= 0) return nullptr;
+    if (!ctx->kv_k) {
+        fprintf(stderr,
+                "qwen3_asr: kv cache not initialized — call qwen3_asr_kv_init first\n");
+        return nullptr;
+    }
+    if (n_tokens > ctx->kv_max_ctx) {
+        fprintf(stderr,
+                "qwen3_asr: aligner needs %d tokens but kv max_ctx is %d\n",
+                n_tokens, ctx->kv_max_ctx);
+        return nullptr;
+    }
+    qwen3_asr_kv_reset(ctx);
+
+    const auto & hp = ctx->model.hparams;
+    const int d  = (int)hp.llm_d_model;
+    const int H  = (int)(hp.llm_lm_head_dim ? hp.llm_lm_head_dim
+                                            : hp.llm_vocab_size);
+    const int Lk = n_tokens;
+
+    // Positions 0..n_tokens-1.
+    std::vector<int32_t> positions(n_tokens);
+    for (int i = 0; i < n_tokens; i++) positions[i] = i;
+
+    // Causal mask for the prefill path. Same encoding the run_llm_kv
+    // path uses (F16, ne[0]=Lk for fast key axis, ne[1]=n_tokens for
+    // queries; -inf above the diagonal).
+    std::vector<ggml_fp16_t> mask;
+    if (n_tokens > 1) {
+        const ggml_fp16_t zero_h   = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neginf_h = ggml_fp32_to_fp16(-INFINITY);
+        mask.assign((size_t)Lk * n_tokens, zero_h);
+        for (int q = 0; q < n_tokens; q++) {
+            for (int k = q + 1; k < Lk; k++) {
+                mask[(size_t)q * Lk + k] = neginf_h;
+            }
+        }
+    }
+
+    ggml_cgraph * gf = qwen3_asr_build_graph_llm_kv(
+        ctx, /*n_past=*/0, n_tokens, /*last_token_only=*/false);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "qwen3_asr: failed to alloc aligner graph\n");
+        return nullptr;
+    }
+
+    ggml_tensor * embeds_in = ggml_graph_get_tensor(gf, "inputs_embeds");
+    ggml_backend_tensor_set(embeds_in, inputs_embeds, 0,
+                            (size_t)d * n_tokens * sizeof(float));
+    ggml_tensor * pos_in = ggml_graph_get_tensor(gf, "positions");
+    ggml_backend_tensor_set(pos_in, positions.data(), 0,
+                            positions.size() * sizeof(int32_t));
+    if (n_tokens > 1) {
+        ggml_tensor * mask_in = ggml_graph_get_tensor(gf, "causal_mask");
+        ggml_backend_tensor_set(mask_in, mask.data(), 0,
+                                mask.size() * sizeof(ggml_fp16_t));
+    }
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "qwen3_asr: aligner graph compute failed\n");
+        return nullptr;
+    }
+
+    ctx->kv_n_used = n_tokens;
+
+    ggml_tensor * out = ggml_graph_get_tensor(gf, "logits");
+    if (!out) return nullptr;
+    if (out_n_tokens)    *out_n_tokens    = n_tokens;
+    if (out_lm_head_dim) *out_lm_head_dim = H;
+
+    const size_t total = (size_t)H * n_tokens;
+    float * result = (float *)malloc(total * sizeof(float));
+    if (!result) return nullptr;
     ggml_backend_tensor_get(out, result, 0, total * sizeof(float));
     return result;
 }
