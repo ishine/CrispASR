@@ -243,13 +243,15 @@ static void self_attention(
         for (int d = 0; d < D; d++)
             xt[t * D + d] = x[d * T + t];
 
-    // QKV = xt @ qkv_w^T + qkv_b  → [T, 3D]
+    // QKV = xt @ qkv_w + qkv_b  → [T, 3D]
+    // ONNX MatMul: output = input @ weight, weight shape (D, 3D).
+    // GGUF stores (D, 3D) as ne=(3D, D) → data[d * 3D + j] = weight[d, j].
     std::vector<float> qkv(T * 3 * D);
     for (int t = 0; t < T; t++) {
         for (int j = 0; j < 3 * D; j++) {
             float sum = qkv_b[j];
             for (int d = 0; d < D; d++)
-                sum += xt[t * D + d] * qkv_w[j * D + d];
+                sum += xt[t * D + d] * qkv_w[d * 3 * D + j];
             qkv[t * 3 * D + j] = sum;
         }
     }
@@ -287,13 +289,14 @@ static void self_attention(
             for (int d = 0; d < D; d++)
                 attn[i * D + d] += scores[i * T + j] * V[j * stride_qkv + d];
 
-    // Output projection: attn @ out_w^T + out_b → [T, D]
+    // Output projection: attn @ out_w + out_b → [T, D]
+    // out_w stored as (D, D) → data[dd * D + d] = weight[dd, d]
     std::vector<float> proj(T * D);
     for (int t = 0; t < T; t++) {
         for (int d = 0; d < D; d++) {
             float sum = out_b[d];
             for (int dd = 0; dd < D; dd++)
-                sum += attn[t * D + dd] * out_w[d * D + dd];
+                sum += attn[t * D + dd] * out_w[dd * D + d];
             proj[t * D + d] = sum;
         }
     }
@@ -316,12 +319,12 @@ static void ffn_residual(
         for (int d = 0; d < D; d++)
             xt[t * D + d] = x[d * T + t];
 
-    // linear1
+    // linear1: x @ ff1_w + ff1_b. ff1_w stored as (D, D) → data[dd * D + d]
     for (int t = 0; t < T; t++)
         for (int d = 0; d < D; d++) {
             float sum = ff1_b[d];
             for (int dd = 0; dd < D; dd++)
-                sum += xt[t * D + dd] * ff1_w[d * D + dd];
+                sum += xt[t * D + dd] * ff1_w[dd * D + d];
             mid[t * D + d] = std::max(0.f, sum);  // ReLU
         }
 
@@ -330,7 +333,7 @@ static void ffn_residual(
         for (int d = 0; d < D; d++) {
             float sum = ff2_b[d];
             for (int dd = 0; dd < D; dd++)
-                sum += mid[t * D + dd] * ff2_w[d * D + dd];
+                sum += mid[t * D + dd] * ff2_w[dd * D + d];
             out[t * D + d] = sum;
         }
 
@@ -594,49 +597,9 @@ extern "C" const char * silero_lid_detect(
             }
         }
 
-        // ---- Stride-2 temporal downsampling (first 4 stages only) ----
-        // The conv1x1 between conv and transformer stages is actually a
-        // strided 1×1 Conv with stride=2 for the first 4 (128-dim) stages,
-        // halving T at each boundary. The last 4 (192-dim) stages use stride=1.
+        // ---- Transformer block (runs BEFORE stride-2 downsample) ----
+        // ONNX order: conv stage → transformer → transpose → stride-2 → next stage
         const auto & tx = st.tx;
-        if (tx.conv1x1_w && si < m.n_downsample_stages) {
-            int C_out = (int)tx.conv1x1_w->ne[2];  // ggml ne for (Cout, Cin, 1)
-            int T_out = T / 2;
-            std::vector<float> ds(C_out * T_out);
-            const float * cw = (const float *)tx.conv1x1_w->data;
-            const float * cb = tx.conv1x1_b ? (const float *)tx.conv1x1_b->data : nullptr;
-            // Strided 1×1 conv: out[co, t] = sum_ci(cw[co, ci] * cur[ci, 2*t]) + bias
-            for (int co = 0; co < C_out; co++) {
-                for (int t = 0; t < T_out; t++) {
-                    float sum = cb ? cb[co] : 0.f;
-                    int t_in = t * 2;
-                    for (int ci = 0; ci < C; ci++)
-                        sum += cw[co * C + ci] * cur[ci * T + t_in];
-                    ds[co * T_out + t] = sum;
-                }
-            }
-            cur = std::move(ds);
-            C = C_out;
-            T = T_out;
-        } else if (tx.conv1x1_w) {
-            // Stride-1 projection (192-dim stages)
-            int C_out = (int)tx.conv1x1_w->ne[2];
-            std::vector<float> proj(C_out * T);
-            const float * cw = (const float *)tx.conv1x1_w->data;
-            const float * cb = tx.conv1x1_b ? (const float *)tx.conv1x1_b->data : nullptr;
-            for (int co = 0; co < C_out; co++) {
-                for (int t = 0; t < T; t++) {
-                    float sum = cb ? cb[co] : 0.f;
-                    for (int ci = 0; ci < C; ci++)
-                        sum += cw[co * C + ci] * cur[ci * T + t];
-                    proj[co * T + t] = sum;
-                }
-            }
-            cur = std::move(proj);
-            C = C_out;
-        }
-
-        // ---- Transformer block ----
         int D = C;
 
         if (tx.norm1_w && tx.qkv_w) {
@@ -661,6 +624,45 @@ extern "C" const char * silero_lid_detect(
                         (const float *)tx.ff1_b->data,
                         (const float *)tx.ff2_w->data,
                         (const float *)tx.ff2_b->data);
+        }
+
+        // ---- Stride-2 temporal downsampling (AFTER transformer, first 4 stages) ----
+        // ONNX order: conv → transformer → transpose → stride-2 Conv → ReLU → next
+        if (tx.conv1x1_w && si < m.n_downsample_stages) {
+            int C_out = (int)tx.conv1x1_w->ne[2];
+            int T_out = T / 2;
+            std::vector<float> ds(C_out * T_out);
+            const float * cw = (const float *)tx.conv1x1_w->data;
+            const float * cb = tx.conv1x1_b ? (const float *)tx.conv1x1_b->data : nullptr;
+            for (int co = 0; co < C_out; co++) {
+                for (int t = 0; t < T_out; t++) {
+                    float sum = cb ? cb[co] : 0.f;
+                    int t_in = t * 2;
+                    for (int ci = 0; ci < C; ci++)
+                        sum += cw[co * C + ci] * cur[ci * T + t_in];
+                    ds[co * T_out + t] = sum;
+                }
+            }
+            for (float & v : ds) v = std::max(0.f, v);
+            cur = std::move(ds);
+            C = C_out;
+            T = T_out;
+        } else if (tx.conv1x1_w) {
+            // Stride-1 projection (192-dim stages)
+            int C_out = (int)tx.conv1x1_w->ne[2];
+            std::vector<float> proj(C_out * T);
+            const float * cw = (const float *)tx.conv1x1_w->data;
+            const float * cb = tx.conv1x1_b ? (const float *)tx.conv1x1_b->data : nullptr;
+            for (int co = 0; co < C_out; co++) {
+                for (int t = 0; t < T; t++) {
+                    float sum = cb ? cb[co] : 0.f;
+                    for (int ci = 0; ci < C; ci++)
+                        sum += cw[co * C + ci] * cur[ci * T + t];
+                    proj[co * T + t] = sum;
+                }
+            }
+            cur = std::move(proj);
+            C = C_out;
         }
     }
 
