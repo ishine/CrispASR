@@ -359,6 +359,17 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# silero-lid — native Silero Language Classifier 95 (GGUF, ggml-based)
+# ---------------------------------------------------------------------------
+add_library(silero-lid STATIC silero_lid.h silero_lid.cpp)
+target_include_directories(silero-lid PUBLIC .)
+target_compile_features   (silero-lid PUBLIC cxx_std_17)
+target_link_libraries     (silero-lid PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(silero-lid PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # ctc-align — CTC forced alignment (Viterbi DP, CPU-only, no ggml dependency)
 # ---------------------------------------------------------------------------
 add_library(ctc-align STATIC align.h align.cpp)

@@ -100,6 +100,7 @@ target_link_libraries(${TARGET} PRIVATE
     qwen3_asr
     canary_ctc
     wav2vec2-ggml
+    silero-lid
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
 )

@@ -31,6 +31,7 @@
 #include "whisper_params.h"
 
 #include "whisper.h"
+#include "silero_lid.h"
 
 #include <algorithm>
 #include <cctype>
@@ -228,11 +229,54 @@ bool detect_with_silero(
     if (p.lid_model.empty()) {
         fprintf(stderr,
             "crispasr[lid]: --lid-backend silero needs --lid-model PATH\n"
-            "               pointing at a sherpa-onnx LID model (download from\n"
-            "               https://github.com/k2-fsa/sherpa-onnx — e.g. the\n"
-            "               Whisper-tiny LID or silero-lang-95 ONNX bundles).\n");
+            "               (GGUF from convert-silero-lid-to-gguf.py, or\n"
+            "                a sherpa-onnx LID model for the subprocess fallback)\n");
         return false;
     }
+
+    // ---- Try native GGUF path first (if the model is a .gguf file) ----
+    const std::string & model_path = p.lid_model;
+    if (model_path.size() >= 5 &&
+        model_path.compare(model_path.size() - 5, 5, ".gguf") == 0)
+    {
+        silero_lid_context * lid = silero_lid_init(model_path.c_str(), p.n_threads);
+        if (lid) {
+            float conf = 0;
+            const char * lang = silero_lid_detect(lid, samples, n_samples, &conf);
+            if (lang && *lang) {
+                // Parse "NN, Language" format → extract ISO code
+                std::string full = lang;
+                // The lang_dict has format "en, English" — extract before comma
+                auto comma = full.find(',');
+                std::string code = (comma != std::string::npos)
+                    ? full.substr(0, comma) : full;
+                // Trim whitespace
+                while (!code.empty() && code.back() == ' ') code.pop_back();
+                while (!code.empty() && code.front() == ' ') code.erase(code.begin());
+                // Trim digits (lang_dict keys are "30" for English index)
+                bool is_digit = true;
+                for (char c : code) if (!isdigit(c)) { is_digit = false; break; }
+                if (is_digit) {
+                    // Index-based — the full string IS the language name
+                    code = full;
+                }
+                out.lang_code  = code;
+                out.confidence = conf;
+                out.source     = "silero-native";
+                if (!p.no_prints) {
+                    fprintf(stderr, "crispasr[lid]: silero-native → %s (%.2f)\n",
+                            full.c_str(), conf);
+                }
+                silero_lid_free(lid);
+                return true;
+            }
+            silero_lid_free(lid);
+            fprintf(stderr, "crispasr[lid]: silero-native returned null — "
+                            "falling back to sherpa subprocess\n");
+        }
+    }
+
+    // ---- Sherpa subprocess fallback (for ONNX models) ----
 
     // Default binary name; user can override via $CRISPASR_SHERPA_LID_BIN
     // for installs that don't put sherpa on $PATH.
