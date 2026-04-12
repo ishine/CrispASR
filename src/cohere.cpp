@@ -81,10 +81,13 @@ static void cohere_log_tensor(const char * name, const struct ggml_tensor * t) {
 // vlog: shown at verbosity >= 1 (model loading info)
 // vlog2: shown at verbosity >= 2 (per-inference timing, steps, perf report)
 // Always print errors/warnings regardless of verbosity.
+// MSVC < C++20 doesn't support __VA_OPT__. Use the classic ##__VA_ARGS__
+// extension (supported by GCC, Clang, and MSVC) which swallows the
+// trailing comma when __VA_ARGS__ is empty.
 #define COHERE_VLOG(v, fmt, ...) \
-    do { if ((v) >= 1) fprintf(stderr, fmt __VA_OPT__(,) __VA_ARGS__); } while (0)
+    do { if ((v) >= 1) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
 #define COHERE_VLOG2(v, fmt, ...) \
-    do { if ((v) >= 2) fprintf(stderr, fmt __VA_OPT__(,) __VA_ARGS__); } while (0)
+    do { if ((v) >= 2) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
 
 // ---------------------------------------------------------------------------
 // Performance counters — accumulated per cohere_transcribe() call

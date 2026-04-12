@@ -426,6 +426,54 @@ extern "C" const char * silero_lid_detect(
         cur.assign(samples, samples + n_samples);
     }
 
+    // ---- Adaptive normalization ----
+    // After the front-end, apply:
+    //   1. ReduceMean over channels → subtract channel mean (per frame)
+    //   2. Conv1d with adaptive_normalization.filter_ (1, 1, 17) along time
+    //      to compute running statistics for per-frame normalization
+    //   3. Normalize frames by the running stats
+    // This is the "adaptive normalization" step that the ONNX graph applies
+    // between the front-end output and the first conv stage.
+    if (m.adaptive_norm_filter) {
+        // Step 1: subtract per-frame channel mean (InstanceNorm-like)
+        for (int t = 0; t < T; t++) {
+            float mean = 0;
+            for (int c = 0; c < C; c++) mean += cur[c * T + t];
+            mean /= C;
+            for (int c = 0; c < C; c++) cur[c * T + t] -= mean;
+        }
+
+        // Step 2: compute per-frame energy, smooth with 17-tap filter
+        std::vector<float> energy(T, 0.f);
+        for (int t = 0; t < T; t++) {
+            for (int c = 0; c < C; c++) {
+                float v = cur[c * T + t];
+                energy[t] += v * v;
+            }
+            energy[t] = sqrtf(energy[t] / C + 1e-7f);
+        }
+
+        // Apply 17-tap filter along time to get smoothed energy
+        const float * filt = (const float *)m.adaptive_norm_filter->data;
+        int K_filt = 17, pad = K_filt / 2;
+        std::vector<float> smooth(T, 0.f);
+        for (int t = 0; t < T; t++) {
+            for (int k = 0; k < K_filt; k++) {
+                int ti = t + k - pad;
+                if (ti >= 0 && ti < T)
+                    smooth[t] += filt[k] * energy[ti];
+            }
+            if (smooth[t] < 1e-7f) smooth[t] = 1e-7f;
+        }
+
+        // Step 3: normalize each frame by smoothed energy
+        for (int t = 0; t < T; t++) {
+            float inv = 1.f / smooth[t];
+            for (int c = 0; c < C; c++)
+                cur[c * T + t] *= inv;
+        }
+    }
+
     for (int si = 0; si < (int)m.stages.size(); si++) {
         const auto & st = m.stages[si];
 
