@@ -55,22 +55,26 @@ All ten runtimes share ggml-based inference. The speech-LLM backends (**qwen3**,
 
 Run `crispasr --list-backends` to see it live. Each backend declares capabilities at runtime; if you ask for a feature the selected backend does not support, CrispASR prints a warning and silently ignores the flag.
 
+<!-- Generated from `crispasr --list-backends`. Keep in sync. -->
+
 | Feature | whisper | parakeet | canary | cohere | granite | voxtral | voxtral4b | qwen3 | fc-ctc |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | Native timestamps | ✔ | ✔ | ✔ | ✔ | | | | | |
-| CTC forced timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Word-level timing | ✔ | ✔ | ✔ | ✔ | via `-am` | via `-am` | via `-am` | via `-am` | via `-am` |
+| CTC timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Word-level timing | ✔ | ✔ | ✔ | ✔ | | | | | |
 | Per-token confidence | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | |
-| Language auto-detect | ✔ | ✔ | LID | LID | LID | LID | LID | ✔ | |
+| Language auto-detect | ✔ | ✔ | | | | | | ✔ | |
 | Speech translation | ✔ | | ✔ | | ✔ | ✔ | | ✔ | |
-| Speaker diarization | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Grammar constraints (GBNF) | ✔ | | | | | | | | |
+| Speaker diarization | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | |
+| Grammar (GBNF) | ✔ | | | | | | | | |
 | Temperature sampling | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | |
 | Beam search | ✔ | | | | | ✔ | | | |
-| Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
+| Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | |
 | Punctuation toggle | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | |
 | Source / target language | | | ✔ | | ✔ | ✔ | | ✔ | |
 | Auto-download | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | |
+
+Capabilities are declared at runtime by each backend. Word-level timing for backends without native word timestamps is available via the CTC forced aligner (`-am canary-ctc-aligner.gguf` or `-am qwen3-forced-aligner.gguf`). Language auto-detect for backends that don't declare it natively is available via the LID pre-step (`-l auto`).
 
 **Speaker diarization** is available for all backends as a post-processing step via `--diarize`:
 - `--diarize-method energy` / `xcorr` — stereo-only, no extra deps
