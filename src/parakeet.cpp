@@ -31,12 +31,6 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-#ifdef GGML_USE_METAL
-#  include "ggml-metal.h"
-#endif
-#ifdef GGML_USE_CUDA
-#  include "ggml-cuda.h"
-#endif
 
 #include <algorithm>
 #include <cassert>
@@ -1054,13 +1048,8 @@ parakeet_tdt_decode(parakeet_context * ctx,
 // ===========================================================================
 
 static ggml_backend_t pick_backend() {
-#ifdef GGML_USE_METAL
-    if (ggml_backend_t b = ggml_backend_metal_init()) return b;
-#endif
-#ifdef GGML_USE_CUDA
-    if (ggml_backend_t b = ggml_backend_cuda_init(0))  return b;
-#endif
-    return ggml_backend_cpu_init();
+    ggml_backend_t b = ggml_backend_init_best();
+    return b ? b : ggml_backend_cpu_init();
 }
 
 // ===========================================================================

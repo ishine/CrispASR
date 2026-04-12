@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(/opt/miniconda/bin/hf auth:*)",
-      "Bash(bash:*)",
-      "Bash(gh auth:*)"
-    ]
-  }
-}
