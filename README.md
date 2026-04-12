@@ -62,20 +62,20 @@ Run `crispasr --list-backends` to see it live. Each backend declares capabilitie
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | Native timestamps | ✔ | ✔ | ✔ | ✔ | | | | | | |
 | CTC timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Word-level timing | ✔ | ✔ | ✔ | ✔ | `-am` | `-am` | `-am` | `-am` | `-am` | |
+| Word-level timing | ✔ | ✔ | ✔ | ✔ | `-am` | `-am` | `-am` | `-am` | | |
 | Per-token confidence | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
 | Language auto-detect | ✔ | ✔ | LID | LID | LID | LID | LID | ✔ | LID | LID |
 | Speech translation | ✔ | | ✔ | | ✔ | ✔ | | ✔ | | |
-| Speaker diarization | all | all | all | all | all | all | all | all | all | all |
+| Speaker diarization | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | all | all |
 | Grammar (GBNF) | ✔ | | | | | | | | | |
 | Temperature sampling | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
 | Beam search | ✔ | | | | | ✔ | | | | |
 | Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
 | Punctuation toggle | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
 | Source / target language | | | ✔ | | ✔ | ✔ | | ✔ | | |
-| Auto-download | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
+| Auto-download (`-m auto`) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
 
-**Key:** ✔ = native, `-am` = via CTC forced aligner (`-am canary-ctc-aligner.gguf` or `-am qwen3-forced-aligner.gguf`), **LID** = via language identification pre-step (`-l auto`), **all** = available for every backend via `--diarize` post-step.
+**Key:** ✔ = native/built-in, `-am` = via CTC forced aligner (`-am canary-ctc-aligner.gguf` or `-am qwen3-forced-aligner.gguf`), **LID** = via external language identification pre-step (`-l auto`), **all** = via `--diarize` post-step (not declared by backend but always available).
 
 **Speaker diarization** is available for all backends as a post-processing step via `--diarize`:
 - `--diarize-method energy` / `xcorr` — stereo-only, no extra deps
