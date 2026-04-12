@@ -346,10 +346,20 @@ static void ggml_linear_f32(std::vector<uint8_t> & scratch,
 // ggml graph-based forward pass (new, GPU-ready)
 // ===========================================================================
 
-static ggml_cgraph * wav2vec2_build_graph(
+// Build a ggml graph for the FULL wav2vec2 forward pass.
+// Returns a graph whose output tensor "logits" has shape (V, T).
+//
+// This replaces the manual C++ forward pass with a single ggml graph
+// that can run on any ggml backend (CPU, CUDA, Metal, Vulkan).
+//
+// NOTE: The CNN feature extractor stays as manual C++ (CPU-only) because
+// ggml_conv_1d with varying strides + LayerNorm/InstanceNorm is fiddly
+// to get right in graph form and the CNN is <5% of total compute.
+// Only the transformer + feature projection + LM head are in the graph.
+static ggml_cgraph * wav2vec2_build_transformer_graph(
     const wav2vec2_model & m,
-    int T_audio, // n_samples after normalization
-    int n_threads)
+    int T,               // number of CNN output frames (computed by caller)
+    std::vector<uint8_t> & compute_meta)
 {
     const auto & hp = m.hparams;
     const int H       = (int)hp.hidden_size;
@@ -357,63 +367,264 @@ static ggml_cgraph * wav2vec2_build_graph(
     const int head_dim = H / n_heads;
     const int I       = (int)hp.intermediate_size;
     const int L       = (int)hp.num_hidden_layers;
+    const int V       = (int)hp.vocab_size;
     const float ln_eps = hp.layer_norm_eps;
 
-    // Compute CNN output length
-    int T = T_audio;
-    for (uint32_t i = 0; i < hp.num_feat_extract_layers; i++)
-        T = (T - (int)hp.conv_kernel[i]) / (int)hp.conv_stride[i] + 1;
-
-    // Graph context
-    size_t ctx_size = ggml_tensor_overhead() * (16384) + ggml_graph_overhead_custom(16384, false);
-    std::vector<uint8_t> buf(ctx_size);
-    ggml_init_params ip = { ctx_size, buf.data(), true };
+    size_t ctx_size = ggml_tensor_overhead() * 16384 + ggml_graph_overhead_custom(16384, false);
+    compute_meta.resize(ctx_size);
+    ggml_init_params ip = { ctx_size, compute_meta.data(), true };
     ggml_context * ctx0 = ggml_init(ip);
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, 16384, false);
 
-    // Input: normalized audio [T_audio]
-    ggml_tensor * audio_in = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, T_audio);
-    ggml_set_name(audio_in, "audio");
-    ggml_set_input(audio_in);
+    // Input: feature-projected hidden states [H, T] from the CNN + proj
+    ggml_tensor * cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, H, T);
+    ggml_set_name(cur, "hidden_in");
+    ggml_set_input(cur);
 
-    // ---- CNN feature extractor ----
-    // 7 strided Conv1d layers: [1, T_audio] → [C_cnn, T]
-    ggml_tensor * cur = ggml_reshape_2d(ctx0, audio_in, T_audio, 1);  // (T, C=1)
-    cur = ggml_cont(ctx0, ggml_transpose(ctx0, cur));                  // (1, T)
+    // ---- L × Transformer layers (pre-norm) ----
+    for (int il = 0; il < L; il++) {
+        const auto & e = m.enc[il];
+        ggml_tensor * residual = cur;
 
-    for (uint32_t li = 0; li < hp.num_feat_extract_layers; li++) {
-        // ggml_conv_1d expects: kernel (K, C_in, C_out), input (T, C_in)
-        // Our weights are stored as (C_out, C_in, K) in numpy → ggml ne=(K, C_in, C_out)
-        cur = ggml_conv_1d(ctx0, m.cnn[li].conv_w, cur,
-                           (int)hp.conv_stride[li], /*pad*/0, /*dilation*/1);
-        if (m.cnn[li].conv_b) {
-            cur = ggml_add(ctx0, cur,
-                           ggml_reshape_3d(ctx0, m.cnn[li].conv_b, 1, m.cnn[li].conv_b->ne[0], 1));
-        }
-        // Norm + GELU
-        if (m.cnn[li].has_norm) {
-            // InstanceNorm or LayerNorm depending on feat_extract_norm_type
-            // For stable_layer_norm (type=1): LayerNorm over channel dim
-            // For group_norm (type=0): InstanceNorm on layer 0 only
-            // TODO: implement properly; for now skip (the manual path handles this)
-        }
-        cur = ggml_gelu(ctx0, cur);
+        // Pre-attention LayerNorm
+        ggml_tensor * x = ggml_norm(ctx0, cur, ln_eps);
+        x = ggml_mul(ctx0, x, e.ln1_w);
+        x = ggml_add(ctx0, x, e.ln1_b);
+
+        // Q/K/V projections
+        ggml_tensor * Q = ggml_add(ctx0, ggml_mul_mat(ctx0, e.q_w, x), e.q_b);
+        ggml_tensor * K = ggml_add(ctx0, ggml_mul_mat(ctx0, e.k_w, x), e.k_b);
+        ggml_tensor * V_t = ggml_add(ctx0, ggml_mul_mat(ctx0, e.v_w, x), e.v_b);
+
+        // Reshape to (head_dim, n_heads, T)
+        Q   = ggml_reshape_3d(ctx0, Q,   head_dim, n_heads, T);
+        K   = ggml_reshape_3d(ctx0, K,   head_dim, n_heads, T);
+        V_t = ggml_reshape_3d(ctx0, V_t, head_dim, n_heads, T);
+
+        // Permute to (head_dim, T, n_heads) for flash attention
+        Q   = ggml_cont(ctx0, ggml_permute(ctx0, Q,   0, 2, 1, 3));
+        K   = ggml_cont(ctx0, ggml_permute(ctx0, K,   0, 2, 1, 3));
+        V_t = ggml_cont(ctx0, ggml_permute(ctx0, V_t, 0, 2, 1, 3));
+
+        // Flash attention (no mask — bidirectional encoder)
+        float attn_scale = 1.0f / sqrtf((float)head_dim);
+        ggml_tensor * attn = ggml_flash_attn_ext(
+            ctx0, Q, K, V_t, /*mask*/nullptr,
+            attn_scale, 0.0f, 0.0f);
+
+        // Reshape back to (H, T)
+        attn = ggml_reshape_2d(ctx0, attn, H, T);
+
+        // Output projection + residual
+        attn = ggml_add(ctx0, ggml_mul_mat(ctx0, e.o_w, attn), e.o_b);
+        cur = ggml_add(ctx0, residual, attn);
+
+        // Pre-FFN LayerNorm
+        residual = cur;
+        x = ggml_norm(ctx0, cur, ln_eps);
+        x = ggml_mul(ctx0, x, e.ln2_w);
+        x = ggml_add(ctx0, x, e.ln2_b);
+
+        // FFN: fc1 → GELU → fc2
+        x = ggml_add(ctx0, ggml_mul_mat(ctx0, e.fc1_w, x), e.fc1_b);
+        x = ggml_gelu(ctx0, x);
+        x = ggml_add(ctx0, ggml_mul_mat(ctx0, e.fc2_w, x), e.fc2_b);
+        cur = ggml_add(ctx0, residual, x);
     }
-    // cur shape: (T_cnn, C_cnn, 1) from conv_1d output layout
-    // Squeeze to (T, C_cnn) and transpose to (C_cnn, T) → (H, T) after projection
-    int C_cnn = (int)hp.conv_dim[hp.num_feat_extract_layers - 1];
 
-    // ---- Feature projection: LN(C_cnn) → Linear(C_cnn → H) ----
-    // TODO: transpose to (C_cnn, T), apply LN, then mul_mat with fp_w
+    // ---- Global LayerNorm ----
+    cur = ggml_norm(ctx0, cur, ln_eps);
+    cur = ggml_mul(ctx0, cur, m.enc_ln_w);
+    cur = ggml_add(ctx0, cur, m.enc_ln_b);
 
-    // For now, mark this as a TODO and fall through to the existing manual path
-    // The graph is structurally complete but needs CNN output shape handling
-    // which depends on ggml_conv_1d's exact output layout.
+    // ---- LM head: Linear(H → V) ----
+    cur = ggml_mul_mat(ctx0, m.lm_w, cur);
+    if (m.lm_b) cur = ggml_add(ctx0, cur, m.lm_b);
 
-    ggml_set_name(cur, "cnn_out");
+    ggml_set_name(cur, "logits");
     ggml_build_forward_expand(gf, cur);
     ggml_free(ctx0);
     return gf;
+}
+
+// ===========================================================================
+// Graph-based forward: CNN (manual) → transformer (ggml graph)
+// ===========================================================================
+
+std::vector<float> wav2vec2_compute_logits_graph(
+    const wav2vec2_model & m,
+    const float * raw_audio, int n_samples,
+    int n_threads)
+{
+    const auto & hp = m.hparams;
+    const int H = (int)hp.hidden_size;
+
+    // ---- 0. Normalize ----
+    std::vector<float> audio(raw_audio, raw_audio + n_samples);
+    {
+        double sum = 0.0, sq = 0.0;
+        for (float v : audio) { sum += v; sq += (double)v * v; }
+        float mean = (float)(sum / n_samples);
+        float std_ = sqrtf(std::max(0.f, (float)(sq / n_samples) - mean * mean) + 1e-7f);
+        for (float & v : audio) v = (v - mean) / std_;
+    }
+
+    // ---- 1. CNN feature extractor (manual C++) ----
+    uint32_t L_cur = (uint32_t)n_samples, C_cur = 1;
+    std::vector<float> cnn_in(audio.begin(), audio.end()), cnn_out;
+
+    for (uint32_t li = 0; li < hp.num_feat_extract_layers; li++) {
+        uint32_t C_out  = hp.conv_dim[li];
+        uint32_t K      = hp.conv_kernel[li];
+        uint32_t stride = hp.conv_stride[li];
+        uint32_t L_out  = (L_cur - K) / stride + 1;
+
+        cnn_out.resize(C_out * L_out);
+
+        std::vector<float> w_buf;
+        const float * wdata;
+        if (m.cnn[li].conv_w->type == GGML_TYPE_F16) {
+            size_t n = C_out * C_cur * K;
+            w_buf.resize(n);
+            const ggml_fp16_t * w16 = (const ggml_fp16_t *)m.cnn[li].conv_w->data;
+            for (size_t i = 0; i < n; i++) w_buf[i] = ggml_fp16_to_fp32(w16[i]);
+            wdata = w_buf.data();
+        } else {
+            wdata = (const float *)m.cnn[li].conv_w->data;
+        }
+        const float * bdata = (const float *)m.cnn[li].conv_b->data;
+        const float * nw    = m.cnn[li].has_norm ? (const float *)m.cnn[li].norm_w->data : nullptr;
+        const float * nb    = m.cnn[li].has_norm ? (const float *)m.cnn[li].norm_b->data : nullptr;
+
+        conv1d(cnn_in.data(), wdata, bdata,
+               cnn_out.data(),
+               (int)C_cur, (int)C_out, (int)K, (int)stride, (int)L_cur, 0);
+
+        if (m.cnn[li].has_norm) {
+            if (hp.feat_extract_norm_type == 1)
+                layer_norm_cf(cnn_out.data(), cnn_out.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps);
+            else
+                instance_norm_1d(cnn_out.data(), cnn_out.data(), nw, nb, (int)C_out, (int)L_out, hp.layer_norm_eps);
+        }
+        for (float & v : cnn_out) v = gelu(v);
+
+        std::swap(cnn_in, cnn_out);
+        C_cur = C_out;
+        L_cur = L_out;
+    }
+
+    int T     = (int)L_cur;
+    int C_cnn = (int)C_cur;
+
+    // Transpose [C_cnn, T] → [T, C_cnn]
+    std::vector<float> feat(T * C_cnn);
+    for (int t = 0; t < T; t++)
+        for (int c = 0; c < C_cnn; c++)
+            feat[t * C_cnn + c] = cnn_in[c * T + t];
+
+    // ---- 2. Feature projection: LN + Linear ----
+    layer_norm(feat.data(), feat.data(),
+               (const float *)m.fp_ln_w->data,
+               (const float *)m.fp_ln_b->data,
+               T, C_cnn, hp.layer_norm_eps);
+
+    std::vector<float> hidden(T * H);
+    std::vector<uint8_t> scratch;
+    ggml_linear_f32(scratch, m.fp_w, (const float *)m.fp_b->data,
+                    feat.data(), hidden.data(), C_cnn, H, T, n_threads);
+
+    // ---- 3. Positional conv (manual — grouped conv is hard in ggml) ----
+    {
+        std::vector<float> hcf(H * T);
+        for (int t = 0; t < T; t++)
+            for (int h = 0; h < H; h++)
+                hcf[h * T + t] = hidden[t * H + h];
+
+        std::vector<float> pos_out(H * T);
+        int K_pos = (int)hp.num_conv_pos_embeddings;
+        int G_pos = (int)hp.num_conv_pos_embedding_groups;
+
+        std::vector<float> pw_buf;
+        const float * pw;
+        size_t pos_w_n = (size_t)H * (H / G_pos) * K_pos;
+        if (m.pos_conv_w->type == GGML_TYPE_F16) {
+            pw_buf.resize(pos_w_n);
+            const ggml_fp16_t * p16 = (const ggml_fp16_t *)m.pos_conv_w->data;
+            for (size_t i = 0; i < pos_w_n; i++) pw_buf[i] = ggml_fp16_to_fp32(p16[i]);
+            pw = pw_buf.data();
+        } else if (m.pos_conv_w->type == GGML_TYPE_F32) {
+            pw = (const float *)m.pos_conv_w->data;
+        } else {
+            fprintf(stderr, "[wav2vec2] pos_conv.weight unsupported type\n");
+            return {};
+        }
+        const float * pb = (const float *)m.pos_conv_b->data;
+
+        grouped_conv1d_same(hcf.data(), pw, pb, pos_out.data(), H, H, K_pos, G_pos, T);
+
+        for (int t = 0; t < T; t++)
+            for (int h = 0; h < H; h++)
+                hidden[t * H + h] += gelu(pos_out[h * T + t]);
+    }
+
+    // ---- 4. Transformer + LN + LM head via ggml graph ----
+    // Transpose hidden [T, H] → [H, T] for ggml (ne[0]=H fastest)
+    std::vector<float> hidden_ht(H * T);
+    for (int t = 0; t < T; t++)
+        for (int h = 0; h < H; h++)
+            hidden_ht[h * T + t] = hidden[t * H + h];
+
+    // Build graph
+    std::vector<uint8_t> compute_meta;
+    ggml_cgraph * gf = wav2vec2_build_transformer_graph(m, T, compute_meta);
+    if (!gf) return {};
+
+    // Allocate + run
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    if (!backend) return {};
+    ggml_backend_cpu_set_n_threads(backend, n_threads);
+
+    ggml_backend_t backends[1] = { backend };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 1, 16384, false, false);
+    ggml_backend_sched_reset(sched);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        fprintf(stderr, "[wav2vec2] graph alloc failed\n");
+        ggml_backend_sched_free(sched);
+        ggml_backend_free(backend);
+        return {};
+    }
+
+    // Set input
+    ggml_tensor * inp = ggml_graph_get_tensor(gf, "hidden_in");
+    ggml_backend_tensor_set(inp, hidden_ht.data(), 0, H * T * sizeof(float));
+
+    // Compute
+    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "[wav2vec2] graph compute failed\n");
+        ggml_backend_sched_free(sched);
+        ggml_backend_free(backend);
+        return {};
+    }
+
+    // Read output
+    ggml_tensor * out = ggml_graph_get_tensor(gf, "logits");
+    int V_out = (int)out->ne[0];
+    int T_out = (int)out->ne[1];
+
+    std::vector<float> logits(V_out * T_out);
+    ggml_backend_tensor_get(out, logits.data(), 0, logits.size() * sizeof(float));
+
+    ggml_backend_sched_free(sched);
+    ggml_backend_free(backend);
+
+    // The graph outputs (V, T) but our API expects (T, V) row-major
+    // Transpose: logits_tv[t*V + v] = logits_vt[v*T + t]
+    std::vector<float> logits_tv(T_out * V_out);
+    for (int t = 0; t < T_out; t++)
+        for (int v = 0; v < V_out; v++)
+            logits_tv[t * V_out + v] = logits[v * T_out + t];
+
+    return logits_tv;
 }
 
 // ===========================================================================
@@ -425,6 +636,16 @@ std::vector<float> wav2vec2_compute_logits(
     const float * raw_audio, int n_samples,
     int n_threads)
 {
+    // The ggml graph path (wav2vec2_compute_logits_graph) is structurally
+    // complete but can't run yet because wav2vec2_load uses the legacy
+    // ggml_init_from_file loader (weights in plain ggml_context, not a
+    // backend buffer). The scheduler crashes when trying to resolve
+    // cross-context tensor references. Enabling the graph path requires
+    // migrating wav2vec2_load to core_gguf::load_weights first.
+    // TODO: refactor loader, then uncomment:
+    // auto result = wav2vec2_compute_logits_graph(m, raw_audio, n_samples, n_threads);
+    // if (!result.empty()) return result;
+
     const auto & hp = m.hparams;
 
     // ------------------------------------------------------------------
