@@ -263,32 +263,38 @@ static void self_attention(
     auto V = qkv.data() + 2 * D;
     int stride_qkv = 3 * D;
 
-    // Scores = Q @ K^T / sqrt(D)  → [T, T]
-    float scale = 1.f / sqrtf((float)D);
-    std::vector<float> scores(T * T);
-    for (int i = 0; i < T; i++) {
-        for (int j = 0; j < T; j++) {
-            float dot = 0;
-            for (int d = 0; d < D; d++)
-                dot += Q[i * stride_qkv + d] * K[j * stride_qkv + d];
-            scores[i * T + j] = dot * scale;
-        }
-        // Softmax over j
-        float mx = *std::max_element(scores.data() + i * T, scores.data() + (i + 1) * T);
-        float sum = 0;
-        for (int j = 0; j < T; j++) {
-            scores[i * T + j] = expf(scores[i * T + j] - mx);
-            sum += scores[i * T + j];
-        }
-        for (int j = 0; j < T; j++) scores[i * T + j] /= sum;
-    }
+    // Multi-head attention: n_heads=2, head_dim=64 for D=128.
+    // ONNX Div_196 scale = 8.0 = sqrt(64) → 1/scale = 1/8 = 0.125.
+    // (Not 1/sqrt(D=128) = 0.088 which is what single-head would use.)
+    const int n_heads = 2;
+    const int head_dim = D / n_heads;  // 64
+    float scale = 1.f / sqrtf((float)head_dim);  // 1/8 = 0.125
 
-    // Attn = scores @ V → [T, D]
     std::vector<float> attn(T * D, 0.f);
-    for (int i = 0; i < T; i++)
-        for (int j = 0; j < T; j++)
-            for (int d = 0; d < D; d++)
-                attn[i * D + d] += scores[i * T + j] * V[j * stride_qkv + d];
+
+    for (int h = 0; h < n_heads; h++) {
+        const int h_off = h * head_dim;
+        std::vector<float> scores(T * T);
+        for (int i = 0; i < T; i++) {
+            for (int j = 0; j < T; j++) {
+                float dot = 0;
+                for (int d = 0; d < head_dim; d++)
+                    dot += Q[i * stride_qkv + h_off + d] * K[j * stride_qkv + h_off + d];
+                scores[i * T + j] = dot * scale;
+            }
+            float mx = *std::max_element(scores.data() + i * T, scores.data() + (i + 1) * T);
+            float sm = 0;
+            for (int j = 0; j < T; j++) {
+                scores[i * T + j] = expf(scores[i * T + j] - mx);
+                sm += scores[i * T + j];
+            }
+            for (int j = 0; j < T; j++) scores[i * T + j] /= sm;
+        }
+        for (int i = 0; i < T; i++)
+            for (int j = 0; j < T; j++)
+                for (int d = 0; d < head_dim; d++)
+                    attn[i * D + h_off + d] += scores[i * T + j] * V[j * stride_qkv + h_off + d];
+    }
 
     // Output projection: attn @ out_w + out_b → [T, D]
     // out_w stored as (D, D) → data[dd * D + d] = weight[dd, d]
