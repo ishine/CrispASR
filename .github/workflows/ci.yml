@@ -127,7 +127,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF
 
       - name: Build
-        run: cmake --build build-ios --target whisper -- -quiet
+        run: cmake --build build-ios --target whisper -j $(sysctl -n hw.logicalcpu)
 
   # ===========================================================================
   # Android (cross-compile gate — no runtime test)
