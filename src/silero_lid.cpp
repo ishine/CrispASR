@@ -510,8 +510,6 @@ extern "C" const char * silero_lid_detect(
             float global_mean = 0;
             for (int t = 0; t < T; t++) global_mean += smooth[t];
             global_mean /= T;
-                    global_mean, T, C_half);
-                    log_mag[0], frame_mean[0], smooth[0]);
 
             // Step 7: normalize = log_mag - global_mean
             for (int i = 0; i < C_half * T; i++) {
