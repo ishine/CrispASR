@@ -6,15 +6,21 @@ Architecture: SincNet → MaxPool × 3 → LSTM × 4 → Linear × 3 → LogSoft
 Input: (N, 1, T) raw 16 kHz audio
 Output: (N, T', 7) per-frame speaker activity log-probabilities
 """
+
 from __future__ import annotations
-import argparse, sys
+import argparse
+import sys
 from pathlib import Path
 import numpy as np
 
-try: import onnx
-except ImportError: sys.exit("pip install onnx")
-try: import gguf
-except ImportError: sys.exit("pip install gguf")
+try:
+    import onnx
+except ImportError:
+    sys.exit("pip install onnx")
+try:
+    import gguf
+except ImportError:
+    sys.exit("pip install gguf")
 
 
 def convert(onnx_path: Path, out_path: Path) -> None:
@@ -33,7 +39,7 @@ def convert(onnx_path: Path, out_path: Path) -> None:
         # Skip scalar constants (shape (), (1,), int64 types)
         if arr.size <= 4 and arr.dtype in (np.int64, np.int32):
             continue
-        if arr.size <= 1 and 'ortshared' in w.name:
+        if arr.size <= 1 and "ortshared" in w.name:
             # Small float constants — keep only meaningful ones
             if arr.dtype == np.float32:
                 name = f"pyannote.const.{w.name}"

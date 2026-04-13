@@ -28,11 +28,13 @@ import os
 import subprocess
 import sys
 
+
 # ============================================================
 # Install dependencies
 # ============================================================
 def install(pkg):
     subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", pkg])
+
 
 # Install ALL dependencies FIRST, before any transformers import.
 # mistral-common MUST be installed before transformers tries to load
@@ -45,15 +47,15 @@ install("huggingface_hub")
 install("transformers>=5.2.0")
 
 # Force reimport after installs (Kaggle/Jupyter caches old import state)
-import importlib
 for mod_name in list(sys.modules.keys()):
-    if 'mistral' in mod_name or 'transformers' in mod_name:
+    if "mistral" in mod_name or "transformers" in mod_name:
         del sys.modules[mod_name]
 
 # Try to get GH_TOKEN from Kaggle secrets
 GH_TOKEN = None
 try:
     from kaggle_secrets import UserSecretsClient
+
     GH_TOKEN = UserSecretsClient().get_secret("GH_TOKEN")
 except Exception:
     GH_TOKEN = os.environ.get("GH_TOKEN", None)
@@ -61,11 +63,9 @@ except Exception:
 if not GH_TOKEN:
     print("WARNING: GH_TOKEN not found — will save locally only, no gist upload")
 
-import numpy as np
-import torch
-import json
-import io
-import requests
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import requests  # noqa: E402
 
 # ============================================================
 # Download model + audio
@@ -74,7 +74,7 @@ print("=" * 60)
 print("Downloading model and audio...")
 print("=" * 60)
 
-from huggingface_hub import snapshot_download
+from huggingface_hub import snapshot_download  # noqa: E402
 
 model_dir = snapshot_download(
     "mistralai/Voxtral-Mini-4B-Realtime-2602",
@@ -88,31 +88,39 @@ audio_url = "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav
 audio_path = "/tmp/jfk.wav"
 if not os.path.exists(audio_path):
     import urllib.request
+
     urllib.request.urlretrieve(audio_url, audio_path)
 print(f"Audio: {audio_path}")
 
 # ============================================================
 # Load audio
 # ============================================================
-import scipy.io.wavfile as wavfile
+import scipy.io.wavfile as wavfile  # noqa: E402
+
 sr, data = wavfile.read(audio_path)
 assert sr == 16000, f"Expected 16kHz, got {sr}"
-audio = data.astype(np.float32) / 32768.0 if data.dtype == np.int16 else data.astype(np.float32)
+audio = (
+    data.astype(np.float32) / 32768.0
+    if data.dtype == np.int16
+    else data.astype(np.float32)
+)
 print(f"Audio: {len(audio)} samples, {len(audio)/16000:.2f}s")
 
 results = {}  # name -> {"shape": ..., "dtype": ..., "data": base64, "stats": ...}
 
+
 def to_np(x):
     """Convert tensor or array to numpy float32, handling GPU tensors."""
-    if hasattr(x, 'cpu'):
+    if hasattr(x, "cpu"):
         x = x.cpu()
-    if hasattr(x, 'detach'):
+    if hasattr(x, "detach"):
         x = x.detach()
-    if hasattr(x, 'float'):
+    if hasattr(x, "float"):
         x = x.float()
-    if hasattr(x, 'numpy'):
+    if hasattr(x, "numpy"):
         x = x.numpy()
     return np.asarray(x, dtype=np.float32)
+
 
 def save_result(name, arr, desc=""):
     """Save a numpy array to results dict."""
@@ -128,7 +136,10 @@ def save_result(name, arr, desc=""):
         "last_8": arr.flatten()[-8:].tolist(),
     }
     np.save(f"/tmp/v4b-{name}.npy", arr)
-    print(f"  {name}: shape={arr.shape} min={arr.min():.6f} max={arr.max():.6f} mean={arr.mean():.6f}")
+    print(
+        f"  {name}: shape={arr.shape} min={arr.min():.6f} max={arr.max():.6f} mean={arr.mean():.6f}"
+    )
+
 
 # ============================================================
 # 1. Time embedding (t_cond) — pure math
@@ -154,20 +165,22 @@ print("=" * 60)
 
 try:
     from librosa.filters import mel as librosa_mel
+
     mel_filters = librosa_mel(sr=16000, n_fft=400, n_mels=128).T  # (201, 128)
 except ImportError:
     install("librosa")
     from librosa.filters import mel as librosa_mel
+
     mel_filters = librosa_mel(sr=16000, n_fft=400, n_mels=128).T
 
-from scipy.signal import get_window
-from scipy.fft import rfft
+from scipy.signal import get_window  # noqa: E402
+from scipy.fft import rfft  # noqa: E402
 
 n_fft, hop, n_mels, n_freqs = 400, 160, 128, 201
-hann = get_window('hann', n_fft, fftbins=True).astype(np.float32)
+hann = get_window("hann", n_fft, fftbins=True).astype(np.float32)
 
 pad = n_fft // 2
-padded = np.pad(audio, (pad, pad), mode='constant')
+padded = np.pad(audio, (pad, pad), mode="constant")
 T = (len(padded) - n_fft) // hop + 1 - 1  # Whisper drops last frame
 
 power = np.zeros((n_freqs, T), dtype=np.float32)
@@ -190,9 +203,11 @@ mel_fixed = (mel_fixed + 4.0) / 4.0
 # Pad to 3000
 T_out = 3000
 mel_padded = np.full((n_mels, T_out), (floor_v + 4.0) / 4.0, dtype=np.float32)
-mel_padded[:, :min(T, T_out)] = mel_fixed[:, :min(T, T_out)]
+mel_padded[:, : min(T, T_out)] = mel_fixed[:, : min(T, T_out)]
 
-save_result("mel_voxtral", mel_padded, "mel with global_log_mel_max=1.5, padded to 3000")
+save_result(
+    "mel_voxtral", mel_padded, "mel with global_log_mel_max=1.5, padded to 3000"
+)
 
 # ============================================================
 # 3. Load model and dump intermediates
@@ -201,38 +216,44 @@ print("\n" + "=" * 60)
 print("3. Loading model...")
 print("=" * 60)
 
-from transformers import VoxtralRealtimeForConditionalGeneration
+from transformers import VoxtralRealtimeForConditionalGeneration  # noqa: E402
 
 # Load processor — try AutoProcessor first, fall back to manual construction
 try:
     from transformers import AutoProcessor
+
     processor = AutoProcessor.from_pretrained(model_dir)
     print("  Loaded processor via AutoProcessor")
 except (ImportError, Exception) as e:
     print(f"  AutoProcessor failed ({e}), building processor manually...")
     # Manually build feature extractor + tokenizer
     from transformers import AutoFeatureExtractor, AutoTokenizer
+
     feature_extractor = AutoFeatureExtractor.from_pretrained(model_dir)
     tokenizer = AutoTokenizer.from_pretrained(model_dir)
+
     # Create a minimal processor-like object
     class MinimalProcessor:
         def __init__(self, fe, tok):
             self.feature_extractor = fe
             self.tokenizer = tok
+
         def __call__(self, audio, **kwargs):
             feats = self.feature_extractor(audio, sampling_rate=16000, **kwargs)
             # Build default input_ids: BOS + STREAMING_PAD * 38
             input_ids = torch.tensor([[1] + [32] * 38])
             feats["input_ids"] = input_ids
             return feats
+
         def batch_decode(self, ids, **kwargs):
             return self.tokenizer.batch_decode(ids, **kwargs)
+
         def decode(self, ids, **kwargs):
             return self.tokenizer.decode(ids, **kwargs)
+
     processor = MinimalProcessor(feature_extractor, tokenizer)
     print("  Built minimal processor")
 
-import torch
 _device = "cuda" if torch.cuda.is_available() else "cpu"
 _dtype = torch.float16 if _device == "cuda" else torch.float32
 print(f"  Loading model on {_device} with {_dtype}")
@@ -250,11 +271,13 @@ print("4. HF Processor mel features")
 print("=" * 60)
 
 inputs = processor(audio, return_tensors="pt")
+
+
 # Move inputs to model device AND cast float tensors to model dtype
 def move_inputs(d, device, dtype):
     out = {}
     for k, v in d.items():
-        if hasattr(v, 'to'):
+        if hasattr(v, "to"):
             if v.is_floating_point():
                 out[k] = v.to(device=device, dtype=dtype)
             else:
@@ -262,12 +285,14 @@ def move_inputs(d, device, dtype):
         else:
             out[k] = v
     return out
+
+
 inputs = move_inputs(inputs, _device, _dtype)
 
 # Debug: print all input shapes
 print("  Input keys and shapes:")
 for k, v in inputs.items():
-    if hasattr(v, 'shape'):
+    if hasattr(v, "shape"):
         print(f"    {k}: {v.shape} dtype={v.dtype}")
 
 # Mel features — handle various possible shapes
@@ -276,21 +301,32 @@ print(f"  raw input_features shape: {raw_mel.shape}")
 if raw_mel.dim() == 4:
     hf_mel = raw_mel[0, 0]  # (batch, channel, n_mels, T) -> (n_mels, T)
 elif raw_mel.dim() == 3:
-    hf_mel = raw_mel[0]      # (batch, n_mels, T) -> (n_mels, T)
+    hf_mel = raw_mel[0]  # (batch, n_mels, T) -> (n_mels, T)
 elif raw_mel.dim() == 2:
-    hf_mel = raw_mel          # already (n_mels, T) or (T, n_mels)
+    hf_mel = raw_mel  # already (n_mels, T) or (T, n_mels)
 else:
     hf_mel = raw_mel.squeeze()
 print(f"  hf_mel shape after squeeze: {hf_mel.shape}")
-save_result("mel_hf", to_np(hf_mel), f"mel from HF processor, raw shape was {list(raw_mel.shape)}")
+save_result(
+    "mel_hf",
+    to_np(hf_mel),
+    f"mel from HF processor, raw shape was {list(raw_mel.shape)}",
+)
 
 # Also save the mel transposed if it looks like (T, n_mels)
 if hf_mel.shape[0] > hf_mel.shape[-1] if hf_mel.dim() >= 2 else False:
-    save_result("mel_hf_transposed", hf_mel.T.numpy(), "mel_hf transposed (might be correct orientation)")
+    save_result(
+        "mel_hf_transposed",
+        hf_mel.T.numpy(),
+        "mel_hf transposed (might be correct orientation)",
+    )
 
 hf_input_ids = inputs["input_ids"][0]
-save_result("input_ids_hf", to_np(hf_input_ids),
-            f"HF processor input_ids (first 20: {hf_input_ids[:20].tolist()})")
+save_result(
+    "input_ids_hf",
+    to_np(hf_input_ids),
+    f"HF processor input_ids (first 20: {hf_input_ids[:20].tolist()})",
+)
 
 # ============================================================
 # 5. Model t_cond (from model's time_embedding module)
@@ -302,7 +338,9 @@ print("=" * 60)
 with torch.no_grad():
     time_tensor = torch.full((1,), float(delay_tokens), device=_device, dtype=_dtype)
     t_cond_model = model.time_embedding(time_tensor)
-    save_result("t_cond_model", to_np(t_cond_model), "t_cond from model.time_embedding(6)")
+    save_result(
+        "t_cond_model", to_np(t_cond_model), "t_cond from model.time_embedding(6)"
+    )
 
 # ============================================================
 # 6. Ada-norm scales per layer
@@ -312,18 +350,25 @@ print("6. Ada-norm scales")
 print("=" * 60)
 
 with torch.no_grad():
-    t_cond_torch = torch.from_numpy(t_cond_np).unsqueeze(0).to(device=_device, dtype=_dtype)
+    t_cond_torch = (
+        torch.from_numpy(t_cond_np).unsqueeze(0).to(device=_device, dtype=_dtype)
+    )
     for il in range(min(3, len(model.language_model.model.layers))):
         layer = model.language_model.model.layers[il]
         ada_out = layer.ada_rms_norm(t_cond_torch)
         one_plus = to_np((1 + ada_out).squeeze(0))
-        save_result(f"ada_scale_layer{il}", one_plus,
-                    f"1 + ada_rms_norm(t_cond) for layer {il}")
+        save_result(
+            f"ada_scale_layer{il}", one_plus, f"1 + ada_rms_norm(t_cond) for layer {il}"
+        )
+
 
 def gpu_cleanup():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    import gc; gc.collect()
+    import gc
+
+    gc.collect()
+
 
 # ============================================================
 # 7. Encoder output (after projector)
@@ -339,16 +384,24 @@ try:
             return_dict=True,
         )
         encoder_out = audio_outputs.pooler_output[0]
-        save_result("encoder_out", to_np(encoder_out),
-                    f"encoder output after projector, shape {encoder_out.shape}")
+        save_result(
+            "encoder_out",
+            to_np(encoder_out),
+            f"encoder output after projector, shape {encoder_out.shape}",
+        )
         encoder_hidden = audio_outputs.last_hidden_state
-        save_result("encoder_hidden_pre_proj", to_np(encoder_hidden[0]),
-                    f"encoder hidden before projector, shape {encoder_hidden[0].shape}")
+        save_result(
+            "encoder_hidden_pre_proj",
+            to_np(encoder_hidden[0]),
+            f"encoder hidden before projector, shape {encoder_hidden[0].shape}",
+        )
         del audio_outputs, encoder_out, encoder_hidden
         gpu_cleanup()
 except Exception as e:
     print(f"  Encoder output failed: {e}")
-    import traceback; traceback.print_exc()
+    import traceback
+
+    traceback.print_exc()
 
 # ============================================================
 # 8. Full generation
@@ -362,8 +415,11 @@ try:
         outputs = model.generate(**inputs, max_new_tokens=50)
         gen_ids = outputs[0].tolist()
         decoded = processor.batch_decode(outputs, skip_special_tokens=True)
-        save_result("gen_ids", np.array(gen_ids, dtype=np.float32),
-                    f"generated token IDs: {gen_ids[:30]}...")
+        save_result(
+            "gen_ids",
+            np.array(gen_ids, dtype=np.float32),
+            f"generated token IDs: {gen_ids[:30]}...",
+        )
         results["gen_text"] = decoded[0]
         print(f"  Generated text: {decoded[0]!r}")
         print(f"  Token IDs: {gen_ids[:30]}...")
@@ -371,7 +427,9 @@ try:
         gpu_cleanup()
 except Exception as e:
     print(f"  Generation failed: {e}")
-    import traceback; traceback.print_exc()
+    import traceback
+
+    traceback.print_exc()
 
 # ============================================================
 # 9. First-token logits from prefill
@@ -385,11 +443,19 @@ try:
         fwd_out = model(**inputs)
         logits = fwd_out.logits[0, -1]
         top_k = torch.topk(logits, 10)
-        save_result("prefill_logits_top10_vals", to_np(top_k.values),
-                    f"top-10 logit values from prefill")
-        save_result("prefill_logits_top10_ids", to_np(top_k.indices),
-                    f"top-10 token IDs: {top_k.indices.tolist()}")
-        print(f"  Top-10 tokens: {[(processor.decode([tid]), float(val)) for tid, val in zip(top_k.indices.tolist(), top_k.values.tolist())]}")
+        save_result(
+            "prefill_logits_top10_vals",
+            to_np(top_k.values),
+            "top-10 logit values from prefill",
+        )
+        save_result(
+            "prefill_logits_top10_ids",
+            to_np(top_k.indices),
+            f"top-10 token IDs: {top_k.indices.tolist()}",
+        )
+        print(
+            f"  Top-10 tokens: {[(processor.decode([tid]), float(val)) for tid, val in zip(top_k.indices.tolist(), top_k.values.tolist())]}"
+        )
 except Exception as e:
     print(f"  Prefill logits failed: {e}")
     gpu_cleanup()
@@ -404,13 +470,18 @@ print("=" * 60)
 try:
     with torch.no_grad():
         conv_out = model.audio_tower.embedder(inputs["input_features"])
-        save_result("conv_stem_out", to_np(conv_out[0, :10, :]),
-                    f"conv stem output (first 10 frames), full shape {conv_out.shape}")
+        save_result(
+            "conv_stem_out",
+            to_np(conv_out[0, :10, :]),
+            f"conv stem output (first 10 frames), full shape {conv_out.shape}",
+        )
         del conv_out
         gpu_cleanup()
 except Exception as e:
     print(f"  Conv stem failed: {e}")
-    import traceback; traceback.print_exc()
+    import traceback
+
+    traceback.print_exc()
 
 # ============================================================
 # Upload to GitHub Gist
@@ -428,8 +499,11 @@ for name in results:
     npy_path = f"/tmp/v4b-{name}.npy"
     if os.path.exists(npy_path):
         import base64
+
         with open(npy_path, "rb") as f:
-            npy_files[f"v4b-{name}.npy.b64"] = base64.b64encode(f.read()).decode("ascii")
+            npy_files[f"v4b-{name}.npy.b64"] = base64.b64encode(f.read()).decode(
+                "ascii"
+            )
 
 if GH_TOKEN:
     gist_files = {
@@ -468,7 +542,7 @@ else:
 print("\n" + "=" * 60)
 print("DONE! All ground truth activations dumped.")
 print("=" * 60)
-print(f"\nKey results:")
+print("\nKey results:")
 print(f"  Generated text: {results.get('gen_text', 'N/A')!r}")
 print(f"  Encoder out shape: {results.get('encoder_out', {}).get('shape', 'N/A')}")
 print(f"  HF mel shape: {results.get('mel_hf', {}).get('shape', 'N/A')}")

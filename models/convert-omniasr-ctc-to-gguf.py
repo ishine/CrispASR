@@ -44,6 +44,7 @@ except ImportError:
 # Tensor name mapping: fairseq2 → wav2vec2-ggml GGUF convention
 # ---------------------------------------------------------------------------
 
+
 def remap(name: str) -> str | None:
     n = name
 
@@ -52,19 +53,21 @@ def remap(name: str) -> str | None:
     # Encoder global layer norm (must come BEFORE the generic .layer_norm.→.norm.
     # replacement so `encoder.layer_norm.weight` doesn't get caught by the CNN rule)
     n = n.replace("encoder.layer_norm.weight", "enc.ln.weight")
-    n = n.replace("encoder.layer_norm.bias",   "enc.ln.bias")
+    n = n.replace("encoder.layer_norm.bias", "enc.ln.bias")
 
     # CNN feature extractor: cnn.N.conv.{weight,bias}, cnn.N.norm.{weight,bias}
     n = n.replace("encoder_frontend.feature_extractor.layers.", "cnn.")
     n = n.replace(".layer_norm.", ".norm.")
 
     # Post-extract LayerNorm → feat_proj.ln.{weight,bias}
-    n = n.replace("encoder_frontend.post_extract_layer_norm.weight", "feat_proj.ln.weight")
-    n = n.replace("encoder_frontend.post_extract_layer_norm.bias",   "feat_proj.ln.bias")
+    n = n.replace(
+        "encoder_frontend.post_extract_layer_norm.weight", "feat_proj.ln.weight"
+    )
+    n = n.replace("encoder_frontend.post_extract_layer_norm.bias", "feat_proj.ln.bias")
 
     # Feature projection → feat_proj.{weight,bias}
     n = n.replace("encoder_frontend.model_dim_proj.weight", "feat_proj.weight")
-    n = n.replace("encoder_frontend.model_dim_proj.bias",   "feat_proj.bias")
+    n = n.replace("encoder_frontend.model_dim_proj.bias", "feat_proj.bias")
 
     # Positional conv — weight_g/weight_v merge done separately
     if "pos_encoder.conv.weight_g" in name or "pos_encoder.conv.weight_v" in name:
@@ -73,17 +76,17 @@ def remap(name: str) -> str | None:
 
     # Encoder layers: enc.N.attn.{q,k,v,out}.{weight,bias} etc
     if n.startswith("encoder.layers."):
-        rest = n[len("encoder.layers."):]
+        rest = n[len("encoder.layers.") :]
         layer_id, sub = rest.split(".", 1)
-        sub = (sub
-            .replace("self_attn.q_proj",       "attn.q")
-            .replace("self_attn.k_proj",       "attn.k")
-            .replace("self_attn.v_proj",       "attn.v")
-            .replace("self_attn.output_proj",  "attn.out")
-            .replace("self_attn_layer_norm",   "ln1")
-            .replace("ffn.inner_proj",         "ffn.fc1")
-            .replace("ffn.output_proj",        "ffn.fc2")
-            .replace("ffn_layer_norm",         "ln2")
+        sub = (
+            sub.replace("self_attn.q_proj", "attn.q")
+            .replace("self_attn.k_proj", "attn.k")
+            .replace("self_attn.v_proj", "attn.v")
+            .replace("self_attn.output_proj", "attn.out")
+            .replace("self_attn_layer_norm", "ln1")
+            .replace("ffn.inner_proj", "ffn.fc1")
+            .replace("ffn.output_proj", "ffn.fc2")
+            .replace("ffn_layer_norm", "ln2")
         )
         n = f"enc.{layer_id}.{sub}"
 
@@ -113,7 +116,9 @@ def convert(input_dir: Path, out_path: Path) -> None:
     intermediate_size = ff_w.shape[0]
     ctc_w = sd["final_proj.weight"]
     vocab_size = ctc_w.shape[0]
-    n_layers = max(int(k.split(".")[2]) for k in sd if k.startswith("encoder.layers.")) + 1
+    n_layers = (
+        max(int(k.split(".")[2]) for k in sd if k.startswith("encoder.layers.")) + 1
+    )
 
     # CNN hparams
     conv_dims = []
@@ -138,13 +143,19 @@ def convert(input_dir: Path, out_path: Path) -> None:
     n_heads = hidden_size // 64  # assume head_dim=64 for omniASR (fairseq2 default)
 
     # Check if there's layer_norm in the CNN (stable LN variant)
-    has_layer_norm = f"encoder_frontend.feature_extractor.layers.0.layer_norm.weight" in sd
+    has_layer_norm = (
+        "encoder_frontend.feature_extractor.layers.0.layer_norm.weight" in sd
+    )
     feat_extract_norm_type = 1 if has_layer_norm else 0
 
-    print(f"  hidden={hidden_size} layers={n_layers} heads={n_heads} ff={intermediate_size}")
+    print(
+        f"  hidden={hidden_size} layers={n_layers} heads={n_heads} ff={intermediate_size}"
+    )
     print(f"  vocab={vocab_size} CNN dims={conv_dims} kernels={conv_kernels}")
     print(f"  pos_conv K={pos_conv_k} groups={hidden_size // pos_conv_g}")
-    print(f"  feat_extract_norm_type={'layer_norm' if has_layer_norm else 'group_norm'}")
+    print(
+        f"  feat_extract_norm_type={'layer_norm' if has_layer_norm else 'group_norm'}"
+    )
 
     # Vocab
     vocab = None
@@ -159,20 +170,26 @@ def convert(input_dir: Path, out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     writer = gguf.GGUFWriter(str(out_path), arch="wav2vec2", use_temp_file=True)
 
-    writer.add_uint32("wav2vec2.vocab_size",                    vocab_size)
-    writer.add_uint32("wav2vec2.hidden_size",                   hidden_size)
-    writer.add_uint32("wav2vec2.num_hidden_layers",             n_layers)
-    writer.add_uint32("wav2vec2.num_attention_heads",           n_heads)
-    writer.add_uint32("wav2vec2.intermediate_size",             intermediate_size)
-    writer.add_uint32("wav2vec2.num_feat_extract_layers",       7)
-    writer.add_uint32("wav2vec2.num_conv_pos_embeddings",       pos_conv_k)
-    writer.add_uint32("wav2vec2.num_conv_pos_embedding_groups", hidden_size // pos_conv_g)
-    writer.add_uint32("wav2vec2.pad_token_id",                  vocab_size - 1)  # CTC blank
-    writer.add_uint32("wav2vec2.feat_extract_norm_type",        feat_extract_norm_type)
+    writer.add_uint32("wav2vec2.vocab_size", vocab_size)
+    writer.add_uint32("wav2vec2.hidden_size", hidden_size)
+    writer.add_uint32("wav2vec2.num_hidden_layers", n_layers)
+    writer.add_uint32("wav2vec2.num_attention_heads", n_heads)
+    writer.add_uint32("wav2vec2.intermediate_size", intermediate_size)
+    writer.add_uint32("wav2vec2.num_feat_extract_layers", 7)
+    writer.add_uint32("wav2vec2.num_conv_pos_embeddings", pos_conv_k)
+    writer.add_uint32(
+        "wav2vec2.num_conv_pos_embedding_groups", hidden_size // pos_conv_g
+    )
+    writer.add_uint32("wav2vec2.pad_token_id", vocab_size - 1)  # CTC blank
+    writer.add_uint32("wav2vec2.feat_extract_norm_type", feat_extract_norm_type)
     for i in range(7):
-        writer.add_uint32(f"wav2vec2.conv_dim_{i}",    conv_dims[i] if i < len(conv_dims) else 512)
-        writer.add_uint32(f"wav2vec2.conv_kernel_{i}",  conv_kernels[i] if i < len(conv_kernels) else 3)
-        writer.add_uint32(f"wav2vec2.conv_stride_{i}",  conv_strides[i])
+        writer.add_uint32(
+            f"wav2vec2.conv_dim_{i}", conv_dims[i] if i < len(conv_dims) else 512
+        )
+        writer.add_uint32(
+            f"wav2vec2.conv_kernel_{i}", conv_kernels[i] if i < len(conv_kernels) else 3
+        )
+        writer.add_uint32(f"wav2vec2.conv_stride_{i}", conv_strides[i])
 
     if vocab:
         writer.add_array("tokenizer.ggml.tokens", vocab)

@@ -1,5 +1,5 @@
 import os
-import subprocess
+import subprocess  # nosec B404
 import re
 import csv
 import wave
@@ -96,11 +96,13 @@ def check_file_exists(file: str) -> bool:
 def get_git_short_hash() -> str:
     try:
         return (
-            subprocess.check_output(["git", "rev-parse", "--short", "HEAD"])
+            subprocess.check_output(  # nosec B603 B607
+                ["git", "rev-parse", "--short", "HEAD"]
+            )
             .decode()
             .strip()
         )
-    except subprocess.CalledProcessError as e:
+    except subprocess.CalledProcessError:
         return ""
 
 
@@ -148,10 +150,20 @@ for model in filtered_models:
     for thread in threads:
         for processor_count in processors:
             # Construct the command to run
-            cmd = f"./build/bin/whisper-cli -m models/{model} -t {thread} -p {processor_count} -f {sample_file}"
+            cmd = [
+                "./build/bin/whisper-cli",
+                "-m",
+                f"models/{model}",
+                "-t",
+                str(thread),
+                "-p",
+                str(processor_count),
+                "-f",
+                sample_file,
+            ]
             # Run the command and get the output
-            process = subprocess.Popen(
-                cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
+            process = subprocess.Popen(  # nosec B603 B607
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
             )
 
             output = ""

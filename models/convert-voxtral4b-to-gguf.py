@@ -51,55 +51,121 @@ except ImportError:
 DIRECT = {
     # Audio encoder front-end (embedder submodule in 4B)
     "audio_tower.embedder.conv1.weight": "audio.conv.1.weight",
-    "audio_tower.embedder.conv1.bias":   "audio.conv.1.bias",
+    "audio_tower.embedder.conv1.bias": "audio.conv.1.bias",
     "audio_tower.embedder.conv2.weight": "audio.conv.2.weight",
-    "audio_tower.embedder.conv2.bias":   "audio.conv.2.bias",
+    "audio_tower.embedder.conv2.bias": "audio.conv.2.bias",
     # Audio encoder post-norm (RMSNorm, no bias)
-    "audio_tower.norm.weight":           "audio.ln_post.weight",
+    "audio_tower.norm.weight": "audio.ln_post.weight",
     # Multi-modal projector
     "multi_modal_projector.linear_1.weight": "proj1.weight",
     "multi_modal_projector.linear_2.weight": "proj2.weight",
     # LLM top level
     "language_model.model.embed_tokens.weight": "token_embd.weight",
-    "language_model.model.norm.weight":         "output_norm.weight",
+    "language_model.model.norm.weight": "output_norm.weight",
     # No lm_head — tied to token_embd. The C++ runtime handles this.
 }
 
 # Audio encoder per-layer (4B naming: o_proj, gate/up/down_proj, RMSNorm)
 AUDIO_LAYER_PATTERNS = [
     # Attention norms (RMSNorm, weight only)
-    (r"audio_tower\.layers\.(\d+)\.self_attn_layer_norm\.weight", "audio.blk.{}.attn_norm.weight"),
-    (r"audio_tower\.layers\.(\d+)\.final_layer_norm\.weight",     "audio.blk.{}.ffn_norm.weight"),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn_layer_norm\.weight",
+        "audio.blk.{}.attn_norm.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.final_layer_norm\.weight",
+        "audio.blk.{}.ffn_norm.weight",
+    ),
     # Attention Q/K/V/O
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.weight",    "audio.blk.{}.attn_q.weight"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.bias",      "audio.blk.{}.attn_q.bias"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.k_proj\.weight",    "audio.blk.{}.attn_k.weight"),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.weight",
+        "audio.blk.{}.attn_q.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.bias",
+        "audio.blk.{}.attn_q.bias",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.k_proj\.weight",
+        "audio.blk.{}.attn_k.weight",
+    ),
     # K has no bias (Whisper quirk preserved)
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.weight",    "audio.blk.{}.attn_v.weight"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.bias",      "audio.blk.{}.attn_v.bias"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.o_proj\.weight",    "audio.blk.{}.attn_out.weight"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.o_proj\.bias",      "audio.blk.{}.attn_out.bias"),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.weight",
+        "audio.blk.{}.attn_v.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.bias",
+        "audio.blk.{}.attn_v.bias",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.o_proj\.weight",
+        "audio.blk.{}.attn_out.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.o_proj\.bias",
+        "audio.blk.{}.attn_out.bias",
+    ),
     # SwiGLU FFN: gate + up + down (down has bias)
-    (r"audio_tower\.layers\.(\d+)\.mlp\.gate_proj\.weight",       "audio.blk.{}.ffn_gate.weight"),
-    (r"audio_tower\.layers\.(\d+)\.mlp\.up_proj\.weight",         "audio.blk.{}.ffn_up.weight"),
-    (r"audio_tower\.layers\.(\d+)\.mlp\.down_proj\.weight",       "audio.blk.{}.ffn_down.weight"),
-    (r"audio_tower\.layers\.(\d+)\.mlp\.down_proj\.bias",         "audio.blk.{}.ffn_down.bias"),
+    (
+        r"audio_tower\.layers\.(\d+)\.mlp\.gate_proj\.weight",
+        "audio.blk.{}.ffn_gate.weight",
+    ),
+    (r"audio_tower\.layers\.(\d+)\.mlp\.up_proj\.weight", "audio.blk.{}.ffn_up.weight"),
+    (
+        r"audio_tower\.layers\.(\d+)\.mlp\.down_proj\.weight",
+        "audio.blk.{}.ffn_down.weight",
+    ),
+    (r"audio_tower\.layers\.(\d+)\.mlp\.down_proj\.bias", "audio.blk.{}.ffn_down.bias"),
 ]
 
 # LLM per-layer (26 layers, includes ada_rms_norm)
 LLM_LAYER_PATTERNS = [
-    (r"language_model\.model\.layers\.(\d+)\.input_layernorm\.weight",          "blk.{}.attn_norm.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.q_proj\.weight",        "blk.{}.attn_q.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.k_proj\.weight",        "blk.{}.attn_k.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.v_proj\.weight",        "blk.{}.attn_v.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.o_proj\.weight",        "blk.{}.attn_output.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.post_attention_layernorm\.weight", "blk.{}.ffn_norm.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.gate_proj\.weight",           "blk.{}.ffn_gate.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.up_proj\.weight",             "blk.{}.ffn_up.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.down_proj\.weight",           "blk.{}.ffn_down.weight"),
+    (
+        r"language_model\.model\.layers\.(\d+)\.input_layernorm\.weight",
+        "blk.{}.attn_norm.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.q_proj\.weight",
+        "blk.{}.attn_q.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.k_proj\.weight",
+        "blk.{}.attn_k.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.v_proj\.weight",
+        "blk.{}.attn_v.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.o_proj\.weight",
+        "blk.{}.attn_output.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.post_attention_layernorm\.weight",
+        "blk.{}.ffn_norm.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.gate_proj\.weight",
+        "blk.{}.ffn_gate.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.up_proj\.weight",
+        "blk.{}.ffn_up.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.down_proj\.weight",
+        "blk.{}.ffn_down.weight",
+    ),
     # Adaptive RMSNorm (time conditioning)
-    (r"language_model\.model\.layers\.(\d+)\.ada_rms_norm\.linear1\.weight",   "blk.{}.ada_norm_down.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.ada_rms_norm\.linear2\.weight",   "blk.{}.ada_norm_up.weight"),
+    (
+        r"language_model\.model\.layers\.(\d+)\.ada_rms_norm\.linear1\.weight",
+        "blk.{}.ada_norm_down.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.ada_rms_norm\.linear2\.weight",
+        "blk.{}.ada_norm_up.weight",
+    ),
 ]
 
 
@@ -134,6 +200,7 @@ def is_f32_tensor(gguf_name: str, shape: tuple[int, ...]) -> bool:
 # Tekken tokenizer serialization (same as 3B)
 # ---------------------------------------------------------------------------
 
+
 def serialize_tekken_vocab(tekken: dict) -> bytes:
     vocab = tekken["vocab"]
     out = bytearray()
@@ -150,12 +217,13 @@ def serialize_tekken_vocab(tekken: dict) -> bytes:
 # Main conversion
 # ---------------------------------------------------------------------------
 
+
 def convert(input_dir: Path, out_path: Path) -> None:
     print(f"Loading: {input_dir}")
     with open(input_dir / "config.json", "r") as f:
         cfg = json.load(f)
     audio = cfg["audio_config"]
-    text  = cfg["text_config"]
+    text = cfg["text_config"]
 
     safetensor_files = sorted(input_dir.glob("model*.safetensors"))
     # Exclude consolidated.safetensors (different naming convention)
@@ -172,8 +240,10 @@ def convert(input_dir: Path, out_path: Path) -> None:
         tekken = json.load(f)
     tekken_cfg = tekken.get("config", {})
     n_specials = len(tekken.get("special_tokens", []))
-    n_vocab    = len(tekken.get("vocab", []))
-    print(f"  tekken: {n_specials} specials + {n_vocab} BPE = {n_specials + n_vocab} total")
+    n_vocab = len(tekken.get("vocab", []))
+    print(
+        f"  tekken: {n_specials} specials + {n_vocab} BPE = {n_specials + n_vocab} total"
+    )
 
     # ----- Write GGUF -----
     print(f"Writing: {out_path}")
@@ -181,40 +251,52 @@ def convert(input_dir: Path, out_path: Path) -> None:
     writer = gguf.GGUFWriter(str(out_path), arch="voxtral4b")
 
     # Audio params
-    writer.add_uint32("voxtral4b.sample_rate",      16000)
-    writer.add_uint32("voxtral4b.n_mels",           audio.get("num_mel_bins", 128))
-    writer.add_uint32("voxtral4b.n_fft",            400)
-    writer.add_uint32("voxtral4b.win_length",       400)
-    writer.add_uint32("voxtral4b.hop_length",       160)
-    writer.add_uint32("voxtral4b.audio.n_layers",   audio.get("num_hidden_layers", 32))
-    writer.add_uint32("voxtral4b.audio.d_model",    audio.get("hidden_size", 1280))
-    writer.add_uint32("voxtral4b.audio.n_heads",    audio.get("num_attention_heads", 32))
-    writer.add_uint32("voxtral4b.audio.head_dim",   audio.get("head_dim", 64))
-    writer.add_uint32("voxtral4b.audio.ff_dim",     audio.get("intermediate_size", 5120))
-    writer.add_uint32("voxtral4b.audio.max_pos",    audio.get("max_position_embeddings", 1500))
-    writer.add_float32("voxtral4b.audio.rope_theta", float(audio.get("rope_theta", 1e6)))
-    writer.add_uint32("voxtral4b.audio.sliding_window", audio.get("sliding_window", 750))
+    writer.add_uint32("voxtral4b.sample_rate", 16000)
+    writer.add_uint32("voxtral4b.n_mels", audio.get("num_mel_bins", 128))
+    writer.add_uint32("voxtral4b.n_fft", 400)
+    writer.add_uint32("voxtral4b.win_length", 400)
+    writer.add_uint32("voxtral4b.hop_length", 160)
+    writer.add_uint32("voxtral4b.audio.n_layers", audio.get("num_hidden_layers", 32))
+    writer.add_uint32("voxtral4b.audio.d_model", audio.get("hidden_size", 1280))
+    writer.add_uint32("voxtral4b.audio.n_heads", audio.get("num_attention_heads", 32))
+    writer.add_uint32("voxtral4b.audio.head_dim", audio.get("head_dim", 64))
+    writer.add_uint32("voxtral4b.audio.ff_dim", audio.get("intermediate_size", 5120))
+    writer.add_uint32(
+        "voxtral4b.audio.max_pos", audio.get("max_position_embeddings", 1500)
+    )
+    writer.add_float32(
+        "voxtral4b.audio.rope_theta", float(audio.get("rope_theta", 1e6))
+    )
+    writer.add_uint32(
+        "voxtral4b.audio.sliding_window", audio.get("sliding_window", 750)
+    )
 
     # Projector params
-    writer.add_uint32("voxtral4b.proj.in_dim",      5120)
-    writer.add_uint32("voxtral4b.proj.out_dim",     text.get("hidden_size", 3072))
+    writer.add_uint32("voxtral4b.proj.in_dim", 5120)
+    writer.add_uint32("voxtral4b.proj.out_dim", text.get("hidden_size", 3072))
     writer.add_uint32("voxtral4b.proj.frame_stack", cfg.get("downsample_factor", 4))
 
     # LLM params
-    writer.add_uint32("voxtral4b.llm.n_layers",     text.get("num_hidden_layers", 26))
-    writer.add_uint32("voxtral4b.llm.d_model",      text.get("hidden_size", 3072))
-    writer.add_uint32("voxtral4b.llm.n_heads",      text.get("num_attention_heads", 32))
-    writer.add_uint32("voxtral4b.llm.n_kv_heads",   text.get("num_key_value_heads", 8))
-    writer.add_uint32("voxtral4b.llm.head_dim",     text.get("head_dim", 128))
-    writer.add_uint32("voxtral4b.llm.ff_dim",       text.get("intermediate_size", 9216))
-    writer.add_float32("voxtral4b.llm.rope_theta",  float(text.get("rope_theta", 1e6)))
-    writer.add_float32("voxtral4b.llm.rms_norm_eps", float(text.get("rms_norm_eps", 1e-5)))
-    writer.add_uint32("voxtral4b.llm.vocab_size",   text.get("vocab_size", 131072))
-    writer.add_uint32("voxtral4b.llm.max_pos",      text.get("max_position_embeddings", 131072))
+    writer.add_uint32("voxtral4b.llm.n_layers", text.get("num_hidden_layers", 26))
+    writer.add_uint32("voxtral4b.llm.d_model", text.get("hidden_size", 3072))
+    writer.add_uint32("voxtral4b.llm.n_heads", text.get("num_attention_heads", 32))
+    writer.add_uint32("voxtral4b.llm.n_kv_heads", text.get("num_key_value_heads", 8))
+    writer.add_uint32("voxtral4b.llm.head_dim", text.get("head_dim", 128))
+    writer.add_uint32("voxtral4b.llm.ff_dim", text.get("intermediate_size", 9216))
+    writer.add_float32("voxtral4b.llm.rope_theta", float(text.get("rope_theta", 1e6)))
+    writer.add_float32(
+        "voxtral4b.llm.rms_norm_eps", float(text.get("rms_norm_eps", 1e-5))
+    )
+    writer.add_uint32("voxtral4b.llm.vocab_size", text.get("vocab_size", 131072))
+    writer.add_uint32(
+        "voxtral4b.llm.max_pos", text.get("max_position_embeddings", 131072)
+    )
     writer.add_uint32("voxtral4b.llm.sliding_window", text.get("sliding_window", 8192))
-    writer.add_uint32("voxtral4b.llm.ada_norm_dim", text.get("ada_rms_norm_t_cond_dim", 32))
-    writer.add_bool  ("voxtral4b.llm.tied_embeddings", True)
-    writer.add_uint32("voxtral4b.audio_token_id",   cfg.get("audio_token_id", 24))
+    writer.add_uint32(
+        "voxtral4b.llm.ada_norm_dim", text.get("ada_rms_norm_t_cond_dim", 32)
+    )
+    writer.add_bool("voxtral4b.llm.tied_embeddings", True)
+    writer.add_uint32("voxtral4b.audio_token_id", cfg.get("audio_token_id", 24))
 
     # Tekken tokenizer
     writer.add_string("tokenizer.tekken.pattern", tekken_cfg.get("pattern", ""))
@@ -225,28 +307,37 @@ def convert(input_dir: Path, out_path: Path) -> None:
     vocab_f32 = np.frombuffer(vocab_blob, dtype=np.uint8).astype(np.float32)
     writer.add_tensor("tokenizer.tekken.vocab_tensor", vocab_f32)
     writer.add_uint32("tokenizer.tekken.n_specials", len(specials))
-    writer.add_uint32("tokenizer.tekken.n_vocab",    n_vocab)
+    writer.add_uint32("tokenizer.tekken.n_vocab", n_vocab)
 
     # Mel filterbank + Hann window
     # IMPORTANT: Voxtral Realtime uses SLANEY mel filters (not HTK/Whisper).
     # All reference implementations (voxtral.c, voxmlx, voxtral-rs) use Slaney.
-    def build_slaney_mel_filters(sr=16000, n_fft=400, n_mels=128, f_min=0.0, f_max=8000.0):
+    def build_slaney_mel_filters(
+        sr=16000, n_fft=400, n_mels=128, f_min=0.0, f_max=8000.0
+    ):
         """Slaney-style mel filter bank matching mistral_common/audio.py."""
         n_freqs = n_fft // 2 + 1
+
         def hz_to_mel(f):
             min_log_hz, min_log_mel = 1000.0, 15.0
             logstep = 27.0 / np.log(6.4)
             mels = 3.0 * np.asarray(f, dtype=np.float64) / 200.0
             mask = np.asarray(f) >= min_log_hz
-            mels[mask] = min_log_mel + np.log(np.asarray(f)[mask] / min_log_hz) * logstep
+            mels[mask] = (
+                min_log_mel + np.log(np.asarray(f)[mask] / min_log_hz) * logstep
+            )
             return mels
+
         def mel_to_hz(m):
             min_log_hz, min_log_mel = 1000.0, 15.0
             logstep = np.log(6.4) / 27.0
             freq = 200.0 * np.asarray(m, dtype=np.float64) / 3.0
             mask = np.asarray(m) >= min_log_mel
-            freq[mask] = min_log_hz * np.exp(logstep * (np.asarray(m)[mask] - min_log_mel))
+            freq[mask] = min_log_hz * np.exp(
+                logstep * (np.asarray(m)[mask] - min_log_mel)
+            )
             return freq
+
         fft_freqs = np.linspace(0, sr / 2, n_freqs)
         mel_min = hz_to_mel(np.array([f_min]))[0]
         mel_max = hz_to_mel(np.array([f_max]))[0]
@@ -257,7 +348,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
         down_slopes = -slopes[:, :-2] / filter_diff[:-1]
         up_slopes = slopes[:, 2:] / filter_diff[1:]
         fb = np.maximum(0.0, np.minimum(down_slopes, up_slopes))
-        enorm = 2.0 / (filter_freqs[2:n_mels+2] - filter_freqs[:n_mels])
+        enorm = 2.0 / (filter_freqs[2 : n_mels + 2] - filter_freqs[:n_mels])
         fb *= enorm[np.newaxis, :]
         return fb.astype(np.float32)  # (n_freqs, n_mels)
 
@@ -265,7 +356,9 @@ def convert(input_dir: Path, out_path: Path) -> None:
     print(f"  mel_filters shape: {mel_filters.shape}")
     writer.add_tensor("audio.mel_filters", mel_filters)
     n_fft_w = 400
-    win = (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n_fft_w) / n_fft_w)).astype(np.float32)
+    win = (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n_fft_w) / n_fft_w)).astype(
+        np.float32
+    )
     writer.add_tensor("audio.mel_window", win)
 
     # ----- Tensors -----
@@ -301,8 +394,10 @@ def convert(input_dir: Path, out_path: Path) -> None:
                 if n_written <= 25 or n_written % 100 == 0:
                     print(f"    {gguf_name:50s} {str(arr.shape):26s} {arr.dtype}")
 
-    print(f"\n  total: {n_written} tensors  (F16: {n_f16}, F32: {n_f32})  "
-          f"skipped: {n_skipped}")
+    print(
+        f"\n  total: {n_written} tensors  (F16: {n_f16}, F32: {n_f32})  "
+        f"skipped: {n_skipped}"
+    )
     if skipped_names:
         print("  skipped tensors:")
         for n in skipped_names:
@@ -317,8 +412,9 @@ def convert(input_dir: Path, out_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Convert Voxtral-Mini-4B-Realtime-2602 HF safetensors → GGUF F16")
-    p.add_argument("--input",  required=True, type=Path, help="HF model directory")
+        description="Convert Voxtral-Mini-4B-Realtime-2602 HF safetensors → GGUF F16"
+    )
+    p.add_argument("--input", required=True, type=Path, help="HF model directory")
     p.add_argument("--output", required=True, type=Path, help="output GGUF path")
     return p.parse_args()
 

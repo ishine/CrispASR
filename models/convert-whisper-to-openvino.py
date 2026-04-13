@@ -6,6 +6,7 @@ from openvino.frontend import FrontEndManager
 from openvino.runtime import serialize
 import shutil
 
+
 def convert_encoder(hparams, encoder, mname):
     encoder.eval()
 
@@ -13,7 +14,7 @@ def convert_encoder(hparams, encoder, mname):
 
     onnx_folder = os.path.join(os.path.dirname(__file__), "onnx_encoder")
 
-    #create a directory to store the onnx model, and other collateral that is saved during onnx export procedure
+    # create a directory to store the onnx model, and other collateral that is saved during onnx export procedure
     if not os.path.isdir(onnx_folder):
         os.makedirs(onnx_folder)
 
@@ -21,11 +22,7 @@ def convert_encoder(hparams, encoder, mname):
 
     # Export the PyTorch model to ONNX
     torch.onnx.export(
-        encoder,
-        mel,
-        onnx_path,
-        input_names=["mel"],
-        output_names=["output_features"]
+        encoder, mel, onnx_path, input_names=["mel"], output_names=["output_features"]
     )
 
     # Convert ONNX to OpenVINO IR format using the frontend
@@ -35,7 +32,12 @@ def convert_encoder(hparams, encoder, mname):
     ov_model = onnx_fe.convert(onnx_model)
 
     # Serialize the OpenVINO model to XML and BIN files
-    serialize(ov_model, xml_path=os.path.join(os.path.dirname(__file__), "ggml-" + mname + "-encoder-openvino.xml"))
+    serialize(
+        ov_model,
+        xml_path=os.path.join(
+            os.path.dirname(__file__), "ggml-" + mname + "-encoder-openvino.xml"
+        ),
+    )
 
     # Cleanup
     if os.path.isdir(onnx_folder):
@@ -44,10 +46,28 @@ def convert_encoder(hparams, encoder, mname):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, help="model to convert (e.g. tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, large-v3, large-v3-turbo)", required=True)
+    parser.add_argument(
+        "--model",
+        type=str,
+        help="model to convert (e.g. tiny, tiny.en, base, base.en, small, small.en, medium, medium.en, large-v1, large-v2, large-v3, large-v3-turbo)",
+        required=True,
+    )
     args = parser.parse_args()
 
-    if args.model not in ["tiny", "tiny.en", "base", "base.en", "small", "small.en", "medium", "medium.en", "large-v1", "large-v2", "large-v3", "large-v3-turbo"]:
+    if args.model not in [
+        "tiny",
+        "tiny.en",
+        "base",
+        "base.en",
+        "small",
+        "small.en",
+        "medium",
+        "medium.en",
+        "large-v1",
+        "large-v2",
+        "large-v3",
+        "large-v3-turbo",
+    ]:
         raise ValueError("Invalid model name")
 
     whisper = load_model(args.model).cpu()

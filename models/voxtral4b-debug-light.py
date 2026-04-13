@@ -6,7 +6,6 @@ Checks: mel features, t_cond, ada_norm scales, and individual tensor loads.
 
 import json
 import math
-import struct
 import sys
 from pathlib import Path
 
@@ -34,9 +33,11 @@ print(f"  dim={dim}, delay_tokens={delay_tokens}")
 print(f"  inv_freq[:8] = {inv_freq[:8].tolist()}")
 print(f"  t_cond[:8]   = {t_cond[:8].tolist()}")
 print(f"  t_cond[1536:1544] = {t_cond[1536:1544].tolist()}")  # sin part
-print(f"  t_cond stats: min={t_cond.min():.6f} max={t_cond.max():.6f} mean={t_cond.mean():.6f}")
+print(
+    f"  t_cond stats: min={t_cond.min():.6f} max={t_cond.max():.6f} mean={t_cond.mean():.6f}"
+)
 np.save("/tmp/v4b-ref-t_cond.npy", t_cond)
-print(f"  saved to /tmp/v4b-ref-t_cond.npy")
+print("  saved to /tmp/v4b-ref-t_cond.npy")
 
 # ============================================================
 # 2. Ada-norm scale for layer 0 (load just 2 small tensors)
@@ -48,6 +49,7 @@ print("=" * 60)
 
 try:
     from safetensors import safe_open
+
     f = safe_open(str(model_dir / "model.safetensors"), framework="numpy")
 
     ada_down = f.get_tensor("language_model.model.layers.0.ada_rms_norm.linear1.weight")
@@ -59,9 +61,14 @@ try:
     if ada_down.dtype == np.uint16:
         # bf16 stored as uint16 — convert manually
         import torch
-        ada_down = torch.from_numpy(ada_down.view(np.int16)).to(torch.bfloat16).float().numpy()
-        ada_up = torch.from_numpy(ada_up.view(np.int16)).to(torch.bfloat16).float().numpy()
-    elif 'bfloat' in str(ada_down.dtype):
+
+        ada_down = (
+            torch.from_numpy(ada_down.view(np.int16)).to(torch.bfloat16).float().numpy()
+        )
+        ada_up = (
+            torch.from_numpy(ada_up.view(np.int16)).to(torch.bfloat16).float().numpy()
+        )
+    elif "bfloat" in str(ada_down.dtype):
         ada_down = ada_down.astype(np.float32)
         ada_up = ada_up.astype(np.float32)
 
@@ -71,17 +78,20 @@ try:
 
     # GELU
     from scipy.special import erf
+
     hidden_gelu = 0.5 * hidden * (1.0 + erf(hidden / math.sqrt(2.0)))
     print(f"  hidden (post-gelu) [:8] = {hidden_gelu[:8].tolist()}")
 
     # scale = ada_up @ hidden  (3072, 32) @ (32,) -> (3072,)
     scale = ada_up @ hidden_gelu
     print(f"  scale[:8] = {scale[:8].tolist()}")
-    print(f"  scale stats: min={scale.min():.6f} max={scale.max():.6f} mean={scale.mean():.6f}")
+    print(
+        f"  scale stats: min={scale.min():.6f} max={scale.max():.6f} mean={scale.mean():.6f}"
+    )
     print(f"  (1+scale)[:8] = {(1+scale)[:8].tolist()}")
 
     np.save("/tmp/v4b-ref-ada_scale_layer0.npy", scale)
-    print(f"  saved to /tmp/v4b-ref-ada_scale_layer0.npy")
+    print("  saved to /tmp/v4b-ref-ada_scale_layer0.npy")
     del f
 except Exception as e:
     print(f"  ERROR: {e}")
@@ -97,6 +107,7 @@ print("=" * 60)
 try:
     # Load audio
     import scipy.io.wavfile as wavfile
+
     sr, data = wavfile.read(audio_path)
     assert sr == 16000
     if data.dtype == np.int16:
@@ -109,7 +120,7 @@ try:
     with open(model_dir / "processor_config.json") as pf:
         proc_cfg = json.load(pf)
     fe_cfg = proc_cfg.get("feature_extractor", {})
-    print(f"  HF feature extractor config:")
+    print("  HF feature extractor config:")
     for k, v in sorted(fe_cfg.items()):
         print(f"    {k}: {v}")
 
@@ -118,16 +129,20 @@ try:
     print(f"\n  *** global_log_mel_max = {global_log_mel_max} ***")
     if global_log_mel_max is not None:
         print("  THIS IS NOT USED IN OUR C++ MEL — likely the bug!")
-        print("  The HF extractor clips log-mel to [-global_log_mel_max, global_log_mel_max]")
+        print(
+            "  The HF extractor clips log-mel to [-global_log_mel_max, global_log_mel_max]"
+        )
         print("  and normalizes differently than Whisper's (v-floor)/(4) formula")
 
     # Try loading the actual HF feature extractor
     try:
-        sys.path.insert(0, str(Path(__file__).parent.parent / "ref" / "voxtral_realtime"))
+        sys.path.insert(
+            0, str(Path(__file__).parent.parent / "ref" / "voxtral_realtime")
+        )
         # Can't easily import VoxtralRealtimeFeatureExtractor without full transformers 5
         # Let's just compute mel manually with the HF algorithm
         pass
-    except:
+    except Exception:
         pass
 
     # Compute mel the Whisper way (what our C++ does)
@@ -138,19 +153,26 @@ try:
 
     # Load mel filterbank from GGUF
     import gguf
-    reader = gguf.GGUFReader(str(Path("test_cohere") / "voxtral-mini-4b-realtime.gguf").
-                             replace("test_cohere", "/mnt/akademie_storage/test_cohere"))
+
+    reader = gguf.GGUFReader(
+        str(Path("test_cohere") / "voxtral-mini-4b-realtime.gguf").replace(
+            "test_cohere", "/mnt/akademie_storage/test_cohere"
+        )
+    )
     # Actually let's just compute from scratch
     from scipy.signal import get_window
     from scipy.fft import rfft
 
     # Hann window
-    hann = get_window('hann', n_fft, fftbins=True).astype(np.float32)
+    hann = get_window("hann", n_fft, fftbins=True).astype(np.float32)
 
     # Mel filterbank (same as Whisper)
     try:
         from librosa.filters import mel as librosa_mel
-        mel_filters = librosa_mel(sr=16000, n_fft=n_fft, n_mels=n_mels).T  # (n_freqs, n_mels)
+
+        mel_filters = librosa_mel(
+            sr=16000, n_fft=n_fft, n_mels=n_mels
+        ).T  # (n_freqs, n_mels)
     except ImportError:
         print("  WARNING: librosa not available, using scipy mel")
         mel_filters = None
@@ -158,7 +180,7 @@ try:
     if mel_filters is not None:
         # Center-pad
         pad = n_fft // 2
-        padded = np.pad(audio, (pad, pad), mode='constant')
+        padded = np.pad(audio, (pad, pad), mode="constant")
 
         T_full = (len(padded) - n_fft) // hop + 1
         T = T_full - 1  # Whisper drops last frame
@@ -182,7 +204,9 @@ try:
         mel_whisper = (mel_clipped + 4.0) / 4.0
 
         print(f"\n  Whisper-style mel (our C++): shape={mel_whisper.shape}")
-        print(f"    min={mel_whisper.min():.4f} max={mel_whisper.max():.4f} mean={mel_whisper.mean():.4f}")
+        print(
+            f"    min={mel_whisper.min():.4f} max={mel_whisper.max():.4f} mean={mel_whisper.mean():.4f}"
+        )
         print(f"    mel_max={mel_max:.4f} floor={floor_v:.4f}")
 
         # Now compute mel the VoxtralRealtime way (if global_log_mel_max is set)
@@ -200,12 +224,16 @@ try:
             mel_voxtral = np.clip(mel_ln / global_log_mel_max, -1.0, 1.0)
 
             print(f"\n  VoxtralRealtime-style mel: shape={mel_voxtral.shape}")
-            print(f"    min={mel_voxtral.min():.4f} max={mel_voxtral.max():.4f} mean={mel_voxtral.mean():.4f}")
+            print(
+                f"    min={mel_voxtral.min():.4f} max={mel_voxtral.max():.4f} mean={mel_voxtral.mean():.4f}"
+            )
             print(f"    mel_ln max={mel_ln.max():.4f}")
 
             # Compare
-            diff = np.abs(mel_whisper[:, :min(T, 3000)] - mel_voxtral[:, :min(T, 3000)])
-            print(f"\n  *** DIFFERENCE between Whisper and VoxtralRealtime mel ***")
+            diff = np.abs(
+                mel_whisper[:, : min(T, 3000)] - mel_voxtral[:, : min(T, 3000)]
+            )
+            print("\n  *** DIFFERENCE between Whisper and VoxtralRealtime mel ***")
             print(f"    max diff: {diff.max():.4f}")
             print(f"    mean diff: {diff.mean():.4f}")
             print(f"    Whisper[0,:5]: {mel_whisper[0,:5].tolist()}")
@@ -213,9 +241,10 @@ try:
 
             np.save("/tmp/v4b-ref-mel-whisper.npy", mel_whisper)
             np.save("/tmp/v4b-ref-mel-voxtral.npy", mel_voxtral)
-            print(f"\n  Saved both mel variants to /tmp/v4b-ref-mel-*.npy")
+            print("\n  Saved both mel variants to /tmp/v4b-ref-mel-*.npy")
 except Exception as e:
     import traceback
+
     print(f"  ERROR: {e}")
     traceback.print_exc()
 
@@ -227,14 +256,29 @@ print("=" * 60)
 print("4. Feature extractor analysis")
 print("=" * 60)
 
-fe_path = Path(__file__).parent.parent / "ref" / "voxtral_realtime" / "feature_extraction_voxtral_realtime.py"
+fe_path = (
+    Path(__file__).parent.parent
+    / "ref"
+    / "voxtral_realtime"
+    / "feature_extraction_voxtral_realtime.py"
+)
 if fe_path.exists():
     with open(fe_path) as f:
         src = f.read()
     # Find the mel computation
-    for line_no, line in enumerate(src.split('\n'), 1):
-        if any(kw in line for kw in ['log_spec', 'global_log_mel', 'magnitudes', 'mel_filters',
-                                      'np.log', 'clip', 'normalize']):
+    for line_no, line in enumerate(src.split("\n"), 1):
+        if any(
+            kw in line
+            for kw in [
+                "log_spec",
+                "global_log_mel",
+                "magnitudes",
+                "mel_filters",
+                "np.log",
+                "clip",
+                "normalize",
+            ]
+        ):
             print(f"  {line_no:4d}: {line.rstrip()}")
 else:
     print(f"  {fe_path} not found")

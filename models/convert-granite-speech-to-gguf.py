@@ -79,15 +79,27 @@ ENC_LAYER_PATTERNS = [
     (r"encoder\.layers\.(\d+)\.attn\.to_kv\.weight", "enc.blk.{}.attn_kv.weight"),
     (r"encoder\.layers\.(\d+)\.attn\.to_out\.weight", "enc.blk.{}.attn_out.weight"),
     (r"encoder\.layers\.(\d+)\.attn\.to_out\.bias", "enc.blk.{}.attn_out.bias"),
-    (r"encoder\.layers\.(\d+)\.attn\.rel_pos_emb\.weight", "enc.blk.{}.attn_rel_pos.weight"),
+    (
+        r"encoder\.layers\.(\d+)\.attn\.rel_pos_emb\.weight",
+        "enc.blk.{}.attn_rel_pos.weight",
+    ),
     # Conv module
     (r"encoder\.layers\.(\d+)\.conv\.up_conv\.weight", "enc.blk.{}.conv_up.weight"),
     (r"encoder\.layers\.(\d+)\.conv\.up_conv\.bias", "enc.blk.{}.conv_up.bias"),
-    (r"encoder\.layers\.(\d+)\.conv\.depth_conv\.conv\.weight", "enc.blk.{}.conv_dw.weight"),
+    (
+        r"encoder\.layers\.(\d+)\.conv\.depth_conv\.conv\.weight",
+        "enc.blk.{}.conv_dw.weight",
+    ),
     (r"encoder\.layers\.(\d+)\.conv\.batch_norm\.weight", "enc.blk.{}.conv_bn.weight"),
     (r"encoder\.layers\.(\d+)\.conv\.batch_norm\.bias", "enc.blk.{}.conv_bn.bias"),
-    (r"encoder\.layers\.(\d+)\.conv\.batch_norm\.running_mean", "enc.blk.{}.conv_bn.running_mean"),
-    (r"encoder\.layers\.(\d+)\.conv\.batch_norm\.running_var", "enc.blk.{}.conv_bn.running_var"),
+    (
+        r"encoder\.layers\.(\d+)\.conv\.batch_norm\.running_mean",
+        "enc.blk.{}.conv_bn.running_mean",
+    ),
+    (
+        r"encoder\.layers\.(\d+)\.conv\.batch_norm\.running_var",
+        "enc.blk.{}.conv_bn.running_var",
+    ),
     (r"encoder\.layers\.(\d+)\.conv\.batch_norm\.num_batches_tracked", None),  # skip
     (r"encoder\.layers\.(\d+)\.conv\.down_conv\.weight", "enc.blk.{}.conv_down.weight"),
     (r"encoder\.layers\.(\d+)\.conv\.down_conv\.bias", "enc.blk.{}.conv_down.bias"),
@@ -114,56 +126,119 @@ ENC_LAYER_PATTERNS = [
 
 PROJ_LAYER_PATTERNS = [
     # Self-attention
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.attention\.(query|key|value)\.weight",
-     "proj.blk.{}.sa_{}.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.attention\.(query|key|value)\.bias",
-     "proj.blk.{}.sa_{}.bias"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.output\.dense\.weight",
-     "proj.blk.{}.sa_out.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.output\.dense\.bias",
-     "proj.blk.{}.sa_out.bias"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.output\.LayerNorm\.weight",
-     "proj.blk.{}.sa_norm.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.output\.LayerNorm\.bias",
-     "proj.blk.{}.sa_norm.bias"),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.attention\.(query|key|value)\.weight",
+        "proj.blk.{}.sa_{}.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.attention\.(query|key|value)\.bias",
+        "proj.blk.{}.sa_{}.bias",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.output\.dense\.weight",
+        "proj.blk.{}.sa_out.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.output\.dense\.bias",
+        "proj.blk.{}.sa_out.bias",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.output\.LayerNorm\.weight",
+        "proj.blk.{}.sa_norm.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.attention\.output\.LayerNorm\.bias",
+        "proj.blk.{}.sa_norm.bias",
+    ),
     # Cross-attention
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.attention\.(query|key|value)\.weight",
-     "proj.blk.{}.ca_{}.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.attention\.(query|key|value)\.bias",
-     "proj.blk.{}.ca_{}.bias"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.output\.dense\.weight",
-     "proj.blk.{}.ca_out.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.output\.dense\.bias",
-     "proj.blk.{}.ca_out.bias"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.output\.LayerNorm\.weight",
-     "proj.blk.{}.ca_norm.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.output\.LayerNorm\.bias",
-     "proj.blk.{}.ca_norm.bias"),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.attention\.(query|key|value)\.weight",
+        "proj.blk.{}.ca_{}.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.attention\.(query|key|value)\.bias",
+        "proj.blk.{}.ca_{}.bias",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.output\.dense\.weight",
+        "proj.blk.{}.ca_out.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.output\.dense\.bias",
+        "proj.blk.{}.ca_out.bias",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.output\.LayerNorm\.weight",
+        "proj.blk.{}.ca_norm.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.crossattention\.output\.LayerNorm\.bias",
+        "proj.blk.{}.ca_norm.bias",
+    ),
     # FFN
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.intermediate_query\.dense\.weight",
-     "proj.blk.{}.ffn_up.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.intermediate_query\.dense\.bias",
-     "proj.blk.{}.ffn_up.bias"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.output_query\.dense\.weight",
-     "proj.blk.{}.ffn_down.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.output_query\.dense\.bias",
-     "proj.blk.{}.ffn_down.bias"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.output_query\.LayerNorm\.weight",
-     "proj.blk.{}.ffn_norm.weight"),
-    (r"projector\.qformer\.encoder\.layer\.(\d+)\.output_query\.LayerNorm\.bias",
-     "proj.blk.{}.ffn_norm.bias"),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.intermediate_query\.dense\.weight",
+        "proj.blk.{}.ffn_up.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.intermediate_query\.dense\.bias",
+        "proj.blk.{}.ffn_up.bias",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.output_query\.dense\.weight",
+        "proj.blk.{}.ffn_down.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.output_query\.dense\.bias",
+        "proj.blk.{}.ffn_down.bias",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.output_query\.LayerNorm\.weight",
+        "proj.blk.{}.ffn_norm.weight",
+    ),
+    (
+        r"projector\.qformer\.encoder\.layer\.(\d+)\.output_query\.LayerNorm\.bias",
+        "proj.blk.{}.ffn_norm.bias",
+    ),
 ]
 
 LLM_LAYER_PATTERNS = [
-    (r"language_model\.model\.layers\.(\d+)\.input_layernorm\.weight", "blk.{}.attn_norm.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.q_proj\.weight", "blk.{}.attn_q.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.k_proj\.weight", "blk.{}.attn_k.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.v_proj\.weight", "blk.{}.attn_v.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.o_proj\.weight", "blk.{}.attn_output.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.post_attention_layernorm\.weight", "blk.{}.ffn_norm.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.gate_proj\.weight", "blk.{}.ffn_gate.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.up_proj\.weight", "blk.{}.ffn_up.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.down_proj\.weight", "blk.{}.ffn_down.weight"),
+    (
+        r"language_model\.model\.layers\.(\d+)\.input_layernorm\.weight",
+        "blk.{}.attn_norm.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.q_proj\.weight",
+        "blk.{}.attn_q.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.k_proj\.weight",
+        "blk.{}.attn_k.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.v_proj\.weight",
+        "blk.{}.attn_v.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.o_proj\.weight",
+        "blk.{}.attn_output.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.post_attention_layernorm\.weight",
+        "blk.{}.ffn_norm.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.gate_proj\.weight",
+        "blk.{}.ffn_gate.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.up_proj\.weight",
+        "blk.{}.ffn_up.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.down_proj\.weight",
+        "blk.{}.ffn_down.weight",
+    ),
 ]
 
 
@@ -196,24 +271,24 @@ def _normalize_rnn_tr_name(hf_name: str) -> str:
     if not m:
         return hf_name
     layer = int(m.group(1)) - 1
-    rest  = m.group(2)
+    rest = m.group(2)
 
     # Sub-path rewrites inside one block.
     #   attn.norm.*                  → attn.pre_norm.*
     #   attn.fn.<x>                  → attn.<x>
-    rest = re.sub(r"^attn\.norm\.",            "attn.pre_norm.", rest)
-    rest = re.sub(r"^attn\.fn\.",              "attn.",           rest)
+    rest = re.sub(r"^attn\.norm\.", "attn.pre_norm.", rest)
+    rest = re.sub(r"^attn\.fn\.", "attn.", rest)
 
     #   ff1.fn.norm.*                → ff1.pre_norm.*
     #   ff1.fn.fn.net.0.*            → ff1.up_proj.*     (first Linear)
     #   ff1.fn.fn.net.3.*            → ff1.down_proj.*   (Linear after GELU+dropout)
-    rest = re.sub(r"^ff1\.fn\.norm\.",         "ff1.pre_norm.",  rest)
-    rest = re.sub(r"^ff1\.fn\.fn\.net\.0\.",   "ff1.up_proj.",   rest)
-    rest = re.sub(r"^ff1\.fn\.fn\.net\.3\.",   "ff1.down_proj.", rest)
+    rest = re.sub(r"^ff1\.fn\.norm\.", "ff1.pre_norm.", rest)
+    rest = re.sub(r"^ff1\.fn\.fn\.net\.0\.", "ff1.up_proj.", rest)
+    rest = re.sub(r"^ff1\.fn\.fn\.net\.3\.", "ff1.down_proj.", rest)
 
-    rest = re.sub(r"^ff2\.fn\.norm\.",         "ff2.pre_norm.",  rest)
-    rest = re.sub(r"^ff2\.fn\.fn\.net\.0\.",   "ff2.up_proj.",   rest)
-    rest = re.sub(r"^ff2\.fn\.fn\.net\.3\.",   "ff2.down_proj.", rest)
+    rest = re.sub(r"^ff2\.fn\.norm\.", "ff2.pre_norm.", rest)
+    rest = re.sub(r"^ff2\.fn\.fn\.net\.0\.", "ff2.up_proj.", rest)
+    rest = re.sub(r"^ff2\.fn\.fn\.net\.3\.", "ff2.down_proj.", rest)
 
     # Conv module is a Sequential:
     #   net.0 = LayerNorm              → conv.norm
@@ -221,11 +296,11 @@ def _normalize_rnn_tr_name(hf_name: str) -> str:
     #   net.4.conv = depthwise         → conv.depth_conv.conv
     #   net.5 = BatchNorm              → conv.batch_norm
     #   net.7 = down pointwise 1×1     → conv.down_conv
-    rest = re.sub(r"^conv\.net\.0\.",          "conv.norm.",          rest)
-    rest = re.sub(r"^conv\.net\.2\.",          "conv.up_conv.",       rest)
-    rest = re.sub(r"^conv\.net\.4\.conv\.",    "conv.depth_conv.conv.", rest)
-    rest = re.sub(r"^conv\.net\.5\.",          "conv.batch_norm.",    rest)
-    rest = re.sub(r"^conv\.net\.7\.",          "conv.down_conv.",     rest)
+    rest = re.sub(r"^conv\.net\.0\.", "conv.norm.", rest)
+    rest = re.sub(r"^conv\.net\.2\.", "conv.up_conv.", rest)
+    rest = re.sub(r"^conv\.net\.4\.conv\.", "conv.depth_conv.conv.", rest)
+    rest = re.sub(r"^conv\.net\.5\.", "conv.batch_norm.", rest)
+    rest = re.sub(r"^conv\.net\.7\.", "conv.down_conv.", rest)
 
     return f"encoder.layers.{layer}.{rest}"
 
@@ -278,13 +353,17 @@ def is_f32_tensor(name: str, shape: tuple) -> bool:
 # Mel filter bank (80 bins, Slaney-style)
 # ---------------------------------------------------------------------------
 
+
 def build_htk_mel_filters(sr=16000, n_fft=512, n_mels=80, f_min=0.0, f_max=8000.0):
     """HTK mel filter bank matching torchaudio.transforms.MelSpectrogram defaults."""
     n_freqs = n_fft // 2 + 1
+
     def hz_to_mel(f):
         return 2595.0 * np.log10(1.0 + np.asarray(f, dtype=np.float64) / 700.0)
+
     def mel_to_hz(m):
         return 700.0 * (10.0 ** (np.asarray(m, dtype=np.float64) / 2595.0) - 1.0)
+
     fft_freqs = np.linspace(0, sr / 2, n_freqs)
     mel_min = hz_to_mel(f_min)
     mel_max = hz_to_mel(f_max)
@@ -302,6 +381,7 @@ def build_htk_mel_filters(sr=16000, n_fft=512, n_mels=80, f_min=0.0, f_max=8000.
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def _load_lora_adapter(input_dir: Path) -> tuple[dict, dict] | None:
     """Load the granite-speech LoRA adapter tensors if present.
@@ -322,15 +402,16 @@ def _load_lora_adapter(input_dir: Path) -> tuple[dict, dict] | None:
     with open(cfg_path) as f:
         cfg = json.load(f)
     alpha = float(cfg.get("lora_alpha", 32))
-    r     = float(cfg.get("r", 64))
+    r = float(cfg.get("r", 64))
     scale = alpha / r
     targets = set(cfg.get("target_modules", ["q_proj", "v_proj"]))
-    print(f"  lora: r={int(r)} alpha={alpha:g} scale={scale:g} targets={sorted(targets)}")
+    print(
+        f"  lora: r={int(r)} alpha={alpha:g} scale={scale:g} targets={sorted(targets)}"
+    )
 
     # Collect (A, B) pairs keyed by the base weight path. PEFT tensors
     # look like "...q_proj.lora_A.weight" / "...q_proj.lora_B.weight";
     # the base weight this LoRA modifies is the corresponding ".weight".
-    import numpy as np
     pairs: dict[str, dict[str, np.ndarray]] = {}
     with safe_open(str(ada_path), framework="pt", device="cpu") as f:
         for name in sorted(f.keys()):
@@ -358,6 +439,7 @@ def _apply_lora(name: str, arr, lora_map) -> any:
     A, B, scale = lora_map[name]
     # W shape: (out, in); B: (out, r); A: (r, in). delta = (out, in).
     import numpy as np
+
     delta = (B @ A).astype(arr.dtype) * np.array(scale, dtype=arr.dtype)
     return arr + delta
 
@@ -398,8 +480,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     # largest single tensor rather than growing with the whole model.
     # This matters for granite-speech-3.2-8b / 3.3-8b (~16 GB total in
     # F16) on machines with under ~16 GB of RAM.
-    writer = gguf.GGUFWriter(str(out_path), arch="granite_speech",
-                             use_temp_file=True)
+    writer = gguf.GGUFWriter(str(out_path), arch="granite_speech", use_temp_file=True)
 
     # Metadata
     writer.add_uint32("granite_speech.sample_rate", 16000)
@@ -409,33 +490,74 @@ def convert(input_dir: Path, out_path: Path) -> None:
     writer.add_uint32("granite_speech.enc.n_heads", enc_cfg.get("num_heads", 8))
     writer.add_uint32("granite_speech.enc.head_dim", enc_cfg.get("dim_head", 128))
     writer.add_uint32("granite_speech.enc.input_dim", enc_cfg.get("input_dim", 160))
-    writer.add_uint32("granite_speech.enc.conv_kernel", enc_cfg.get("conv_kernel_size", 15))
-    writer.add_uint32("granite_speech.enc.ff_dim", enc_cfg.get("hidden_dim", 1024) * enc_cfg.get("feedforward_mult", 4))
+    writer.add_uint32(
+        "granite_speech.enc.conv_kernel", enc_cfg.get("conv_kernel_size", 15)
+    )
+    writer.add_uint32(
+        "granite_speech.enc.ff_dim",
+        enc_cfg.get("hidden_dim", 1024) * enc_cfg.get("feedforward_mult", 4),
+    )
 
-    writer.add_uint32("granite_speech.proj.n_layers", proj_cfg.get("num_hidden_layers", 2))
+    writer.add_uint32(
+        "granite_speech.proj.n_layers", proj_cfg.get("num_hidden_layers", 2)
+    )
     writer.add_uint32("granite_speech.proj.d_model", proj_cfg.get("hidden_size", 1024))
-    writer.add_uint32("granite_speech.proj.n_heads", proj_cfg.get("num_attention_heads", 16))
-    writer.add_uint32("granite_speech.proj.ff_dim", proj_cfg.get("intermediate_size", 4096))
+    writer.add_uint32(
+        "granite_speech.proj.n_heads", proj_cfg.get("num_attention_heads", 16)
+    )
+    writer.add_uint32(
+        "granite_speech.proj.ff_dim", proj_cfg.get("intermediate_size", 4096)
+    )
 
-    writer.add_uint32("granite_speech.llm.n_layers", text_cfg.get("num_hidden_layers", 40))
+    writer.add_uint32(
+        "granite_speech.llm.n_layers", text_cfg.get("num_hidden_layers", 40)
+    )
     writer.add_uint32("granite_speech.llm.d_model", text_cfg.get("hidden_size", 2048))
-    writer.add_uint32("granite_speech.llm.n_heads", text_cfg.get("num_attention_heads", 16))
-    writer.add_uint32("granite_speech.llm.n_kv_heads", text_cfg.get("num_key_value_heads", 4))
-    writer.add_uint32("granite_speech.llm.head_dim", text_cfg.get("hidden_size", 2048) // text_cfg.get("num_attention_heads", 16))
-    writer.add_uint32("granite_speech.llm.ff_dim", text_cfg.get("intermediate_size", 4096))
-    writer.add_float32("granite_speech.llm.rope_theta", float(text_cfg.get("rope_theta", 10000)))
-    writer.add_float32("granite_speech.llm.rms_norm_eps", float(text_cfg.get("rms_norm_eps", 1e-5)))
-    writer.add_uint32("granite_speech.llm.vocab_size", text_cfg.get("vocab_size", 100353))
+    writer.add_uint32(
+        "granite_speech.llm.n_heads", text_cfg.get("num_attention_heads", 16)
+    )
+    writer.add_uint32(
+        "granite_speech.llm.n_kv_heads", text_cfg.get("num_key_value_heads", 4)
+    )
+    writer.add_uint32(
+        "granite_speech.llm.head_dim",
+        text_cfg.get("hidden_size", 2048) // text_cfg.get("num_attention_heads", 16),
+    )
+    writer.add_uint32(
+        "granite_speech.llm.ff_dim", text_cfg.get("intermediate_size", 4096)
+    )
+    writer.add_float32(
+        "granite_speech.llm.rope_theta", float(text_cfg.get("rope_theta", 10000))
+    )
+    writer.add_float32(
+        "granite_speech.llm.rms_norm_eps", float(text_cfg.get("rms_norm_eps", 1e-5))
+    )
+    writer.add_uint32(
+        "granite_speech.llm.vocab_size", text_cfg.get("vocab_size", 100353)
+    )
 
     # μP multipliers
-    writer.add_float32("granite_speech.llm.embedding_multiplier", float(text_cfg.get("embedding_multiplier", 12.0)))
-    writer.add_float32("granite_speech.llm.attention_multiplier", float(text_cfg.get("attention_multiplier", 0.0078125)))
-    writer.add_float32("granite_speech.llm.residual_multiplier", float(text_cfg.get("residual_multiplier", 0.22)))
-    writer.add_float32("granite_speech.llm.logits_scaling", float(text_cfg.get("logits_scaling", 8.0)))
+    writer.add_float32(
+        "granite_speech.llm.embedding_multiplier",
+        float(text_cfg.get("embedding_multiplier", 12.0)),
+    )
+    writer.add_float32(
+        "granite_speech.llm.attention_multiplier",
+        float(text_cfg.get("attention_multiplier", 0.0078125)),
+    )
+    writer.add_float32(
+        "granite_speech.llm.residual_multiplier",
+        float(text_cfg.get("residual_multiplier", 0.22)),
+    )
+    writer.add_float32(
+        "granite_speech.llm.logits_scaling", float(text_cfg.get("logits_scaling", 8.0))
+    )
 
     writer.add_uint32("granite_speech.downsample_rate", cfg.get("downsample_rate", 5))
     writer.add_uint32("granite_speech.window_size", cfg.get("window_size", 15))
-    writer.add_uint32("granite_speech.audio_token_index", cfg.get("audio_token_index", 100352))
+    writer.add_uint32(
+        "granite_speech.audio_token_index", cfg.get("audio_token_index", 100352)
+    )
 
     # EOS / BOS — varies between releases (granite-4.0 uses 100257 from the
     # GPT-NeoX table, granite-3.x uses 0 from the granite tokenizer). Read
@@ -446,6 +568,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     if gen_cfg_path.exists():
         with open(gen_cfg_path) as f:
             gen_cfg = json.load(f)
+
     def _first_int(*vals, default):
         for v in vals:
             if isinstance(v, list) and v:
@@ -453,12 +576,17 @@ def convert(input_dir: Path, out_path: Path) -> None:
             if isinstance(v, int):
                 return int(v)
         return default
+
     eos_id = _first_int(
-        gen_cfg.get("eos_token_id"), text_cfg.get("eos_token_id"),
-        default=text_cfg.get("eos_token_id", 0) or 0)
+        gen_cfg.get("eos_token_id"),
+        text_cfg.get("eos_token_id"),
+        default=text_cfg.get("eos_token_id", 0) or 0,
+    )
     bos_id = _first_int(
-        gen_cfg.get("bos_token_id"), text_cfg.get("bos_token_id"),
-        default=text_cfg.get("bos_token_id", 0) or 0)
+        gen_cfg.get("bos_token_id"),
+        text_cfg.get("bos_token_id"),
+        default=text_cfg.get("bos_token_id", 0) or 0,
+    )
     writer.add_uint32("granite_speech.llm.eos_token_id", eos_id)
     writer.add_uint32("granite_speech.llm.bos_token_id", bos_id)
     print(f"  eos_token_id={eos_id}  bos_token_id={bos_id}")
@@ -511,7 +639,9 @@ def convert(input_dir: Path, out_path: Path) -> None:
     win_length = 400
     n_fft = 512
     win = np.zeros(n_fft, dtype=np.float32)
-    win[:win_length] = (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(win_length) / win_length)).astype(np.float32)
+    win[:win_length] = (
+        0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(win_length) / win_length)
+    ).astype(np.float32)
     writer.add_tensor("audio.mel_window", win)
 
     # Tensors
@@ -525,7 +655,9 @@ def convert(input_dir: Path, out_path: Path) -> None:
     # main loop finishes so we only write the tensor once.
     tie_word_embeddings = bool(text_cfg.get("tie_word_embeddings", False))
     if tie_word_embeddings:
-        print("  llm: tie_word_embeddings=true — aliasing token embedding as output.weight")
+        print(
+            "  llm: tie_word_embeddings=true — aliasing token embedding as output.weight"
+        )
     token_embd_arr = None  # captured during the loop for the tie-alias path
 
     n_lora_merged = 0
@@ -567,13 +699,19 @@ def convert(input_dir: Path, out_path: Path) -> None:
         # lm_head.weight when embeddings are tied.
         writer.add_tensor("output.weight", token_embd_arr)
         n_written += 1
-        print(f"    output.weight (aliased from token_embd.weight) "
-              f"{token_embd_arr.shape} {token_embd_arr.dtype}")
+        print(
+            f"    output.weight (aliased from token_embd.weight) "
+            f"{token_embd_arr.shape} {token_embd_arr.dtype}"
+        )
 
     if lora_map is not None:
-        print(f"  lora: folded {n_lora_merged}/{len(lora_map)} deltas into base weights")
+        print(
+            f"  lora: folded {n_lora_merged}/{len(lora_map)} deltas into base weights"
+        )
 
-    print(f"\n  total: {n_written} tensors (F16: {n_f16}, F32: {n_f32}) skipped: {n_skipped}")
+    print(
+        f"\n  total: {n_written} tensors (F16: {n_f16}, F32: {n_f32}) skipped: {n_skipped}"
+    )
     if skipped:
         print("  skipped:")
         for s in skipped:

@@ -1,9 +1,9 @@
 import os
 import struct
 import argparse
-import torch
 import numpy as np
 from silero_vad import load_silero_vad, __version__ as silero_version
+
 
 def convert_silero_vad(output_path, print_tensors=True):
     model = load_silero_vad()
@@ -30,14 +30,14 @@ def convert_silero_vad(output_path, print_tensors=True):
 
     with open(output_file, "wb") as fout:
         # Write magic and version
-        fout.write(struct.pack("i", 0x67676d6c))
+        fout.write(struct.pack("i", 0x67676D6C))
 
         model_type = "silero-16k"
         str_len = len(model_type)
         fout.write(struct.pack("i", str_len))
-        fout.write(model_type.encode('utf-8'))
+        fout.write(model_type.encode("utf-8"))
 
-        version_parts = silero_version.split('.')
+        version_parts = silero_version.split(".")
         major, minor, patch = map(int, version_parts)
         print(f"Version: {major}.{minor}.{patch}")
         fout.write(struct.pack("i", major))
@@ -92,14 +92,14 @@ def convert_silero_vad(output_path, print_tensors=True):
             "_model.decoder.rnn.weight_ih",
             "_model.decoder.rnn.weight_hh",
             "_model.decoder.rnn.bias_ih",
-            "_model.decoder.rnn.bias_hh"
+            "_model.decoder.rnn.bias_hh",
         ]
         tensor_keys.extend([k for k in lstm_keys if k in cleaned_dict])
 
         # Final conv weights
         final_keys = [
             "_model.decoder.decoder.2.weight",
-            "_model.decoder.decoder.2.bias"
+            "_model.decoder.decoder.2.bias",
         ]
         tensor_keys.extend([k for k in final_keys if k in cleaned_dict])
 
@@ -144,7 +144,9 @@ def convert_silero_vad(output_path, print_tensors=True):
                 tensor_shape.reverse()
 
                 # Check if this is a convolution weight tensor
-                is_conv_weight = "weight" in key and ("encoder" in key or "_model.decoder.decoder.2" in key)
+                is_conv_weight = "weight" in key and (
+                    "encoder" in key or "_model.decoder.decoder.2" in key
+                )
 
             # Convert to float16 for convolution weights
             if is_conv_weight:
@@ -162,7 +164,7 @@ def convert_silero_vad(output_path, print_tensors=True):
             print(f"  Type: {'float16' if ftype == 1 else 'float32'}")
 
             # Convert tensor name to bytes
-            name_bytes = key.encode('utf-8')
+            name_bytes = key.encode("utf-8")
             name_length = len(name_bytes)
 
             # Write tensor header
@@ -187,10 +189,17 @@ def convert_silero_vad(output_path, print_tensors=True):
     print(f"\nDone! Model has been converted to GGML format: {output_file}")
     print(f"File size: {os.path.getsize(output_file)} bytes")
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Convert Silero-VAD PyTorch model to GGML format")
-    parser.add_argument("--output", type=str, required=True, help="Path to output GGML model file")
-    parser.add_argument("--print-tensors", action="store_true", help="Print tensor values", default=True)
+    parser = argparse.ArgumentParser(
+        description="Convert Silero-VAD PyTorch model to GGML format"
+    )
+    parser.add_argument(
+        "--output", type=str, required=True, help="Path to output GGML model file"
+    )
+    parser.add_argument(
+        "--print-tensors", action="store_true", help="Print tensor values", default=True
+    )
     args = parser.parse_args()
 
     convert_silero_vad(args.output, args.print_tensors)

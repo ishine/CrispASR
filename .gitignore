@@ -11,6 +11,7 @@
 .vimspector.json
 /CMakeSettings.json
 /talk-llama.dSYM/
+bandit_bench.json
 
 build/
 build-*/

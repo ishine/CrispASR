@@ -2,9 +2,7 @@
 """Compare C++ intermediate results with Python reference for voxtral4b."""
 
 import numpy as np
-import struct
 import sys
-from pathlib import Path
 
 # ============================================================
 # 1. Compare t_cond: C++ vs Python
@@ -15,7 +13,8 @@ print("=" * 60)
 
 # C++ t_cond: run a small test binary that dumps it
 # For now, compute the Python reference
-import math
+import math  # noqa: E402
+
 dim = 3072
 delay_tokens = 6
 theta = 10000.0
@@ -37,7 +36,10 @@ print("=" * 60)
 
 try:
     import gguf
-    reader = gguf.GGUFReader("/mnt/akademie_storage/test_cohere/voxtral-mini-4b-realtime.gguf")
+
+    reader = gguf.GGUFReader(
+        "/mnt/akademie_storage/test_cohere/voxtral-mini-4b-realtime.gguf"
+    )
 
     # Find ada_norm tensors for layer 0
     ada_down = ada_up = None
@@ -49,7 +51,7 @@ try:
 
     if ada_down is not None and ada_up is not None:
         print(f"  ada_down shape: {ada_down.shape}")  # should be (32, 3072)
-        print(f"  ada_up shape: {ada_up.shape}")    # should be (3072, 32)
+        print(f"  ada_up shape: {ada_up.shape}")  # should be (3072, 32)
 
         # hidden = ada_down @ t_cond
         hidden = ada_down @ t_cond_py
@@ -57,6 +59,7 @@ try:
 
         # GELU
         from scipy.special import erf
+
         hidden_gelu = 0.5 * hidden * (1.0 + erf(hidden / math.sqrt(2.0)))
         print(f"  hidden post-gelu[:8]: {hidden_gelu[:8].tolist()}")
 
@@ -65,13 +68,16 @@ try:
         one_plus_scale = 1.0 + scale
         print(f"  scale[:8]: {scale[:8].tolist()}")
         print(f"  (1+scale)[:8]: {one_plus_scale[:8].tolist()}")
-        print(f"  scale stats: min={scale.min():.6f} max={scale.max():.6f} mean={scale.mean():.6f}")
+        print(
+            f"  scale stats: min={scale.min():.6f} max={scale.max():.6f} mean={scale.mean():.6f}"
+        )
 
         np.save("/tmp/v4b-ref-ada_scale_gguf_l0.npy", one_plus_scale)
     else:
         print("  Ada-norm tensors not found in GGUF")
 except Exception as e:
     import traceback
+
     print(f"  ERROR: {e}")
     traceback.print_exc()
 
@@ -89,20 +95,25 @@ try:
     from scipy.fft import rfft
 
     sr, data = wavfile.read("samples/jfk.wav")
-    audio = data.astype(np.float32) / 32768.0 if data.dtype == np.int16 else data.astype(np.float32)
+    audio = (
+        data.astype(np.float32) / 32768.0
+        if data.dtype == np.int16
+        else data.astype(np.float32)
+    )
 
     n_fft, hop, n_mels, n_freqs = 400, 160, 128, 201
-    hann = get_window('hann', n_fft, fftbins=True).astype(np.float32)
+    hann = get_window("hann", n_fft, fftbins=True).astype(np.float32)
 
     try:
         from librosa.filters import mel as librosa_mel
+
         mel_filters = librosa_mel(sr=16000, n_fft=n_fft, n_mels=n_mels).T
     except ImportError:
         print("  librosa not available, skipping mel check")
         sys.exit(0)
 
     pad = n_fft // 2
-    padded = np.pad(audio, (pad, pad), mode='constant')
+    padded = np.pad(audio, (pad, pad), mode="constant")
     T = (len(padded) - n_fft) // hop + 1 - 1
 
     power = np.zeros((n_freqs, T), dtype=np.float32)
@@ -125,18 +136,21 @@ try:
     # Pad to 3000
     T_out = 3000
     mel_padded = np.full((n_mels, T_out), (floor_v + 4.0) / 4.0, dtype=np.float32)
-    mel_padded[:, :min(T, T_out)] = mel_fixed[:, :min(T, T_out)]
+    mel_padded[:, : min(T, T_out)] = mel_fixed[:, : min(T, T_out)]
 
     print(f"  mel (fixed max) shape: {mel_padded.shape}")
-    print(f"  mel stats: min={mel_padded.min():.4f} max={mel_padded.max():.4f} mean={mel_padded.mean():.4f}")
+    print(
+        f"  mel stats: min={mel_padded.min():.4f} max={mel_padded.max():.4f} mean={mel_padded.mean():.4f}"
+    )
     print(f"  mel[0,:5]: {mel_padded[0,:5].tolist()}")
     print(f"  mel[64,:5]: {mel_padded[64,:5].tolist()}")
 
     np.save("/tmp/v4b-ref-mel-fixed.npy", mel_padded)
-    print(f"  saved to /tmp/v4b-ref-mel-fixed.npy")
+    print("  saved to /tmp/v4b-ref-mel-fixed.npy")
 
 except Exception as e:
     import traceback
+
     print(f"  ERROR: {e}")
     traceback.print_exc()
 

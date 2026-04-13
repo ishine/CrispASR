@@ -69,6 +69,7 @@ except ImportError:
 # .nemo unpacking — extract ONLY the timestamps_asr_model files
 # ---------------------------------------------------------------------------
 
+
 def unpack_nemo_aux(nemo_path: Path, out_dir: Path) -> dict:
     """Extract the aux CTC model files from a canary .nemo tarball."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -77,18 +78,20 @@ def unpack_nemo_aux(nemo_path: Path, out_dir: Path) -> dict:
         for m in tf.getmembers():
             n = m.name.lstrip("./")
             if n == "timestamps_asr_model_weights.ckpt":
-                tf.extract(m, out_dir, filter='data')
+                tf.extract(m, out_dir, filter="data")
                 paths["weights"] = out_dir / m.name.lstrip("./")
             elif n == "timestamps_asr_model_config.yaml":
-                tf.extract(m, out_dir, filter='data')
+                tf.extract(m, out_dir, filter="data")
                 paths["config"] = out_dir / m.name.lstrip("./")
             elif n.endswith("_tokenizer.model") and "spe_tokenizer" not in n:
                 # Pick the tokenizer that matches the aux model's vocab.
                 # In canary-1b-v2.nemo there are multiple tokenizer files;
                 # we want the one referenced by the aux model's config.
                 # Easiest heuristic: take all and filter later.
-                tf.extract(m, out_dir, filter='data')
-                paths.setdefault("spm_candidates", []).append(out_dir / m.name.lstrip("./"))
+                tf.extract(m, out_dir, filter="data")
+                paths.setdefault("spm_candidates", []).append(
+                    out_dir / m.name.lstrip("./")
+                )
     if "weights" not in paths:
         sys.exit(f"could not find timestamps_asr_model_weights.ckpt in {nemo_path}")
     return paths
@@ -98,14 +101,17 @@ def unpack_nemo_aux(nemo_path: Path, out_dir: Path) -> dict:
 # Tensor name remapping (mostly identical to convert-parakeet-to-gguf.py)
 # ---------------------------------------------------------------------------
 
+
 def remap_name(nemo_name: str) -> str | None:
     n = nemo_name
     if n.endswith("num_batches_tracked"):
         return None
 
     # ---- preprocessor ----
-    if n == "preprocessor.featurizer.fb":     return "preprocessor.fb"
-    if n == "preprocessor.featurizer.window": return "preprocessor.window"
+    if n == "preprocessor.featurizer.fb":
+        return "preprocessor.fb"
+    if n == "preprocessor.featurizer.window":
+        return "preprocessor.window"
 
     # ---- pre-encoder ----
     if n.startswith("encoder.pre_encode."):
@@ -113,25 +119,25 @@ def remap_name(nemo_name: str) -> str | None:
 
     # ---- encoder layers ----
     if n.startswith("encoder.layers."):
-        rest = n[len("encoder.layers."):]
+        rest = n[len("encoder.layers.") :]
         layer_id, sub = rest.split(".", 1)
-        sub = (sub
-            .replace("feed_forward1",        "ff1")
-            .replace("feed_forward2",        "ff2")
-            .replace("norm_feed_forward1",   "norm_ff1")
-            .replace("norm_feed_forward2",   "norm_ff2")
-            .replace("norm_self_att",        "norm_attn")
-            .replace("self_attn.linear_q",   "attn.q")
-            .replace("self_attn.linear_k",   "attn.k")
-            .replace("self_attn.linear_v",   "attn.v")
+        sub = (
+            sub.replace("feed_forward1", "ff1")
+            .replace("feed_forward2", "ff2")
+            .replace("norm_feed_forward1", "norm_ff1")
+            .replace("norm_feed_forward2", "norm_ff2")
+            .replace("norm_self_att", "norm_attn")
+            .replace("self_attn.linear_q", "attn.q")
+            .replace("self_attn.linear_k", "attn.k")
+            .replace("self_attn.linear_v", "attn.v")
             .replace("self_attn.linear_out", "attn.out")
             .replace("self_attn.linear_pos", "attn.pos")
             .replace("self_attn.pos_bias_u", "attn.pos_bias_u")
             .replace("self_attn.pos_bias_v", "attn.pos_bias_v")
             .replace("conv.pointwise_conv1", "conv.pw1")
-            .replace("conv.depthwise_conv",  "conv.dw")
+            .replace("conv.depthwise_conv", "conv.dw")
             .replace("conv.pointwise_conv2", "conv.pw2")
-            .replace("conv.batch_norm",      "conv.bn")
+            .replace("conv.batch_norm", "conv.bn")
         )
         return f"encoder.layers.{layer_id}.{sub}"
 
@@ -148,18 +154,25 @@ def remap_name(nemo_name: str) -> str | None:
 
 
 def is_f32_tensor(gguf_name: str, shape: tuple[int, ...]) -> bool:
-    if gguf_name.startswith("preprocessor."):    return True
-    if gguf_name.endswith(".bias"):               return True
-    if "norm" in gguf_name:                       return True
-    if "bn" in gguf_name:                         return True
-    if "pos_bias_u" in gguf_name or "pos_bias_v" in gguf_name: return True
-    if len(shape) <= 1:                           return True
+    if gguf_name.startswith("preprocessor."):
+        return True
+    if gguf_name.endswith(".bias"):
+        return True
+    if "norm" in gguf_name:
+        return True
+    if "bn" in gguf_name:
+        return True
+    if "pos_bias_u" in gguf_name or "pos_bias_v" in gguf_name:
+        return True
+    if len(shape) <= 1:
+        return True
     return False
 
 
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
+
 
 def convert(nemo_path: Path, out_path: Path) -> None:
     print(f"Loading: {nemo_path}")
@@ -186,7 +199,7 @@ def convert(nemo_path: Path, out_path: Path) -> None:
                 continue
         if spm_path is None:
             print(f"  [warn] no SentencePiece tokenizer matches vocab={target_vocab}")
-            print(f"         CTC head will work but the embedded vocab may be wrong")
+            print("         CTC head will work but the embedded vocab may be wrong")
             # Pick the first as fallback
             spm_path = paths.get("spm_candidates", [None])[0]
 
@@ -196,29 +209,29 @@ def convert(nemo_path: Path, out_path: Path) -> None:
             print(f"  spm:     {spm_path.name}  ({len(vocab)} pieces)")
         else:
             vocab = [f"<{i}>" for i in range(target_vocab)]
-            print(f"  spm:     none — using placeholder vocab")
+            print("  spm:     none — using placeholder vocab")
 
     # ----- write GGUF -----
     print(f"\nWriting: {out_path}")
     writer = gguf.GGUFWriter(str(out_path), arch="canary-ctc")
 
     # Hyperparameters (parakeet-style encoder + CTC head)
-    writer.add_uint32("canary_ctc.sample_rate",          16000)
-    writer.add_uint32("canary_ctc.n_mels",               128)
-    writer.add_uint32("canary_ctc.n_fft",                512)
-    writer.add_uint32("canary_ctc.win_length",           400)
-    writer.add_uint32("canary_ctc.hop_length",           160)
-    writer.add_uint32("canary_ctc.d_model",              1024)
-    writer.add_uint32("canary_ctc.n_layers",             24)
-    writer.add_uint32("canary_ctc.n_heads",              8)
-    writer.add_uint32("canary_ctc.head_dim",             128)
-    writer.add_uint32("canary_ctc.ff_dim",               4096)
-    writer.add_uint32("canary_ctc.subsampling_factor",   8)
+    writer.add_uint32("canary_ctc.sample_rate", 16000)
+    writer.add_uint32("canary_ctc.n_mels", 128)
+    writer.add_uint32("canary_ctc.n_fft", 512)
+    writer.add_uint32("canary_ctc.win_length", 400)
+    writer.add_uint32("canary_ctc.hop_length", 160)
+    writer.add_uint32("canary_ctc.d_model", 1024)
+    writer.add_uint32("canary_ctc.n_layers", 24)
+    writer.add_uint32("canary_ctc.n_heads", 8)
+    writer.add_uint32("canary_ctc.head_dim", 128)
+    writer.add_uint32("canary_ctc.ff_dim", 4096)
+    writer.add_uint32("canary_ctc.subsampling_factor", 8)
     writer.add_uint32("canary_ctc.subsampling_channels", 256)
-    writer.add_uint32("canary_ctc.conv_kernel",          9)
-    writer.add_uint32("canary_ctc.vocab_size",           len(vocab))
-    writer.add_uint32("canary_ctc.blank_id",             len(vocab))   # blank is the last index
-    writer.add_uint32("canary_ctc.frame_dur_cs",         8)            # 80 ms / encoder frame
+    writer.add_uint32("canary_ctc.conv_kernel", 9)
+    writer.add_uint32("canary_ctc.vocab_size", len(vocab))
+    writer.add_uint32("canary_ctc.blank_id", len(vocab))  # blank is the last index
+    writer.add_uint32("canary_ctc.frame_dur_cs", 8)  # 80 ms / encoder frame
 
     writer.add_array("tokenizer.ggml.tokens", vocab)
 
@@ -265,8 +278,10 @@ def convert(nemo_path: Path, out_path: Path) -> None:
         n_written += 1
         n_f32 += 1
 
-    print(f"\n  total tensors: {n_written}  (F16: {n_f16}, F32: {n_f32})  "
-          f"(+{len(layers_seen)} synthetic conv.dw.bias)")
+    print(
+        f"\n  total tensors: {n_written}  (F16: {n_f16}, F32: {n_f32})  "
+        f"(+{len(layers_seen)} synthetic conv.dw.bias)"
+    )
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -277,11 +292,10 @@ def convert(nemo_path: Path, out_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Extract Canary 1B v2's auxiliary CTC alignment model and convert to GGUF F16")
-    p.add_argument("--nemo",   required=True, type=Path,
-                   help="path to canary-1b-v2.nemo")
-    p.add_argument("--output", required=True, type=Path,
-                   help="output GGUF path")
+        description="Extract Canary 1B v2's auxiliary CTC alignment model and convert to GGUF F16"
+    )
+    p.add_argument("--nemo", required=True, type=Path, help="path to canary-1b-v2.nemo")
+    p.add_argument("--output", required=True, type=Path, help="output GGUF path")
     return p.parse_args()
 
 

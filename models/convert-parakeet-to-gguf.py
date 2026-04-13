@@ -103,6 +103,7 @@ except ImportError:
 # .nemo unpacking
 # ---------------------------------------------------------------------------
 
+
 def unpack_nemo(nemo_path: Path, out_dir: Path) -> dict:
     """Extract .nemo tarball, return paths to weights / config / tokenizer."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -111,10 +112,14 @@ def unpack_nemo(nemo_path: Path, out_dir: Path) -> dict:
     paths = {}
     for f in out_dir.iterdir():
         n = f.name
-        if n.endswith("model_weights.ckpt"): paths["weights"] = f
-        elif n.endswith("model_config.yaml"): paths["config"]  = f
-        elif n.endswith("_tokenizer.model"):  paths["spm"]     = f
-        elif n.endswith("_vocab.txt"):        paths["vocab"]   = f
+        if n.endswith("model_weights.ckpt"):
+            paths["weights"] = f
+        elif n.endswith("model_config.yaml"):
+            paths["config"] = f
+        elif n.endswith("_tokenizer.model"):
+            paths["spm"] = f
+        elif n.endswith("_vocab.txt"):
+            paths["vocab"] = f
     if "weights" not in paths or "spm" not in paths:
         sys.exit(f"could not find weights / tokenizer in {nemo_path}")
     return paths
@@ -123,6 +128,7 @@ def unpack_nemo(nemo_path: Path, out_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Tensor name remapping
 # ---------------------------------------------------------------------------
+
 
 def remap_name(nemo_name: str) -> str | None:
     """
@@ -149,25 +155,25 @@ def remap_name(nemo_name: str) -> str | None:
 
     # ---- conformer layers ----
     if n.startswith("encoder.layers."):
-        rest = n[len("encoder.layers."):]
+        rest = n[len("encoder.layers.") :]
         layer_id, sub = rest.split(".", 1)
-        sub = (sub
-            .replace("feed_forward1",     "ff1")
-            .replace("feed_forward2",     "ff2")
-            .replace("norm_feed_forward1","norm_ff1")
-            .replace("norm_feed_forward2","norm_ff2")
-            .replace("norm_self_att",     "norm_attn")
-            .replace("self_attn.linear_q",   "attn.q")
-            .replace("self_attn.linear_k",   "attn.k")
-            .replace("self_attn.linear_v",   "attn.v")
+        sub = (
+            sub.replace("feed_forward1", "ff1")
+            .replace("feed_forward2", "ff2")
+            .replace("norm_feed_forward1", "norm_ff1")
+            .replace("norm_feed_forward2", "norm_ff2")
+            .replace("norm_self_att", "norm_attn")
+            .replace("self_attn.linear_q", "attn.q")
+            .replace("self_attn.linear_k", "attn.k")
+            .replace("self_attn.linear_v", "attn.v")
             .replace("self_attn.linear_out", "attn.out")
             .replace("self_attn.linear_pos", "attn.pos")
             .replace("self_attn.pos_bias_u", "attn.pos_bias_u")
             .replace("self_attn.pos_bias_v", "attn.pos_bias_v")
             .replace("conv.pointwise_conv1", "conv.pw1")
-            .replace("conv.depthwise_conv",  "conv.dw")
+            .replace("conv.depthwise_conv", "conv.dw")
             .replace("conv.pointwise_conv2", "conv.pw2")
-            .replace("conv.batch_norm",      "conv.bn")
+            .replace("conv.batch_norm", "conv.bn")
         )
         return f"encoder.layers.{layer_id}.{sub}"
 
@@ -175,28 +181,34 @@ def remap_name(nemo_name: str) -> str | None:
     if n == "decoder.prediction.embed.weight":
         return "decoder.embed.weight"
     if n.startswith("decoder.prediction.dec_rnn.lstm."):
-        suf = n[len("decoder.prediction.dec_rnn.lstm."):]
+        suf = n[len("decoder.prediction.dec_rnn.lstm.") :]
         # weight_ih_l0 / weight_hh_l0 / bias_ih_l0 / bias_hh_l0
         for key, gguf_key in [
             ("weight_ih_l0", "lstm.0.w_ih"),
             ("weight_hh_l0", "lstm.0.w_hh"),
-            ("bias_ih_l0",   "lstm.0.b_ih"),
-            ("bias_hh_l0",   "lstm.0.b_hh"),
+            ("bias_ih_l0", "lstm.0.b_ih"),
+            ("bias_hh_l0", "lstm.0.b_hh"),
             ("weight_ih_l1", "lstm.1.w_ih"),
             ("weight_hh_l1", "lstm.1.w_hh"),
-            ("bias_ih_l1",   "lstm.1.b_ih"),
-            ("bias_hh_l1",   "lstm.1.b_hh"),
+            ("bias_ih_l1", "lstm.1.b_ih"),
+            ("bias_hh_l1", "lstm.1.b_hh"),
         ]:
             if suf == key:
                 return f"decoder.{gguf_key}"
 
     # ---- joint ----
-    if n == "joint.enc.weight":         return "joint.enc.weight"
-    if n == "joint.enc.bias":           return "joint.enc.bias"
-    if n == "joint.pred.weight":        return "joint.pred.weight"
-    if n == "joint.pred.bias":          return "joint.pred.bias"
-    if n == "joint.joint_net.2.weight": return "joint.out.weight"
-    if n == "joint.joint_net.2.bias":   return "joint.out.bias"
+    if n == "joint.enc.weight":
+        return "joint.enc.weight"
+    if n == "joint.enc.bias":
+        return "joint.enc.bias"
+    if n == "joint.pred.weight":
+        return "joint.pred.weight"
+    if n == "joint.pred.bias":
+        return "joint.pred.bias"
+    if n == "joint.joint_net.2.weight":
+        return "joint.out.weight"
+    if n == "joint.joint_net.2.bias":
+        return "joint.out.bias"
 
     print(f"  [warn] unmapped tensor: {n}", file=sys.stderr)
     return None
@@ -223,6 +235,7 @@ def is_f32_tensor(gguf_name: str, shape: tuple[int, ...]) -> bool:
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
+
 
 def model_d_for_layer(sd, layer_id: int) -> int:
     """Look up d_model for the given encoder layer (1024 for parakeet-tdt-0.6b-v3)."""
@@ -252,27 +265,27 @@ def convert(nemo_path: Path, out_path: Path) -> None:
     writer = gguf.GGUFWriter(str(out_path), arch="parakeet")
 
     # Hyper-parameters (hard-coded for parakeet-tdt-0.6b-v3 based on config inspection)
-    writer.add_uint32("parakeet.sample_rate",          16000)
-    writer.add_uint32("parakeet.n_mels",               128)
-    writer.add_uint32("parakeet.n_fft",                512)
-    writer.add_uint32("parakeet.win_length",           400)
-    writer.add_uint32("parakeet.hop_length",           160)
-    writer.add_uint32("parakeet.d_model",              1024)
-    writer.add_uint32("parakeet.n_layers",             24)
-    writer.add_uint32("parakeet.n_heads",              8)
-    writer.add_uint32("parakeet.head_dim",             128)
-    writer.add_uint32("parakeet.ff_dim",               4096)
-    writer.add_uint32("parakeet.subsampling_factor",   8)
+    writer.add_uint32("parakeet.sample_rate", 16000)
+    writer.add_uint32("parakeet.n_mels", 128)
+    writer.add_uint32("parakeet.n_fft", 512)
+    writer.add_uint32("parakeet.win_length", 400)
+    writer.add_uint32("parakeet.hop_length", 160)
+    writer.add_uint32("parakeet.d_model", 1024)
+    writer.add_uint32("parakeet.n_layers", 24)
+    writer.add_uint32("parakeet.n_heads", 8)
+    writer.add_uint32("parakeet.head_dim", 128)
+    writer.add_uint32("parakeet.ff_dim", 4096)
+    writer.add_uint32("parakeet.subsampling_factor", 8)
     writer.add_uint32("parakeet.subsampling_channels", 256)
-    writer.add_uint32("parakeet.conv_kernel",          9)
-    writer.add_uint32("parakeet.pred_hidden",          640)
-    writer.add_uint32("parakeet.pred_layers",          2)
-    writer.add_uint32("parakeet.joint_hidden",         640)
-    writer.add_uint32("parakeet.vocab_size",           len(vocab))
-    writer.add_uint32("parakeet.blank_id",             len(vocab))      # blank is vocab_size
-    writer.add_uint32("parakeet.n_tdt_durations",      5)
-    writer.add_array ("parakeet.tdt_durations",        [0, 1, 2, 3, 4])
-    writer.add_uint32("parakeet.frame_dur_cs",         8)               # 80 ms = 8 cs
+    writer.add_uint32("parakeet.conv_kernel", 9)
+    writer.add_uint32("parakeet.pred_hidden", 640)
+    writer.add_uint32("parakeet.pred_layers", 2)
+    writer.add_uint32("parakeet.joint_hidden", 640)
+    writer.add_uint32("parakeet.vocab_size", len(vocab))
+    writer.add_uint32("parakeet.blank_id", len(vocab))  # blank is vocab_size
+    writer.add_uint32("parakeet.n_tdt_durations", 5)
+    writer.add_array("parakeet.tdt_durations", [0, 1, 2, 3, 4])
+    writer.add_uint32("parakeet.frame_dur_cs", 8)  # 80 ms = 8 cs
 
     writer.add_array("tokenizer.ggml.tokens", vocab)
 
@@ -318,8 +331,10 @@ def convert(nemo_path: Path, out_path: Path) -> None:
         n_written += 1
         n_f32 += 1
 
-    print(f"\n  total tensors: {n_written}  (F16: {n_f16}, F32: {n_f32})  "
-          f"(+{len(layers_seen)} synthetic conv.dw.bias)")
+    print(
+        f"\n  total tensors: {n_written}  (F16: {n_f16}, F32: {n_f32})  "
+        f"(+{len(layers_seen)} synthetic conv.dw.bias)"
+    )
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -330,9 +345,10 @@ def convert(nemo_path: Path, out_path: Path) -> None:
 
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert Parakeet TDT .nemo → GGUF F16")
-    p.add_argument("--nemo",   required=True, type=Path, help="path to .nemo file")
+    p.add_argument("--nemo", required=True, type=Path, help="path to .nemo file")
     p.add_argument("--output", required=True, type=Path, help="output GGUF path")
     return p.parse_args()
 

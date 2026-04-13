@@ -16,21 +16,34 @@ ONNX numeric initializer assignment (confirmed by consumer-node walk):
 
   Biases are named (encoder.N.attention.QKV.bias, etc.) and pass through directly.
 """
+
 from __future__ import annotations
-import argparse, json, sys
+import argparse
+import json
+import sys
 from pathlib import Path
 import numpy as np
 
-try: import onnx
-except ImportError: sys.exit("pip install onnx")
-try: import gguf
-except ImportError: sys.exit("pip install gguf")
+try:
+    import onnx
+except ImportError:
+    sys.exit("pip install onnx")
+try:
+    import gguf
+except ImportError:
+    sys.exit("pip install gguf")
 
 
 # Stage layout: (conv_stage_id, tx_stage_id, dim)
 STAGES = [
-    (0,  1,  128), (5,  6,  128), (10, 11, 128), (15, 16, 128),
-    (20, 21, 192), (25, 26, 192), (30, 31, 192), (35, 36, 192),
+    (0, 1, 128),
+    (5, 6, 128),
+    (10, 11, 128),
+    (15, 16, 128),
+    (20, 21, 192),
+    (25, 26, 192),
+    (30, 31, 192),
+    (35, 36, 192),
 ]
 
 
@@ -45,7 +58,8 @@ def convert(input_dir: Path, out_path: Path) -> None:
     with open(input_dir / "lang_group_dict_95.json") as f:
         group_dict = json.load(f)
     lang_list = [""] * 95
-    for k, v in lang_dict.items(): lang_list[int(k)] = v
+    for k, v in lang_dict.items():
+        lang_list[int(k)] = v
     group_list = [""] * 58
     for k, v in group_dict.items():
         group_list[int(k)] = json.dumps(v) if not isinstance(v, str) else v
@@ -58,15 +72,19 @@ def convert(input_dir: Path, out_path: Path) -> None:
     # The initial frame-extraction Conv has stride=160 and uses a Constant
     # node (not an initializer). Extract it from the ONNX graph.
     for n in model.graph.node:
-        if n.op_type == 'Constant' and n.output[0] in [
-            inp for node in model.graph.node if node.op_type == 'Conv'
+        if n.op_type == "Constant" and n.output[0] in [
+            inp
+            for node in model.graph.node
+            if node.op_type == "Conv"
             for inp in node.input[1:2]
-            if any(a.name == 'strides' and list(a.ints) == [160] for a in node.attribute)
+            if any(
+                a.name == "strides" and list(a.ints) == [160] for a in node.attribute
+            )
         ]:
             for a in n.attribute:
-                if a.name == 'value':
+                if a.name == "value":
                     arr = onnx.numpy_helper.to_array(a.t).astype(np.float32)
-                    inits['_frontend_conv_weight'] = arr
+                    inits["_frontend_conv_weight"] = arr
                     print(f"  frontend conv: {arr.shape} (stride=160, learned STFT)")
                     break
 
@@ -75,7 +93,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
 
     # Separate by role: 1×1 Conv weight (3D) vs MatMul weight (2D)
     conv1x1_w_ids = [i for i in numeric_ids if len(inits[str(i)].shape) == 3]
-    matmul_ids    = [i for i in numeric_ids if len(inits[str(i)].shape) == 2]
+    matmul_ids = [i for i in numeric_ids if len(inits[str(i)].shape) == 2]
 
     # Pair each 1×1 Conv weight with its bias (the next numeric ID, 1D, same dim).
     conv1x1_pairs = []
@@ -90,7 +108,7 @@ def convert(input_dir: Path, out_path: Path) -> None:
     # Order: QKV, out_proj, linear1, linear2
     matmul_groups = []
     for bi in range(0, len(matmul_ids), 4):
-        matmul_groups.append(matmul_ids[bi:bi+4])
+        matmul_groups.append(matmul_ids[bi : bi + 4])
 
     print(f"  conv1x1 pairs: {len(conv1x1_pairs)}")
     print(f"  matmul groups: {len(matmul_groups)} (× 4 each)")
@@ -127,7 +145,12 @@ def convert(input_dir: Path, out_path: Path) -> None:
         # Conv blocks (12 per stage)
         for bi in range(12):
             prefix = f"encoder.{conv_id}.{bi}"
-            for sub in ["dw_conv.0.weight", "dw_conv.0.bias", "pw_conv.0.weight", "pw_conv.0.bias"]:
+            for sub in [
+                "dw_conv.0.weight",
+                "dw_conv.0.bias",
+                "pw_conv.0.weight",
+                "pw_conv.0.bias",
+            ]:
                 key = f"{prefix}.{sub}"
                 if key in inits:
                     gguf_name = f"lid.conv.{si}.{bi}.{sub.replace('.0.', '.')}"
@@ -155,20 +178,20 @@ def convert(input_dir: Path, out_path: Path) -> None:
 
     # ---- Numeric tensor assignment ----
     # Conv1x1 projections: one per stage
-    for si, (wid, bid) in enumerate(conv1x1_pairs[:len(STAGES)]):
+    for si, (wid, bid) in enumerate(conv1x1_pairs[: len(STAGES)]):
         write(f"lid.{si}.tx.conv1x1.weight", inits[str(wid)])
         if bid is not None:
             write(f"lid.{si}.tx.conv1x1.bias", inits[str(bid)])
 
     # MatMul weights: 4 per block (QKV, out, ff1, ff2)
-    for si, group in enumerate(matmul_groups[:len(STAGES)]):
+    for si, group in enumerate(matmul_groups[: len(STAGES)]):
         roles = ["tx.qkv.weight", "tx.out.weight", "tx.ff1.weight", "tx.ff2.weight"]
         for role, mid in zip(roles, group):
             write(f"lid.{si}.{role}", inits[str(mid)])
 
     # ---- Front-end Conv weight (learned STFT, stride=160) ----
-    if '_frontend_conv_weight' in inits:
-        write("lid.frontend.weight", inits['_frontend_conv_weight'])
+    if "_frontend_conv_weight" in inits:
+        write("lid.frontend.weight", inits["_frontend_conv_weight"])
     else:
         print("  WARNING: frontend conv weight not found in ONNX graph!")
 

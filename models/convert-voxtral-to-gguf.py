@@ -104,52 +104,112 @@ except ImportError:
 
 DIRECT = {
     # Audio encoder front-end
-    "audio_tower.conv1.weight":           "audio.conv.1.weight",
-    "audio_tower.conv1.bias":             "audio.conv.1.bias",
-    "audio_tower.conv2.weight":           "audio.conv.2.weight",
-    "audio_tower.conv2.bias":             "audio.conv.2.bias",
+    "audio_tower.conv1.weight": "audio.conv.1.weight",
+    "audio_tower.conv1.bias": "audio.conv.1.bias",
+    "audio_tower.conv2.weight": "audio.conv.2.weight",
+    "audio_tower.conv2.bias": "audio.conv.2.bias",
     "audio_tower.embed_positions.weight": "audio.embed_positions",
-    "audio_tower.layer_norm.weight":      "audio.ln_post.weight",
-    "audio_tower.layer_norm.bias":        "audio.ln_post.bias",
+    "audio_tower.layer_norm.weight": "audio.ln_post.weight",
+    "audio_tower.layer_norm.bias": "audio.ln_post.bias",
     # Multi-modal projector
     "multi_modal_projector.linear_1.weight": "proj1.weight",
     "multi_modal_projector.linear_2.weight": "proj2.weight",
     # LLM top level
     "language_model.model.embed_tokens.weight": "token_embd.weight",
-    "language_model.model.norm.weight":         "output_norm.weight",
-    "language_model.lm_head.weight":            "output.weight",
+    "language_model.model.norm.weight": "output_norm.weight",
+    "language_model.lm_head.weight": "output.weight",
 }
 
 # Per-layer regex patterns
 AUDIO_LAYER_PATTERNS = [
-    (r"audio_tower\.layers\.(\d+)\.self_attn_layer_norm\.weight", "audio.blk.{}.attn_norm.weight"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn_layer_norm\.bias",   "audio.blk.{}.attn_norm.bias"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.weight",    "audio.blk.{}.attn_q.weight"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.bias",      "audio.blk.{}.attn_q.bias"),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn_layer_norm\.weight",
+        "audio.blk.{}.attn_norm.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn_layer_norm\.bias",
+        "audio.blk.{}.attn_norm.bias",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.weight",
+        "audio.blk.{}.attn_q.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.q_proj\.bias",
+        "audio.blk.{}.attn_q.bias",
+    ),
     # Note: K has weight only (Whisper quirk)
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.k_proj\.weight",    "audio.blk.{}.attn_k.weight"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.weight",    "audio.blk.{}.attn_v.weight"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.bias",      "audio.blk.{}.attn_v.bias"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.out_proj\.weight",  "audio.blk.{}.attn_out.weight"),
-    (r"audio_tower\.layers\.(\d+)\.self_attn\.out_proj\.bias",    "audio.blk.{}.attn_out.bias"),
-    (r"audio_tower\.layers\.(\d+)\.final_layer_norm\.weight",     "audio.blk.{}.ffn_norm.weight"),
-    (r"audio_tower\.layers\.(\d+)\.final_layer_norm\.bias",       "audio.blk.{}.ffn_norm.bias"),
-    (r"audio_tower\.layers\.(\d+)\.fc1\.weight",                  "audio.blk.{}.ffn_up.weight"),
-    (r"audio_tower\.layers\.(\d+)\.fc1\.bias",                    "audio.blk.{}.ffn_up.bias"),
-    (r"audio_tower\.layers\.(\d+)\.fc2\.weight",                  "audio.blk.{}.ffn_down.weight"),
-    (r"audio_tower\.layers\.(\d+)\.fc2\.bias",                    "audio.blk.{}.ffn_down.bias"),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.k_proj\.weight",
+        "audio.blk.{}.attn_k.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.weight",
+        "audio.blk.{}.attn_v.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.v_proj\.bias",
+        "audio.blk.{}.attn_v.bias",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.out_proj\.weight",
+        "audio.blk.{}.attn_out.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.self_attn\.out_proj\.bias",
+        "audio.blk.{}.attn_out.bias",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.final_layer_norm\.weight",
+        "audio.blk.{}.ffn_norm.weight",
+    ),
+    (
+        r"audio_tower\.layers\.(\d+)\.final_layer_norm\.bias",
+        "audio.blk.{}.ffn_norm.bias",
+    ),
+    (r"audio_tower\.layers\.(\d+)\.fc1\.weight", "audio.blk.{}.ffn_up.weight"),
+    (r"audio_tower\.layers\.(\d+)\.fc1\.bias", "audio.blk.{}.ffn_up.bias"),
+    (r"audio_tower\.layers\.(\d+)\.fc2\.weight", "audio.blk.{}.ffn_down.weight"),
+    (r"audio_tower\.layers\.(\d+)\.fc2\.bias", "audio.blk.{}.ffn_down.bias"),
 ]
 
 LLM_LAYER_PATTERNS = [
-    (r"language_model\.model\.layers\.(\d+)\.input_layernorm\.weight",          "blk.{}.attn_norm.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.q_proj\.weight",        "blk.{}.attn_q.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.k_proj\.weight",        "blk.{}.attn_k.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.v_proj\.weight",        "blk.{}.attn_v.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.self_attn\.o_proj\.weight",        "blk.{}.attn_output.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.post_attention_layernorm\.weight", "blk.{}.ffn_norm.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.gate_proj\.weight",           "blk.{}.ffn_gate.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.up_proj\.weight",             "blk.{}.ffn_up.weight"),
-    (r"language_model\.model\.layers\.(\d+)\.mlp\.down_proj\.weight",           "blk.{}.ffn_down.weight"),
+    (
+        r"language_model\.model\.layers\.(\d+)\.input_layernorm\.weight",
+        "blk.{}.attn_norm.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.q_proj\.weight",
+        "blk.{}.attn_q.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.k_proj\.weight",
+        "blk.{}.attn_k.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.v_proj\.weight",
+        "blk.{}.attn_v.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.self_attn\.o_proj\.weight",
+        "blk.{}.attn_output.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.post_attention_layernorm\.weight",
+        "blk.{}.ffn_norm.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.gate_proj\.weight",
+        "blk.{}.ffn_gate.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.up_proj\.weight",
+        "blk.{}.ffn_up.weight",
+    ),
+    (
+        r"language_model\.model\.layers\.(\d+)\.mlp\.down_proj\.weight",
+        "blk.{}.ffn_down.weight",
+    ),
 ]
 
 
@@ -197,6 +257,7 @@ def is_f32_tensor(gguf_name: str, shape: tuple[int, ...]) -> bool:
 #                              approximation)
 # ---------------------------------------------------------------------------
 
+
 def serialize_tekken_vocab(tekken: dict) -> bytes:
     """Encode the 150k vocab entries as length-prefixed (u16 len + bytes)."""
     vocab = tekken["vocab"]
@@ -214,12 +275,13 @@ def serialize_tekken_vocab(tekken: dict) -> bytes:
 # Main conversion
 # ---------------------------------------------------------------------------
 
+
 def convert(input_dir: Path, out_path: Path) -> None:
     print(f"Loading: {input_dir}")
     with open(input_dir / "config.json", "r") as f:
         cfg = json.load(f)
     audio = cfg["audio_config"]
-    text  = cfg["text_config"]
+    text = cfg["text_config"]
 
     safetensor_files = sorted(input_dir.glob("model-*.safetensors"))
     if not safetensor_files:
@@ -237,8 +299,10 @@ def convert(input_dir: Path, out_path: Path) -> None:
         tekken = json.load(f)
     tekken_cfg = tekken.get("config", {})
     n_specials = len(tekken.get("special_tokens", []))
-    n_vocab    = len(tekken.get("vocab", []))
-    print(f"  tekken: {n_specials} specials + {n_vocab} BPE = {n_specials + n_vocab} total")
+    n_vocab = len(tekken.get("vocab", []))
+    print(
+        f"  tekken: {n_specials} specials + {n_vocab} BPE = {n_specials + n_vocab} total"
+    )
 
     # ----- Write GGUF -----
     print(f"Writing: {out_path}")
@@ -246,35 +310,39 @@ def convert(input_dir: Path, out_path: Path) -> None:
     writer = gguf.GGUFWriter(str(out_path), arch="voxtral")
 
     # Audio params
-    writer.add_uint32("voxtral.sample_rate",      16000)
-    writer.add_uint32("voxtral.n_mels",           audio.get("num_mel_bins", 128))
-    writer.add_uint32("voxtral.n_fft",            400)
-    writer.add_uint32("voxtral.win_length",       400)
-    writer.add_uint32("voxtral.hop_length",       160)
-    writer.add_uint32("voxtral.audio.n_layers",   audio.get("num_hidden_layers", 32))
-    writer.add_uint32("voxtral.audio.d_model",    audio.get("hidden_size", 1280))
-    writer.add_uint32("voxtral.audio.n_heads",    audio.get("num_attention_heads", 20))
-    writer.add_uint32("voxtral.audio.head_dim",   audio.get("head_dim", 64))
-    writer.add_uint32("voxtral.audio.ff_dim",     audio.get("intermediate_size", 5120))
-    writer.add_uint32("voxtral.audio.max_pos",    audio.get("max_source_positions", 1500))
+    writer.add_uint32("voxtral.sample_rate", 16000)
+    writer.add_uint32("voxtral.n_mels", audio.get("num_mel_bins", 128))
+    writer.add_uint32("voxtral.n_fft", 400)
+    writer.add_uint32("voxtral.win_length", 400)
+    writer.add_uint32("voxtral.hop_length", 160)
+    writer.add_uint32("voxtral.audio.n_layers", audio.get("num_hidden_layers", 32))
+    writer.add_uint32("voxtral.audio.d_model", audio.get("hidden_size", 1280))
+    writer.add_uint32("voxtral.audio.n_heads", audio.get("num_attention_heads", 20))
+    writer.add_uint32("voxtral.audio.head_dim", audio.get("head_dim", 64))
+    writer.add_uint32("voxtral.audio.ff_dim", audio.get("intermediate_size", 5120))
+    writer.add_uint32("voxtral.audio.max_pos", audio.get("max_source_positions", 1500))
 
     # Projector params
-    writer.add_uint32("voxtral.proj.in_dim",      5120)  # audio.d_model × 4
-    writer.add_uint32("voxtral.proj.out_dim",     text.get("hidden_size", 3072))
+    writer.add_uint32("voxtral.proj.in_dim", 5120)  # audio.d_model × 4
+    writer.add_uint32("voxtral.proj.out_dim", text.get("hidden_size", 3072))
     writer.add_uint32("voxtral.proj.frame_stack", 4)
 
     # LLM params
-    writer.add_uint32("voxtral.llm.n_layers",     text.get("num_hidden_layers", 30))
-    writer.add_uint32("voxtral.llm.d_model",      text.get("hidden_size", 3072))
-    writer.add_uint32("voxtral.llm.n_heads",      text.get("num_attention_heads", 32))
-    writer.add_uint32("voxtral.llm.n_kv_heads",   text.get("num_key_value_heads", 8))
-    writer.add_uint32("voxtral.llm.head_dim",     text.get("head_dim", 128))
-    writer.add_uint32("voxtral.llm.ff_dim",       text.get("intermediate_size", 8192))
-    writer.add_float32("voxtral.llm.rope_theta",  float(text.get("rope_theta", 1e8)))
-    writer.add_float32("voxtral.llm.rms_norm_eps", float(text.get("rms_norm_eps", 1e-5)))
-    writer.add_uint32("voxtral.llm.vocab_size",   text.get("vocab_size", 131072))
-    writer.add_uint32("voxtral.llm.max_pos",      text.get("max_position_embeddings", 131072))
-    writer.add_uint32("voxtral.audio_token_id",   cfg.get("audio_token_id", 24))
+    writer.add_uint32("voxtral.llm.n_layers", text.get("num_hidden_layers", 30))
+    writer.add_uint32("voxtral.llm.d_model", text.get("hidden_size", 3072))
+    writer.add_uint32("voxtral.llm.n_heads", text.get("num_attention_heads", 32))
+    writer.add_uint32("voxtral.llm.n_kv_heads", text.get("num_key_value_heads", 8))
+    writer.add_uint32("voxtral.llm.head_dim", text.get("head_dim", 128))
+    writer.add_uint32("voxtral.llm.ff_dim", text.get("intermediate_size", 8192))
+    writer.add_float32("voxtral.llm.rope_theta", float(text.get("rope_theta", 1e8)))
+    writer.add_float32(
+        "voxtral.llm.rms_norm_eps", float(text.get("rms_norm_eps", 1e-5))
+    )
+    writer.add_uint32("voxtral.llm.vocab_size", text.get("vocab_size", 131072))
+    writer.add_uint32(
+        "voxtral.llm.max_pos", text.get("max_position_embeddings", 131072)
+    )
+    writer.add_uint32("voxtral.audio_token_id", cfg.get("audio_token_id", 24))
 
     # Tekken tokenizer (custom blobs, NOT the standard tokenizer.ggml.* keys
     # because Tekken isn't GPT-2 BPE — it's a tiktoken-style rank BPE)
@@ -290,19 +358,24 @@ def convert(input_dir: Path, out_path: Path) -> None:
     vocab_f32 = np.frombuffer(vocab_blob, dtype=np.uint8).astype(np.float32)
     writer.add_tensor("tokenizer.tekken.vocab_tensor", vocab_f32)
     writer.add_uint32("tokenizer.tekken.n_specials", len(specials))
-    writer.add_uint32("tokenizer.tekken.n_vocab",    n_vocab)
+    writer.add_uint32("tokenizer.tekken.n_vocab", n_vocab)
 
     # ----- Mel filterbank + Hann window (same as Qwen3-ASR, same params) -----
     try:
         from transformers import WhisperFeatureExtractor
+
         fe = WhisperFeatureExtractor.from_pretrained(str(input_dir))
     except Exception:
-        fe = processor.feature_extractor
+        from transformers import AutoProcessor
+
+        fe = AutoProcessor.from_pretrained(str(input_dir)).feature_extractor
     mel_filters = np.asarray(fe.mel_filters, dtype=np.float32)  # (n_freqs, n_mels)
     print(f"  mel_filters shape: {mel_filters.shape}")
     writer.add_tensor("audio.mel_filters", mel_filters)
     n_fft_w = 400
-    win = (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n_fft_w) / n_fft_w)).astype(np.float32)
+    win = (0.5 - 0.5 * np.cos(2.0 * np.pi * np.arange(n_fft_w) / n_fft_w)).astype(
+        np.float32
+    )
     writer.add_tensor("audio.mel_window", win)
     print(f"  mel_window shape: {win.shape}")
 
@@ -339,8 +412,10 @@ def convert(input_dir: Path, out_path: Path) -> None:
                 if n_written <= 25 or n_written % 100 == 0:
                     print(f"    {gguf_name:50s} {str(arr.shape):26s} {arr.dtype}")
 
-    print(f"\n  total: {n_written} tensors  (F16: {n_f16}, F32: {n_f32})  "
-          f"skipped: {n_skipped}")
+    print(
+        f"\n  total: {n_written} tensors  (F16: {n_f16}, F32: {n_f32})  "
+        f"skipped: {n_skipped}"
+    )
     if skipped_names:
         print("  skipped tensors (first 10):")
         for n in skipped_names[:10]:
@@ -354,8 +429,10 @@ def convert(input_dir: Path, out_path: Path) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Convert Voxtral-Mini-3B-2507 HF safetensors → GGUF F16")
-    p.add_argument("--input",  required=True, type=Path, help="HF model directory")
+    p = argparse.ArgumentParser(
+        description="Convert Voxtral-Mini-3B-2507 HF safetensors → GGUF F16"
+    )
+    p.add_argument("--input", required=True, type=Path, help="HF model directory")
     p.add_argument("--output", required=True, type=Path, help="output GGUF path")
     return p.parse_args()
 

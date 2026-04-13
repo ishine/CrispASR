@@ -69,7 +69,8 @@ def unpack_nemo(nemo_path: Path, out_dir: Path) -> dict:
             elif n.endswith("_tokenizer.model"):
                 tf.extract(m, out_dir, filter="data")
                 paths.setdefault("spm_candidates", []).append(
-                    out_dir / m.name.lstrip("./"))
+                    out_dir / m.name.lstrip("./")
+                )
     if "weights" not in paths:
         sys.exit(f"could not find model_weights.ckpt in {nemo_path}")
     return paths
@@ -80,30 +81,32 @@ def remap_name(nemo_name: str) -> str | None:
     n = nemo_name
     if n.endswith("num_batches_tracked"):
         return None
-    if n == "preprocessor.featurizer.fb":     return "preprocessor.fb"
-    if n == "preprocessor.featurizer.window": return "preprocessor.window"
+    if n == "preprocessor.featurizer.fb":
+        return "preprocessor.fb"
+    if n == "preprocessor.featurizer.window":
+        return "preprocessor.window"
     if n.startswith("encoder.pre_encode."):
         return n.replace("encoder.pre_encode.", "encoder.pre.")
     if n.startswith("encoder.layers."):
-        rest = n[len("encoder.layers."):]
+        rest = n[len("encoder.layers.") :]
         layer_id, sub = rest.split(".", 1)
-        sub = (sub
-            .replace("feed_forward1",        "ff1")
-            .replace("feed_forward2",        "ff2")
-            .replace("norm_feed_forward1",   "norm_ff1")
-            .replace("norm_feed_forward2",   "norm_ff2")
-            .replace("norm_self_att",        "norm_attn")
-            .replace("self_attn.linear_q",   "attn.q")
-            .replace("self_attn.linear_k",   "attn.k")
-            .replace("self_attn.linear_v",   "attn.v")
+        sub = (
+            sub.replace("feed_forward1", "ff1")
+            .replace("feed_forward2", "ff2")
+            .replace("norm_feed_forward1", "norm_ff1")
+            .replace("norm_feed_forward2", "norm_ff2")
+            .replace("norm_self_att", "norm_attn")
+            .replace("self_attn.linear_q", "attn.q")
+            .replace("self_attn.linear_k", "attn.k")
+            .replace("self_attn.linear_v", "attn.v")
             .replace("self_attn.linear_out", "attn.out")
             .replace("self_attn.linear_pos", "attn.pos")
             .replace("self_attn.pos_bias_u", "attn.pos_bias_u")
             .replace("self_attn.pos_bias_v", "attn.pos_bias_v")
             .replace("conv.pointwise_conv1", "conv.pw1")
-            .replace("conv.depthwise_conv",  "conv.dw")
+            .replace("conv.depthwise_conv", "conv.dw")
             .replace("conv.pointwise_conv2", "conv.pw2")
-            .replace("conv.batch_norm",      "conv.bn")
+            .replace("conv.batch_norm", "conv.bn")
         )
         return f"encoder.layers.{layer_id}.{sub}"
     # NeMo CTC head: `decoder.decoder_layers.0.{weight,bias}` with
@@ -118,12 +121,18 @@ def remap_name(nemo_name: str) -> str | None:
 
 
 def is_f32_tensor(name: str, shape: tuple[int, ...]) -> bool:
-    if name.startswith("preprocessor."):                         return True
-    if name.endswith(".bias"):                                   return True
-    if "norm" in name:                                           return True
-    if "bn" in name:                                             return True
-    if "pos_bias_u" in name or "pos_bias_v" in name:             return True
-    if len(shape) <= 1:                                          return True
+    if name.startswith("preprocessor."):
+        return True
+    if name.endswith(".bias"):
+        return True
+    if "norm" in name:
+        return True
+    if "bn" in name:
+        return True
+    if "pos_bias_u" in name or "pos_bias_v" in name:
+        return True
+    if len(shape) <= 1:
+        return True
     return False
 
 
@@ -137,16 +146,20 @@ def parse_yaml_hparams(yaml_path: Path) -> dict:
     with open(yaml_path) as f:
         for line in f:
             s = line.strip()
-            if ":" not in s: continue
+            if ":" not in s:
+                continue
             k, _, v = s.partition(":")
             k = k.strip()
             v = v.strip().split("#", 1)[0].strip()
-            if not v: continue
+            if not v:
+                continue
             if v.lstrip("-").isdigit():
                 hp[k] = int(v)
             elif v.replace(".", "", 1).replace("e-", "", 1).lstrip("-").isdigit():
-                try: hp[k] = float(v)
-                except ValueError: pass
+                try:
+                    hp[k] = float(v)
+                except ValueError:
+                    pass
     return hp
 
 
@@ -179,59 +192,62 @@ def convert(nemo_path: Path, out_path: Path) -> None:
             except Exception:
                 continue
         if spm_path is None:
-            sys.exit(f"could not find a SentencePiece tokenizer with {vocab_size} pieces")
+            sys.exit(
+                f"could not find a SentencePiece tokenizer with {vocab_size} pieces"
+            )
         sp = spm.SentencePieceProcessor(model_file=str(spm_path))
         vocab = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
         print(f"  spm:     {spm_path.name} ({len(vocab)} pieces)")
 
         # Encoder hparams from the YAML (with sane defaults for the Large variant).
-        n_layers     = hp.get("n_layers", 18)
-        d_model      = hp.get("d_model", hidden)
-        n_heads      = hp.get("n_heads", 8)
-        head_dim     = d_model // n_heads
-        ff_dim       = d_model * hp.get("ff_expansion_factor", 4)
-        sub_factor   = hp.get("subsampling_factor", 8)
+        n_layers = hp.get("n_layers", 18)
+        d_model = hp.get("d_model", hidden)
+        n_heads = hp.get("n_heads", 8)
+        head_dim = d_model // n_heads
+        ff_dim = d_model * hp.get("ff_expansion_factor", 4)
+        sub_factor = hp.get("subsampling_factor", 8)
         sub_channels = hp.get("subsampling_conv_channels", 256)
-        conv_kernel  = hp.get("conv_kernel_size", 9)
-        n_mels       = hp.get("features", 80)
-        n_fft        = hp.get("n_fft", 512)
-        win_length   = int(hp.get("window_size", 0.025) * hp.get("sample_rate", 16000))
-        hop_length   = int(hp.get("window_stride", 0.01) * hp.get("sample_rate", 16000))
+        conv_kernel = hp.get("conv_kernel_size", 9)
+        n_mels = hp.get("features", 80)
+        n_fft = hp.get("n_fft", 512)
+        win_length = int(hp.get("window_size", 0.025) * hp.get("sample_rate", 16000))
+        hop_length = int(hp.get("window_stride", 0.01) * hp.get("sample_rate", 16000))
 
-        print(f"  encoder: n_layers={n_layers} d_model={d_model} heads={n_heads}"
-              f" head_dim={head_dim} ff_dim={ff_dim} mels={n_mels}")
+        print(
+            f"  encoder: n_layers={n_layers} d_model={d_model} heads={n_heads}"
+            f" head_dim={head_dim} ff_dim={ff_dim} mels={n_mels}"
+        )
         print(f"  ctc head: vocab={vocab_size} (+1 blank)")
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # arch tag stays "canary-ctc" so src/canary_ctc.cpp hosts the
         # result unchanged — the bias-carrying branch is selected at
         # load time based on tensor presence, not on the arch tag.
-        writer = gguf.GGUFWriter(str(out_path), arch="canary-ctc",
-                                 use_temp_file=True)
+        writer = gguf.GGUFWriter(str(out_path), arch="canary-ctc", use_temp_file=True)
 
-        writer.add_uint32("canary_ctc.sample_rate",          16000)
-        writer.add_uint32("canary_ctc.n_mels",               n_mels)
-        writer.add_uint32("canary_ctc.n_fft",                n_fft)
-        writer.add_uint32("canary_ctc.win_length",           win_length)
-        writer.add_uint32("canary_ctc.hop_length",           hop_length)
-        writer.add_uint32("canary_ctc.d_model",              d_model)
-        writer.add_uint32("canary_ctc.n_layers",             n_layers)
-        writer.add_uint32("canary_ctc.n_heads",              n_heads)
-        writer.add_uint32("canary_ctc.head_dim",             head_dim)
-        writer.add_uint32("canary_ctc.ff_dim",               ff_dim)
-        writer.add_uint32("canary_ctc.subsampling_factor",   sub_factor)
+        writer.add_uint32("canary_ctc.sample_rate", 16000)
+        writer.add_uint32("canary_ctc.n_mels", n_mels)
+        writer.add_uint32("canary_ctc.n_fft", n_fft)
+        writer.add_uint32("canary_ctc.win_length", win_length)
+        writer.add_uint32("canary_ctc.hop_length", hop_length)
+        writer.add_uint32("canary_ctc.d_model", d_model)
+        writer.add_uint32("canary_ctc.n_layers", n_layers)
+        writer.add_uint32("canary_ctc.n_heads", n_heads)
+        writer.add_uint32("canary_ctc.head_dim", head_dim)
+        writer.add_uint32("canary_ctc.ff_dim", ff_dim)
+        writer.add_uint32("canary_ctc.subsampling_factor", sub_factor)
         writer.add_uint32("canary_ctc.subsampling_channels", sub_channels)
-        writer.add_uint32("canary_ctc.conv_kernel",          conv_kernel)
-        writer.add_uint32("canary_ctc.vocab_size",           vocab_size)
-        writer.add_uint32("canary_ctc.blank_id",             vocab_size)
-        writer.add_uint32("canary_ctc.frame_dur_cs",         8)
+        writer.add_uint32("canary_ctc.conv_kernel", conv_kernel)
+        writer.add_uint32("canary_ctc.vocab_size", vocab_size)
+        writer.add_uint32("canary_ctc.blank_id", vocab_size)
+        writer.add_uint32("canary_ctc.frame_dur_cs", 8)
         # NeMo FastConformer-CTC standalones are trained with
         # xscaling=true — the runtime multiplies the pre-encoder output
         # by sqrt(d_model) before the first block. The canary_ctc
         # aligner is the only other consumer of this loader and was
         # trained with xscaling=false; its GGUF omits the key and the
         # C++ default of 0 keeps that path unchanged.
-        writer.add_uint32("canary_ctc.xscaling",             1)
+        writer.add_uint32("canary_ctc.xscaling", 1)
 
         writer.add_array("tokenizer.ggml.tokens", vocab)
 
@@ -273,9 +289,9 @@ def convert(nemo_path: Path, out_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Convert a NeMo FastConformer-CTC .nemo checkpoint to GGUF")
-    p.add_argument("--nemo",   required=True, type=Path,
-                   help="path to the .nemo tarball")
+        description="Convert a NeMo FastConformer-CTC .nemo checkpoint to GGUF"
+    )
+    p.add_argument("--nemo", required=True, type=Path, help="path to the .nemo tarball")
     p.add_argument("--output", required=True, type=Path)
     return p.parse_args()
 

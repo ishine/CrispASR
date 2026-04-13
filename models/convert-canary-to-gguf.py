@@ -109,17 +109,21 @@ except ImportError:
 # .nemo unpacking
 # ---------------------------------------------------------------------------
 
+
 def unpack_nemo(nemo_path: Path, out_dir: Path) -> dict:
     out_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(nemo_path, "r") as tf:
-        tf.extractall(out_dir, filter='data')
+        tf.extractall(out_dir, filter="data")
     paths = {}
     for f in out_dir.iterdir():
         n = f.name
         # Skip the auxiliary timestamps_asr_model_weights.ckpt
-        if n == "model_weights.ckpt":              paths["weights"] = f
-        elif n == "model_config.yaml":             paths["config"]  = f
-        elif n.endswith("_tokenizer.model"):       paths.setdefault("spm", f)   # multiple, take first
+        if n == "model_weights.ckpt":
+            paths["weights"] = f
+        elif n == "model_config.yaml":
+            paths["config"] = f
+        elif n.endswith("_tokenizer.model"):
+            paths.setdefault("spm", f)  # multiple, take first
     if "weights" not in paths or "spm" not in paths:
         sys.exit(f"could not find weights / tokenizer in {nemo_path}")
     return paths
@@ -128,6 +132,7 @@ def unpack_nemo(nemo_path: Path, out_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 # Tensor name remapping
 # ---------------------------------------------------------------------------
+
 
 def remap_name(nemo_name: str) -> str | None:
     """
@@ -139,8 +144,10 @@ def remap_name(nemo_name: str) -> str | None:
         return None
 
     # ---- preprocessor ----
-    if n == "preprocessor.featurizer.fb":     return "preprocessor.fb"
-    if n == "preprocessor.featurizer.window": return "preprocessor.window"
+    if n == "preprocessor.featurizer.fb":
+        return "preprocessor.fb"
+    if n == "preprocessor.featurizer.window":
+        return "preprocessor.window"
 
     # ---- pre-encoder ----
     if n.startswith("encoder.pre_encode."):
@@ -148,25 +155,25 @@ def remap_name(nemo_name: str) -> str | None:
 
     # ---- encoder layers ----
     if n.startswith("encoder.layers."):
-        rest = n[len("encoder.layers."):]
+        rest = n[len("encoder.layers.") :]
         layer_id, sub = rest.split(".", 1)
-        sub = (sub
-            .replace("feed_forward1",        "ff1")
-            .replace("feed_forward2",        "ff2")
-            .replace("norm_feed_forward1",   "norm_ff1")
-            .replace("norm_feed_forward2",   "norm_ff2")
-            .replace("norm_self_att",        "norm_attn")
-            .replace("self_attn.linear_q",   "attn.q")
-            .replace("self_attn.linear_k",   "attn.k")
-            .replace("self_attn.linear_v",   "attn.v")
+        sub = (
+            sub.replace("feed_forward1", "ff1")
+            .replace("feed_forward2", "ff2")
+            .replace("norm_feed_forward1", "norm_ff1")
+            .replace("norm_feed_forward2", "norm_ff2")
+            .replace("norm_self_att", "norm_attn")
+            .replace("self_attn.linear_q", "attn.q")
+            .replace("self_attn.linear_k", "attn.k")
+            .replace("self_attn.linear_v", "attn.v")
             .replace("self_attn.linear_out", "attn.out")
             .replace("self_attn.linear_pos", "attn.pos")
             .replace("self_attn.pos_bias_u", "attn.pos_bias_u")
             .replace("self_attn.pos_bias_v", "attn.pos_bias_v")
             .replace("conv.pointwise_conv1", "conv.pw1")
-            .replace("conv.depthwise_conv",  "conv.dw")
+            .replace("conv.depthwise_conv", "conv.dw")
             .replace("conv.pointwise_conv2", "conv.pw2")
-            .replace("conv.batch_norm",      "conv.bn")
+            .replace("conv.batch_norm", "conv.bn")
         )
         return f"encoder.layers.{layer_id}.{sub}"
 
@@ -182,7 +189,7 @@ def remap_name(nemo_name: str) -> str | None:
 
     # ---- decoder layers ----
     if n.startswith("transf_decoder._decoder.layers."):
-        rest = n[len("transf_decoder._decoder.layers."):]
+        rest = n[len("transf_decoder._decoder.layers.") :]
         layer_id, sub = rest.split(".", 1)
 
         # NeMo TransformerDecoderBlock has three sub-layers and three LNs.
@@ -193,20 +200,20 @@ def remap_name(nemo_name: str) -> str | None:
         # first_sub_layer = self-attention
         # second_sub_layer = cross-attention
         # third_sub_layer = FFN
-        sub = (sub
-            .replace("layer_norm_1",                  "norm_sa")
-            .replace("layer_norm_2",                  "norm_ca")
-            .replace("layer_norm_3",                  "norm_ff")
-            .replace("first_sub_layer.query_net",     "sa_q")
-            .replace("first_sub_layer.key_net",       "sa_k")
-            .replace("first_sub_layer.value_net",     "sa_v")
-            .replace("first_sub_layer.out_projection","sa_out")
-            .replace("second_sub_layer.query_net",    "ca_q")
-            .replace("second_sub_layer.key_net",      "ca_k")
-            .replace("second_sub_layer.value_net",    "ca_v")
-            .replace("second_sub_layer.out_projection","ca_out")
-            .replace("third_sub_layer.dense_in",      "ff_in")
-            .replace("third_sub_layer.dense_out",     "ff_out")
+        sub = (
+            sub.replace("layer_norm_1", "norm_sa")
+            .replace("layer_norm_2", "norm_ca")
+            .replace("layer_norm_3", "norm_ff")
+            .replace("first_sub_layer.query_net", "sa_q")
+            .replace("first_sub_layer.key_net", "sa_k")
+            .replace("first_sub_layer.value_net", "sa_v")
+            .replace("first_sub_layer.out_projection", "sa_out")
+            .replace("second_sub_layer.query_net", "ca_q")
+            .replace("second_sub_layer.key_net", "ca_k")
+            .replace("second_sub_layer.value_net", "ca_v")
+            .replace("second_sub_layer.out_projection", "ca_out")
+            .replace("third_sub_layer.dense_in", "ff_in")
+            .replace("third_sub_layer.dense_out", "ff_out")
         )
         return f"decoder.layers.{layer_id}.{sub}"
 
@@ -227,19 +234,27 @@ def remap_name(nemo_name: str) -> str | None:
 
 # Tensors that should stay F32 even when --quant-linear is set:
 def is_f32_tensor(gguf_name: str, shape: tuple[int, ...]) -> bool:
-    if gguf_name.startswith("preprocessor."):    return True
-    if gguf_name == "decoder.pos_enc":            return True
-    if gguf_name.endswith(".bias"):               return True
-    if "norm" in gguf_name:                       return True
-    if "bn" in gguf_name:                         return True
-    if "pos_bias_u" in gguf_name or "pos_bias_v" in gguf_name: return True
-    if len(shape) <= 1:                           return True
+    if gguf_name.startswith("preprocessor."):
+        return True
+    if gguf_name == "decoder.pos_enc":
+        return True
+    if gguf_name.endswith(".bias"):
+        return True
+    if "norm" in gguf_name:
+        return True
+    if "bn" in gguf_name:
+        return True
+    if "pos_bias_u" in gguf_name or "pos_bias_v" in gguf_name:
+        return True
+    if len(shape) <= 1:
+        return True
     return False
 
 
 # ---------------------------------------------------------------------------
 # Main conversion
 # ---------------------------------------------------------------------------
+
 
 def convert(nemo_path: Path, out_path: Path) -> None:
     print(f"Loading: {nemo_path}")
@@ -262,30 +277,29 @@ def convert(nemo_path: Path, out_path: Path) -> None:
     print(f"\nWriting: {out_path}")
     writer = gguf.GGUFWriter(str(out_path), arch="canary")
 
-    writer.add_uint32("canary.sample_rate",          16000)
-    writer.add_uint32("canary.n_mels",               128)
-    writer.add_uint32("canary.n_fft",                512)
-    writer.add_uint32("canary.win_length",           400)
-    writer.add_uint32("canary.hop_length",           160)
-    writer.add_uint32("canary.d_model",              1024)
-    writer.add_uint32("canary.enc_n_layers",         32)
-    writer.add_uint32("canary.dec_n_layers",         8)
-    writer.add_uint32("canary.n_heads",              8)
-    writer.add_uint32("canary.head_dim",             128)
-    writer.add_uint32("canary.ff_dim",               4096)
-    writer.add_uint32("canary.subsampling_factor",   8)
+    writer.add_uint32("canary.sample_rate", 16000)
+    writer.add_uint32("canary.n_mels", 128)
+    writer.add_uint32("canary.n_fft", 512)
+    writer.add_uint32("canary.win_length", 400)
+    writer.add_uint32("canary.hop_length", 160)
+    writer.add_uint32("canary.d_model", 1024)
+    writer.add_uint32("canary.enc_n_layers", 32)
+    writer.add_uint32("canary.dec_n_layers", 8)
+    writer.add_uint32("canary.n_heads", 8)
+    writer.add_uint32("canary.head_dim", 128)
+    writer.add_uint32("canary.ff_dim", 4096)
+    writer.add_uint32("canary.subsampling_factor", 8)
     writer.add_uint32("canary.subsampling_channels", 256)
-    writer.add_uint32("canary.conv_kernel",          9)
-    writer.add_uint32("canary.vocab_size",           len(vocab))
-    writer.add_uint32("canary.max_dec_ctx",          1024)
-    writer.add_uint32("canary.frame_dur_cs",         8)
+    writer.add_uint32("canary.conv_kernel", 9)
+    writer.add_uint32("canary.vocab_size", len(vocab))
+    writer.add_uint32("canary.max_dec_ctx", 1024)
+    writer.add_uint32("canary.frame_dur_cs", 8)
 
     writer.add_array("tokenizer.ggml.tokens", vocab)
 
     n_written = 0
     n_f16 = 0
     n_f32 = 0
-    layers_seen = set()
     for name in sorted(sd.keys()):
         gguf_name = remap_name(name)
         if gguf_name is None:
@@ -330,7 +344,9 @@ def convert(nemo_path: Path, out_path: Path) -> None:
     if missing:
         print(f"  injected {len(missing)} synthetic conv.dw.bias zeros")
     else:
-        print(f"  conv.dw.bias already present in all {len(needed_bias_layers)} layers (Canary has use_bias=True)")
+        print(
+            f"  conv.dw.bias already present in all {len(needed_bias_layers)} layers (Canary has use_bias=True)"
+        )
 
     print(f"\n  total tensors: {n_written}  (F16: {n_f16}, F32: {n_f32})")
 
@@ -343,7 +359,7 @@ def convert(nemo_path: Path, out_path: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert Canary 1B v2 .nemo → GGUF F16")
-    p.add_argument("--nemo",   required=True, type=Path, help="path to .nemo file")
+    p.add_argument("--nemo", required=True, type=Path, help="path to .nemo file")
     p.add_argument("--output", required=True, type=Path, help="output GGUF path")
     return p.parse_args()
 
