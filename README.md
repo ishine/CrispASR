@@ -30,6 +30,7 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 - [Audio formats](#audio-formats)
 - [Architecture](#architecture)
 - [Adding a new backend](#adding-a-new-backend)
+- [HOWTO Quantize](#howto-quantize)
 - [Branch state & roadmap](#branch-state--roadmap)
 - [Credits](#credits)
 
@@ -658,6 +659,47 @@ hooks and returns a dict `{stage_name: ndarray}`. See
 `tools/reference_backends/qwen3.py` and `voxtral.py` for worked
 examples; `voxtral4b.py` and `granite.py` are stubs with inline notes
 on what to port from the legacy `models/*-dump-*.py` scripts.
+
+---
+
+## HOWTO Quantize
+
+CrispASR includes a unified GGUF re-quantization tool, `crispasr-quantize`, that works across all supported model families (Whisper, Parakeet, Canary, Cohere, Voxtral, Qwen3, Granite, Wav2Vec2, etc.).
+
+It is a model-agnostic tool that iterates through the GGUF tensor list and re-quantizes eligible 2D weight matrices while preserving metadata and non-quantizable tensors (norms, positional embeddings, biases) in their original types.
+
+### Usage
+
+```bash
+./build/bin/crispasr-quantize model-f16.gguf model-quant.gguf <type>
+```
+
+### Supported types
+
+| Type | Description |
+|---|---|
+| `q4_0` | 4-bit (scale only) |
+| `q4_1` | 4-bit (scale + minimum; slightly higher accuracy than q4_0) |
+| `q5_0` | 5-bit (scale only) |
+| `q5_1` | 5-bit (scale + minimum; slightly higher accuracy than q5_0) |
+| `q8_0` | 8-bit (scale only) |
+| `q2_k` | 2-bit K-quant |
+| `q3_k` | 3-bit K-quant |
+| `q4_k` | 4-bit K-quant (generally preferred over legacy Q4) |
+| `q5_k` | 5-bit K-quant (generally preferred over legacy Q5) |
+| `q6_k` | 6-bit K-quant |
+
+### Examples
+
+```bash
+# Quantize a Parakeet F16 model to Q4_K
+./build/bin/crispasr-quantize parakeet-f16.gguf parakeet-q4_k.gguf q4_k
+
+# Quantize a Voxtral model to Q5_0
+./build/bin/crispasr-quantize voxtral-f16.gguf voxtral-q5_0.gguf q5_0
+```
+
+> **Note on alignment.** K-quants (`q2_k` through `q6_k`) require tensor row sizes to be multiples of 256. If a tensor does not meet this requirement (e.g., the 896-wide tensors in some Qwen3-ASR layers), the tool automatically falls back to a compatible legacy quantization type (like `q4_0` or `q8_0`) to ensure the entire model is quantized.
 
 ---
 
