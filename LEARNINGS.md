@@ -621,7 +621,23 @@ Analysed SYSTRAN/faster-whisper and Vaibhavs10/insanely-fast-whisper
 **Bottom line:** On CPU, we're already within 2x of the theoretical
 limit (2.2x realtime for parakeet on jfk.wav). The big wins are
 GPU-specific: batched encoder (5x) and speculative decoding (2-4x).
-These require CUDA/Metal hardware and are tracked as [later] in TODO.
+
+**Implemented optimizations (April 2026):**
+- Parallel VAD slice transcription (thread pool with separate backend
+  instances — helps on GPU where each instance uses a separate stream)
+- Full-graph ggml_backend_sched path for wav2vec2 with explicit weight
+  tensor assignment via `ggml_backend_sched_set_tensor_backend` — GPU-
+  ready single-graph dispatch for all 24 transformer layers
+- Buffer reuse across layers (saves 24×80MB alloc/free cycles)
+- Server-mode audio cache (instant response on repeated queries)
+- Realtime speed reporting per file
+- All model weights loaded to GPU when ggml_backend_init_best() picks
+  a GPU backend (already built into core_gguf::load_weights)
+
+**Key discovery:** `ggml_backend_sched_set_tensor_backend()` prevents
+the scheduler from reallocating external weight tensors. This was the
+missing piece for making the full-graph path work with model weights
+on a separate buffer. Without it, gallocr corrupts external tensors.
 
 ### Windows fseek overflow: the silent >2 GB file killer
 
