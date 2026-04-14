@@ -341,8 +341,10 @@ bool detect_with_silero(const float* samples, int n_samples, const whisper_param
     }
 
     std::ostringstream cmd;
+    // clang-format off
     cmd << bin << " --whisper-model='" << p.lid_model << "'"
         << " '" << wav_path << "' 2>&1";
+    // clang-format on
     if (!p.no_prints) {
         fprintf(stderr, "crispasr[lid]: %s\n", cmd.str().c_str());
     }
