@@ -177,6 +177,11 @@ struct whisper_params {
     bool        mic              = false;  // capture from default microphone
     bool        stream_continuous = false; // don't stop on EOS, keep transcribing
     bool        stream_monitor   = false; // show unicode progress symbols during processing
+
+    // Server mode: keep model loaded, accept HTTP requests
+    bool        server           = false;
+    std::string server_host      = "127.0.0.1";
+    int32_t     server_port      = 8080;
     int32_t     stream_step_ms   = 3000;  // chunk size in ms (default 3s)
     int32_t     stream_length_ms = 10000; // context window in ms (default 10s)
     int32_t     stream_keep_ms   = 200;   // overlap to keep between chunks

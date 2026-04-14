@@ -34,6 +34,7 @@ add_executable(${TARGET}
     crispasr_output.cpp
     crispasr_model_mgr.cpp
     crispasr_run.cpp
+    crispasr_server.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -85,6 +86,9 @@ target_link_libraries(crispasr-diff PRIVATE
 install(TARGETS crispasr-diff RUNTIME BUNDLE DESTINATION bin)
 
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
+
+# httplib.h is in the server example directory
+target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/examples/server)
 
 include(DefaultTargetOptions)
 

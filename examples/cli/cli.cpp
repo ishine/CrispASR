@@ -5,6 +5,7 @@
 #include "grammar-parser.h"
 #include "whisper_params.h"      // struct whisper_params (shared with crispasr_*)
 #include "crispasr_backend.h"    // crispasr_run_backend() dispatch entry point
+#include "crispasr_server.h"    // crispasr_run_server()
 
 #include <cmath>
 #include <algorithm>
@@ -236,6 +237,9 @@ static bool whisper_params_parse(int argc, char ** argv, whisper_params & params
         else if (                  arg == "--mic")                  { params.mic = true; params.stream = true; }
         else if (                  arg == "--live")                 { params.mic = true; params.stream = true; params.stream_continuous = true; }
         else if (                  arg == "--monitor")              { params.stream_monitor = true; }
+        else if (                  arg == "--server")               { params.server = true; }
+        else if (                  arg == "--host")                 { params.server_host = ARGV_NEXT; }
+        else if (                  arg == "--port")                 { params.server_port = std::stoi(ARGV_NEXT); }
         else if (                  arg == "--stream-step")          { params.stream_step_ms         = std::stoi(ARGV_NEXT); }
         else if (                  arg == "--stream-length")        { params.stream_length_ms       = std::stoi(ARGV_NEXT); }
         else if (                  arg == "--stream-keep")          { params.stream_keep_ms         = std::stoi(ARGV_NEXT); }
@@ -349,6 +353,9 @@ static void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params
     fprintf(stderr, "  --mic                             [%-7s] capture from default microphone (implies --stream)\n", params.mic ? "true" : "false");
     fprintf(stderr, "  --live                            [%-7s] continuous live transcription (implies --mic --stream)\n", params.stream_continuous ? "true" : "false");
     fprintf(stderr, "  --monitor                         [%-7s] show unicode progress symbols during streaming\n",      params.stream_monitor ? "true" : "false");
+    fprintf(stderr, "  --server                          [%-7s] run as HTTP server (persistent model, POST /inference)\n", params.server ? "true" : "false");
+    fprintf(stderr, "  --host HOST                       [%-7s] server bind address\n",                                  params.server_host.c_str());
+    fprintf(stderr, "  --port PORT                       [%-7d] server port\n",                                          params.server_port);
     fprintf(stderr, "  --stream-step N                   [%-7d] chunk size in ms for streaming\n",                    params.stream_step_ms);
     fprintf(stderr, "  --stream-length N                 [%-7d] context window in ms for streaming\n",                params.stream_length_ms);
     fprintf(stderr, "  --stream-keep N                   [%-7d] overlap to keep between chunks in ms\n",              params.stream_keep_ms);
@@ -1081,6 +1088,11 @@ int main(int argc, char ** argv) {
         }
 
         it++;
+    }
+
+    // Server mode: keep model loaded, accept HTTP requests
+    if (params.server) {
+        return crispasr_run_server(params, params.server_host, params.server_port);
     }
 
     if (params.fname_inp.empty() && !params.stream) {
