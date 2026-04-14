@@ -151,6 +151,53 @@ cmake --build build -j$(nproc) --target whisper-cli
 
 The target is named `whisper-cli` for CMake compatibility; the produced binary is `build/bin/crispasr` with a `build/bin/whisper-cli` alias next to it. Either name works.
 
+### Windows (convenience scripts)
+
+Two batch scripts handle the Windows build without requiring a pre-opened Developer Command Prompt. They use `vswhere.exe` to locate Visual Studio 2022 automatically, call `vcvars64.bat`, then drive CMake + Ninja.
+
+#### `build-windows.bat` — CPU build
+
+```cmd
+build-windows.bat
+```
+
+Produces `build\bin\crispasr.exe`. Extra CMake flags can be appended:
+
+```cmd
+build-windows.bat -DWHISPER_CURL=ON          :: enable libcurl fallback
+build-windows.bat -DGGML_CUDA=ON             :: NVIDIA GPU (CUDA must be installed)
+```
+
+What it does:
+1. Locates `vswhere.exe` under `%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\`
+2. Finds the latest VS 2022 installation that includes the VC++ toolchain
+3. Calls `vcvars64.bat` to initialize the 64-bit MSVC environment
+4. Runs `cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release [extra flags]`
+5. Builds the `whisper-cli` target → `build\bin\crispasr.exe`
+
+#### `build-vulkan.bat` — Vulkan GPU build
+
+```cmd
+build-vulkan.bat
+```
+
+Produces `build-vulkan\bin\crispasr.exe` with the Vulkan compute backend enabled. In addition to the VS detection above, it:
+
+1. Checks `%VULKAN_SDK%`. If unset, scans `C:\VulkanSDK\` for the newest installed version and sets `VULKAN_SDK` accordingly.
+2. Adds `-DGGML_VULKAN=ON -DGGML_CUDA=OFF` so CUDA is not accidentally pulled in if the CUDA toolkit is also installed.
+3. Writes the build into a separate `build-vulkan\` directory so it coexists with a CPU build.
+
+```cmd
+:: Typical usage — VULKAN_SDK is picked up automatically
+build-vulkan.bat
+
+:: Override Vulkan SDK location explicitly
+set VULKAN_SDK=C:\VulkanSDK\1.4.304.1
+build-vulkan.bat
+```
+
+Both scripts exit with a non-zero code and a `[ERROR]` message if any step fails (VS not found, CMake configure error, build error).
+
 ### With GPU backends
 
 ```bash
