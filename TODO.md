@@ -31,6 +31,9 @@ Remaining extraction opportunities (each saves ~30-60 LOC but has only 1-2 consu
   optional `q_norm_w`/`k_norm_w` params.
 - **[done]** ~~Whisper-style audio encoder (voxtral 3B)~~ — migrated to
   `core_attn::encoder_self_attn()` with biased Q/V/O, no K bias, no RoPE.
+- **[done]** ~~voxtral4b encoder attention migration~~ — migrated to
+  `core_attn::encoder_self_attn()` with `permute_cont = false` (matching
+  original no-cont graph structure). Bit-identical on jfk.wav verified.
 - **[later]** Sliding-window attention (voxtral4b encoder — single consumer)
 - **[later]** µP scale tricks for granite (attention_multiplier, residual_multiplier)
 
@@ -119,15 +122,11 @@ each backend. High-value gaps to close:
   voxtral4b, qwen3 and granite all honour `-tp N` via the shared
   `core_greedy_decode` helper's `sample_temp` path. Default
   temperature=0 stays on the bit-identical pure-argmax path.
-- **[later]** **Beam search for LLM backends** — the four LLM
-  backends still greedy-decode even with `-bs > 1`. Implementing
-  beam search on an autoregressive transformer decoder requires
-  per-beam KV cache cloning (expensive) or interleaved forwards.
-  Reasonable middle-ground: "best-of-N" sampling, where we run N
-  independent temperature-sampled decodes and pick the one with
-  highest mean token log-probability. That reuses the existing
-  `run_with_probs` output and costs N decode loops instead of
-  N*beam*seq forwards. Punted until there's concrete demand.
+- **[done]** ~~**Best-of-N sampling for LLM backends**~~ — voxtral
+  (via pipeline template), qwen3, and granite all support `--best-of N`
+  with `--temperature > 0`. Each run uses a different RNG seed, best
+  selected by mean token softmax probability. voxtral4b deferred
+  (streaming pre_hook incompatible with `run_with_probs`).
 
 - **[later]** **VAD integration in LLM backends.** qwen3 and voxtral
   currently don't chunk long audio; the dispatch layer does VAD slicing
@@ -197,9 +196,10 @@ each backend. High-value gaps to close:
 - **[later]** Remove dead ggml graph encoder `granite_build_encoder`.
 
 ### canary_ctc (aligner)
-- **[later]** Fix single-backend scheduler — currently no CPU fallback
-  if the primary backend rejects an op. Match the 2-backend pattern
-  from canary.cpp / cohere.cpp. ~20 LOC.
+- **[done]** ~~Fix single-backend scheduler — currently no CPU fallback
+  if the primary backend rejects an op.~~ Already uses the 2-backend
+  pattern (GPU primary + CPU fallback) at both scheduler init points
+  (`canary_ctc_compute_logits_from_mel_debug` and `canary_ctc_compute_logits`).
 
 ---
 
@@ -302,35 +302,12 @@ contributor-facing path for adding backends with confidence. Status:
   extension point — just another `if (be == "vosk")` branch. For
   now we stick with whisper-tiny (shipping) and the future native
   Silero GGUF port.
-- **[later]** **Qwen3-ForcedAligner-0.6B as a generic timestamp post-step.**
-  Qwen3 ships a separate `Qwen3-ForcedAligner-0.6B` model that predicts
-  per-token timestamps for an arbitrary (audio, transcript) pair. It
-  reuses the Qwen3-ASR audio encoder + LLM body, but its lm_head is
-  `(5000, 1024)` instead of `(vocab, 1024)` — each `<|timestamp|>`
-  placeholder (id 151705) in the input gets a 5000-class softmax
-  prediction, and `argmax * 80 ms` = the timestamp.
-  Implementation plan:
-   1. The converter already handles it via the existing
-      `models/convert-qwen3-asr-to-gguf.py` (verified — produces a
-      valid GGUF). The 5000-class lm_head appears as
-      `output.weight (5000, 1024)`.
-   2. The `qwen3_asr_load_model` C++ side currently dies with
-      "tensor read out of bounds" because it assumes the lm_head
-      shape matches `llm.vocab_size`. Fix is one branch: read the
-      lm_head shape from GGUF and don't assert it equals vocab.
-   3. Add a `qwen3_asr_run_aligner(ctx, audio, ids, n_ids,
-      out_ts)` extern "C" entry point that does ONE forward pass
-      (no autoregressive decode) and returns the argmax of the
-      output head at each input position where `id == 151705`.
-   4. Wire through `examples/cli/crispasr_aligner.cpp` as a second
-      provider beside canary-ctc-aligner, dispatched on the
-      `-am qwen3-forced-aligner-*.gguf` filename. Once it lands,
-      every backend in CrispASR can call `-am qwen3-fa.gguf` for
-      timestamps without going through the CTC aligner path.
-  This is functionally equivalent to a generic
-  `--forced-aligner BACKEND` post-step like LID and diarize — the
-  full HF pipeline is documented at
-  https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/inference/qwen3_forced_aligner.py
+- **[done]** ~~**Qwen3-ForcedAligner-0.6B as a generic timestamp post-step.**~~
+  Fully implemented. `qwen3_asr_align_words()` does the full pipeline:
+  mel → encoder → prompt with `<|timestamp|>` markers → single forward
+  pass → argmax * 80ms per position. Dispatched in `crispasr_aligner.cpp`
+  via filename detection. GGUF on HF: `cstr/qwen3-forced-aligner-0.6b-GGUF`.
+  Verified working with voxtral on jfk.wav.
 - **[done]** ~~Native GGUF port of Silero's language detector.~~
   **Done.** `src/silero_lid.{h,cpp}` implements a pure-C++ forward pass
   (no ggml graph — manual F32 loops, similar to pyannote_seg). GGUF

@@ -256,49 +256,74 @@ public:
         }
         free(proj);
 
-        // ---- KV cache + prefill ----
+        // ---- KV cache + best-of-N decode ----
         if (!granite_speech_kv_init(ctx_, 4096)) {
             free(all_embeds);
             fprintf(stderr, "crispasr[granite]: kv init failed\n");
             return out;
         }
-        granite_speech_kv_reset(ctx_);
 
-        int vocab = 0;
-        float* logits = granite_speech_run_llm_kv(ctx_, all_embeds, total_prompt, 0, nullptr, &vocab);
-        free(all_embeds);
-        if (!logits) {
-            fprintf(stderr, "crispasr[granite]: prefill failed\n");
-            return out;
-        }
-
-        // ---- Decode loop via src/core/greedy_decode.h ----
-        // Temperature sampling kicks in when --temperature > 0; otherwise
-        // we stay on the historical bit-identical greedy path.
         core_greedy_decode::Config dec_cfg;
         dec_cfg.max_new_tokens = params.max_new_tokens > 0 ? params.max_new_tokens : 200;
         dec_cfg.eos_id = eos_tok;
-        dec_cfg.vocab_size = vocab;
         dec_cfg.temperature = params.temperature;
 
-        int next = 0;
-        float next_p = 1.0f;
-        if (dec_cfg.temperature > 0.0f) {
-            std::mt19937_64 seed_rng(dec_cfg.seed != 0 ? dec_cfg.seed : (uint64_t)std::random_device{}());
-            next = core_greedy_decode::sample_temp(logits, vocab, dec_cfg.temperature, seed_rng);
-        } else {
-            next = core_greedy_decode::argmax(logits, vocab);
-        }
-        next_p = core_greedy_decode::softmax_of(logits, vocab, next, logits[next]);
-        free(logits);
+        const int n_runs = (params.temperature > 0.0f && params.best_of > 1) ? params.best_of : 1;
+        core_greedy_decode::Result best_dec;
+        double best_score = -1.0;
 
-        auto dec = core_greedy_decode::run_with_probs(ctx_,
-                                                      /*first_token=*/next,
-                                                      /*first_prob=*/next_p,
-                                                      /*initial_n_past=*/total_prompt, granite_speech_embed_tokens,
-                                                      granite_speech_run_llm_kv, dec_cfg);
-        const std::vector<int32_t>& gen_ids = dec.tokens;
-        const std::vector<float>& probs = dec.probs;
+        for (int run = 0; run < n_runs; run++) {
+            granite_speech_kv_reset(ctx_);
+
+            int vocab = 0;
+            float* logits = granite_speech_run_llm_kv(ctx_, all_embeds, total_prompt, 0, nullptr, &vocab);
+            if (!logits) {
+                fprintf(stderr, "crispasr[granite]: prefill failed (run %d/%d)\n", run + 1, n_runs);
+                free(all_embeds);
+                return out;
+            }
+            if (run == 0)
+                dec_cfg.vocab_size = vocab;
+
+            int next = 0;
+            float next_p = 1.0f;
+            if (dec_cfg.temperature > 0.0f) {
+                std::mt19937_64 seed_rng((dec_cfg.seed != 0 ? dec_cfg.seed : (uint64_t)std::random_device{}()) ^
+                                         (uint64_t)(run * 0x9E3779B97F4A7C15ull));
+                next = core_greedy_decode::sample_temp(logits, vocab, dec_cfg.temperature, seed_rng);
+            } else {
+                next = core_greedy_decode::argmax(logits, vocab);
+            }
+            next_p = core_greedy_decode::softmax_of(logits, vocab, next, logits[next]);
+            free(logits);
+
+            auto dec = core_greedy_decode::run_with_probs(ctx_,
+                                                          /*first_token=*/next,
+                                                          /*first_prob=*/next_p,
+                                                          /*initial_n_past=*/total_prompt, granite_speech_embed_tokens,
+                                                          granite_speech_run_llm_kv, dec_cfg);
+
+            double sum = 0.0;
+            int cnt = 0;
+            for (size_t i = 0; i < dec.probs.size(); i++) {
+                if ((int32_t)dec.tokens[i] == eos_tok)
+                    break;
+                sum += (double)dec.probs[i];
+                cnt++;
+            }
+            const double score = (cnt > 0) ? (sum / cnt) : 0.0;
+            if (run == 0 || score > best_score) {
+                best_score = score;
+                best_dec = std::move(dec);
+            }
+        }
+        free(all_embeds);
+
+        if (!params.no_prints && n_runs > 1)
+            fprintf(stderr, "crispasr[granite]: best-of-%d picked score=%.4f\n", n_runs, best_score);
+
+        const std::vector<int32_t>& gen_ids = best_dec.tokens;
+        const std::vector<float>& probs = best_dec.probs;
 
         // Strip EOS from generated IDs before detokenizing.
         std::vector<int32_t> text_ids;

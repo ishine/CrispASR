@@ -591,38 +591,20 @@ static ggml_cgraph* voxtral4b_build_graph_encoder(voxtral4b_context* ctx, int T_
         ggml_tensor* x = ggml_rms_norm(ctx0, cur, kRmsEps);
         x = ggml_mul(ctx0, x, b.attn_norm_w);
 
-        // Q, K, V projections
-        ggml_tensor* Q = ggml_mul_mat(ctx0, b.attn_q_w, x);
-        if (b.attn_q_b)
-            Q = ggml_add(ctx0, Q, b.attn_q_b);
-        ggml_tensor* K = ggml_mul_mat(ctx0, b.attn_k_w, x);
-        ggml_tensor* V = ggml_mul_mat(ctx0, b.attn_v_w, x);
-        if (b.attn_v_b)
-            V = ggml_add(ctx0, V, b.attn_v_b);
-
-        // Reshape to (head_dim, n_heads, T_enc)
-        Q = ggml_reshape_3d(ctx0, Q, head_dim, n_heads, T_enc);
-        K = ggml_reshape_3d(ctx0, K, head_dim, n_heads, T_enc);
-        V = ggml_reshape_3d(ctx0, V, head_dim, n_heads, T_enc);
-
-        // Apply RoPE to Q and K
-        Q = ggml_rope_ext(ctx0, Q, pos_enc, nullptr, head_dim, 2, 0, hp.audio_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        K = ggml_rope_ext(ctx0, K, pos_enc, nullptr, head_dim, 2, 0, hp.audio_rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-
-        // Permute for attention: (hd, T, n_h) — flash_attn handles non-contiguous
-        Q = ggml_permute(ctx0, Q, 0, 2, 1, 3);
-        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
-        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
-
-        // Flash attention with optional SWA mask
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, swa_mask, attn_scale, 0.0f, 0.0f);
-        // Flash attn output: (hd, nh, T, 1) → reshape to (nh*hd, T) = (2048, T_enc)
-        attn = ggml_reshape_2d(ctx0, attn, n_heads * head_dim, T_enc);
-
-        // Output projection
-        attn = ggml_mul_mat(ctx0, b.attn_out_w, attn);
-        if (b.attn_out_b)
-            attn = ggml_add(ctx0, attn, b.attn_out_b);
+        // Self-attention via shared helper (no cont after permute to
+        // match the original voxtral4b graph structure).
+        core_attn::EncoderSelfAttnParams ap = {};
+        ap.n_heads = n_heads;
+        ap.n_kv_heads = n_heads;
+        ap.head_dim = head_dim;
+        ap.n_kv_grp = 1;
+        ap.attn_scale = attn_scale;
+        ap.n_ctx_orig = 0;
+        ap.rope_theta = hp.audio_rope_theta;
+        ap.permute_cont = false;
+        ggml_tensor* attn =
+            core_attn::encoder_self_attn(ctx0, x, b.attn_q_w, b.attn_q_b, b.attn_k_w, nullptr, // no K bias
+                                         b.attn_v_w, b.attn_v_b, b.attn_out_w, b.attn_out_b, pos_enc, swa_mask, ap);
         cur = ggml_add(ctx0, residual, attn);
 
         // FFN: Pre-RMSNorm + SwiGLU (audio encoder may carry an optional

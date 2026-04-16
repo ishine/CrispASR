@@ -262,23 +262,13 @@ public:
         }
         free(audio_embeds);
 
-        // ---- KV cache + prefill ----
+        // ---- KV cache + best-of-N decode ----
         if (!qwen3_asr_kv_init(ctx_, 4096)) {
             free(text_embeds);
             fprintf(stderr, "crispasr[qwen3]: kv_init failed\n");
             return out;
         }
-        qwen3_asr_kv_reset(ctx_);
 
-        int n_t = 0, vocab = 0;
-        float* logits = qwen3_asr_run_llm_kv(ctx_, text_embeds, (int)ids.size(), 0, &n_t, &vocab);
-        free(text_embeds);
-        if (!logits) {
-            fprintf(stderr, "crispasr[qwen3]: prefill failed\n");
-            return out;
-        }
-
-        // ---- First token selection (argmax or temperature sample) ----
         // Qwen3 EOS tokens: <|im_end|> (id unknown — look up via tokenize).
         int eos_id = -1;
         int n_eos = 0;
@@ -290,28 +280,65 @@ public:
         core_greedy_decode::Config dec_cfg;
         dec_cfg.max_new_tokens = params.max_new_tokens > 0 ? params.max_new_tokens : 256;
         dec_cfg.eos_id = eos_id;
-        dec_cfg.vocab_size = vocab;
         dec_cfg.temperature = params.temperature;
 
-        const int last_off = (n_t - 1) * vocab;
-        int next = 0;
-        float next_p = 1.0f;
-        if (dec_cfg.temperature > 0.0f) {
-            std::mt19937_64 seed_rng(dec_cfg.seed != 0 ? dec_cfg.seed : (uint64_t)std::random_device{}());
-            next = core_greedy_decode::sample_temp(logits + last_off, vocab, dec_cfg.temperature, seed_rng);
-        } else {
-            next = core_greedy_decode::argmax(logits + last_off, vocab);
-        }
-        next_p = core_greedy_decode::softmax_of(logits + last_off, vocab, next, logits[last_off + next]);
-        free(logits);
+        const int n_runs = (params.temperature > 0.0f && params.best_of > 1) ? params.best_of : 1;
+        core_greedy_decode::Result best_dec;
+        double best_score = -1.0;
 
-        auto dec = core_greedy_decode::run_with_probs(ctx_,
-                                                      /*first_token=*/next,
-                                                      /*first_prob=*/next_p,
-                                                      /*initial_n_past=*/(int)ids.size(), qwen3_asr_embed_tokens,
-                                                      qwen3_asr_run_llm_kv, dec_cfg);
-        const std::vector<int32_t>& gen = dec.tokens;
-        const std::vector<float>& probs = dec.probs;
+        for (int run = 0; run < n_runs; run++) {
+            qwen3_asr_kv_reset(ctx_);
+
+            int n_t = 0, vocab = 0;
+            float* logits = qwen3_asr_run_llm_kv(ctx_, text_embeds, (int)ids.size(), 0, &n_t, &vocab);
+            if (!logits) {
+                fprintf(stderr, "crispasr[qwen3]: prefill failed (run %d/%d)\n", run + 1, n_runs);
+                free(text_embeds);
+                return out;
+            }
+            if (run == 0)
+                dec_cfg.vocab_size = vocab;
+
+            const int last_off = (n_t - 1) * vocab;
+            int next = 0;
+            float next_p = 1.0f;
+            if (dec_cfg.temperature > 0.0f) {
+                std::mt19937_64 seed_rng((dec_cfg.seed != 0 ? dec_cfg.seed : (uint64_t)std::random_device{}()) ^
+                                         (uint64_t)(run * 0x9E3779B97F4A7C15ull));
+                next = core_greedy_decode::sample_temp(logits + last_off, vocab, dec_cfg.temperature, seed_rng);
+            } else {
+                next = core_greedy_decode::argmax(logits + last_off, vocab);
+            }
+            next_p = core_greedy_decode::softmax_of(logits + last_off, vocab, next, logits[last_off + next]);
+            free(logits);
+
+            auto dec = core_greedy_decode::run_with_probs(ctx_,
+                                                          /*first_token=*/next,
+                                                          /*first_prob=*/next_p,
+                                                          /*initial_n_past=*/(int)ids.size(), qwen3_asr_embed_tokens,
+                                                          qwen3_asr_run_llm_kv, dec_cfg);
+
+            double sum = 0.0;
+            int cnt = 0;
+            for (size_t i = 0; i < dec.probs.size(); i++) {
+                if ((int32_t)dec.tokens[i] == eos_id)
+                    break;
+                sum += (double)dec.probs[i];
+                cnt++;
+            }
+            const double score = (cnt > 0) ? (sum / cnt) : 0.0;
+            if (run == 0 || score > best_score) {
+                best_score = score;
+                best_dec = std::move(dec);
+            }
+        }
+        free(text_embeds);
+
+        if (!params.no_prints && n_runs > 1)
+            fprintf(stderr, "crispasr[qwen3]: best-of-%d picked score=%.4f\n", n_runs, best_score);
+
+        const std::vector<int32_t>& gen = best_dec.tokens;
+        const std::vector<float>& probs = best_dec.probs;
 
         // ---- Detokenize via GPT-2 byte decoder ----
         // Qwen3-ASR emits structured metadata tokens before the transcript:

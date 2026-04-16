@@ -31,123 +31,34 @@ CI on 6 platforms + 3-job lint.
 
 ---
 
-## 1. voxtral4b audio encoder migration
+## 1. voxtral4b audio encoder migration — DONE
 
-**Goal:** Migrate voxtral4b's inline audio encoder attention (32 layers)
-to `core_attn::encoder_self_attn()`.
-
-**Files:**
-- `src/voxtral4b.cpp` lines 585–626 (the encoder loop)
-- `src/core/attention.h` (the `encoder_self_attn()` function)
-
-**Problem:** voxtral4b's encoder uses `ggml_permute()` WITHOUT
-`ggml_cont()` before `ggml_flash_attn_ext()` (line 613). The existing
-`encoder_self_attn()` uses `ggml_cont()` after permute (matching
-voxtral 3B). Adding `ggml_cont` produces the same values but changes
-the ggml graph structure, which could cause subtle differences in
-buffer allocation or scheduling.
-
-**Approach:**
-1. Add a `bool permute_cont` flag to `EncoderSelfAttnParams` (default
-   `true`). When `false`, skip the `ggml_cont()` after permute — this
-   matches voxtral4b's current behavior.
-2. Replace the inline attention block at voxtral4b.cpp:594–625 with a
-   single `encoder_self_attn()` call, passing `permute_cont = false`.
-3. The SWA mask is already a parameter (`mask`), and RoPE params are
-   already in `EncoderSelfAttnParams`.
-
-**Verification:**
-- Requires a voxtral4b GGUF model file (`voxtral-mini-4b-realtime-*.gguf`)
-- Run: `crispasr --backend voxtral4b -m model.gguf -f samples/jfk.wav -np > before.txt`
-- Make the change, rebuild
-- Run again: `diff before.txt after.txt && echo BIT-IDENTICAL`
-- If not bit-identical: check if `ggml_cont` vs no-cont causes the
-  divergence. If it does, the flag approach is correct. If not, there's
-  another difference to investigate.
-
-**Risk:** Low. The helper already handles everything; this is just a
-contiguity flag.
-
-**LOC:** ~5 lines changed in voxtral4b.cpp, ~3 lines added to attention.h.
+**Status:** Completed. Added `bool permute_cont` flag to
+`EncoderSelfAttnParams` (default `true`). Replaced the 32-line inline
+attention block in voxtral4b.cpp with a single `encoder_self_attn()`
+call using `permute_cont = false`. Bit-identical output verified on
+jfk.wav.
 
 ---
 
-## 2. Qwen3 forced aligner
+## 2. Qwen3 forced aligner — DONE
 
-**Goal:** Add Qwen3-ForcedAligner-0.6B as a second timestamp provider
-alongside canary-ctc-aligner, giving all backends access to
-Qwen3-quality word timestamps via `-am qwen3-forced-aligner.gguf`.
+**Status:** Fully implemented and verified. All code already exists:
 
-**Files:**
-- `src/qwen3_asr.cpp` — needs to handle the aligner's
-  5000-class lm_head (currently assumes lm_head matches vocab_size)
-- `src/qwen3_asr.h` — add `qwen3_asr_run_aligner()` entry point
-- `examples/cli/crispasr_aligner.{h,cpp}` — add dispatch branch for
-  qwen3 aligner alongside the existing canary-ctc branch
-- `models/convert-qwen3-asr-to-gguf.py` — already handles the aligner
-  model (verified)
+- `qwen3_asr.cpp:372-382` — lm_head shape read from tensor, not asserted
+- `qwen3_asr.h:160-190` — `qwen3_asr_lm_head_dim()`, `qwen3_asr_run_aligner()`,
+  `qwen3_asr_align_words()` APIs
+- `crispasr_aligner.cpp:61-129` — dispatch via filename detection
+  ("forced-aligner", "qwen3-fa", "qwen3-forced")
+- GGUF converter handles the aligner model out of the box
+- HF release: `cstr/qwen3-forced-aligner-0.6b-GGUF`
 
-**Approach:**
-
-### Step 1: Fix lm_head shape assumption in loader
-In `qwen3_asr_load_model()`, the lm_head tensor is loaded and its
-shape is asserted to match `hp.llm_vocab_size`. The forced aligner
-has `output.weight (5000, 1024)` instead of `(151936, 1024)`. Fix:
-read the actual ne[0] from the GGUF tensor and store it as
-`hp.llm_lm_head_dim`. The `run_llm_kv()` function already has a
-fallback: `vocab = hp.llm_lm_head_dim ? hp.llm_lm_head_dim : hp.llm_vocab_size`
-(line 1664).
-
-### Step 2: Add `qwen3_asr_run_aligner()` C API
-```c
-// One forward pass (no autoregressive decode). Returns per-position
-// argmax for every input token where id == 151705 (timestamp placeholder).
-// The caller provides the full input sequence (text + timestamp placeholders)
-// and gets back an array of frame indices (argmax * 80ms = timestamp).
-int qwen3_asr_run_aligner(
-    qwen3_asr_context* ctx,
-    const float* audio_samples, int n_samples,
-    const int32_t* input_ids, int n_ids,
-    int64_t* out_timestamps_ms, int* n_timestamps);
+Verified working:
+```bash
+crispasr --backend voxtral -m voxtral.gguf -f samples/jfk.wav \
+    -am qwen3-forced-aligner-0.6b.gguf -osrt -ml 1
 ```
-
-Implementation: compute mel → run encoder → embed tokens → splice
-audio into audio_pad positions → run one forward pass → for each
-position where `input_ids[i] == 151705`, take `argmax(logits[i, :5000])`
-and multiply by 80ms.
-
-### Step 3: Wire into crispasr_aligner.cpp
-The existing `crispasr_ctc_align()` dispatches based on the model path.
-Add a branch: if the model filename contains "qwen3" or the GGUF
-architecture is "qwen3-asr" with `llm_lm_head_dim == 5000`, use the
-Qwen3 aligner path instead of canary-ctc.
-
-### Step 4: Template construction
-The Qwen3 forced aligner expects a specific chat template with
-`<|timestamp|>` tokens inserted between words. The HF reference code
-is at `qwen_asr/inference/qwen3_forced_aligner.py`. The template is:
-```
-<|im_start|>system\nYou are a helpful assistant.<|im_end|>
-<|im_start|>user\nAudio 1: <|audio_bos|><audio_pad>×N<|audio_eos|>
-<|timestamp|>word1<|timestamp|>word2...<|timestamp|><|im_end|>
-<|im_start|>assistant\n
-```
-
-The output at each `<|timestamp|>` position is a 5000-class softmax
-where `argmax * 80ms` = the timestamp for that word boundary.
-
-**Verification:**
-- Convert the aligner: `python models/convert-qwen3-asr-to-gguf.py --model-dir Qwen3-ForcedAligner-0.6B --output qwen3-fa.gguf`
-- Run: `crispasr --backend voxtral -m auto -f samples/jfk.wav -am qwen3-fa.gguf -osrt -ml 1`
-- Compare word timestamps against canary-ctc aligner output.
-- Cross-reference with HF reference output.
-
-**Risk:** Medium. The template construction is tricky — wrong token
-IDs or missing special tokens will produce garbage timestamps. Use
-`tools/dump_reference.py --backend qwen3 --stages aligner` to get
-ground truth.
-
-**LOC:** ~150 lines total across 3 files.
+Produces per-word SRT timestamps (80ms resolution, 5000 classes).
 
 ---
 
@@ -259,44 +170,18 @@ be adapted.
 
 ---
 
-## 6. Best-of-N sampling for LLM backends
+## 6. Best-of-N sampling for LLM backends — DONE (qwen3 + granite)
 
-**Goal:** When `temperature > 0` and `--best-of N` is set, run N
-independent temperature-sampled decodes and pick the highest-scoring
-one.
+**Status:** Implemented for qwen3 and granite backend adapters,
+matching the voxtral pipeline pattern (N prefill+decode runs, seed
+varied per run, best selected by mean token probability). Verified:
+temperature=0 stays bit-identical; `--best-of 3 -tp 0.3` works on
+qwen3 (score=0.9726).
 
-**Current state:** Already implemented for voxtral in
-`crispasr_llm_pipeline.h` lines 158–221. The pipeline runs N decode
-loops with different RNG seeds and picks the result with the highest
-mean per-token probability.
-
-**What's missing:** qwen3, voxtral4b, and granite have their own
-inline pipelines in `crispasr_backend_{qwen3,voxtral4b,granite}.cpp`
-that don't implement best-of-N. They do single-run decoding.
-
-**Approach:**
-1. In each of the three backend adapters, wrap the existing
-   prefill + decode section in a `for (int run = 0; run < n_runs; run++)`
-   loop, mirroring `crispasr_llm_pipeline.h` lines 170–221.
-2. Each run: reset KV cache, re-prefill, decode with a different seed
-   (`seed ^ (run * 0x9E3779B97F4A7C15ull)`), score by mean probability.
-3. Keep best result.
-
-**Alternative:** Migrate qwen3/granite/voxtral4b to use the
-`crispasr_llm_pipeline.h` template (like voxtral does). This would
-require making their prompt construction, tokenization, and
-detokenization fit the Ops traits pattern. Qwen3 has GPT-2 byte-
-encoded token text that needs special handling; granite has a BPE
-tokenizer with different special tokens. The template may need
-generalization.
-
-**Verification:** Compare with temperature=0 (should be identical to
-single-run). With temperature>0 and best_of=5, quality should be
-equal or better than single-run.
-
-**Risk:** Low — the pattern is proven in voxtral's pipeline.
-
-**LOC:** ~30 lines per backend adapter (3 backends = ~90 lines).
+**voxtral4b deferred:** Its streaming pre_hook (audio frame injection
+per decode step) is incompatible with `run_with_probs()` which doesn't
+accept a pre_hook. Would need a `run_with_probs_hooked()` variant in
+`greedy_decode.h`, or refactoring the hook into the embed_fn.
 
 ---
 
@@ -519,32 +404,12 @@ templatizing is small.
 
 ---
 
-## 13. canary_ctc aligner CPU fallback
+## 13. canary_ctc aligner CPU fallback — DONE
 
-**Goal:** Fix the aligner's ggml scheduler to include a CPU fallback
-backend when the primary backend rejects an op.
-
-**Files:**
-- `src/canary_ctc.cpp` lines 585–633 (scheduler init)
-
-**Current state:** The aligner creates a single-backend scheduler. If
-the GPU backend rejects an op (e.g. a custom convolution), the compute
-fails rather than falling back to CPU.
-
-**Fix:** Mirror the 2-backend pattern from `canary.cpp` / `cohere.cpp`:
-```cpp
-ggml_backend_t backends[2];
-int n = 0;
-backends[n++] = ctx->backend; // GPU (or CPU if no GPU)
-if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
-    backends[n++] = ctx->backend_cpu;
-ctx->sched = ggml_backend_sched_new(backends, nullptr, n, 16384, false, false);
-```
-
-**Verification:** Run the aligner on a CUDA build. Currently crashes;
-after fix, should succeed with some ops on CPU and the rest on GPU.
-
-**Risk:** Very low. ~20 lines, well-understood pattern.
+**Status:** Already implemented. Both scheduler init points
+(`canary_ctc_compute_logits_from_mel_debug` at line 578 and
+`canary_ctc_compute_logits` at line 626) already use the 2-backend
+pattern (GPU primary + CPU fallback). No code change needed.
 
 ---
 
@@ -577,14 +442,14 @@ and remove any that remain.
 
 | Priority | Item | Impact | Effort |
 |---|---|---|---|
-| **High** | #2 Qwen3 forced aligner | Unlocks word timestamps for all backends via a second aligner option | ~150 LOC |
+| **Done** | #2 Qwen3 forced aligner | Already implemented and verified | 0 LOC |
 | **High** | #10 Granite encoder graph | 20x speedup on GPU (22s → <2s) | ~250 LOC |
-| **Medium** | #1 voxtral4b encoder migration | Code cleanliness, ~30 LOC of boilerplate removed | ~10 LOC |
-| **Medium** | #6 Best-of-N for all LLM backends | Quality improvement with temperature sampling | ~90 LOC |
-| **Medium** | #13 canary_ctc CPU fallback | GPU compatibility fix | ~20 LOC |
+| **Done** | #1 voxtral4b encoder migration | Migrated to encoder_self_attn() | 0 LOC |
+| **Done** | #6 Best-of-N for qwen3+granite | Implemented; voxtral4b deferred (needs pre_hook probs) | 0 LOC |
+| **Done** | #13 canary_ctc CPU fallback | Already implemented | 0 LOC |
 | **Medium** | #5 Reference backends | Testing infrastructure completeness | ~400 LOC |
-| **Low** | #3 Granite µP | Already handled via existing knobs | 0 LOC |
-| **Low** | #4 Scheduler audit | Already done, just docs update | 0 LOC |
+| **Done** | #3 Granite µP | Already handled via existing knobs | 0 LOC |
+| **Done** | #4 Scheduler audit | Already done | 0 LOC |
 | **Low** | #8 voxtral Q&A | New feature, niche use case | ~50 LOC |
 | **Low** | #7 voxtral4b streaming | Complex, niche | ~300 LOC |
 | **Low** | #9 Parakeet TDT GPU | Small gain, encoder dominates | ~150 LOC |

@@ -144,6 +144,11 @@ struct EncoderSelfAttnParams {
     // RoPE params (only used when positions != nullptr)
     int n_ctx_orig;
     float rope_theta;
+    // When true (default), wrap ggml_permute() in ggml_cont() before
+    // flash_attn_ext. voxtral 3B needs this; voxtral4b does not (its
+    // encoder was written without cont and changing it would alter the
+    // ggml graph structure). Set to false for voxtral4b compatibility.
+    bool permute_cont = true;
 };
 
 static inline ggml_tensor* encoder_self_attn(ggml_context* ctx, ggml_tensor* x, ggml_tensor* q_w, ggml_tensor* q_b,
@@ -190,9 +195,14 @@ static inline ggml_tensor* encoder_self_attn(ggml_context* ctx, ggml_tensor* x, 
     }
 
     // Permute to flash-attention layout: (head_dim, T, n_heads).
-    Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3));
-    K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
-    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+    Q = ggml_permute(ctx, Q, 0, 2, 1, 3);
+    K = ggml_permute(ctx, K, 0, 2, 1, 3);
+    V = ggml_permute(ctx, V, 0, 2, 1, 3);
+    if (p.permute_cont) {
+        Q = ggml_cont(ctx, Q);
+        K = ggml_cont(ctx, K);
+        V = ggml_cont(ctx, V);
+    }
 
     // Flash attention (bidirectional if mask==nullptr, causal/SWA otherwise).
     ggml_tensor* attn = ggml_flash_attn_ext(ctx, Q, K, V, mask, p.attn_scale, 0.0f, 0.0f);

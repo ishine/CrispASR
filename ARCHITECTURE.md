@@ -68,7 +68,7 @@ Which model uses which shared helper, today:
 | canary_ctc    |  ✔  |     |     |  ✔  |
 | cohere        |  ✔  |     |     |  ✔  |
 | voxtral       |  ✔  |  ✔  |  ✔ (LLM block) |  ✔  |
-| voxtral4b     |  ✔  |  ✔  |     |  ✔  |
+| voxtral4b     |  ✔  |  ✔  |  ✔ (encoder + LLM) |  ✔  |
 | qwen3_asr     |  ✔  |  ✔  |     |  ✔  |
 | granite_speech|     |  ✔  |     |  ✔  |
 | wav2vec2-ggml |     |     |     |     |
