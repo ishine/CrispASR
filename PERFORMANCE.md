@@ -62,20 +62,36 @@ runs the same model via ggml with automatic backend selection.
 | **Binary size** | Single `crispasr` binary for all backends | Single binary, voxtral4b only |
 | **Dependencies** | ggml (bundled) | Apple Accelerate/MPS |
 
-### Performance comparison (Voxtral Realtime 4B)
+### Same-hardware comparison (Xeon 4-core CPU, no GPU)
 
-| Metric | voxtral.c (M3 Max GPU) | CrispASR (Xeon CPU) |
+Both tools tested on identical hardware (Intel Xeon Skylake, 4 vCPU,
+7.6 GiB RAM, no GPU), same audio file (jfk.wav, 11 seconds), same
+model (Voxtral Realtime 4B). Both produce correct transcripts.
+
+| Metric | voxtral.c (BLAS) | CrispASR (ggml) |
 |---|---|---|
-| **Model size** | 8.9 GB (BF16) | 8.3 GB (F16) |
-| **Encoder (3.6s audio)** | 284 ms (MPS) | ~15 s (CPU, estimated) |
-| **Decoder per-step** | 23.5-31.6 ms | ~800 ms (CPU) |
+| **Model format** | 8.9 GB BF16 safetensors | 8.3 GB F16 GGUF |
+| **Total (11s jfk.wav)** | **660 s (11m 0s)** | **172.5 s (2m 52s)** |
+| **Realtime factor** | 60x slower than RT | 15.7x slower than RT |
+| **Speedup** | baseline | **3.8x faster** |
+| **Quantisation option** | none | Q4_K → ~2.5 GB, much faster |
+
+**CrispASR is 3.8x faster on CPU** for the same model. This is
+attributable to ggml's optimised matmul kernels (AVX2/FMA on x86,
+NEON on ARM) vs voxtral.c's OpenBLAS dependency.
+
+### GPU comparison (voxtral.c's published M3 Max numbers)
+
+| Metric | voxtral.c (M3 Max MPS) | CrispASR (Xeon CPU) |
+|---|---|---|
+| **Encoder (3.6s audio)** | 284 ms | ~15 s |
+| **Decoder per-step** | 23.5-31.6 ms | ~800 ms |
 | **Total (11s jfk.wav)** | ~5 s (estimated) | 172.5 s |
 | **Realtime factor** | ~2.5x faster than RT | 15.7x slower than RT |
 
-The voxtral.c numbers reflect Apple M3 Max GPU acceleration, which
-is ~30x faster than CPU-only inference. CrispASR with a CUDA/Metal GPU
-would close this gap significantly (ggml's Metal backend achieves
-comparable performance to hand-tuned MPS kernels on Apple Silicon).
+These numbers are not directly comparable — M3 Max GPU vs Xeon CPU.
+CrispASR with ggml Metal/CUDA on equivalent GPU hardware would
+narrow this gap significantly.
 
 ### Where CrispASR wins
 

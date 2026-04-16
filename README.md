@@ -75,6 +75,7 @@ Run `crispasr --list-backends` to see it live. Each backend declares capabilitie
 | Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
 | Punctuation toggle | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
 | Source / target language | | | ✔ | | ✔ | ✔ | | ✔ | | |
+| Audio Q&A (`--ask`) | | | | | | ✔ | | | | |
 | Streaming (`--stream/--mic/--live`) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
 | Auto-download (`-m auto`) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | |
 
