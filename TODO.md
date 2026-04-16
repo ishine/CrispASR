@@ -17,7 +17,7 @@ are in `LEARNINGS.md`.
 |---|---|---|---|
 | **mel spectrogram** | `mel.{h,cpp}` | 8/8 non-whisper | ✅ done |
 | **FastConformer encoder** | `fastconformer.h` | parakeet, canary, canary_ctc, stt_en_fc_ctc | ✅ done |
-| **LLM self-attention** | `attention.h` | voxtral, qwen3 (full + KV-cached) | ✅ done |
+| **LLM self-attention** | `attention.h` | voxtral (encoder + LLM), voxtral4b/qwen3/granite (KV-cached) | ✅ done |
 | **FFN (SwiGLU/SiLU)** | `ffn.h` | qwen3, voxtral, voxtral4b, granite | ✅ done |
 | **GGUF loader** | `gguf_loader.{h,cpp}` | all 8 non-whisper | ✅ done |
 | **BPE encoder** | `bpe.h` | qwen3, granite | ✅ done |
@@ -25,15 +25,19 @@ are in `LEARNINGS.md`.
 
 Remaining extraction opportunities (each saves ~30-60 LOC but has only 1-2 consumers):
 
-- **[later]** KV-cached attention variant for qwen3/voxtral4b/granite LLM
-- **[later]** Q/K norm variant for qwen3
-- **[later]** Whisper-style audio encoder (voxtral 3B only — single consumer)
+- **[done]** ~~KV-cached attention variant for qwen3/voxtral4b/granite LLM~~ —
+  all 4 LLM backends migrated to `core_attn::kv_self_attn()`.
+- **[done]** ~~Q/K norm variant for qwen3~~ — `kv_self_attn()` accepts
+  optional `q_norm_w`/`k_norm_w` params.
+- **[done]** ~~Whisper-style audio encoder (voxtral 3B)~~ — migrated to
+  `core_attn::encoder_self_attn()` with biased Q/V/O, no K bias, no RoPE.
 - **[later]** Sliding-window attention (voxtral4b encoder — single consumer)
 - **[later]** µP scale tricks for granite (attention_multiplier, residual_multiplier)
 
-- **[later]** **`src/core/attention.h` — voxtral audio encoder.**
-  Different flavour: Q/V biases, **no** K bias (Whisper quirk), no RoPE.
-  ~30-line sibling helper.
+- **[done]** ~~**`src/core/attention.h` — voxtral audio encoder.**~~
+  `encoder_self_attn()` added: optional biases on Q/K/V/O, optional RoPE,
+  optional mask. Voxtral 3B migrated. Voxtral4b is a candidate but uses
+  no-cont permute (needs bit-identity verification with model files).
 
 - **[later]** **`src/core/attention.h` — sliding-window attention.**
   voxtral4b audio encoder uses 750-token SWA. Needs a `sliding_window`
@@ -162,9 +166,8 @@ each backend. High-value gaps to close:
   Currently regression-tested on German only.
 
 ### cohere
-- **[later]** F32→F16 self-attention KV cache upgrade. Currently uses
-  F32 where other models use F16, wasting 2× GPU memory bandwidth.
-  ~30 LOC, low risk.
+- **[done]** ~~F32→F16 self-attention KV cache upgrade.~~ Already F16
+  (decoder + cross-attention KV caches both use GGML_TYPE_F16).
 
 ### qwen3 / voxtral
 - **[later]** Stop recreating `ggml_backend_sched` on every compute

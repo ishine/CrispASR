@@ -140,7 +140,7 @@ struct EncoderSelfAttnParams {
     int n_kv_heads; // key/value heads (usually == n_heads for encoders)
     int head_dim;
     int n_kv_grp;     // n_heads / n_kv_heads (1 for MHA)
-    float attn_scale;  // usually 1/sqrt(head_dim)
+    float attn_scale; // usually 1/sqrt(head_dim)
     // RoPE params (only used when positions != nullptr)
     int n_ctx_orig;
     float rope_theta;
