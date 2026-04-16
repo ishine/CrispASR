@@ -63,6 +63,12 @@ struct VoxtralOps {
     static std::string build_prefix(const whisper_params& /*p*/) { return "<s>[INST][BEGIN_AUDIO]"; }
     static std::string build_suffix(const whisper_params& p) {
         const std::string lang = p.language.empty() ? std::string("en") : p.language;
+        if (!p.ask.empty()) {
+            // Audio understanding / Q&A mode: instead of transcribing,
+            // ask a question about the audio content. The model responds
+            // with free-form text.
+            return "[/INST]" + p.ask;
+        }
         if (p.translate) {
             // Voxtral handles translation as an instruction. We keep
             // the lang: marker so the model knows the source language

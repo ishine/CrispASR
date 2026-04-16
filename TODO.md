@@ -144,10 +144,9 @@ each backend. High-value gaps to close:
   Currently we run it in chunk-and-transcribe mode. Exposing a
   streaming mode through the CLI is a bigger design question.
 
-- **[later]** **Audio understanding mode for voxtral 3B.** The model
-  supports Q&A over audio content, not just transcription. Needs a
-  prompt template flag and a chat-style turn loop. Separate feature,
-  not a strict regression.
+- **[done]** ~~**Audio understanding mode for voxtral 3B.**~~ `--ask`
+  flag switches from transcription to Q&A template. Tested: language
+  detection ("The audio is in English.") and summarization work.
 
 ---
 

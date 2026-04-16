@@ -241,6 +241,8 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
             params.detect_language = true;
         } else if (arg == "--prompt") {
             params.prompt = ARGV_NEXT;
+        } else if (arg == "--ask") {
+            params.ask = ARGV_NEXT;
         } else if (arg == "--carry-initial-prompt") {
             params.carry_initial_prompt = true;
         } else if (arg == "-m" || arg == "--model") {

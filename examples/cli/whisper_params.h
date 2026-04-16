@@ -75,6 +75,7 @@ struct whisper_params {
 
     std::string language = "en";
     std::string prompt;
+    std::string ask; // Q&A prompt for audio understanding (voxtral --ask)
     std::string font_path = "/System/Library/Fonts/Supplemental/Courier New Bold.ttf";
     std::string model = "models/ggml-base.en.bin";
     std::string grammar;

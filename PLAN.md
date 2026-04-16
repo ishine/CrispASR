@@ -432,7 +432,7 @@ and remove any that remain.
 | **Medium** | #5 Reference backends | Testing infrastructure completeness | ~400 LOC |
 | **Done** | #3 Granite µP | Already handled via existing knobs | 0 LOC |
 | **Done** | #4 Scheduler audit | Already done | 0 LOC |
-| **Low** | #8 voxtral Q&A | New feature, niche use case | ~50 LOC |
+| **Done** | #8 voxtral Q&A | --ask flag for audio understanding | ~10 LOC |
 | **Low** | #7 voxtral4b streaming | Complex, niche | ~300 LOC |
 | **Low** | #9 Parakeet TDT GPU | Small gain, encoder dominates | ~150 LOC |
 | **Low** | #11 WebSocket streaming | Needs new dependency | ~300 LOC |
