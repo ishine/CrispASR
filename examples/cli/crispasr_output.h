@@ -49,8 +49,7 @@ struct crispasr_disp_segment {
 //   This creates natural subtitle lines even when segments are long.
 //   Works with and without word-level timestamps.
 std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector<crispasr_segment>& segments,
-                                                               int max_len,
-                                                               bool split_on_punct = false);
+                                                               int max_len, bool split_on_punct = false);
 
 // ---------------------------------------------------------------------------
 // Writers. All take a full file path; callers are expected to choose the

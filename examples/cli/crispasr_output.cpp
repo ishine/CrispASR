@@ -90,8 +90,7 @@ static std::vector<std::pair<std::string, float>> split_text_at_punct(const std:
 }
 
 std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector<crispasr_segment>& segments,
-                                                               int max_len,
-                                                               bool split_on_punct) {
+                                                               int max_len, bool split_on_punct) {
     std::vector<crispasr_disp_segment> out;
 
     for (const auto& seg : segments) {
@@ -149,12 +148,12 @@ std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector
             cur.t1 = w.t1;
 
             const std::string sep = cur.text.empty() ? "" : " ";
-            const bool would_overflow = max_len > 1 &&
-                !cur.text.empty() && (int)(cur.text.size() + sep.size() + w.text.size()) > max_len;
+            const bool would_overflow =
+                max_len > 1 && !cur.text.empty() && (int)(cur.text.size() + sep.size() + w.text.size()) > max_len;
 
             // Split at sentence-ending punctuation
-            const bool at_sentence_end = split_on_punct && !cur.text.empty() &&
-                !w.text.empty() && is_sentence_end(cur.text.back());
+            const bool at_sentence_end =
+                split_on_punct && !cur.text.empty() && !w.text.empty() && is_sentence_end(cur.text.back());
 
             if (would_overflow || at_sentence_end) {
                 flush();
