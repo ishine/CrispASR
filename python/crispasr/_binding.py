@@ -25,13 +25,20 @@ class Segment:
 
 
 def _find_lib():
-    """Find the whisper shared library."""
-    names = {
-        "Linux": "libwhisper.so",
-        "Darwin": "libwhisper.dylib",
-        "Windows": "whisper.dll",
-    }
-    lib_name = names.get(platform.system(), "libwhisper.so")
+    """Find the crispasr / whisper shared library.
+
+    As of CrispASR 0.4.0 the build produces both `libcrispasr.*`
+    (preferred — all 10 backends linked) and the historical
+    `libwhisper.*` (alias). We probe candidates in order so any build
+    layout is picked up transparently.
+    """
+    system = platform.system()
+    if system == "Darwin":
+        candidates = ["libcrispasr.dylib", "libwhisper.dylib"]
+    elif system == "Windows":
+        candidates = ["crispasr.dll", "whisper.dll"]
+    else:
+        candidates = ["libcrispasr.so", "libwhisper.so"]
 
     search = [
         Path(__file__).parent,
@@ -42,10 +49,11 @@ def _find_lib():
         Path.cwd() / "build" / "src",
     ]
     for d in search:
-        p = d / lib_name
-        if p.exists():
-            return str(p)
-    return lib_name
+        for name in candidates:
+            p = d / name
+            if p.exists():
+                return str(p)
+    return candidates[0]
 
 
 # Whisper sampling strategies
@@ -272,6 +280,178 @@ class CrispASR:
         if hasattr(self, "_ctx") and self._ctx:
             self._lib.whisper_free(self._ctx)
             self._ctx = None
+
+    def __del__(self):
+        self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+# =========================================================================
+# Unified session — works for every backend libcrispasr was built with
+# =========================================================================
+
+@dataclass
+class SessionWord:
+    """Word-level timing from a session transcribe (backends that produce it)."""
+    text: str
+    start: float  # seconds
+    end: float    # seconds
+
+
+@dataclass
+class SessionSegment:
+    """A transcription segment from Session.transcribe."""
+    text: str
+    start: float  # seconds
+    end: float    # seconds
+    words: List[SessionWord]
+
+
+class Session:
+    """Backend-agnostic transcription session over any CrispASR-supported GGUF.
+
+    The backend is auto-detected from the file's `general.architecture`
+    metadata. `Session.available_backends()` lists which backends the
+    bundled libcrispasr was actually compiled with — a model whose
+    backend isn't in that list will fail to open.
+
+    Usage:
+        with crispasr.Session("model.gguf") as s:
+            print(f"backend: {s.backend}")
+            for seg in s.transcribe(pcm_f32):
+                print(f"[{seg.start:.1f}-{seg.end:.1f}s] {seg.text}")
+    """
+
+    def __init__(self, model_path: str, lib_path: Optional[str] = None,
+                 n_threads: int = 4, backend: Optional[str] = None):
+        self._lib = ctypes.CDLL(lib_path or _find_lib())
+        self._setup_session_signatures()
+
+        path_bytes = model_path.encode("utf-8")
+        if backend:
+            self._handle = self._lib.crispasr_session_open_explicit(
+                path_bytes, backend.encode("utf-8"), n_threads
+            )
+        else:
+            self._handle = self._lib.crispasr_session_open(path_bytes, n_threads)
+
+        if not self._handle:
+            avail = Session.available_backends(lib_path=lib_path)
+            raise RuntimeError(
+                f"Failed to open {model_path!r} — backend not supported. "
+                f"libcrispasr was built with: {avail}"
+            )
+        be = self._lib.crispasr_session_backend(self._handle)
+        self.backend = be.decode("utf-8") if be else ""
+
+    def _setup_session_signatures(self):
+        lib = self._lib
+        # Missing symbol ⇒ pre-0.4.0 dylib.
+        for name in (
+            "crispasr_session_open", "crispasr_session_transcribe",
+            "crispasr_session_available_backends", "crispasr_session_close",
+        ):
+            if not hasattr(lib, name):
+                raise RuntimeError(
+                    "Unified session API not found in loaded library — "
+                    "rebuild CrispASR with 0.4.0+ helpers."
+                )
+
+        lib.crispasr_session_open.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.crispasr_session_open.restype = ctypes.c_void_p
+        lib.crispasr_session_open_explicit.argtypes = [
+            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int,
+        ]
+        lib.crispasr_session_open_explicit.restype = ctypes.c_void_p
+        lib.crispasr_session_backend.argtypes = [ctypes.c_void_p]
+        lib.crispasr_session_backend.restype = ctypes.c_char_p
+        lib.crispasr_session_available_backends.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.crispasr_session_available_backends.restype = ctypes.c_int
+        lib.crispasr_session_transcribe.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+        ]
+        lib.crispasr_session_transcribe.restype = ctypes.c_void_p
+        lib.crispasr_session_result_n_segments.argtypes = [ctypes.c_void_p]
+        lib.crispasr_session_result_n_segments.restype = ctypes.c_int
+        lib.crispasr_session_result_segment_text.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.crispasr_session_result_segment_text.restype = ctypes.c_char_p
+        lib.crispasr_session_result_segment_t0.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.crispasr_session_result_segment_t0.restype = ctypes.c_int64
+        lib.crispasr_session_result_segment_t1.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.crispasr_session_result_segment_t1.restype = ctypes.c_int64
+        lib.crispasr_session_result_n_words.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.crispasr_session_result_n_words.restype = ctypes.c_int
+        lib.crispasr_session_result_word_text.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.crispasr_session_result_word_text.restype = ctypes.c_char_p
+        lib.crispasr_session_result_word_t0.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.crispasr_session_result_word_t0.restype = ctypes.c_int64
+        lib.crispasr_session_result_word_t1.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+        lib.crispasr_session_result_word_t1.restype = ctypes.c_int64
+        lib.crispasr_session_result_free.argtypes = [ctypes.c_void_p]
+        lib.crispasr_session_result_free.restype = None
+        lib.crispasr_session_close.argtypes = [ctypes.c_void_p]
+        lib.crispasr_session_close.restype = None
+
+    @staticmethod
+    def available_backends(lib_path: Optional[str] = None) -> List[str]:
+        """List the backend names the loaded CrispASR library was built with."""
+        lib = ctypes.CDLL(lib_path or _find_lib())
+        if not hasattr(lib, "crispasr_session_available_backends"):
+            return []
+        lib.crispasr_session_available_backends.argtypes = [ctypes.c_char_p, ctypes.c_int]
+        lib.crispasr_session_available_backends.restype = ctypes.c_int
+        buf = ctypes.create_string_buffer(256)
+        lib.crispasr_session_available_backends(buf, 256)
+        csv = buf.value.decode("utf-8")
+        return [s.strip() for s in csv.split(",") if s.strip()]
+
+    def transcribe(
+        self, pcm: np.ndarray, sample_rate: int = 16000,
+    ) -> List[SessionSegment]:
+        """Transcribe 16 kHz mono float32 PCM. Dispatches via crispasr_session."""
+        if sample_rate != 16000:
+            ratio = 16000 / sample_rate
+            new_len = int(len(pcm) * ratio)
+            indices = np.linspace(0, len(pcm) - 1, new_len)
+            pcm = np.interp(indices, np.arange(len(pcm)), pcm).astype(np.float32)
+        pcm = np.asarray(pcm, dtype=np.float32)
+        samples_ptr = pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        res = self._lib.crispasr_session_transcribe(self._handle, samples_ptr, len(pcm))
+        if not res:
+            raise RuntimeError(f"crispasr_session_transcribe failed for backend {self.backend!r}")
+
+        try:
+            n_seg = self._lib.crispasr_session_result_n_segments(res)
+            out: List[SessionSegment] = []
+            for i in range(n_seg):
+                t = self._lib.crispasr_session_result_segment_text(res, i)
+                text = t.decode("utf-8") if t else ""
+                t0 = self._lib.crispasr_session_result_segment_t0(res, i) / 100.0
+                t1 = self._lib.crispasr_session_result_segment_t1(res, i) / 100.0
+                wn = self._lib.crispasr_session_result_n_words(res, i)
+                words: List[SessionWord] = []
+                for j in range(wn):
+                    wt = self._lib.crispasr_session_result_word_text(res, i, j)
+                    words.append(SessionWord(
+                        text=wt.decode("utf-8") if wt else "",
+                        start=self._lib.crispasr_session_result_word_t0(res, i, j) / 100.0,
+                        end=self._lib.crispasr_session_result_word_t1(res, i, j) / 100.0,
+                    ))
+                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words))
+            return out
+        finally:
+            self._lib.crispasr_session_result_free(res)
+
+    def close(self) -> None:
+        if getattr(self, "_handle", None):
+            self._lib.crispasr_session_close(self._handle)
+            self._handle = None
 
     def __del__(self):
         self.close()

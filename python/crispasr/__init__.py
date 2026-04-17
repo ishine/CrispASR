@@ -1,6 +1,18 @@
 """CrispASR — lightweight speech recognition via ggml."""
 
-from ._binding import CrispASR, Segment
+from ._binding import (
+    CrispASR,
+    Segment,
+    Session,
+    SessionSegment,
+    SessionWord,
+)
 
-__all__ = ["CrispASR", "Segment"]
-__version__ = "0.1.0"
+__all__ = [
+    "CrispASR",
+    "Segment",
+    "Session",
+    "SessionSegment",
+    "SessionWord",
+]
+__version__ = "0.4.0"

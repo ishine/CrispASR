@@ -75,3 +75,84 @@ extern "C" {
     pub fn whisper_lang_str(id: c_int) -> *const c_char;
     pub fn whisper_lang_id(lang: *const c_char) -> c_int;
 }
+
+// =========================================================================
+// Unified session FFI (CrispASR 0.4.0+) — multi-backend dispatch
+// =========================================================================
+//
+// Open any CrispASR-supported GGUF (Whisper, Parakeet, Canary, Cohere,
+// Qwen3-ASR, Granite Speech, FastConformer-CTC, Canary-CTC, Voxtral,
+// Voxtral4B, Wav2Vec2) through one handle. Backend auto-detected from
+// `general.architecture` metadata unless overridden.
+
+/// Opaque handle returned by `crispasr_session_open`.
+#[repr(C)]
+pub struct CrispasrSession(c_void);
+
+/// Opaque result handle returned by `crispasr_session_transcribe`.
+/// Must be freed with `crispasr_session_result_free`.
+#[repr(C)]
+pub struct CrispasrSessionResult(c_void);
+
+extern "C" {
+    pub fn crispasr_session_open(
+        model_path: *const c_char,
+        n_threads: c_int,
+    ) -> *mut CrispasrSession;
+
+    pub fn crispasr_session_open_explicit(
+        model_path: *const c_char,
+        backend_name: *const c_char,
+        n_threads: c_int,
+    ) -> *mut CrispasrSession;
+
+    pub fn crispasr_session_backend(s: *mut CrispasrSession) -> *const c_char;
+
+    /// Write a comma-separated list of backend names the loaded dylib
+    /// was built with. Returns the number of bytes written (not counting
+    /// NUL) or a negative error.
+    pub fn crispasr_session_available_backends(
+        out_csv: *mut c_char,
+        out_cap: c_int,
+    ) -> c_int;
+
+    pub fn crispasr_session_transcribe(
+        s: *mut CrispasrSession,
+        pcm: *const c_float,
+        n_samples: c_int,
+    ) -> *mut CrispasrSessionResult;
+
+    pub fn crispasr_session_result_n_segments(r: *mut CrispasrSessionResult) -> c_int;
+    pub fn crispasr_session_result_segment_text(
+        r: *mut CrispasrSessionResult,
+        i: c_int,
+    ) -> *const c_char;
+    pub fn crispasr_session_result_segment_t0(r: *mut CrispasrSessionResult, i: c_int) -> i64;
+    pub fn crispasr_session_result_segment_t1(r: *mut CrispasrSessionResult, i: c_int) -> i64;
+
+    pub fn crispasr_session_result_n_words(r: *mut CrispasrSessionResult, i_seg: c_int) -> c_int;
+    pub fn crispasr_session_result_word_text(
+        r: *mut CrispasrSessionResult,
+        i_seg: c_int,
+        i_word: c_int,
+    ) -> *const c_char;
+    pub fn crispasr_session_result_word_t0(
+        r: *mut CrispasrSessionResult,
+        i_seg: c_int,
+        i_word: c_int,
+    ) -> i64;
+    pub fn crispasr_session_result_word_t1(
+        r: *mut CrispasrSessionResult,
+        i_seg: c_int,
+        i_word: c_int,
+    ) -> i64;
+
+    pub fn crispasr_session_result_free(r: *mut CrispasrSessionResult);
+    pub fn crispasr_session_close(s: *mut CrispasrSession);
+
+    pub fn crispasr_detect_backend_from_gguf(
+        path: *const c_char,
+        out_name: *mut c_char,
+        out_cap: c_int,
+    ) -> c_int;
+}
