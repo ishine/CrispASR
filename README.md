@@ -426,6 +426,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 | `-pc` | Color-code output by token confidence (where supported) |
 | `--no-timestamps` | Plain text only, no timing |
 | `-ml N` | Max chars per display segment. `0`=unlimited, `1`=per-word, `N`=split at word boundaries |
+| `-sp`, `--split-on-punct` | Split subtitle lines at sentence-ending punctuation (`. ! ?`). Creates readable subtitles even for CTC models that produce long segments |
 
 ### Segmentation / chunking
 
@@ -551,6 +552,44 @@ CrispASR writes these formats side-by-side with the input audio (e.g. `jfk.wav` 
 ```
 
 Add `-ojf` (`--output-json-full`) to include per-word `words[]` and per-token `tokens[]` arrays when the backend populates them.
+
+---
+
+## Language bindings
+
+### Python
+
+```python
+from crispasr import CrispASR
+
+model = CrispASR("ggml-base.en.bin")
+segments = model.transcribe("audio.wav")
+for seg in segments:
+    print(f"[{seg.start:.1f}s - {seg.end:.1f}s] {seg.text}")
+```
+
+### Rust
+
+```rust
+use crispasr::CrispASR;
+
+let model = CrispASR::new("ggml-base.en.bin")?;
+let segments = model.transcribe_pcm(&pcm_f32)?;
+```
+
+### Dart / Flutter
+
+```dart
+final model = CrispASR('ggml-base.en.bin');
+final segments = model.transcribePcm(pcmFloat32);
+```
+
+### Mobile
+
+```bash
+./build-ios.sh                    # iOS xcframework with Metal
+./build-android.sh --vulkan       # Android NDK with Vulkan GPU
+```
 
 ---
 
