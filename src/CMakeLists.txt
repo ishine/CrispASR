@@ -107,6 +107,11 @@ add_library(whisper
             ../include/whisper.h
             whisper-arch.h
             whisper.cpp
+            # C-ABI helpers consumed by the Dart FFI binding in
+            # `flutter/crispasr/`. Declared extern "C" with
+            # `crispasr_*` prefixes so they don't collide with
+            # upstream whisper.h identifiers.
+            crispasr_dart_helpers.cpp
             )
 
 # Cohere Transcribe library (Conformer encoder + transformer decoder)

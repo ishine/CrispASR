@@ -1,0 +1,99 @@
+// Smoke test — confirms every 0.2.0 FFI symbol resolves against the freshly
+// built libwhisper. Does NOT run real transcription (that needs a model
+// download); purely checks the binding surface.
+//
+// Requires CRISPASR_LIB pointing at the built libwhisper:
+//   CRISPASR_LIB=../../../build/src/libwhisper.dylib dart test/bindings_smoke_test.dart
+
+import 'dart:ffi';
+import 'dart:io';
+
+import 'package:ffi/ffi.dart';
+import 'package:test/test.dart';
+
+DynamicLibrary _openLib() {
+  final path = Platform.environment['CRISPASR_LIB'];
+  if (path != null && path.isNotEmpty) {
+    return DynamicLibrary.open(path);
+  }
+  if (Platform.isMacOS || Platform.isIOS) {
+    return DynamicLibrary.open('../../build/src/libwhisper.dylib');
+  }
+  return DynamicLibrary.open('../../build/src/libwhisper.so');
+}
+
+void main() {
+  late DynamicLibrary lib;
+
+  setUpAll(() {
+    lib = _openLib();
+  });
+
+  test('0.1.0 whisper symbols resolve', () {
+    for (final s in [
+      'whisper_init_from_file_with_params',
+      'whisper_free',
+      'whisper_full',
+      'whisper_full_default_params_by_ref',
+      'whisper_context_default_params_by_ref',
+      'whisper_full_n_segments',
+      'whisper_full_get_segment_text',
+      'whisper_full_get_segment_t0',
+      'whisper_full_get_segment_t1',
+      'whisper_full_get_segment_no_speech_prob',
+      'whisper_free_params',
+    ]) {
+      expect(() => lib.lookup(s), returnsNormally, reason: s);
+    }
+  });
+
+  test('0.2.0 crispasr_ helpers resolve', () {
+    for (final s in [
+      'crispasr_params_set_language',
+      'crispasr_params_set_translate',
+      'crispasr_params_set_detect_language',
+      'crispasr_params_set_token_timestamps',
+      'crispasr_params_set_n_threads',
+      'crispasr_params_set_max_len',
+      'crispasr_params_set_split_on_word',
+      'crispasr_params_set_no_context',
+      'crispasr_params_set_single_segment',
+      'crispasr_params_set_print_realtime',
+      'crispasr_params_set_print_progress',
+      'crispasr_params_set_print_timestamps',
+      'crispasr_params_set_print_special',
+      'crispasr_params_set_suppress_blank',
+      'crispasr_params_set_temperature',
+      'crispasr_params_set_initial_prompt',
+      'crispasr_token_t0',
+      'crispasr_token_t1',
+      'crispasr_token_p',
+      'crispasr_detect_language',
+      'crispasr_vad_segments',
+      'crispasr_vad_free',
+      'crispasr_dart_helpers_version',
+    ]) {
+      expect(() => lib.lookup(s), returnsNormally, reason: s);
+    }
+  });
+
+  test('0.2.0 whisper language helpers resolve', () {
+    for (final s in [
+      'whisper_lang_max_id',
+      'whisper_lang_id',
+      'whisper_lang_str',
+      'whisper_full_n_tokens',
+      'whisper_full_get_token_text',
+      'whisper_full_get_token_p',
+    ]) {
+      expect(() => lib.lookup(s), returnsNormally, reason: s);
+    }
+  });
+
+  test('helpers_version reports 0.2.0', () {
+    final fn = lib.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+        'crispasr_dart_helpers_version');
+    final ptr = fn();
+    expect(ptr.cast<Uint8>().address, isNot(0));
+  });
+}
