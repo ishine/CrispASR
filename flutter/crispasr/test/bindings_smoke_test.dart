@@ -90,10 +90,23 @@ void main() {
     }
   });
 
-  test('helpers_version reports 0.2.0', () {
+  test('helpers_version reports 0.3.0', () {
     final fn = lib.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
         'crispasr_dart_helpers_version');
     final ptr = fn();
     expect(ptr.cast<Uint8>().address, isNot(0));
+    expect(ptr.toDartString(), '0.3.0');
+  });
+
+  test('0.3.0 streaming helpers resolve', () {
+    for (final s in [
+      'crispasr_stream_open',
+      'crispasr_stream_feed',
+      'crispasr_stream_flush',
+      'crispasr_stream_get_text',
+      'crispasr_stream_close',
+    ]) {
+      expect(() => lib.lookup(s), returnsNormally, reason: s);
+    }
   });
 }

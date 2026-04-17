@@ -61,6 +61,37 @@ class LanguageDetection {
       'LanguageDetection($code, ${(probability * 100).toStringAsFixed(1)}%)';
 }
 
+/// One "commit" from a streaming session — the latest concatenated text
+/// that whisper produced for the current rolling window, plus its absolute
+/// start/end time in the live audio stream.
+class StreamingUpdate {
+  /// Concatenated text of the last decode. Overwritten on every new
+  /// [StreamingSession.feed] / [StreamingSession.flush] cycle that produces
+  /// output, so caller diffs against previous text if they want an
+  /// append-only stream.
+  final String text;
+  /// Start of the decoded window, in seconds from the beginning of the
+  /// live stream.
+  final double start;
+  /// End of the decoded window, in seconds from the beginning of the
+  /// live stream.
+  final double end;
+  /// Monotonic decode counter — useful to distinguish "new decode, same
+  /// text" from "stale text replayed".
+  final int counter;
+
+  const StreamingUpdate({
+    required this.text,
+    required this.start,
+    required this.end,
+    required this.counter,
+  });
+
+  @override
+  String toString() =>
+      '[${start.toStringAsFixed(1)}-${end.toStringAsFixed(1)}s] $text';
+}
+
 /// A speech span returned by [CrispASR.vad].
 class VadSpan {
   final double start; // seconds
@@ -197,6 +228,26 @@ typedef _LangId       = int   Function(Pointer<Utf8>);
 typedef _IntNative  = Int32 Function();
 typedef _IntFn      = int   Function();
 
+// Streaming helpers (0.3.0).
+typedef _StreamOpenNative = Pointer<Void> Function(
+    Pointer<Void>, Int32, Int32, Int32, Int32, Pointer<Utf8>, Int32);
+typedef _StreamOpen = Pointer<Void> Function(
+    Pointer<Void>, int, int, int, int, Pointer<Utf8>, int);
+
+typedef _StreamFeedNative = Int32 Function(Pointer<Void>, Pointer<Float>, Int32);
+typedef _StreamFeed       = int   Function(Pointer<Void>, Pointer<Float>, int);
+
+typedef _StreamFlushNative = Int32 Function(Pointer<Void>);
+typedef _StreamFlush       = int   Function(Pointer<Void>);
+
+typedef _StreamGetTextNative = Int32 Function(
+    Pointer<Void>, Pointer<Utf8>, Int32, Pointer<Double>, Pointer<Double>, Pointer<Int64>);
+typedef _StreamGetText = int Function(
+    Pointer<Void>, Pointer<Utf8>, int, Pointer<Double>, Pointer<Double>, Pointer<Int64>);
+
+typedef _StreamCloseNative = Void Function(Pointer<Void>);
+typedef _StreamClose       = void Function(Pointer<Void>);
+
 /// On-device speech recognition model.
 ///
 /// ```dart
@@ -252,7 +303,14 @@ class CrispASR {
   _LangId?      _langId;
   _IntFn?       _langMaxId;
 
+  _StreamOpen?    _streamOpen;
+  _StreamFeed?    _streamFeed;
+  _StreamFlush?   _streamFlush;
+  _StreamGetText? _streamGetText;
+  _StreamClose?   _streamClose;
+
   bool get supportsExtended => _detectLang != null;
+  bool get supportsStreaming => _streamOpen != null;
 
   CrispASR(String modelPath, {String? libPath}) {
     _lib = DynamicLibrary.open(libPath ?? _findLib());
@@ -363,6 +421,22 @@ class CrispASR {
     }
     if (_lib.providesSymbol('whisper_lang_max_id')) {
       _langMaxId = _lib.lookupFunction<_IntNative, _IntFn>('whisper_lang_max_id');
+    }
+
+    if (_lib.providesSymbol('crispasr_stream_open')) {
+      _streamOpen = _lib.lookupFunction<_StreamOpenNative, _StreamOpen>('crispasr_stream_open');
+    }
+    if (_lib.providesSymbol('crispasr_stream_feed')) {
+      _streamFeed = _lib.lookupFunction<_StreamFeedNative, _StreamFeed>('crispasr_stream_feed');
+    }
+    if (_lib.providesSymbol('crispasr_stream_flush')) {
+      _streamFlush = _lib.lookupFunction<_StreamFlushNative, _StreamFlush>('crispasr_stream_flush');
+    }
+    if (_lib.providesSymbol('crispasr_stream_get_text')) {
+      _streamGetText = _lib.lookupFunction<_StreamGetTextNative, _StreamGetText>('crispasr_stream_get_text');
+    }
+    if (_lib.providesSymbol('crispasr_stream_close')) {
+      _streamClose = _lib.lookupFunction<_StreamCloseNative, _StreamClose>('crispasr_stream_close');
     }
   }
 
@@ -573,6 +647,60 @@ class CrispASR {
     return out;
   }
 
+  /// Open a streaming session over this model. Feed PCM chunks as they
+  /// arrive and poll each [StreamingSession.feed] return value for new
+  /// text.
+  ///
+  /// Uses whisper.cpp's sliding-window trick: every [stepMs] of fresh
+  /// audio triggers a decode over the last [lengthMs], carrying
+  /// [keepMs] of context from the previous window. Good first defaults
+  /// are the CLI's own (3000 / 10000 / 200 ms). No threads are spawned —
+  /// every decode happens synchronously inside `feed`.
+  ///
+  /// Throws [UnsupportedError] if the loaded dylib is pre-0.3.0.
+  StreamingSession openStream({
+    int stepMs = 3000,
+    int lengthMs = 10000,
+    int keepMs = 200,
+    int nThreads = 4,
+    String? language,
+    bool translate = false,
+  }) {
+    _checkDisposed();
+    if (_streamOpen == null ||
+        _streamFeed == null ||
+        _streamGetText == null ||
+        _streamClose == null) {
+      throw UnsupportedError(
+          'Streaming helpers not available — rebuild CrispASR with 0.3.0+.');
+    }
+
+    final langPtr = (language == null || language.isEmpty || language == 'auto')
+        ? nullptr
+        : language.toNativeUtf8();
+    final handle = _streamOpen!(
+      _ctx,
+      nThreads,
+      stepMs,
+      lengthMs,
+      keepMs,
+      langPtr.cast<Utf8>(),
+      translate ? 1 : 0,
+    );
+    if (langPtr != nullptr) calloc.free(langPtr);
+    if (handle == nullptr) {
+      throw Exception('crispasr_stream_open returned null');
+    }
+
+    return StreamingSession._(
+      handle: handle,
+      feed: _streamFeed!,
+      flush: _streamFlush,
+      getText: _streamGetText!,
+      close: _streamClose!,
+    );
+  }
+
   void dispose() {
     if (!_disposed) {
       _free(_ctx);
@@ -589,5 +717,107 @@ class CrispASR {
     if (Platform.isIOS || Platform.isMacOS) return 'whisper.framework/whisper';
     if (Platform.isWindows) return 'whisper.dll';
     return 'libwhisper.so';
+  }
+}
+
+/// A live streaming decode session, created via [CrispASR.openStream].
+///
+/// Feed PCM chunks as they arrive; every chunk whose accumulation crosses
+/// the configured `stepMs` triggers a decode over the rolling window and
+/// returns a [StreamingUpdate]. Chunks that don't trigger a decode return
+/// `null` — the caller is still buffering.
+///
+/// Close the session explicitly with [close] to free the native state —
+/// there is no Dart finalizer hooking libwhisper.
+class StreamingSession {
+  StreamingSession._({
+    required Pointer<Void> handle,
+    required _StreamFeed feed,
+    required _StreamFlush? flush,
+    required _StreamGetText getText,
+    required _StreamClose close,
+  })  : _handle = handle,
+        _feedFn = feed,
+        _flushFn = flush,
+        _getTextFn = getText,
+        _closeFn = close;
+
+  final Pointer<Void> _handle;
+  final _StreamFeed    _feedFn;
+  final _StreamFlush?  _flushFn;
+  final _StreamGetText _getTextFn;
+  final _StreamClose   _closeFn;
+
+  bool _closed = false;
+  int _lastCounter = -1;
+
+  bool get isClosed => _closed;
+
+  /// Feed a chunk of 16 kHz mono float32 PCM. Returns a [StreamingUpdate]
+  /// when this chunk's arrival triggered a new decode, otherwise `null`.
+  StreamingUpdate? feed(Float32List pcm) {
+    if (_closed) throw StateError('StreamingSession is closed');
+    if (pcm.isEmpty) return null;
+
+    final buf = calloc<Float>(pcm.length);
+    for (var i = 0; i < pcm.length; i++) {
+      buf[i] = pcm[i];
+    }
+    try {
+      final r = _feedFn(_handle, buf, pcm.length);
+      if (r < 0) throw Exception('crispasr_stream_feed error $r');
+      if (r == 0) return null; // still buffering
+      return _readOutput();
+    } finally {
+      calloc.free(buf);
+    }
+  }
+
+  /// Force a final decode on whatever audio is currently buffered.
+  ///
+  /// Useful when the caller's audio source has ended (e.g. user stopped
+  /// recording) and they want the last partial flushed out. Returns the
+  /// resulting update, or `null` if nothing was buffered.
+  StreamingUpdate? flush() {
+    if (_closed) throw StateError('StreamingSession is closed');
+    if (_flushFn == null) return _readOutput();
+    final r = _flushFn!(_handle);
+    if (r <= 0) return null;
+    return _readOutput();
+  }
+
+  StreamingUpdate? _readOutput() {
+    final outCap = 4096;
+    final outBuf = calloc<Uint8>(outCap);
+    final out    = outBuf.cast<Utf8>();
+    final t0Ptr  = calloc<Double>();
+    final t1Ptr  = calloc<Double>();
+    final cntPtr = calloc<Int64>();
+
+    try {
+      final n = _getTextFn(_handle, out, outCap, t0Ptr, t1Ptr, cntPtr);
+      if (n <= 0) return null;
+      final counter = cntPtr.value;
+      if (counter == _lastCounter) return null; // same decode we already saw
+      _lastCounter = counter;
+      return StreamingUpdate(
+        text: out.toDartString(),
+        start: t0Ptr.value,
+        end: t1Ptr.value,
+        counter: counter,
+      );
+    } finally {
+      calloc.free(outBuf);
+      calloc.free(t0Ptr);
+      calloc.free(t1Ptr);
+      calloc.free(cntPtr);
+    }
+  }
+
+  /// Release the native session. Safe to call more than once.
+  void close() {
+    if (_closed) return;
+    _closed = true;
+    _closeFn(_handle);
   }
 }

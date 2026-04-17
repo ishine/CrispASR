@@ -217,9 +217,202 @@ CA_EXPORT void crispasr_vad_free(float * spans) {
 }
 
 // =========================================================================
+// Streaming transcription
+// =========================================================================
+//
+// Port of `examples/stream/stream.cpp`'s rolling-window approach, but
+// packaged as a pure-C-ABI struct so Dart can drive it without spinning
+// its own threads. Non-blocking: caller feeds PCM in chunks of any size,
+// and each feed whose accumulation crosses `step_ms` runs a single
+// `whisper_full` on the last `length_ms` of audio (plus a small `keep_ms`
+// context carry-over) and returns the concatenated text.
+//
+// This is the same "sliding-window" trick the CLI uses. It is not true
+// token-level streaming — it is chunked batch with context carry, which
+// is what whisper.cpp itself supports.
+
+struct crispasr_stream {
+    whisper_context * ctx = nullptr;      // not owned
+    int n_threads         = 4;
+    int step_ms           = 3000;
+    int length_ms         = 10000;
+    int keep_ms           = 200;
+    std::string language;                 // empty = auto
+    bool translate        = false;
+
+    int n_samples_step    = 0;            // cached from step_ms
+    int n_samples_length  = 0;
+    int n_samples_keep    = 0;
+
+    std::vector<float> accum;             // samples fed since last decode
+    std::vector<float> history;           // last decoded window (for carry)
+
+    // Last decode output, held here until caller pulls it with
+    // `crispasr_stream_get_text`.
+    std::string out_text;
+    double out_t0_s       = 0.0;
+    double out_t1_s       = 0.0;
+    bool   has_output     = false;
+
+    // Monotonic counter so callers can detect when output has been replaced
+    // by a subsequent decode even if the text didn't visibly change.
+    int64_t decode_counter = 0;
+
+    double stream_time_s  = 0.0;          // total audio fed, in seconds
+};
+
+CA_EXPORT crispasr_stream * crispasr_stream_open(whisper_context * ctx,
+                                                 int               n_threads,
+                                                 int               step_ms,
+                                                 int               length_ms,
+                                                 int               keep_ms,
+                                                 const char *      language,
+                                                 int               translate) {
+    if (!ctx) return nullptr;
+    auto * s = new crispasr_stream();
+    s->ctx       = ctx;
+    s->n_threads = n_threads > 0 ? n_threads : 4;
+    s->step_ms   = step_ms   > 0 ? step_ms   : 3000;
+    s->length_ms = length_ms > 0 ? length_ms : 10000;
+    s->keep_ms   = keep_ms   >= 0 ? keep_ms  : 200;
+    s->translate = translate != 0;
+    if (language && language[0] != '\0') s->language = language;
+
+    constexpr int kSampleRate = 16000;
+    s->n_samples_step   = (int) (1e-3 * s->step_ms   * kSampleRate);
+    s->n_samples_length = (int) (1e-3 * s->length_ms * kSampleRate);
+    s->n_samples_keep   = (int) (1e-3 * s->keep_ms   * kSampleRate);
+    return s;
+}
+
+CA_EXPORT void crispasr_stream_close(crispasr_stream * s) {
+    if (!s) return;
+    delete s;
+}
+
+static int crispasr_stream_run_decode(crispasr_stream * s) {
+    // Assemble the decode window: tail of `history` (length `n_samples_take`)
+    // + all of `accum`.
+    const int n_new  = (int) s->accum.size();
+    const int n_take = std::min((int) s->history.size(),
+                                std::max(0, s->n_samples_keep + s->n_samples_length - n_new));
+
+    std::vector<float> pcm;
+    pcm.reserve(n_take + n_new);
+    if (n_take > 0) {
+        const size_t start = s->history.size() - (size_t) n_take;
+        pcm.insert(pcm.end(),
+                   s->history.begin() + start,
+                   s->history.end());
+    }
+    pcm.insert(pcm.end(), s->accum.begin(), s->accum.end());
+
+    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    wparams.print_progress   = false;
+    wparams.print_realtime   = false;
+    wparams.print_timestamps = false;
+    wparams.print_special    = false;
+    wparams.single_segment   = true;         // mirror stream.cpp non-VAD path
+    wparams.no_timestamps    = false;
+    wparams.translate        = s->translate;
+    wparams.n_threads        = s->n_threads;
+    wparams.language         = s->language.empty() ? nullptr : s->language.c_str();
+    wparams.detect_language  = s->language.empty();
+    wparams.no_context       = true;
+
+    if (whisper_full(s->ctx, wparams, pcm.data(), (int) pcm.size()) != 0) {
+        return -1;
+    }
+
+    // Concatenate all segments produced by this decode.
+    const int n_seg = whisper_full_n_segments(s->ctx);
+    std::string text;
+    double t0_s = 1e18;
+    double t1_s = 0.0;
+    for (int i = 0; i < n_seg; ++i) {
+        const char * segtext = whisper_full_get_segment_text(s->ctx, i);
+        if (segtext) text += segtext;
+
+        const double t0 = whisper_full_get_segment_t0(s->ctx, i) / 100.0;
+        const double t1 = whisper_full_get_segment_t1(s->ctx, i) / 100.0;
+        if (t0 < t0_s) t0_s = t0;
+        if (t1 > t1_s) t1_s = t1;
+    }
+    if (n_seg == 0) { t0_s = 0.0; t1_s = 0.0; }
+
+    // Re-base timestamps onto absolute stream time: the last sample fed
+    // sits at `stream_time_s`; the start of the decode window sits
+    // `pcm.size() / 16000` seconds before that.
+    const double win_end_abs   = s->stream_time_s;
+    const double win_start_abs = win_end_abs - (double) pcm.size() / 16000.0;
+    s->out_text  = std::move(text);
+    s->out_t0_s  = win_start_abs + t0_s;
+    s->out_t1_s  = win_start_abs + t1_s;
+    s->has_output = true;
+    s->decode_counter += 1;
+
+    // Keep the last ~`length_ms + keep_ms` of audio as history so the next
+    // decode can carry context. Anything older is dropped.
+    s->history = pcm;
+    const int max_hist = s->n_samples_length + s->n_samples_keep;
+    if ((int) s->history.size() > max_hist) {
+        s->history.erase(s->history.begin(),
+                         s->history.begin() + ((int) s->history.size() - max_hist));
+    }
+    s->accum.clear();
+    return 0;
+}
+
+CA_EXPORT int crispasr_stream_feed(crispasr_stream * s,
+                                   const float *     pcm,
+                                   int               n_samples) {
+    if (!s || !pcm || n_samples <= 0) return -1;
+    s->accum.insert(s->accum.end(), pcm, pcm + n_samples);
+    s->stream_time_s += (double) n_samples / 16000.0;
+
+    if ((int) s->accum.size() < s->n_samples_step) {
+        return 0; // still buffering
+    }
+
+    if (crispasr_stream_run_decode(s) != 0) return -2;
+    return 1; // new output ready
+}
+
+CA_EXPORT int crispasr_stream_get_text(crispasr_stream * s,
+                                       char *            out_text,
+                                       int               out_cap,
+                                       double *          out_t0_s,
+                                       double *          out_t1_s,
+                                       int64_t *         out_counter) {
+    if (!s || !out_text || out_cap <= 0) return -1;
+    if (!s->has_output) {
+        out_text[0] = '\0';
+        if (out_t0_s) *out_t0_s = 0.0;
+        if (out_t1_s) *out_t1_s = 0.0;
+        if (out_counter) *out_counter = 0;
+        return 0;
+    }
+    std::strncpy(out_text, s->out_text.c_str(), out_cap - 1);
+    out_text[out_cap - 1] = '\0';
+    if (out_t0_s) *out_t0_s = s->out_t0_s;
+    if (out_t1_s) *out_t1_s = s->out_t1_s;
+    if (out_counter) *out_counter = s->decode_counter;
+    return (int) s->out_text.size();
+}
+
+/// Force a decode on whatever audio is currently buffered, regardless of
+/// whether we hit the step threshold. Useful when the caller knows the
+/// audio has ended and wants a final flush.
+CA_EXPORT int crispasr_stream_flush(crispasr_stream * s) {
+    if (!s) return -1;
+    if (s->accum.empty()) return 0;
+    return crispasr_stream_run_decode(s) == 0 ? 1 : -2;
+}
+
+// =========================================================================
 // Version reporting for the Dart binding
 // =========================================================================
 
 CA_EXPORT const char * crispasr_dart_helpers_version(void) {
-    return "0.2.0";
+    return "0.3.0";
 }
