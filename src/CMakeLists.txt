@@ -470,6 +470,15 @@ endif()
 if (TARGET canary_ctc)
     target_link_libraries(whisper PUBLIC canary_ctc)
 endif()
+if (TARGET voxtral)
+    target_link_libraries(whisper PUBLIC voxtral)
+endif()
+if (TARGET voxtral4b)
+    target_link_libraries(whisper PUBLIC voxtral4b)
+endif()
+if (TARGET wav2vec2-ggml)
+    target_link_libraries(whisper PUBLIC wav2vec2-ggml)
+endif()
 
 # Convenience alias: produce `libcrispasr.{dylib,so,dll}` as a symlink (or
 # copy on Windows) next to `libwhisper`, pointing at the same file. Lets

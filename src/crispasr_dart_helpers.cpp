@@ -44,6 +44,18 @@
   #include "canary_ctc.h"
   #define CA_HAVE_CTC 1
 #endif
+#if __has_include("voxtral.h")
+  #include "voxtral.h"
+  #define CA_HAVE_VOXTRAL 1
+#endif
+#if __has_include("voxtral4b.h")
+  #include "voxtral4b.h"
+  #define CA_HAVE_VOXTRAL4B 1
+#endif
+#if __has_include("wav2vec2-ggml.h")
+  #include "wav2vec2-ggml.h"
+  #define CA_HAVE_WAV2VEC2 1
+#endif
 
 #ifdef _WIN32
   #define CA_EXPORT extern "C" __declspec(dllexport)
@@ -609,6 +621,17 @@ struct crispasr_session {
     // pipeline.
     canary_ctc_context * ctc_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_VOXTRAL
+    voxtral_context * voxtral_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_VOXTRAL4B
+    voxtral4b_context * voxtral4b_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_WAV2VEC2
+    // wav2vec2_model is a C++ struct by-value; we heap-allocate it so
+    // Dart can carry a pointer. `nullptr` means this slot is unused.
+    wav2vec2_model * wav2vec2_ctx = nullptr;
+#endif
 };
 
 struct crispasr_session_seg {
@@ -700,6 +723,37 @@ CA_EXPORT crispasr_session * crispasr_session_open_explicit(const char * model_p
         return s;
     }
 #endif
+#ifdef CA_HAVE_VOXTRAL
+    if (s->backend == "voxtral") {
+        voxtral_context_params p = voxtral_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = 0;
+        s->voxtral_ctx = voxtral_init_from_file(model_path, p);
+        if (!s->voxtral_ctx) { delete s; return nullptr; }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_VOXTRAL4B
+    if (s->backend == "voxtral4b") {
+        voxtral4b_context_params p = voxtral4b_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = 0;
+        s->voxtral4b_ctx = voxtral4b_init_from_file(model_path, p);
+        if (!s->voxtral4b_ctx) { delete s; return nullptr; }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_WAV2VEC2
+    if (s->backend == "wav2vec2") {
+        s->wav2vec2_ctx = new wav2vec2_model();
+        if (!wav2vec2_load(model_path, *s->wav2vec2_ctx)) {
+            delete s->wav2vec2_ctx;
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 
     // Unknown or unsupported-in-this-build backend.
     delete s;
@@ -744,9 +798,181 @@ CA_EXPORT int crispasr_session_available_backends(char * out_csv, int out_cap) {
 #ifdef CA_HAVE_CTC
     list += ",fastconformer-ctc,canary-ctc";
 #endif
+#ifdef CA_HAVE_VOXTRAL
+    list += ",voxtral";
+#endif
+#ifdef CA_HAVE_VOXTRAL4B
+    list += ",voxtral4b";
+#endif
+#ifdef CA_HAVE_WAV2VEC2
+    list += ",wav2vec2";
+#endif
     std::strncpy(out_csv, list.c_str(), out_cap - 1);
     out_csv[out_cap - 1] = '\0';
     return (int) list.size();
+}
+
+// Shared greedy generation loop for Voxtral-family audio-LLM backends.
+// Each backend provides its own function pointers via the VoxtralOps trait
+// struct below so we can share the code without pulling in the full
+// CLI's crispasr_llm_pipeline.h (which depends on whisper_params and
+// other CLI-only machinery).
+//
+// Prompt convention matches the Tekken template the CLI uses:
+//   "<s>[INST][BEGIN_AUDIO]" + audio-pad×N_enc + "[/INST]lang:<LANG>[TRANSCRIBE]"
+// The audio-pad slot embeddings are replaced in place with the encoder
+// output so the LLM attends to the real audio features.
+template <typename Ctx>
+struct VoxtralFamilyOps {
+    // Function-pointer plumbing — populated via factory methods below so
+    // we can template over either voxtral_* or voxtral4b_* without
+    // macro-pasting.
+    typedef float *        (*ComputeMelFn)(Ctx *, const float *, int, int *, int *);
+    typedef float *        (*RunEncoderFn)(Ctx *, const float *, int, int, int *, int *);
+    typedef int32_t *      (*TokenizeFn)(Ctx *, const char *, int *);
+    typedef float *        (*EmbedTokensFn)(Ctx *, const int32_t *, int);
+    typedef bool           (*KvInitFn)(Ctx *, int);
+    typedef void           (*KvResetFn)(Ctx *);
+    typedef float *        (*RunLlmKvFn)(Ctx *, const float *, int, int, int *, int *);
+    typedef const uint8_t *(*TokenTextFn)(Ctx *, int, int *);
+
+    ComputeMelFn  compute_mel  = nullptr;
+    RunEncoderFn  run_encoder  = nullptr;
+    TokenizeFn    tokenize     = nullptr;
+    EmbedTokensFn embed_tokens = nullptr;
+    KvInitFn      kv_init      = nullptr;
+    KvResetFn     kv_reset     = nullptr;
+    RunLlmKvFn    run_llm_kv   = nullptr;
+    TokenTextFn   token_text   = nullptr;
+
+    int audio_pad_id = 24; // Tekken <audio_pad>
+    int eos_id       = 2;  // Tekken </s>
+};
+
+template <typename Ctx>
+static crispasr_session_result * run_voxtral_family(Ctx * ctx,
+                                                    const VoxtralFamilyOps<Ctx> & ops,
+                                                    const float * pcm, int n_samples,
+                                                    const std::string & language) {
+    auto * r = new crispasr_session_result();
+    r->segments.reserve(1);
+
+    // 1. Mel spectrogram.
+    int n_mels = 0, T_mel = 0;
+    float * mel = ops.compute_mel(ctx, pcm, n_samples, &n_mels, &T_mel);
+    if (!mel) { delete r; return nullptr; }
+
+    // 2. Audio encoder.
+    int N_enc = 0, enc_dim = 0;
+    float * audio_embeds = ops.run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &enc_dim);
+    std::free(mel);
+    if (!audio_embeds) { delete r; return nullptr; }
+
+    // 3. Tokenize prefix + build audio-pad run + tokenize suffix.
+    const char * prefix = "<s>[INST][BEGIN_AUDIO]";
+    const std::string suffix =
+        std::string("[/INST]lang:") + (language.empty() ? "en" : language) + "[TRANSCRIBE]";
+
+    int n_pref = 0;
+    int32_t * pref_ids = ops.tokenize(ctx, prefix, &n_pref);
+    int n_suf = 0;
+    int32_t * suf_ids  = ops.tokenize(ctx, suffix.c_str(), &n_suf);
+    if (!pref_ids || !suf_ids) {
+        if (pref_ids) std::free(pref_ids);
+        if (suf_ids)  std::free(suf_ids);
+        std::free(audio_embeds);
+        delete r;
+        return nullptr;
+    }
+
+    // 4. Embed prefix.
+    float * pref_embeds = ops.embed_tokens(ctx, pref_ids, n_pref);
+    std::free(pref_ids);
+    if (!pref_embeds) {
+        std::free(suf_ids); std::free(audio_embeds); delete r; return nullptr;
+    }
+
+    // 5. Embed suffix.
+    float * suf_embeds = ops.embed_tokens(ctx, suf_ids, n_suf);
+    std::free(suf_ids);
+    if (!suf_embeds) {
+        std::free(pref_embeds); std::free(audio_embeds); delete r; return nullptr;
+    }
+
+    // 6. Splice [prefix][audio][suffix] into one embedding buffer, then
+    //    prefill the KV cache with it in one shot.
+    const int total_tokens = n_pref + N_enc + n_suf;
+    std::vector<float> spliced((size_t) total_tokens * (size_t) enc_dim);
+    std::memcpy(spliced.data(),
+                pref_embeds,
+                (size_t) n_pref * (size_t) enc_dim * sizeof(float));
+    std::memcpy(spliced.data() + (size_t) n_pref * (size_t) enc_dim,
+                audio_embeds,
+                (size_t) N_enc * (size_t) enc_dim * sizeof(float));
+    std::memcpy(spliced.data() + (size_t)(n_pref + N_enc) * (size_t) enc_dim,
+                suf_embeds,
+                (size_t) n_suf * (size_t) enc_dim * sizeof(float));
+    std::free(pref_embeds);
+    std::free(audio_embeds);
+    std::free(suf_embeds);
+
+    // 7. KV-cache prefill. Allow enough room for ~512 new tokens.
+    constexpr int kMaxNewTokens = 512;
+    if (!ops.kv_init(ctx, total_tokens + kMaxNewTokens + 16)) {
+        delete r; return nullptr;
+    }
+    ops.kv_reset(ctx);
+
+    int out_n_tok = 0, out_vocab = 0;
+    float * logits = ops.run_llm_kv(ctx, spliced.data(), total_tokens, 0,
+                                    &out_n_tok, &out_vocab);
+    if (!logits || out_vocab <= 0) {
+        delete r; return nullptr;
+    }
+
+    // 8. Greedy generation loop. Pick argmax at each step, embed the new
+    //    token, feed it through run_llm_kv with n_past=total_tokens+step,
+    //    stop on EOS or kMaxNewTokens.
+    std::string generated;
+    generated.reserve(512);
+    int n_past = total_tokens;
+    for (int step = 0; step < kMaxNewTokens; ++step) {
+        // argmax over the last position's logits.
+        const float * last = logits + (size_t)(out_n_tok - 1) * (size_t) out_vocab;
+        int best = 0;
+        float best_score = last[0];
+        for (int i = 1; i < out_vocab; ++i) {
+            if (last[i] > best_score) { best_score = last[i]; best = i; }
+        }
+        std::free(logits);
+        logits = nullptr;
+
+        if (best == ops.eos_id) break;
+
+        int tok_len = 0;
+        const uint8_t * tok_bytes = ops.token_text(ctx, best, &tok_len);
+        if (tok_bytes && tok_len > 0) {
+            generated.append(reinterpret_cast<const char *>(tok_bytes), (size_t) tok_len);
+        }
+
+        // Embed the newly-chosen token and step the KV cache.
+        int32_t next_id = best;
+        float * next_emb = ops.embed_tokens(ctx, &next_id, 1);
+        if (!next_emb) break;
+        logits = ops.run_llm_kv(ctx, next_emb, 1, n_past,
+                                &out_n_tok, &out_vocab);
+        std::free(next_emb);
+        if (!logits) break;
+        n_past += 1;
+    }
+    if (logits) std::free(logits);
+
+    crispasr_session_seg seg;
+    seg.text = std::move(generated);
+    seg.t0 = 0;
+    seg.t1 = (int64_t)((double) n_samples * 100.0 / 16000.0);
+    r->segments.push_back(std::move(seg));
+    return r;
 }
 
 CA_EXPORT crispasr_session_result * crispasr_session_transcribe(crispasr_session * s,
@@ -851,6 +1077,58 @@ CA_EXPORT crispasr_session_result * crispasr_session_transcribe(crispasr_session
             s->granite_ctx, pcm, n_samples));
     }
 #endif
+#ifdef CA_HAVE_VOXTRAL
+    if (s->backend == "voxtral" && s->voxtral_ctx) {
+        delete r; // run_voxtral_family creates its own
+        VoxtralFamilyOps<voxtral_context> ops;
+        ops.compute_mel  = &voxtral_compute_mel;
+        ops.run_encoder  = &voxtral_run_encoder;
+        ops.tokenize     = &voxtral_tokenize;
+        ops.embed_tokens = &voxtral_embed_tokens;
+        ops.kv_init      = &voxtral_kv_init;
+        ops.kv_reset     = &voxtral_kv_reset;
+        ops.run_llm_kv   = &voxtral_run_llm_kv;
+        ops.token_text   = &voxtral_token_text;
+        ops.audio_pad_id = 24; // Tekken <audio_pad>
+        ops.eos_id       = 2;  // Tekken </s>
+        return run_voxtral_family(s->voxtral_ctx, ops, pcm, n_samples, /*lang=*/"en");
+    }
+#endif
+#ifdef CA_HAVE_VOXTRAL4B
+    if (s->backend == "voxtral4b" && s->voxtral4b_ctx) {
+        delete r;
+        VoxtralFamilyOps<voxtral4b_context> ops;
+        ops.compute_mel  = &voxtral4b_compute_mel;
+        ops.run_encoder  = &voxtral4b_run_encoder;
+        ops.tokenize     = &voxtral4b_tokenize;
+        ops.embed_tokens = &voxtral4b_embed_tokens;
+        ops.kv_init      = &voxtral4b_kv_init;
+        ops.kv_reset     = &voxtral4b_kv_reset;
+        ops.run_llm_kv   = &voxtral4b_run_llm_kv;
+        ops.token_text   = &voxtral4b_token_text;
+        ops.audio_pad_id = 24;
+        ops.eos_id       = 2;
+        return run_voxtral_family(s->voxtral4b_ctx, ops, pcm, n_samples, /*lang=*/"en");
+    }
+#endif
+#ifdef CA_HAVE_WAV2VEC2
+    if (s->backend == "wav2vec2" && s->wav2vec2_ctx) {
+        // Encoder + CTC head → logits → greedy decode, same pipeline
+        // wav2vec2-ggml.h advertises.
+        auto logits = wav2vec2_compute_logits(*s->wav2vec2_ctx, pcm, n_samples, s->n_threads);
+        if (logits.empty()) { delete r; return nullptr; }
+        const int V = (int) s->wav2vec2_ctx->hparams.vocab_size;
+        const int T = (int) (logits.size() / (size_t) V);
+        const std::string text = wav2vec2_greedy_decode(*s->wav2vec2_ctx, logits.data(), T);
+
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double) n_samples * 100.0 / 16000.0);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
 #ifdef CA_HAVE_CTC
     if ((s->backend == "fastconformer-ctc" || s->backend == "canary-ctc") && s->ctc_ctx) {
         // Two-stage: encoder → logits → greedy CTC decode. Same pipeline
@@ -937,6 +1215,19 @@ CA_EXPORT void crispasr_session_close(crispasr_session * s) {
 #endif
 #ifdef CA_HAVE_CTC
     if (s->ctc_ctx) canary_ctc_free(s->ctc_ctx);
+#endif
+#ifdef CA_HAVE_VOXTRAL
+    if (s->voxtral_ctx) voxtral_free(s->voxtral_ctx);
+#endif
+#ifdef CA_HAVE_VOXTRAL4B
+    if (s->voxtral4b_ctx) voxtral4b_free(s->voxtral4b_ctx);
+#endif
+#ifdef CA_HAVE_WAV2VEC2
+    if (s->wav2vec2_ctx) {
+        // wav2vec2 has no dedicated free fn — the destructor chain releases
+        // ggml_context, backend buffer, and tensors.
+        delete s->wav2vec2_ctx;
+    }
 #endif
     delete s;
 }
