@@ -24,6 +24,22 @@
   #include "parakeet.h"
   #define CA_HAVE_PARAKEET 1
 #endif
+#if __has_include("canary.h")
+  #include "canary.h"
+  #define CA_HAVE_CANARY 1
+#endif
+#if __has_include("qwen3_asr.h")
+  #include "qwen3_asr.h"
+  #define CA_HAVE_QWEN3 1
+#endif
+#if __has_include("cohere.h")
+  #include "cohere.h"
+  #define CA_HAVE_COHERE 1
+#endif
+#if __has_include("granite_speech.h")
+  #include "granite_speech.h"
+  #define CA_HAVE_GRANITE 1
+#endif
 
 #ifdef _WIN32
   #define CA_EXPORT extern "C" __declspec(dllexport)
@@ -570,6 +586,18 @@ struct crispasr_session {
 #ifdef CA_HAVE_PARAKEET
     parakeet_context * parakeet_ctx = nullptr;
 #endif
+#ifdef CA_HAVE_CANARY
+    canary_context * canary_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_QWEN3
+    qwen3_asr_context * qwen3_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_COHERE
+    cohere_context * cohere_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_GRANITE
+    granite_speech_context * granite_ctx = nullptr;
+#endif
 };
 
 struct crispasr_session_seg {
@@ -611,6 +639,46 @@ CA_EXPORT crispasr_session * crispasr_session_open_explicit(const char * model_p
         return s;
     }
 #endif
+#ifdef CA_HAVE_CANARY
+    if (s->backend == "canary") {
+        canary_context_params p = canary_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = 0;
+        s->canary_ctx = canary_init_from_file(model_path, p);
+        if (!s->canary_ctx) { delete s; return nullptr; }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_QWEN3
+    if (s->backend == "qwen3") {
+        qwen3_asr_context_params p = qwen3_asr_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = 0;
+        s->qwen3_ctx = qwen3_asr_init_from_file(model_path, p);
+        if (!s->qwen3_ctx) { delete s; return nullptr; }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_COHERE
+    if (s->backend == "cohere") {
+        cohere_context_params p = cohere_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = 0;
+        s->cohere_ctx = cohere_init_from_file(model_path, p);
+        if (!s->cohere_ctx) { delete s; return nullptr; }
+        return s;
+    }
+#endif
+#ifdef CA_HAVE_GRANITE
+    if (s->backend == "granite") {
+        granite_speech_context_params p = granite_speech_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = 0;
+        s->granite_ctx = granite_speech_init_from_file(model_path, p);
+        if (!s->granite_ctx) { delete s; return nullptr; }
+        return s;
+    }
+#endif
 
     // Unknown or unsupported-in-this-build backend.
     delete s;
@@ -639,6 +707,18 @@ CA_EXPORT int crispasr_session_available_backends(char * out_csv, int out_cap) {
     std::string list = "whisper";
 #ifdef CA_HAVE_PARAKEET
     list += ",parakeet";
+#endif
+#ifdef CA_HAVE_CANARY
+    list += ",canary";
+#endif
+#ifdef CA_HAVE_QWEN3
+    list += ",qwen3";
+#endif
+#ifdef CA_HAVE_COHERE
+    list += ",cohere";
+#endif
+#ifdef CA_HAVE_GRANITE
+    list += ",granite";
 #endif
     std::strncpy(out_csv, list.c_str(), out_cap - 1);
     out_csv[out_cap - 1] = '\0';
@@ -705,6 +785,49 @@ CA_EXPORT crispasr_session_result * crispasr_session_transcribe(crispasr_session
     }
 #endif
 
+    // Backends below all return a `char * malloc`'d transcript — we package
+    // the whole thing into a single segment with no word timings. They're
+    // LLM-style decoders (or ASR without native word-level alignment);
+    // word timestamps would need CTC alignment as a post-step.
+    auto run_char_transcribe = [&](char * raw) -> crispasr_session_result * {
+        if (!raw) { delete r; return nullptr; }
+        crispasr_session_seg seg;
+        seg.text = raw;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double) n_samples * 100.0 / 16000.0);
+        r->segments.push_back(std::move(seg));
+        std::free(raw);
+        return r;
+    };
+
+#ifdef CA_HAVE_CANARY
+    if (s->backend == "canary" && s->canary_ctx) {
+        // Default to English ASR (source=en, target=en, punctuation on).
+        // Full translation control is available through the backend-specific
+        // helpers if the caller wants to override.
+        return run_char_transcribe(canary_transcribe(
+            s->canary_ctx, pcm, n_samples, "en", "en", true));
+    }
+#endif
+#ifdef CA_HAVE_QWEN3
+    if (s->backend == "qwen3" && s->qwen3_ctx) {
+        return run_char_transcribe(qwen3_asr_transcribe(
+            s->qwen3_ctx, pcm, n_samples));
+    }
+#endif
+#ifdef CA_HAVE_COHERE
+    if (s->backend == "cohere" && s->cohere_ctx) {
+        return run_char_transcribe(cohere_transcribe(
+            s->cohere_ctx, pcm, n_samples, "en"));
+    }
+#endif
+#ifdef CA_HAVE_GRANITE
+    if (s->backend == "granite" && s->granite_ctx) {
+        return run_char_transcribe(granite_speech_transcribe(
+            s->granite_ctx, pcm, n_samples));
+    }
+#endif
+
     delete r;
     return nullptr;
 }
@@ -750,6 +873,18 @@ CA_EXPORT void crispasr_session_close(crispasr_session * s) {
     if (s->whisper_ctx) whisper_free(s->whisper_ctx);
 #ifdef CA_HAVE_PARAKEET
     if (s->parakeet_ctx) parakeet_free(s->parakeet_ctx);
+#endif
+#ifdef CA_HAVE_CANARY
+    if (s->canary_ctx) canary_free(s->canary_ctx);
+#endif
+#ifdef CA_HAVE_QWEN3
+    if (s->qwen3_ctx) qwen3_asr_free(s->qwen3_ctx);
+#endif
+#ifdef CA_HAVE_COHERE
+    if (s->cohere_ctx) cohere_free(s->cohere_ctx);
+#endif
+#ifdef CA_HAVE_GRANITE
+    if (s->granite_ctx) granite_speech_free(s->granite_ctx);
 #endif
     delete s;
 }

@@ -455,3 +455,47 @@ endif()
 if (TARGET parakeet)
     target_link_libraries(whisper PUBLIC parakeet)
 endif()
+if (TARGET canary)
+    target_link_libraries(whisper PUBLIC canary)
+endif()
+if (TARGET qwen3_asr)
+    target_link_libraries(whisper PUBLIC qwen3_asr)
+endif()
+if (TARGET cohere)
+    target_link_libraries(whisper PUBLIC cohere)
+endif()
+if (TARGET granite_speech)
+    target_link_libraries(whisper PUBLIC granite_speech)
+endif()
+
+# Convenience alias: produce `libcrispasr.{dylib,so,dll}` as a symlink (or
+# copy on Windows) next to `libwhisper`, pointing at the same file. Lets
+# downstream consumers that know CrispASR as a project — not as a
+# whisper.cpp fork — open the library under its "real" name. Existing
+# `libwhisper` consumers are unaffected.
+if (BUILD_SHARED_LIBS)
+    if (APPLE)
+        add_custom_command(TARGET whisper POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                $<TARGET_FILE_NAME:whisper>
+                libcrispasr.dylib
+            WORKING_DIRECTORY $<TARGET_FILE_DIR:whisper>
+            COMMENT "Creating libcrispasr.dylib -> $<TARGET_FILE_NAME:whisper> alias"
+        )
+    elseif (UNIX)
+        add_custom_command(TARGET whisper POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                $<TARGET_FILE_NAME:whisper>
+                libcrispasr.so
+            WORKING_DIRECTORY $<TARGET_FILE_DIR:whisper>
+            COMMENT "Creating libcrispasr.so -> $<TARGET_FILE_NAME:whisper> alias"
+        )
+    elseif (WIN32)
+        add_custom_command(TARGET whisper POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:whisper>
+                $<TARGET_FILE_DIR:whisper>/crispasr.dll
+            COMMENT "Copying $<TARGET_FILE:whisper> to crispasr.dll alias"
+        )
+    endif()
+endif()

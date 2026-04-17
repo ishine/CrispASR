@@ -732,14 +732,41 @@ class CrispASR {
 
   static String _findLib() => defaultLibName();
 
-  /// Platform-default filename for the CrispASR shared library. Public so
-  /// [CrispasrSession] and other consumers can open it with the same
-  /// convention [CrispASR] uses.
+  /// Platform-default filename for the CrispASR shared library.
+  ///
+  /// As of CrispASR 0.4.0 the build produces both `libcrispasr.*`
+  /// (preferred) and the historical `libwhisper.*` (alias). We open the
+  /// new name first, fall back to the old one if the user's bundle
+  /// predates the rename.
   static String defaultLibName() {
-    if (Platform.isAndroid || Platform.isLinux) return 'libwhisper.so';
-    if (Platform.isIOS || Platform.isMacOS) return 'whisper.framework/whisper';
-    if (Platform.isWindows) return 'whisper.dll';
-    return 'libwhisper.so';
+    for (final name in _libCandidates()) {
+      try {
+        DynamicLibrary.open(name); // probe
+        return name;
+      } catch (_) {/* try next */}
+    }
+    // Give the caller a sensible default to produce an error message
+    // against; opening it will throw and the exception text points at
+    // the name they can bundle.
+    return _libCandidates().first;
+  }
+
+  static List<String> _libCandidates() {
+    if (Platform.isAndroid || Platform.isLinux) {
+      return ['libcrispasr.so', 'libwhisper.so'];
+    }
+    if (Platform.isIOS || Platform.isMacOS) {
+      return [
+        'libcrispasr.dylib',
+        'crispasr.framework/crispasr',
+        'libwhisper.dylib',
+        'whisper.framework/whisper',
+      ];
+    }
+    if (Platform.isWindows) {
+      return ['crispasr.dll', 'whisper.dll'];
+    }
+    return ['libcrispasr.so', 'libwhisper.so'];
   }
 }
 
