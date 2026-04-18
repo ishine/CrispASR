@@ -124,6 +124,115 @@ DecodedAudio decodeAudioFile(String path, {String? libPath}) {
   }
 }
 
+/// One ASR segment passed in to [diarizeSegments]. Callers fill [t0] and
+/// [t1] (seconds) from the upstream transcribe result; the diarizer
+/// writes the zero-based speaker index into [speaker] (`-1` means the
+/// method had no info to pick).
+class DiarizeSegment {
+  final double t0;
+  final double t1;
+  int speaker;
+  DiarizeSegment({required this.t0, required this.t1, this.speaker = -1});
+}
+
+enum DiarizeMethod {
+  /// Stereo only. |L| vs |R| energy per segment, 1.1× margin.
+  energy,
+  /// Stereo only. TDOA via cross-correlation, ±5 ms search window.
+  xcorr,
+  /// Mono-friendly. Alternates 0/1 every time the inter-segment gap
+  /// exceeds 600 ms.
+  vadTurns,
+  /// Mono-friendly, ML-based. Runs the GGUF pyannote segmentation net.
+  /// Requires [pyannoteModelPath].
+  pyannote,
+}
+
+/// Assign a speaker index to each of [segs], based on the selected
+/// [method], mutating each [DiarizeSegment.speaker] in place.
+///
+/// `left` is mono PCM for mono-only methods, otherwise the left channel
+/// of a stereo pair. When `isStereo` is true, `right` must point at the
+/// right channel. All PCM is 16 kHz float32.
+///
+/// Returns `true` on success. The only failure case is
+/// [DiarizeMethod.pyannote] when the GGUF model can't be loaded — all
+/// other methods always succeed (they may leave individual segments
+/// with `speaker = -1` when they had no information to decide).
+///
+/// `sliceT0` is the absolute start time (seconds) of the PCM buffer
+/// within the original audio, so absolute segment times in [DiarizeSegment]
+/// can be mapped back to sample indices.
+bool diarizeSegments({
+  required List<DiarizeSegment> segs,
+  required Float32List left,
+  Float32List? right,
+  bool isStereo = false,
+  DiarizeMethod method = DiarizeMethod.vadTurns,
+  String? pyannoteModelPath,
+  int nThreads = 4,
+  double sliceT0 = 0.0,
+  DynamicLibrary? lib,
+}) {
+  if (segs.isEmpty || left.isEmpty) return true;
+  lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+
+  final n = left.length;
+  final leftPtr = calloc<Float>(n);
+  for (var i = 0; i < n; i++) leftPtr[i] = left[i];
+
+  Pointer<Float> rightPtr = leftPtr;
+  if (isStereo && right != null) {
+    rightPtr = calloc<Float>(right.length);
+    for (var i = 0; i < right.length; i++) rightPtr[i] = right[i];
+  }
+
+  // ABI struct layout must match `crispasr_diarize_seg_abi`:
+  // int64 t0_cs, int64 t1_cs, int32 speaker, int32 _pad. 24 bytes each.
+  final segsPtr = calloc<Uint8>(24 * segs.length);
+  for (var i = 0; i < segs.length; i++) {
+    final base = segsPtr.elementAt(i * 24);
+    base.cast<Int64>().value = (segs[i].t0 * 100).round();
+    base.elementAt(8).cast<Int64>().value = (segs[i].t1 * 100).round();
+    base.elementAt(16).cast<Int32>().value = segs[i].speaker;
+    base.elementAt(20).cast<Int32>().value = 0;
+  }
+
+  // ABI opts: int32 method, int32 n_threads, int64 slice_t0_cs, const char*.
+  // 4+4+8+8 = 24 bytes on 64-bit. We write each field explicitly.
+  final optsPtr = calloc<Uint8>(24);
+  optsPtr.cast<Int32>().value = method.index;
+  optsPtr.elementAt(4).cast<Int32>().value = nThreads;
+  optsPtr.elementAt(8).cast<Int64>().value = (sliceT0 * 100).round();
+  final pathPtr = (method == DiarizeMethod.pyannote &&
+          pyannoteModelPath != null &&
+          pyannoteModelPath.isNotEmpty)
+      ? pyannoteModelPath.toNativeUtf8()
+      : nullptr;
+  optsPtr.elementAt(16).cast<IntPtr>().value = pathPtr.address;
+
+  final fn = lib.lookupFunction<
+      Int32 Function(Pointer<Float>, Pointer<Float>, Int32, Int32,
+          Pointer<Uint8>, Int32, Pointer<Uint8>),
+      int Function(Pointer<Float>, Pointer<Float>, int, int, Pointer<Uint8>,
+          int, Pointer<Uint8>)>('crispasr_diarize_segments_abi');
+  final rc = fn(leftPtr, rightPtr, n, isStereo ? 1 : 0, segsPtr, segs.length, optsPtr);
+
+  if (rc == 0) {
+    for (var i = 0; i < segs.length; i++) {
+      segs[i].speaker = segsPtr.elementAt(i * 24 + 16).cast<Int32>().value;
+    }
+  }
+
+  calloc.free(leftPtr);
+  if (rightPtr != leftPtr) calloc.free(rightPtr);
+  calloc.free(segsPtr);
+  calloc.free(optsPtr);
+  if (pathPtr != nullptr) calloc.free(pathPtr);
+
+  return rc == 0;
+}
+
 /// Tunables for [CrispasrSession.transcribeVad]. Field names and defaults
 /// mirror whisper.cpp's `whisper_vad_params` plus the max-chunk fallback
 /// the shared library uses to bound encoder cost on long audio.

@@ -141,6 +141,29 @@ impl Default for CrispasrVadAbiOpts {
     }
 }
 
+/// ABI segment for [`crispasr_diarize_segments_abi`]. Caller fills
+/// `t0_cs` / `t1_cs`; the diarizer writes `speaker` (-1 if unassigned).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrispasrDiarizeSegAbi {
+    pub t0_cs: i64,
+    pub t1_cs: i64,
+    pub speaker: c_int,
+    pub _pad: c_int,
+}
+
+/// ABI options for [`crispasr_diarize_segments_abi`]. `method` is a
+/// value in 0..3: 0 = Energy, 1 = Xcorr, 2 = VadTurns, 3 = Pyannote.
+/// `pyannote_model_path` is required for Pyannote, ignored otherwise.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrispasrDiarizeOptsAbi {
+    pub method: c_int,
+    pub n_threads: c_int,
+    pub slice_t0_cs: i64,
+    pub pyannote_model_path: *const c_char,
+}
+
 extern "C" {
     pub fn crispasr_session_open(
         model_path: *const c_char,
@@ -186,6 +209,19 @@ extern "C" {
         vad_model_path: *const c_char,
         opts: *const CrispasrVadAbiOpts,
     ) -> *mut CrispasrSessionResult;
+
+    /// Shared speaker diarization (0.4.5+). Writes a zero-based speaker
+    /// index into each `segs[i].speaker`. Returns 0 on success, 1 on
+    /// Pyannote model load failure, -1 on invalid args.
+    pub fn crispasr_diarize_segments_abi(
+        left_pcm: *const c_float,
+        right_pcm: *const c_float,
+        n_samples: c_int,
+        is_stereo: c_int,
+        segs: *mut CrispasrDiarizeSegAbi,
+        n_segs: c_int,
+        opts: *const CrispasrDiarizeOptsAbi,
+    ) -> c_int;
 
     pub fn crispasr_session_result_n_segments(r: *mut CrispasrSessionResult) -> c_int;
     pub fn crispasr_session_result_segment_text(

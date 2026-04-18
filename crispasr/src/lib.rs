@@ -512,3 +512,144 @@ impl Drop for Session {
         unsafe { crispasr_sys::crispasr_session_close(self.handle) }
     }
 }
+
+// =========================================================================
+// Diarization (shared C-ABI, 0.4.5+)
+// =========================================================================
+
+/// One ASR segment passed to [`diarize_segments`]. Caller fills `t0` / `t1`
+/// (seconds) from the upstream transcribe result; the diarizer writes the
+/// zero-based speaker index into `speaker` (`-1` means the method had no
+/// info to pick).
+#[derive(Clone, Copy, Debug)]
+pub struct DiarizeSegment {
+    pub t0: f64,
+    pub t1: f64,
+    pub speaker: i32,
+}
+
+impl DiarizeSegment {
+    pub fn new(t0: f64, t1: f64) -> Self {
+        Self {
+            t0,
+            t1,
+            speaker: -1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum DiarizeMethod {
+    /// Stereo only. |L| vs |R| energy per segment, 1.1× margin.
+    Energy = 0,
+    /// Stereo only. TDOA via cross-correlation, ±5 ms search window.
+    Xcorr = 1,
+    /// Mono-friendly. Alternates 0/1 every >600 ms gap.
+    VadTurns = 2,
+    /// Mono-friendly, ML-based. Runs the GGUF pyannote segmentation net;
+    /// requires a model path.
+    Pyannote = 3,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiarizeOptions {
+    pub method: DiarizeMethod,
+    /// GGUF path. Required for `Pyannote`, ignored otherwise.
+    pub pyannote_model_path: Option<String>,
+    /// Threads for pyannote inference; ignored by other methods.
+    pub n_threads: i32,
+    /// Absolute start (seconds) of the PCM buffer within the original
+    /// audio, so the diarizer can map absolute segment timestamps back
+    /// to sample indices.
+    pub slice_t0: f64,
+}
+
+impl Default for DiarizeOptions {
+    fn default() -> Self {
+        Self {
+            method: DiarizeMethod::VadTurns,
+            pyannote_model_path: None,
+            n_threads: 4,
+            slice_t0: 0.0,
+        }
+    }
+}
+
+/// Assign a speaker index to each of `segs`, mutating each
+/// [`DiarizeSegment::speaker`] in place.
+///
+/// Four methods — see [`DiarizeMethod`]. `left` is mono PCM for
+/// mono-only methods, otherwise the left channel of a stereo pair.
+/// When `is_stereo` is true, `right` must be `Some`. All PCM is 16 kHz
+/// float32.
+///
+/// Returns `Ok(())` on success. Only [`DiarizeMethod::Pyannote`] can
+/// fail (model load failure).
+pub fn diarize_segments(
+    segs: &mut [DiarizeSegment],
+    left: &[f32],
+    right: Option<&[f32]>,
+    is_stereo: bool,
+    opts: &DiarizeOptions,
+) -> Result<(), String> {
+    if segs.is_empty() || left.is_empty() {
+        return Ok(());
+    }
+
+    let path_c = match (&opts.pyannote_model_path, opts.method) {
+        (Some(p), DiarizeMethod::Pyannote) => Some(
+            CString::new(p.as_str())
+                .map_err(|e| format!("pyannote_model_path contains NUL: {e}"))?,
+        ),
+        _ => None,
+    };
+
+    let abi_opts = crispasr_sys::CrispasrDiarizeOptsAbi {
+        method: opts.method as i32,
+        n_threads: opts.n_threads,
+        slice_t0_cs: (opts.slice_t0 * 100.0).round() as i64,
+        pyannote_model_path: path_c
+            .as_ref()
+            .map(|c| c.as_ptr())
+            .unwrap_or(std::ptr::null()),
+    };
+
+    let mut abi_segs: Vec<crispasr_sys::CrispasrDiarizeSegAbi> = segs
+        .iter()
+        .map(|s| crispasr_sys::CrispasrDiarizeSegAbi {
+            t0_cs: (s.t0 * 100.0).round() as i64,
+            t1_cs: (s.t1 * 100.0).round() as i64,
+            speaker: s.speaker,
+            _pad: 0,
+        })
+        .collect();
+
+    let right_ptr = match (is_stereo, right) {
+        (true, Some(r)) => r.as_ptr(),
+        _ => left.as_ptr(),
+    };
+
+    let rc = unsafe {
+        crispasr_sys::crispasr_diarize_segments_abi(
+            left.as_ptr(),
+            right_ptr,
+            left.len() as i32,
+            if is_stereo { 1 } else { 0 },
+            abi_segs.as_mut_ptr(),
+            abi_segs.len() as i32,
+            &abi_opts,
+        )
+    };
+    match rc {
+        0 => {
+            for (i, s) in segs.iter_mut().enumerate() {
+                s.speaker = abi_segs[i].speaker;
+            }
+            Ok(())
+        }
+        1 => Err("pyannote model load failed".to_string()),
+        -1 => Err("invalid arguments to crispasr_diarize_segments_abi".to_string()),
+        other => Err(format!("crispasr_diarize_segments_abi returned {other}")),
+    }
+}

@@ -13,7 +13,7 @@
 #include "crispasr_model_mgr.h"
 #include "crispasr_aligner.h"
 #include "crispasr_lid.h"
-#include "crispasr_diarize.h"
+#include "crispasr_diarize_cli.h"
 #include "whisper_params.h"
 
 #include "common-whisper.h" // read_audio_data

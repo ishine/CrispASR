@@ -119,6 +119,10 @@ add_library(whisper
             # Consumed by the CLI and by the C-ABI `crispasr_session_transcribe_vad`
             # wrapper so every language binding benefits without re-implementing.
             crispasr_vad.cpp
+            # Shared diarization methods (energy, xcorr, vad-turns, pyannote).
+            # Consumed by the CLI and by the C-ABI `crispasr_diarize_segments`.
+            # The sherpa-ONNX subprocess method stays in the CLI shim.
+            crispasr_diarize.cpp
             )
 # Non-Whisper backends reachable through crispasr_c_api.cpp are linked
 # into libwhisper further down in this file, once those targets have been
@@ -489,6 +493,12 @@ if (TARGET voxtral4b)
 endif()
 if (TARGET wav2vec2-ggml)
     target_link_libraries(whisper PUBLIC wav2vec2-ggml)
+endif()
+# Pyannote segmentation is not a backend; it's consumed by
+# crispasr_diarize.cpp for the "pyannote" method. Still needs linking in
+# so the native diarizer's symbols resolve at libwhisper load time.
+if (TARGET pyannote-seg)
+    target_link_libraries(whisper PUBLIC pyannote-seg)
 endif()
 
 # Convenience alias: produce `libcrispasr.{dylib,so,dll}` as a symlink (or

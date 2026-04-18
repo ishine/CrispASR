@@ -75,6 +75,10 @@ void main() {
       // stitches with 0.1s gaps, remaps timestamps — same algorithm
       // as the CLI's --vad path, reachable from every binding.
       'crispasr_session_transcribe_vad',
+      // Shared diarization (0.4.5+). Assigns a speaker index to each
+      // caller-supplied segment; 4 methods (energy, xcorr, vad-turns,
+      // pyannote) share the library path with the CLI.
+      'crispasr_diarize_segments_abi',
       // Canonical C-ABI version symbol (was `crispasr_dart_helpers_version`
       // before the file moved to `src/crispasr_c_api.cpp`).
       'crispasr_c_api_version',

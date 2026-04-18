@@ -355,6 +355,116 @@ class SessionSegment:
     words: List[SessionWord]
 
 
+# =========================================================================
+# Diarization (shared C-ABI, 0.4.5+)
+# =========================================================================
+
+class DiarizeMethod:
+    """Diarization method identifiers matching the C-ABI enum."""
+    ENERGY = 0      # stereo only
+    XCORR = 1       # stereo only
+    VAD_TURNS = 2   # mono-friendly, timing-based
+    PYANNOTE = 3    # mono-friendly, GGUF pyannote seg model
+
+
+@dataclass
+class DiarizeSegment:
+    """One ASR segment passed in to :func:`diarize_segments`.
+
+    The caller fills ``t0`` / ``t1`` (seconds) from the upstream
+    transcribe result; the diarizer writes the zero-based speaker index
+    into ``speaker`` (``-1`` means the method had no info to pick).
+    """
+    t0: float
+    t1: float
+    speaker: int = -1
+
+
+def diarize_segments(
+    segs: List[DiarizeSegment],
+    left: np.ndarray,
+    *,
+    right: Optional[np.ndarray] = None,
+    is_stereo: bool = False,
+    method: int = DiarizeMethod.VAD_TURNS,
+    pyannote_model_path: Optional[str] = None,
+    n_threads: int = 4,
+    slice_t0: float = 0.0,
+    lib_path: Optional[str] = None,
+) -> bool:
+    """Assign a speaker index to each of ``segs``, mutating in place.
+
+    Four methods — see :class:`DiarizeMethod`. ``left`` is mono PCM for
+    mono-only methods, otherwise the left channel of a stereo pair.
+    All PCM is 16 kHz float32. Returns ``True`` on success; only
+    ``PYANNOTE`` can fail (model load failure).
+    """
+    if not segs or left is None or len(left) == 0:
+        return True
+
+    lib = ctypes.CDLL(lib_path or _find_lib())
+    if not hasattr(lib, "crispasr_diarize_segments_abi"):
+        raise RuntimeError(
+            "crispasr_diarize_segments_abi not in loaded library — rebuild "
+            "CrispASR 0.4.5+ to use diarization from the Python binding."
+        )
+    lib.crispasr_diarize_segments_abi.argtypes = [
+        ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+        ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p,
+        ctypes.c_int32, ctypes.c_void_p,
+    ]
+    lib.crispasr_diarize_segments_abi.restype = ctypes.c_int
+
+    left_np = np.asarray(left, dtype=np.float32)
+    left_ptr = left_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    if is_stereo and right is not None:
+        right_np = np.asarray(right, dtype=np.float32)
+        right_ptr = right_np.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    else:
+        right_ptr = left_ptr
+
+    # ABI structs must match crispasr_c_api.cpp.
+    class _SegAbi(ctypes.Structure):
+        _fields_ = [
+            ("t0_cs", ctypes.c_int64),
+            ("t1_cs", ctypes.c_int64),
+            ("speaker", ctypes.c_int32),
+            ("_pad", ctypes.c_int32),
+        ]
+
+    class _OptsAbi(ctypes.Structure):
+        _fields_ = [
+            ("method", ctypes.c_int32),
+            ("n_threads", ctypes.c_int32),
+            ("slice_t0_cs", ctypes.c_int64),
+            ("pyannote_model_path", ctypes.c_char_p),
+        ]
+
+    seg_array = (_SegAbi * len(segs))()
+    for i, s in enumerate(segs):
+        seg_array[i].t0_cs = int(round(s.t0 * 100))
+        seg_array[i].t1_cs = int(round(s.t1 * 100))
+        seg_array[i].speaker = s.speaker
+        seg_array[i]._pad = 0
+
+    opts = _OptsAbi(
+        method=int(method),
+        n_threads=int(n_threads),
+        slice_t0_cs=int(round(slice_t0 * 100)),
+        pyannote_model_path=(pyannote_model_path.encode("utf-8")
+                             if pyannote_model_path else None),
+    )
+
+    rc = lib.crispasr_diarize_segments_abi(
+        left_ptr, right_ptr, int(len(left_np)), 1 if is_stereo else 0,
+        ctypes.byref(seg_array), len(segs), ctypes.byref(opts),
+    )
+    if rc == 0:
+        for i, s in enumerate(segs):
+            s.speaker = int(seg_array[i].speaker)
+    return rc == 0
+
+
 class Session:
     """Backend-agnostic transcription session over any CrispASR-supported GGUF.
 
@@ -428,6 +538,14 @@ class Session:
                 ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p,
             ]
             lib.crispasr_session_transcribe_vad.restype = ctypes.c_void_p
+        # 0.4.5+: shared speaker diarization. Same hasattr guard.
+        if hasattr(lib, "crispasr_diarize_segments_abi"):
+            lib.crispasr_diarize_segments_abi.argtypes = [
+                ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+                ctypes.c_int32, ctypes.c_int32, ctypes.c_void_p,
+                ctypes.c_int32, ctypes.c_void_p,
+            ]
+            lib.crispasr_diarize_segments_abi.restype = ctypes.c_int
         lib.crispasr_session_result_n_segments.argtypes = [ctypes.c_void_p]
         lib.crispasr_session_result_n_segments.restype = ctypes.c_int
         lib.crispasr_session_result_segment_text.argtypes = [ctypes.c_void_p, ctypes.c_int]

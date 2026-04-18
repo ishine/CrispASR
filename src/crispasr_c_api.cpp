@@ -20,7 +20,8 @@
 #include <vector>
 
 #include "whisper.h"
-#include "crispasr_vad.h" // VAD slicing + stitching (shared with CLI)
+#include "crispasr_vad.h"     // VAD slicing + stitching (shared with CLI)
+#include "crispasr_diarize.h" // Speaker diarization (shared with CLI)
 // Non-Whisper backend headers. Each of these lives in `src/` and is built as
 // its own shared library — we link them into libwhisper privately so Dart
 // only has to open one library to reach every backend. Any missing header
@@ -1358,6 +1359,69 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_vad(crispasr_sess
         }
     }
     return r;
+}
+
+// ---------------------------------------------------------------------------
+// Speaker diarization (shared across all 4 consumers).
+//
+// Operates on a PCM buffer + a caller-supplied array of segment timings,
+// writes a zero-based speaker index into each segment. Four methods:
+//   0 Energy    — stereo only, |L| vs |R| per segment
+//   1 Xcorr     — stereo only, TDOA via cross-correlation
+//   2 VadTurns  — mono-friendly, alternates every >600 ms gap
+//   3 Pyannote  — mono-friendly, ML via GGUF pyannote seg model
+//
+// `right_pcm` may be null when `is_stereo == 0`. `opts->pyannote_model_path`
+// must point at a concrete GGUF for the Pyannote method; other methods
+// ignore it.
+//
+// Returns 0 on success, 1 when Pyannote was requested but the model
+// failed to load, -1 on invalid arguments. `speaker = -1` in a seg
+// means the method had no information to pick a label for that segment.
+// ---------------------------------------------------------------------------
+struct crispasr_diarize_seg_abi {
+    int64_t t0_cs;
+    int64_t t1_cs;
+    int32_t speaker; // out: -1 if unassigned
+    int32_t _pad;
+};
+
+struct crispasr_diarize_opts_abi {
+    int32_t method; // 0..3 from crispasr_diarize_method_t
+    int32_t n_threads;
+    int64_t slice_t0_cs;
+    const char* pyannote_model_path; // required for method 3, ignored otherwise
+};
+
+CA_EXPORT int crispasr_diarize_segments_abi(const float* left_pcm, const float* right_pcm, int32_t n_samples,
+                                            int32_t is_stereo, crispasr_diarize_seg_abi* segs, int32_t n_segs,
+                                            const crispasr_diarize_opts_abi* opts) {
+    if (!left_pcm || !segs || n_segs <= 0 || !opts)
+        return -1;
+    if (opts->method < 0 || opts->method > 3)
+        return -1;
+
+    CrispasrDiarizeOptions lib_opts;
+    lib_opts.method = static_cast<CrispasrDiarizeMethod>(opts->method);
+    lib_opts.n_threads = opts->n_threads > 0 ? opts->n_threads : 4;
+    lib_opts.slice_t0_cs = opts->slice_t0_cs;
+    if (opts->pyannote_model_path)
+        lib_opts.pyannote_model_path = opts->pyannote_model_path;
+
+    std::vector<CrispasrDiarizeSegment> lib_segs;
+    lib_segs.reserve(n_segs);
+    for (int i = 0; i < n_segs; i++)
+        lib_segs.push_back({segs[i].t0_cs, segs[i].t1_cs, segs[i].speaker});
+
+    const float* r = (is_stereo && right_pcm) ? right_pcm : left_pcm;
+    const bool ok = crispasr_diarize_segments(left_pcm, r, n_samples, is_stereo != 0, lib_segs, lib_opts);
+    if (!ok)
+        return 1;
+
+    for (int i = 0; i < n_segs; i++) {
+        segs[i].speaker = lib_segs[i].speaker;
+    }
+    return 0;
 }
 
 CA_EXPORT int crispasr_session_result_n_segments(crispasr_session_result* r) {
