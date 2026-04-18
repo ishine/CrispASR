@@ -73,16 +73,20 @@ std::vector<crispasr_audio_slice> crispasr_compute_audio_slices(const float* sam
 
         const int nv = vseg ? whisper_vad_segments_n_segments(vseg) : 0;
         for (int i = 0; i < nv; i++) {
-            const float t0s = whisper_vad_segments_get_segment_t0(vseg, i);
-            const float t1s = whisper_vad_segments_get_segment_t1(vseg, i);
+            // The whisper VAD API returns timestamps in centiseconds,
+            // not seconds. Convert to seconds for sample index computation.
+            const float t0_cs = whisper_vad_segments_get_segment_t0(vseg, i);
+            const float t1_cs = whisper_vad_segments_get_segment_t1(vseg, i);
+            const float t0s = t0_cs / 100.0f;
+            const float t1s = t1_cs / 100.0f;
             const int s = std::max(0, (int)(t0s * sample_rate));
             const int e = std::min(n_samples, (int)(t1s * sample_rate));
             if (e > s) {
                 slices.push_back({
                     s,
                     e,
-                    (int64_t)(t0s * 100.0f),
-                    (int64_t)(t1s * 100.0f),
+                    (int64_t)t0_cs,
+                    (int64_t)t1_cs,
                 });
             }
         }
