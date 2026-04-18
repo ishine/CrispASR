@@ -554,4 +554,6 @@ backends that lack native timestamps (voxtral, granite, cohere).
 | **Done** | #17 VAD stitching | Stitch + remap matching whisper.cpp | ~155 LOC |
 | **Medium** | #18 Aligner LIS | Full LIS monotonicity fix + language-specific tokenization | ~80 LOC |
 | **Medium** | #15 CMake target rename | Rename whisper-cli → crispasr across CI/tests/scripts (~50 refs) | ~50 files |
+| **High** | #19 wav2vec2-base support | Fix forward pass for base models (768 hidden, group norm) | ~50 LOC |
+| **Medium** | #20 OGG support on Windows | stb_vorbis not linked or read_audio_data path issue (#10) | ~20 LOC |
 | **Low** | #16 Shaw RPE for granite graph | Add query-dependent position bias to encoder graph | ~80 LOC |
