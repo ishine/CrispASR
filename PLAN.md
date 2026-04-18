@@ -551,7 +551,7 @@ backends that lack native timestamps (voxtral, granite, cohere).
 | **Low** | #11 WebSocket streaming | Needs new dependency | ~300 LOC |
 | **Low** | #12 Pipeline template | ROI too small with only 4 backends | 0 LOC |
 | **Low** | #14 Cleanup | Cosmetic | ~20 LOC |
-| **High** | #17 VAD stitching | Stitch VAD segments into one buffer like whisper.cpp, remap timestamps | ~100 LOC |
+| **Done** | #17 VAD stitching | Stitch + remap matching whisper.cpp | ~155 LOC |
 | **Medium** | #18 Aligner LIS | Full LIS monotonicity fix + language-specific tokenization | ~80 LOC |
 | **Medium** | #15 CMake target rename | Rename whisper-cli → crispasr across CI/tests/scripts (~50 refs) | ~50 files |
 | **Low** | #16 Shaw RPE for granite graph | Add query-dependent position bias to encoder graph | ~80 LOC |

@@ -655,3 +655,99 @@ the fseek path entirely.
 that might exceed 2 GB. Always use platform-specific 64-bit seek. This
 is a classic portability trap that doesn't manifest on Linux/macOS
 (where `long` is 64-bit on LP64).
+
+---
+
+## VAD integration and long audio (April 2026)
+
+### whisper VAD returns centiseconds, not seconds
+
+The `whisper_vad_segments_get_segment_t0/t1()` functions return
+timestamps in **centiseconds** (e.g. 29.0 = 0.29 seconds), not
+seconds. Our initial integration multiplied by `sample_rate` directly,
+producing sample indices 100× too large. Every segment fell past the
+end of the audio, causing "no speech detected" for every file.
+
+**Lesson:** Always check the units of external API return values. The
+whisper.cpp VAD API stores `start`/`end` via `samples_to_cs()` (line
+5676) and the internal code divides by 100.0 for display (line 6914).
+The getter functions return the raw centisecond values.
+
+### Short VAD segments break ASR quality
+
+Silero VAD can produce very short segments (0.35s) for speech with
+brief pauses. These are too short for most ASR encoders to produce
+reliable output. On jfk.wav (11s), the VAD split into 5 segments of
+0.35-2.4s each, causing parakeet to produce garbled output.
+
+**Fix:** Post-merge adjacent VAD segments: combine if gap < 1s or if
+the accumulated segment is shorter than 3s. This produces 2 merged
+segments instead of 5 tiny ones, with correct transcription.
+
+### VAD stitching matches whisper.cpp quality
+
+whisper.cpp stitches VAD segments into one contiguous buffer with 0.1s
+silence gaps, builds a mapping table, processes as one audio stream,
+then remaps timestamps. This is fundamentally better than independent
+per-slice processing because the decoder sees continuous audio context.
+
+We now do the same for non-whisper backends: stitch → single
+`transcribe()` call → remap. Tested on 89s and 227s audio — no
+boundary artifacts, correct timestamps throughout.
+
+### Backend-specific audio length limits
+
+| Backend | Mel length | Hard limit? | Notes |
+|---|---|---|---|
+| whisper | 3000 frames (30s) | Yes | Pads to exactly 3000 frames |
+| voxtral 3B | 3000 frames (30s) | Yes | `T_mel = 3000` hardcoded |
+| voxtral4b | variable | No | Causal encoder, streams |
+| qwen3 | variable | No | Chunked conv subsampler |
+| parakeet | variable | No | O(T²) attention, ~5min practical limit |
+| canary | variable | No | O(T²) attention, ~5min practical limit |
+| cohere | variable | No | O(T²) attention, ~5min practical limit |
+| granite | variable | No | Block-local attention (ctx=200), any length |
+
+For whisper and voxtral 3B, 30s chunking is mandatory. For the rest,
+longer chunks work but hit O(T²) memory walls. VAD stitching helps by
+removing silence (shorter effective audio), and the max-chunk split
+prevents OOM on very long continuous speech.
+
+### Qwen3 forced aligner leading-silence issue
+
+The qwen3 forced aligner assigns timestamps starting from 0 even when
+audio has leading silence. On the user's 227s JavaScript tutorial with
+~3s of leading silence, the first word was stamped at 0.24s instead
+of ~3.2s. With VAD stitching, the silence is removed before alignment,
+fixing the issue.
+
+**Lesson:** The forced aligner only works well when the audio starts
+with speech. Always use VAD to trim silence before alignment.
+
+### Qwen3 forced aligner monotonicity
+
+The reference implementation (`qwen3_forced_aligner.py`) has a
+`fix_timestamp()` function using longest-increasing-subsequence (LIS)
+to correct non-monotonic timestamps. We use a simpler forward clamp
+(each timestamp >= previous). This handles most cases but may miss
+complex inversions. Parakeet's native TDT timestamps are always
+better when available.
+
+### CrispASR vs voxtral.c: 3.8× faster on CPU
+
+Direct same-hardware comparison (Xeon 4-core, no GPU) on jfk.wav:
+- voxtral.c (OpenBLAS): 11m 0s (encoder 220s, decoder 2660ms/step)
+- CrispASR (ggml): 2m 52s
+- Speedup: 3.8×, attributable to ggml's optimised matmul kernels
+
+### Susurrus architecture insights
+
+Susurrus (CrispStrobe's Python ASR tool) uses:
+- `vad_filter=True` hardcoded in faster-whisper (always on)
+- 25-minute chunks with 2s overlap for voxtral local
+- GPU memory explicitly freed between chunks (`torch.cuda.empty_cache`)
+- Generator-based segment yielding (streaming/incremental)
+
+**Lesson:** VAD should be the default, not an opt-in. 30s chunks are
+too conservative for most models; 5-10 minutes is practical for
+variable-length backends on 16GB VRAM.
