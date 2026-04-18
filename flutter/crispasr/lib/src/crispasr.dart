@@ -214,6 +214,20 @@ class TranscribeOptions {
   /// Silence the library's own stdout output.
   final bool silent;
 
+  // --- VAD (Silero, built into whisper.cpp). Set [vad] + [vadModelPath]
+  // to have whisper skip silent regions automatically; the rest are
+  // fine-tuning knobs. ---
+  final bool vad;
+  final String? vadModelPath;
+  final double vadThreshold;
+  final int vadMinSpeechMs;
+  final int vadMinSilenceMs;
+
+  /// tinydiarize speaker-turn markers. Requires a whisper .en.tdrz
+  /// finetune; output will contain `[SPEAKER_TURN]` tokens the host can
+  /// split segments on.
+  final bool tdrz;
+
   const TranscribeOptions({
     this.strategy = 0,
     this.language,
@@ -225,6 +239,12 @@ class TranscribeOptions {
     this.nThreads = 0,
     this.initialPrompt,
     this.silent = true,
+    this.vad = false,
+    this.vadModelPath,
+    this.vadThreshold = 0.5,
+    this.vadMinSpeechMs = 250,
+    this.vadMinSilenceMs = 100,
+    this.tdrz = false,
   });
 }
 
@@ -370,6 +390,14 @@ class CrispASR {
   _ParamsSetBool?   _paramsSetPrintTimestamps;
   _ParamsSetBool?   _paramsSetPrintSpecial;
 
+  // 0.4.2 additions — VAD + tinydiarize setters on whisper_full_params.
+  _ParamsSetBool?   _paramsSetVad;
+  _ParamsSetString? _paramsSetVadModelPath;
+  _ParamsSetFloat?  _paramsSetVadThreshold;
+  _ParamsSetInt?    _paramsSetVadMinSpeechMs;
+  _ParamsSetInt?    _paramsSetVadMinSilenceMs;
+  _ParamsSetBool?   _paramsSetTdrz;
+
   _FullNTokens? _fullNTokens;
   _TokenText?   _tokenText;
   _TokenT0?     _tokenT0;
@@ -468,6 +496,26 @@ class CrispASR {
       _paramsSetPrintSpecial = _lib.lookupFunction<_ParamsSetBoolNative, _ParamsSetBool>('crispasr_params_set_print_special');
     }
 
+    // 0.4.2 — VAD + tdrz.
+    if (_lib.providesSymbol('crispasr_params_set_vad')) {
+      _paramsSetVad = _lib.lookupFunction<_ParamsSetBoolNative, _ParamsSetBool>('crispasr_params_set_vad');
+    }
+    if (_lib.providesSymbol('crispasr_params_set_vad_model_path')) {
+      _paramsSetVadModelPath = _lib.lookupFunction<_ParamsSetStringNative, _ParamsSetString>('crispasr_params_set_vad_model_path');
+    }
+    if (_lib.providesSymbol('crispasr_params_set_vad_threshold')) {
+      _paramsSetVadThreshold = _lib.lookupFunction<_ParamsSetFloatNative, _ParamsSetFloat>('crispasr_params_set_vad_threshold');
+    }
+    if (_lib.providesSymbol('crispasr_params_set_vad_min_speech_ms')) {
+      _paramsSetVadMinSpeechMs = _lib.lookupFunction<_ParamsSetIntNative, _ParamsSetInt>('crispasr_params_set_vad_min_speech_ms');
+    }
+    if (_lib.providesSymbol('crispasr_params_set_vad_min_silence_ms')) {
+      _paramsSetVadMinSilenceMs = _lib.lookupFunction<_ParamsSetIntNative, _ParamsSetInt>('crispasr_params_set_vad_min_silence_ms');
+    }
+    if (_lib.providesSymbol('crispasr_params_set_tdrz')) {
+      _paramsSetTdrz = _lib.lookupFunction<_ParamsSetBoolNative, _ParamsSetBool>('crispasr_params_set_tdrz');
+    }
+
     if (_lib.providesSymbol('whisper_full_n_tokens')) {
       _fullNTokens = _lib.lookupFunction<_FullNTokensNative, _FullNTokens>('whisper_full_n_tokens');
     }
@@ -543,6 +591,7 @@ class CrispASR {
     final params = _defaultParams(opts.strategy);
     Pointer<Utf8>? langPtr;
     Pointer<Utf8>? promptPtr;
+    Pointer<Utf8>? vadPathPtr;
 
     try {
       // Apply every option we have a setter for. Older dylibs skip these.
@@ -566,6 +615,17 @@ class CrispASR {
         promptPtr = opts.initialPrompt!.toNativeUtf8();
         _paramsSetInitialPrompt?.call(params, promptPtr);
       }
+      if (opts.vad) {
+        _paramsSetVad?.call(params, 1);
+        _paramsSetVadThreshold?.call(params, opts.vadThreshold);
+        _paramsSetVadMinSpeechMs?.call(params, opts.vadMinSpeechMs);
+        _paramsSetVadMinSilenceMs?.call(params, opts.vadMinSilenceMs);
+        if (opts.vadModelPath != null && opts.vadModelPath!.isNotEmpty) {
+          vadPathPtr = opts.vadModelPath!.toNativeUtf8();
+          _paramsSetVadModelPath?.call(params, vadPathPtr);
+        }
+      }
+      if (opts.tdrz) _paramsSetTdrz?.call(params, 1);
 
       final ret = _full(_ctx, params, samples, pcm.length);
       if (ret != 0) throw Exception('Transcription failed (error $ret)');
@@ -576,6 +636,7 @@ class CrispASR {
       calloc.free(samples);
       if (langPtr != null) calloc.free(langPtr);
       if (promptPtr != null) calloc.free(promptPtr);
+      if (vadPathPtr != null) calloc.free(vadPathPtr);
     }
   }
 

@@ -168,6 +168,19 @@ class CrispASR:
         lib.whisper_lang_str.argtypes = [ctypes.c_int]
         lib.whisper_lang_str.restype = ctypes.c_char_p
 
+        # 0.4.2 — VAD + tdrz param setters on whisper_full_params.
+        for _sym, _argtypes in [
+            ("crispasr_params_set_vad", [ctypes.c_void_p, ctypes.c_int]),
+            ("crispasr_params_set_vad_model_path", [ctypes.c_void_p, ctypes.c_char_p]),
+            ("crispasr_params_set_vad_threshold", [ctypes.c_void_p, ctypes.c_float]),
+            ("crispasr_params_set_vad_min_speech_ms", [ctypes.c_void_p, ctypes.c_int]),
+            ("crispasr_params_set_vad_min_silence_ms", [ctypes.c_void_p, ctypes.c_int]),
+            ("crispasr_params_set_tdrz", [ctypes.c_void_p, ctypes.c_int]),
+        ]:
+            if hasattr(lib, _sym):
+                getattr(lib, _sym).argtypes = _argtypes
+                getattr(lib, _sym).restype = None
+
     def transcribe(
         self,
         audio_path: str,
@@ -193,6 +206,12 @@ class CrispASR:
         sample_rate: int = 16000,
         language: str = "auto",
         strategy: int = WHISPER_SAMPLING_GREEDY,
+        vad: bool = False,
+        vad_model_path: Optional[str] = None,
+        vad_threshold: float = 0.5,
+        vad_min_speech_ms: int = 250,
+        vad_min_silence_ms: int = 100,
+        tdrz: bool = False,
     ) -> List[Segment]:
         """Transcribe raw PCM audio data.
 
@@ -201,6 +220,12 @@ class CrispASR:
             sample_rate: Sample rate (will be resampled to 16kHz if different).
             language: Language code or "auto".
             strategy: Sampling strategy.
+            vad: Enable Silero VAD to skip silent regions (0.4.2+ dylibs).
+            vad_model_path: Path to Silero VAD GGML model. Required when vad=True.
+            vad_threshold: Speech detection threshold (0.0-1.0, default 0.5).
+            vad_min_speech_ms: Minimum speech span to keep (default 250ms).
+            vad_min_silence_ms: Minimum silence span to split on (default 100ms).
+            tdrz: Enable tinydiarize speaker-turn markers (requires .en.tdrz model).
 
         Returns:
             List of Segment objects.
@@ -217,6 +242,24 @@ class CrispASR:
 
         # Get default params
         params_ptr = self._lib.whisper_full_default_params_by_ref(strategy)
+
+        # 0.4.2: VAD + tdrz. Setters are optional — older dylibs don't
+        # have them, the lookup-time hasattr() guard skipped the argtypes
+        # declaration so these calls no-op silently.
+        if vad and hasattr(self._lib, "crispasr_params_set_vad"):
+            self._lib.crispasr_params_set_vad(params_ptr, 1)
+            if hasattr(self._lib, "crispasr_params_set_vad_threshold"):
+                self._lib.crispasr_params_set_vad_threshold(params_ptr, vad_threshold)
+            if hasattr(self._lib, "crispasr_params_set_vad_min_speech_ms"):
+                self._lib.crispasr_params_set_vad_min_speech_ms(params_ptr, vad_min_speech_ms)
+            if hasattr(self._lib, "crispasr_params_set_vad_min_silence_ms"):
+                self._lib.crispasr_params_set_vad_min_silence_ms(params_ptr, vad_min_silence_ms)
+            if vad_model_path and hasattr(self._lib, "crispasr_params_set_vad_model_path"):
+                self._lib.crispasr_params_set_vad_model_path(
+                    params_ptr, vad_model_path.encode("utf-8")
+                )
+        if tdrz and hasattr(self._lib, "crispasr_params_set_tdrz"):
+            self._lib.crispasr_params_set_tdrz(params_ptr, 1)
 
         # Run inference
         if self._helpers:

@@ -74,6 +74,26 @@ extern "C" {
     pub fn whisper_full_lang_id(ctx: *mut WhisperContext) -> c_int;
     pub fn whisper_lang_str(id: c_int) -> *const c_char;
     pub fn whisper_lang_id(lang: *const c_char) -> c_int;
+
+    // --- 0.4.2: VAD + tdrz setters on whisper_full_params ---
+    pub fn crispasr_params_set_vad(p: *mut WhisperFullParams, v: c_int);
+    pub fn crispasr_params_set_vad_model_path(
+        p: *mut WhisperFullParams,
+        path: *const c_char,
+    );
+    pub fn crispasr_params_set_vad_threshold(
+        p: *mut WhisperFullParams,
+        threshold: c_float,
+    );
+    pub fn crispasr_params_set_vad_min_speech_ms(
+        p: *mut WhisperFullParams,
+        ms: c_int,
+    );
+    pub fn crispasr_params_set_vad_min_silence_ms(
+        p: *mut WhisperFullParams,
+        ms: c_int,
+    );
+    pub fn crispasr_params_set_tdrz(p: *mut WhisperFullParams, v: c_int);
 }
 
 // =========================================================================

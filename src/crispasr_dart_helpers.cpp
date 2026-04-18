@@ -137,6 +137,42 @@ CA_EXPORT void crispasr_params_set_initial_prompt(whisper_full_params* p, const 
         p->initial_prompt = prompt; // caller owns the string
 }
 
+// VAD (whisper.cpp built-in Silero pipeline). When enabled, whisper_full
+// detects speech spans internally and only decodes those regions —
+// timestamps are adjusted for the caller. Skips costly decode on silence.
+CA_EXPORT void crispasr_params_set_vad(whisper_full_params * p, int v) {
+    if (p) p->vad = v != 0;
+}
+CA_EXPORT void crispasr_params_set_vad_model_path(whisper_full_params * p,
+                                                  const char *          path) {
+    if (p) p->vad_model_path = path; // caller owns the string
+}
+CA_EXPORT void crispasr_params_set_vad_threshold(whisper_full_params * p,
+                                                 float t) {
+    if (p) p->vad_params.threshold = t;
+}
+CA_EXPORT void crispasr_params_set_vad_min_speech_ms(whisper_full_params * p,
+                                                     int ms) {
+    if (p) p->vad_params.min_speech_duration_ms = ms;
+}
+CA_EXPORT void crispasr_params_set_vad_min_silence_ms(whisper_full_params * p,
+                                                      int ms) {
+    if (p) p->vad_params.min_silence_duration_ms = ms;
+}
+
+// tinydiarize (`tdrz`) — whisper's own experimental speaker-turn marker
+// injection. Requires a whisper *.en.tdrz finetune. Emits `[SPEAKER_TURN]`
+// tokens in-segment which the host can split on.
+CA_EXPORT void crispasr_params_set_tdrz(whisper_full_params * p, int v) {
+    if (p) p->tdrz_enable = v != 0;
+}
+
+// NOTE — DTW (Dynamic Time Warping) fields for precise per-token timing
+// live on `whisper_context_params`, set at context init, not
+// `whisper_full_params`. Exposing them needs a new
+// `crispasr_init_with_dtw_params` entry point and wider binding work;
+// tracked separately.
+
 // =========================================================================
 // Token-level timestamp getters
 // =========================================================================

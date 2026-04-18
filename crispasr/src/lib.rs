@@ -23,6 +23,21 @@ pub struct Segment {
     pub no_speech_prob: f32,
 }
 
+/// Options for `transcribe_pcm_with_options`. Leave defaults for standard
+/// Whisper behaviour; set `vad: true` + `vad_model_path` for built-in
+/// Silero VAD, or `tdrz: true` with a `.en.tdrz` model for speaker-turn
+/// markers.
+#[derive(Debug, Clone, Default)]
+pub struct TranscribeOptions {
+    pub strategy: Option<i32>,
+    pub vad: bool,
+    pub vad_model_path: Option<String>,
+    pub vad_threshold: Option<f32>,
+    pub vad_min_speech_ms: Option<i32>,
+    pub vad_min_silence_ms: Option<i32>,
+    pub tdrz: bool,
+}
+
 /// A loaded CrispASR model.
 ///
 /// Not `Sync` — do not share between threads.
@@ -61,10 +76,72 @@ impl CrispASR {
         pcm: &[f32],
         strategy: i32,
     ) -> Result<Vec<Segment>, String> {
+        self.transcribe_pcm_with_options(
+            pcm,
+            &TranscribeOptions {
+                strategy: Some(strategy),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Transcribe with full option control — VAD, tinydiarize, and future
+    /// knobs as they land upstream. Safe against older dylibs: setters
+    /// that the loaded library doesn't expose are no-ops.
+    pub fn transcribe_pcm_with_options(
+        &self,
+        pcm: &[f32],
+        opts: &TranscribeOptions,
+    ) -> Result<Vec<Segment>, String> {
+        let strategy = opts.strategy.unwrap_or(crispasr_sys::WHISPER_SAMPLING_GREEDY);
         let params = unsafe {
             crispasr_sys::whisper_full_default_params_by_ref(strategy)
         };
 
+        // VAD
+        if opts.vad {
+            unsafe {
+                crispasr_sys::crispasr_params_set_vad(params, 1);
+                if let Some(t) = opts.vad_threshold {
+                    crispasr_sys::crispasr_params_set_vad_threshold(params, t);
+                }
+                if let Some(ms) = opts.vad_min_speech_ms {
+                    crispasr_sys::crispasr_params_set_vad_min_speech_ms(params, ms);
+                }
+                if let Some(ms) = opts.vad_min_silence_ms {
+                    crispasr_sys::crispasr_params_set_vad_min_silence_ms(params, ms);
+                }
+            }
+            // Keep the CString alive until after whisper_full returns.
+            let vad_path_cstr = opts
+                .vad_model_path
+                .as_ref()
+                .map(|s| CString::new(s.as_str()).ok())
+                .flatten();
+            if let Some(cs) = &vad_path_cstr {
+                unsafe {
+                    crispasr_sys::crispasr_params_set_vad_model_path(
+                        params,
+                        cs.as_ptr(),
+                    );
+                }
+            }
+            // vad_path_cstr stays in scope for the whisper_full call below.
+            return self.run_full(pcm, params, vad_path_cstr);
+        }
+        if opts.tdrz {
+            unsafe { crispasr_sys::crispasr_params_set_tdrz(params, 1) };
+        }
+
+        self.run_full(pcm, params, None)
+    }
+
+    fn run_full(
+        &self,
+        pcm: &[f32],
+        params: *mut crispasr_sys::WhisperFullParams,
+        _keep_alive_vad_path: Option<CString>,
+    ) -> Result<Vec<Segment>, String> {
         let ret = unsafe {
             crispasr_sys::whisper_full(
                 self.ctx,
