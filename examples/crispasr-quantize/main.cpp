@@ -24,57 +24,78 @@
 #include <thread>
 #include <cmath>
 
-static bool crispasr_model_quantize(const std::string & fname_inp, const std::string & fname_out, ggml_ftype ftype) {
+static bool crispasr_model_quantize(const std::string& fname_inp, const std::string& fname_out, ggml_ftype ftype) {
     ggml_type qtype = GGML_TYPE_F32;
 
     switch (ftype) {
-        case GGML_FTYPE_MOSTLY_Q4_0: qtype = GGML_TYPE_Q4_0; break;
-        case GGML_FTYPE_MOSTLY_Q4_1: qtype = GGML_TYPE_Q4_1; break;
-        case GGML_FTYPE_MOSTLY_Q5_0: qtype = GGML_TYPE_Q5_0; break;
-        case GGML_FTYPE_MOSTLY_Q5_1: qtype = GGML_TYPE_Q5_1; break;
-        case GGML_FTYPE_MOSTLY_Q8_0: qtype = GGML_TYPE_Q8_0; break;
-        case GGML_FTYPE_MOSTLY_Q2_K: qtype = GGML_TYPE_Q2_K; break;
-        case GGML_FTYPE_MOSTLY_Q3_K: qtype = GGML_TYPE_Q3_K; break;
-        case GGML_FTYPE_MOSTLY_Q4_K: qtype = GGML_TYPE_Q4_K; break;
-        case GGML_FTYPE_MOSTLY_Q5_K: qtype = GGML_TYPE_Q5_K; break;
-        case GGML_FTYPE_MOSTLY_Q6_K: qtype = GGML_TYPE_Q6_K; break;
-        default:
-            fprintf(stderr, "%s: unsupported quantization type %d\n", __func__, ftype);
-            return false;
+    case GGML_FTYPE_MOSTLY_Q4_0:
+        qtype = GGML_TYPE_Q4_0;
+        break;
+    case GGML_FTYPE_MOSTLY_Q4_1:
+        qtype = GGML_TYPE_Q4_1;
+        break;
+    case GGML_FTYPE_MOSTLY_Q5_0:
+        qtype = GGML_TYPE_Q5_0;
+        break;
+    case GGML_FTYPE_MOSTLY_Q5_1:
+        qtype = GGML_TYPE_Q5_1;
+        break;
+    case GGML_FTYPE_MOSTLY_Q8_0:
+        qtype = GGML_TYPE_Q8_0;
+        break;
+    case GGML_FTYPE_MOSTLY_Q2_K:
+        qtype = GGML_TYPE_Q2_K;
+        break;
+    case GGML_FTYPE_MOSTLY_Q3_K:
+        qtype = GGML_TYPE_Q3_K;
+        break;
+    case GGML_FTYPE_MOSTLY_Q4_K:
+        qtype = GGML_TYPE_Q4_K;
+        break;
+    case GGML_FTYPE_MOSTLY_Q5_K:
+        qtype = GGML_TYPE_Q5_K;
+        break;
+    case GGML_FTYPE_MOSTLY_Q6_K:
+        qtype = GGML_TYPE_Q6_K;
+        break;
+    default:
+        fprintf(stderr, "%s: unsupported quantization type %d\n", __func__, ftype);
+        return false;
     }
 
     printf("%s: loading model from '%s'\n", __func__, fname_inp.c_str());
 
-    struct ggml_context * ctx_in_ggml = nullptr;
+    struct ggml_context* ctx_in_ggml = nullptr;
     struct gguf_init_params params = {};
     params.no_alloc = true;
     params.ctx = &ctx_in_ggml;
-    struct gguf_context * ctx_in = gguf_init_from_file(fname_inp.c_str(), params);
+    struct gguf_context* ctx_in = gguf_init_from_file(fname_inp.c_str(), params);
     if (!ctx_in || !ctx_in_ggml) {
         fprintf(stderr, "%s: failed to load model from '%s'\n", __func__, fname_inp.c_str());
         return false;
     }
 
-    struct gguf_context * ctx_out = gguf_init_empty();
+    struct gguf_context* ctx_out = gguf_init_empty();
     gguf_set_kv(ctx_out, ctx_in);
     gguf_set_val_u32(ctx_out, "general.quantization_version", GGML_QNT_VERSION);
     gguf_set_val_u32(ctx_out, "general.file_type", ftype);
 
     const int n_tensors = gguf_get_n_tensors(ctx_in);
     for (int i = 0; i < n_tensors; i++) {
-        const char * name = gguf_get_tensor_name(ctx_in, i);
-        struct ggml_tensor * t = ggml_get_tensor(ctx_in_ggml, name);
+        const char* name = gguf_get_tensor_name(ctx_in, i);
+        struct ggml_tensor* t = ggml_get_tensor(ctx_in_ggml, name);
         gguf_add_tensor(ctx_out, t);
     }
 
     // Allocate output file
     printf("%s: writing quantized model to '%s'\n", __func__, fname_out.c_str());
-    FILE * fout = fopen(fname_out.c_str(), "wb");
+    FILE* fout = fopen(fname_out.c_str(), "wb");
     if (!fout) {
         fprintf(stderr, "%s: failed to open '%s' for writing\n", __func__, fname_out.c_str());
         gguf_free(ctx_in);
         gguf_free(ctx_out);
-        if (ctx_in_ggml) ggml_free(ctx_in_ggml);
+        if (ctx_in_ggml)
+            ggml_free(ctx_in_ggml);
         return false;
     }
 
@@ -84,24 +105,23 @@ static bool crispasr_model_quantize(const std::string & fname_inp, const std::st
     fwrite(meta_data.data(), 1, meta_size, fout);
 
     // Open input file for data reading
-    FILE * fin = fopen(fname_inp.c_str(), "rb");
+    FILE* fin = fopen(fname_inp.c_str(), "rb");
     const size_t data_offset_in = gguf_get_data_offset(ctx_in);
 
     std::vector<float> f32_data;
     std::vector<uint8_t> q_data;
 
     for (int i = 0; i < n_tensors; i++) {
-        const char * name = gguf_get_tensor_name(ctx_in, i);
-        struct ggml_tensor * t = ggml_get_tensor(ctx_in_ggml, name);
-        
+        const char* name = gguf_get_tensor_name(ctx_in, i);
+        struct ggml_tensor* t = ggml_get_tensor(ctx_in_ggml, name);
+
         enum ggml_type type = t->type;
         size_t size = ggml_nbytes(t);
         size_t offset = data_offset_in + gguf_get_tensor_offset(ctx_in, i);
 
         printf("[%3d/%3d] %-40s - %10s, ", i + 1, n_tensors, name, ggml_type_name(type));
 
-        bool quantize = ggml_is_quantized(qtype) &&
-                        (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) &&
+        bool quantize = ggml_is_quantized(qtype) && (type == GGML_TYPE_F32 || type == GGML_TYPE_F16) &&
                         (ggml_n_dims(t) == 2) && // Quantize only 2D matrices
                         (std::string(name).find("weight") != std::string::npos) &&
                         (std::string(name).find("norm") == std::string::npos) &&
@@ -120,24 +140,38 @@ static bool crispasr_model_quantize(const std::string & fname_inp, const std::st
         if (quantize && ncols % qk_k != 0) {
             ggml_type fallback = GGML_TYPE_COUNT;
             switch (qtype) {
-                case GGML_TYPE_Q2_K:
-                case GGML_TYPE_Q3_K:
-                case GGML_TYPE_Q4_K: fallback = GGML_TYPE_Q4_0; break;
-                case GGML_TYPE_Q5_K: fallback = GGML_TYPE_Q5_0; break;
-                case GGML_TYPE_Q6_K: fallback = GGML_TYPE_Q8_0; break;
-                default: break;
+            case GGML_TYPE_Q2_K:
+            case GGML_TYPE_Q3_K:
+            case GGML_TYPE_Q4_K:
+                fallback = GGML_TYPE_Q4_0;
+                break;
+            case GGML_TYPE_Q5_K:
+                fallback = GGML_TYPE_Q5_0;
+                break;
+            case GGML_TYPE_Q6_K:
+                fallback = GGML_TYPE_Q8_0;
+                break;
+            default:
+                break;
             }
             if (fallback != GGML_TYPE_COUNT && ncols % ggml_blck_size(fallback) == 0) {
                 qtype_used = fallback;
                 qk_k = ggml_blck_size(qtype_used);
                 printf("(fallback %s) ", ggml_type_name(qtype_used));
             } else {
-                printf("warning: ncols %lld not divisible by %lld, skipping quantization for this tensor\n", (long long)ncols, (long long)qk_k);
+                printf("warning: ncols %lld not divisible by %lld, skipping quantization for this tensor\n",
+                       (long long)ncols, (long long)qk_k);
                 quantize = false;
             }
         }
 
-        fseek(fin, offset, SEEK_SET);
+        // Use 64-bit seek to avoid overflow on files > 2 GB (Windows
+        // long is 32-bit even on x86_64, wrapping at 2^31).
+#ifdef _WIN32
+        _fseeki64(fin, (__int64)offset, SEEK_SET);
+#else
+        fseeko(fin, (off_t)offset, SEEK_SET);
+#endif
 
         if (quantize) {
             printf("quantizing to %s... ", ggml_type_name(qtype_used));
@@ -156,20 +190,23 @@ static bool crispasr_model_quantize(const std::string & fname_inp, const std::st
                     fprintf(stderr, "failed to read f16 data\n");
                     return false;
                 }
-                for (int j = 0; j < nelements; j++) f32_data[j] = ggml_fp16_to_fp32(f16_data[j]);
+                for (int j = 0; j < nelements; j++)
+                    f32_data[j] = ggml_fp16_to_fp32(f16_data[j]);
             }
 
             const size_t max_q_size = ggml_row_size(qtype_used, t->ne[0]) * (nelements / t->ne[0]);
             q_data.resize(max_q_size);
 
-            size_t q_size = ggml_quantize_chunk(qtype_used, f32_data.data(), q_data.data(), 0, nelements / t->ne[0], t->ne[0], nullptr);
+            size_t q_size = ggml_quantize_chunk(qtype_used, f32_data.data(), q_data.data(), 0, nelements / t->ne[0],
+                                                t->ne[0], nullptr);
 
             fwrite(q_data.data(), 1, q_size, fout);
             gguf_set_tensor_type(ctx_out, name, qtype_used);
 
             // Padding
             size_t pad = GGML_PAD(q_size, GGUF_DEFAULT_ALIGNMENT) - q_size;
-            for (size_t j = 0; j < pad; j++) fputc(0, fout);
+            for (size_t j = 0; j < pad; j++)
+                fputc(0, fout);
 
             printf("done\n");
         } else {
@@ -183,7 +220,8 @@ static bool crispasr_model_quantize(const std::string & fname_inp, const std::st
 
             // Padding
             size_t pad = GGML_PAD(size, GGUF_DEFAULT_ALIGNMENT) - size;
-            for (size_t j = 0; j < pad; j++) fputc(0, fout);
+            for (size_t j = 0; j < pad; j++)
+                fputc(0, fout);
             printf("done\n");
         }
     }
@@ -202,7 +240,7 @@ static bool crispasr_model_quantize(const std::string & fname_inp, const std::st
     return true;
 }
 
-int main(int argc, char ** argv) {
+int main(int argc, char** argv) {
     if (argc != 4) {
         fprintf(stderr, "usage: %s model-f16.gguf model-quant.gguf type\n", argv[0]);
         ggml_print_ftypes(stderr);
