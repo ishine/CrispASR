@@ -115,6 +115,10 @@ add_library(whisper
             # Lets language wrappers feed `crispasr_session_transcribe`
             # any audio format without bundling an external ffmpeg.
             crispasr_audio.cpp
+            # Silero-VAD-driven segmentation + whisper.cpp-style stitching.
+            # Consumed by the CLI and by the C-ABI `crispasr_session_transcribe_vad`
+            # wrapper so every language binding benefits without re-implementing.
+            crispasr_vad.cpp
             )
 # Non-Whisper backends reachable through crispasr_c_api.cpp are linked
 # into libwhisper further down in this file, once those targets have been

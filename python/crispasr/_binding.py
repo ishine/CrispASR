@@ -419,6 +419,15 @@ class Session:
             ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
         ]
         lib.crispasr_session_transcribe.restype = ctypes.c_void_p
+        # 0.4.3+: VAD-driven session transcribe. hasattr-guarded so a
+        # binding loaded against an older dylib still works for non-VAD
+        # calls.
+        if hasattr(lib, "crispasr_session_transcribe_vad"):
+            lib.crispasr_session_transcribe_vad.argtypes = [
+                ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int,
+                ctypes.c_int, ctypes.c_char_p, ctypes.c_void_p,
+            ]
+            lib.crispasr_session_transcribe_vad.restype = ctypes.c_void_p
         lib.crispasr_session_result_n_segments.argtypes = [ctypes.c_void_p]
         lib.crispasr_session_result_n_segments.restype = ctypes.c_int
         lib.crispasr_session_result_segment_text.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -468,6 +477,102 @@ class Session:
         res = self._lib.crispasr_session_transcribe(self._handle, samples_ptr, len(pcm))
         if not res:
             raise RuntimeError(f"crispasr_session_transcribe failed for backend {self.backend!r}")
+
+        try:
+            n_seg = self._lib.crispasr_session_result_n_segments(res)
+            out: List[SessionSegment] = []
+            for i in range(n_seg):
+                t = self._lib.crispasr_session_result_segment_text(res, i)
+                text = t.decode("utf-8") if t else ""
+                t0 = self._lib.crispasr_session_result_segment_t0(res, i) / 100.0
+                t1 = self._lib.crispasr_session_result_segment_t1(res, i) / 100.0
+                wn = self._lib.crispasr_session_result_n_words(res, i)
+                words: List[SessionWord] = []
+                for j in range(wn):
+                    wt = self._lib.crispasr_session_result_word_text(res, i, j)
+                    words.append(SessionWord(
+                        text=wt.decode("utf-8") if wt else "",
+                        start=self._lib.crispasr_session_result_word_t0(res, i, j) / 100.0,
+                        end=self._lib.crispasr_session_result_word_t1(res, i, j) / 100.0,
+                    ))
+                out.append(SessionSegment(text=text.strip(), start=t0, end=t1, words=words))
+            return out
+        finally:
+            self._lib.crispasr_session_result_free(res)
+
+    def transcribe_vad(
+        self,
+        pcm: np.ndarray,
+        vad_model_path: str,
+        *,
+        sample_rate: int = 16000,
+        threshold: float = 0.5,
+        min_speech_duration_ms: int = 250,
+        min_silence_duration_ms: int = 100,
+        speech_pad_ms: int = 30,
+        chunk_seconds: int = 30,
+        n_threads: int = 4,
+    ) -> List[SessionSegment]:
+        """Transcribe with Silero VAD segmentation + whisper.cpp-style stitching.
+
+        Runs VAD on ``pcm``, merges short / overlong speech slices into usable
+        chunks, stitches them into a single buffer with 0.1s silence gaps,
+        calls the backend once, then remaps segment + word timestamps back to
+        original-audio positions.
+
+        ``vad_model_path`` must point to a Silero GGUF on disk. If it fails
+        to load, this falls back to a plain :meth:`transcribe` call.
+
+        Compared to the fixed-chunk CLI loop, one stitched call preserves
+        cross-segment context (no boundary artefacts like words split across
+        chunks), which matters for O(T²) backends such as parakeet /
+        cohere / canary.
+        """
+        if not hasattr(self._lib, "crispasr_session_transcribe_vad"):
+            raise RuntimeError(
+                "crispasr_session_transcribe_vad not in loaded library — "
+                "rebuild CrispASR 0.4.3+ or call transcribe() instead."
+            )
+        if sample_rate != 16000:
+            ratio = 16000 / sample_rate
+            new_len = int(len(pcm) * ratio)
+            indices = np.linspace(0, len(pcm) - 1, new_len)
+            pcm = np.interp(indices, np.arange(len(pcm)), pcm).astype(np.float32)
+        pcm = np.asarray(pcm, dtype=np.float32)
+        samples_ptr = pcm.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
+        # ABI struct layout must match crispasr_vad_abi_opts (crispasr_c_api.cpp):
+        # float + 5 x int32.
+        class _VadAbiOpts(ctypes.Structure):
+            _fields_ = [
+                ("threshold", ctypes.c_float),
+                ("min_speech_duration_ms", ctypes.c_int32),
+                ("min_silence_duration_ms", ctypes.c_int32),
+                ("speech_pad_ms", ctypes.c_int32),
+                ("chunk_seconds", ctypes.c_int32),
+                ("n_threads", ctypes.c_int32),
+            ]
+        opts = _VadAbiOpts(
+            float(threshold),
+            int(min_speech_duration_ms),
+            int(min_silence_duration_ms),
+            int(speech_pad_ms),
+            int(chunk_seconds),
+            int(n_threads),
+        )
+
+        res = self._lib.crispasr_session_transcribe_vad(
+            self._handle,
+            samples_ptr,
+            len(pcm),
+            16000,
+            vad_model_path.encode("utf-8"),
+            ctypes.byref(opts),
+        )
+        if not res:
+            raise RuntimeError(
+                f"crispasr_session_transcribe_vad failed for backend {self.backend!r}"
+            )
 
         try:
             n_seg = self._lib.crispasr_session_result_n_segments(res)

@@ -114,6 +114,33 @@ pub struct CrispasrSession(c_void);
 #[repr(C)]
 pub struct CrispasrSessionResult(c_void);
 
+/// Tunables for [`crispasr_session_transcribe_vad`]. Mirrors whisper.cpp's
+/// `whisper_vad_params` plus the max-chunk fallback used to bound encoder
+/// cost on long audio. Pass a null pointer to use defaults.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrispasrVadAbiOpts {
+    pub threshold: c_float,
+    pub min_speech_duration_ms: c_int,
+    pub min_silence_duration_ms: c_int,
+    pub speech_pad_ms: c_int,
+    pub chunk_seconds: c_int,
+    pub n_threads: c_int,
+}
+
+impl Default for CrispasrVadAbiOpts {
+    fn default() -> Self {
+        Self {
+            threshold: 0.5,
+            min_speech_duration_ms: 250,
+            min_silence_duration_ms: 100,
+            speech_pad_ms: 30,
+            chunk_seconds: 30,
+            n_threads: 4,
+        }
+    }
+}
+
 extern "C" {
     pub fn crispasr_session_open(
         model_path: *const c_char,
@@ -140,6 +167,24 @@ extern "C" {
         s: *mut CrispasrSession,
         pcm: *const c_float,
         n_samples: c_int,
+    ) -> *mut CrispasrSessionResult;
+
+    /// VAD-driven session transcribe. Runs Silero VAD on the PCM buffer,
+    /// merges short / overlong speech slices, stitches them into one
+    /// contiguous buffer with 0.1s silence gaps, calls the backend once,
+    /// then remaps segment + word timestamps back to original-audio
+    /// positions.
+    ///
+    /// `vad_model_path` must point to a Silero GGUF on disk. Pass a null
+    /// or empty `opts` pointer to use defaults (mirrors whisper.cpp's
+    /// `whisper_vad_default_params`).
+    pub fn crispasr_session_transcribe_vad(
+        s: *mut CrispasrSession,
+        pcm: *const c_float,
+        n_samples: c_int,
+        sample_rate: c_int,
+        vad_model_path: *const c_char,
+        opts: *const CrispasrVadAbiOpts,
     ) -> *mut CrispasrSessionResult;
 
     pub fn crispasr_session_result_n_segments(r: *mut CrispasrSessionResult) -> c_int;

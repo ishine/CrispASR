@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "whisper.h"
+#include "crispasr_vad.h" // VAD slicing + stitching (shared with CLI)
 // Non-Whisper backend headers. Each of these lives in `src/` and is built as
 // its own shared library — we link them into libwhisper privately so Dart
 // only has to open one library to reach every backend. Any missing header
@@ -1278,6 +1279,85 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe(crispasr_session*
 
     delete r;
     return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// VAD-driven transcription over the session API.
+//
+// Runs Silero VAD on the PCM buffer, merges short / overlong slices into
+// usable chunks, stitches them into a single contiguous buffer with 0.1s
+// silence gaps (whisper.cpp-style), calls crispasr_session_transcribe on
+// the stitched buffer, and remaps segment + word timestamps from
+// stitched-buffer space back to original-audio positions.
+//
+// The same algorithm the CLI uses (see examples/cli/crispasr_run.cpp) is
+// now reachable from every binding via a single call.
+//
+// Falls back to a direct crispasr_session_transcribe(pcm) when VAD
+// produces no slices (no speech / model load failure). Callers should
+// pass sample_rate = 16000 for all currently-supported backends.
+// ---------------------------------------------------------------------------
+struct crispasr_vad_abi_opts {
+    float threshold;               // 0.5 typical
+    int32_t min_speech_duration_ms; // 250
+    int32_t min_silence_duration_ms; // 100
+    int32_t speech_pad_ms;          // 30
+    int32_t chunk_seconds;          // 30 (0 = no max-split)
+    int32_t n_threads;              // 4
+};
+
+CA_EXPORT crispasr_session_result* crispasr_session_transcribe_vad(crispasr_session* s, const float* pcm, int n_samples,
+                                                                   int sample_rate, const char* vad_model_path,
+                                                                   const crispasr_vad_abi_opts* opts_or_null) {
+    if (!s || !pcm || n_samples <= 0 || sample_rate <= 0)
+        return nullptr;
+
+    // Fill a library opts struct from the ABI struct, or use defaults.
+    crispasr_vad_options opts;
+    if (opts_or_null) {
+        opts.threshold = opts_or_null->threshold;
+        opts.min_speech_duration_ms = opts_or_null->min_speech_duration_ms;
+        opts.min_silence_duration_ms = opts_or_null->min_silence_duration_ms;
+        opts.speech_pad_ms = opts_or_null->speech_pad_ms;
+        opts.chunk_seconds = opts_or_null->chunk_seconds;
+        if (opts_or_null->n_threads > 0)
+            opts.n_threads = opts_or_null->n_threads;
+    }
+
+    // Compute speech slices. Empty slices ⇒ VAD model missing or no speech
+    // detected — fall back to a plain transcribe so callers always get some
+    // result when audio exists.
+    std::vector<crispasr_audio_slice> slices;
+    if (vad_model_path && *vad_model_path) {
+        slices = crispasr_compute_vad_slices(pcm, n_samples, sample_rate, vad_model_path, opts);
+    }
+    if (slices.empty()) {
+        return crispasr_session_transcribe(s, pcm, n_samples);
+    }
+
+    // One slice ⇒ no stitching needed, but still clip to the speech region
+    // so the backend doesn't burn cycles on leading / trailing silence.
+    if (slices.size() == 1) {
+        const auto& sl = slices.front();
+        return crispasr_session_transcribe(s, pcm + sl.start, sl.end - sl.start);
+    }
+
+    // Multiple slices ⇒ stitch with 0.1s silence gaps, transcribe once,
+    // remap timestamps back to original-audio positions.
+    auto stitched = crispasr_stitch_vad_slices(pcm, n_samples, sample_rate, slices);
+    crispasr_session_result* r = crispasr_session_transcribe(s, stitched.samples.data(), (int)stitched.samples.size());
+    if (!r)
+        return nullptr;
+
+    for (auto& seg : r->segments) {
+        seg.t0 = crispasr_vad_remap_timestamp(stitched.mapping, seg.t0);
+        seg.t1 = crispasr_vad_remap_timestamp(stitched.mapping, seg.t1);
+        for (auto& w : seg.words) {
+            w.t0 = crispasr_vad_remap_timestamp(stitched.mapping, w.t0);
+            w.t1 = crispasr_vad_remap_timestamp(stitched.mapping, w.t1);
+        }
+    }
+    return r;
 }
 
 CA_EXPORT int crispasr_session_result_n_segments(crispasr_session_result* r) {

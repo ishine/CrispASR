@@ -124,6 +124,38 @@ DecodedAudio decodeAudioFile(String path, {String? libPath}) {
   }
 }
 
+/// Tunables for [CrispasrSession.transcribeVad]. Field names and defaults
+/// mirror whisper.cpp's `whisper_vad_params` plus the max-chunk fallback
+/// the shared library uses to bound encoder cost on long audio.
+class SessionVadOptions {
+  /// Silero VAD decision threshold (0..1). Higher = fewer / shorter
+  /// speech regions. whisper.cpp ships 0.5.
+  final double threshold;
+  /// Shortest run of voiced frames (ms) kept as a speech segment.
+  final int minSpeechDurationMs;
+  /// Shortest silence (ms) needed to split one segment from the next.
+  final int minSilenceDurationMs;
+  /// Extra context padding (ms) added on each side of every segment.
+  final int speechPadMs;
+  /// Maximum merged-segment length (seconds). Any speech slice longer
+  /// than this is split into roughly equal sub-slices so O(T²) backends
+  /// don't blow up on a 10-minute continuous lecture. 0 disables the
+  /// split.
+  final int chunkSeconds;
+  /// Threads used for Silero VAD inference. The ASR backend uses its
+  /// own thread count configured at session open time.
+  final int nThreads;
+
+  const SessionVadOptions({
+    this.threshold = 0.5,
+    this.minSpeechDurationMs = 250,
+    this.minSilenceDurationMs = 100,
+    this.speechPadMs = 30,
+    this.chunkSeconds = 30,
+    this.nThreads = 4,
+  });
+}
+
 /// One decoded segment from [CrispasrSession.transcribe]. Similar to the
 /// Whisper-specific [Segment] but produced by a backend-agnostic code path.
 class SessionSegment {
@@ -1141,6 +1173,73 @@ class CrispasrSession {
           _lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>(
         'crispasr_session_result_free',
       );
+      freeFn(res);
+    }
+  }
+
+  /// Transcribe with Silero VAD segmentation + whisper.cpp-style stitching.
+  ///
+  /// Runs VAD on [pcm], merges short / overlong speech slices into usable
+  /// chunks, stitches them into a single buffer with 0.1s silence gaps,
+  /// calls the backend once on the stitched buffer, then remaps segment
+  /// and word timestamps back to original-audio positions.
+  ///
+  /// [vadModelPath] must point to a Silero GGUF on disk (e.g. the one
+  /// bundled as a Flutter asset). If it's empty or the model fails to
+  /// load, this falls back to a plain [transcribe] call so callers always
+  /// get a result when audio exists.
+  ///
+  /// Compared to calling [transcribe] on the raw buffer, this:
+  /// * skips silence, cutting encoder cost substantially for sparse audio;
+  /// * preserves cross-segment decoder context (one call, not N), which
+  ///   matters for O(T²) backends such as parakeet / cohere / canary.
+  List<SessionSegment> transcribeVad(
+    Float32List pcm,
+    String vadModelPath, {
+    int sampleRate = 16000,
+    SessionVadOptions options = const SessionVadOptions(),
+  }) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (pcm.isEmpty) return const [];
+
+    final samples = calloc<Float>(pcm.length);
+    for (var i = 0; i < pcm.length; i++) {
+      samples[i] = pcm[i];
+    }
+    final vadPathPtr = vadModelPath.toNativeUtf8();
+
+    // ABI struct layout must match crispasr_vad_abi_opts in crispasr_c_api.cpp.
+    // float threshold + 5 x int32 = 24 bytes.
+    final optsPtr = calloc<Uint8>(24);
+    optsPtr.cast<Float>().value = options.threshold;
+    final intView = optsPtr.elementAt(4).cast<Int32>();
+    intView[0] = options.minSpeechDurationMs;
+    intView[1] = options.minSilenceDurationMs;
+    intView[2] = options.speechPadMs;
+    intView[3] = options.chunkSeconds;
+    intView[4] = options.nThreads;
+
+    final fn = _lib.lookupFunction<
+        Pointer<Void> Function(Pointer<Void>, Pointer<Float>, Int32, Int32,
+            Pointer<Utf8>, Pointer<Uint8>),
+        Pointer<Void> Function(Pointer<Void>, Pointer<Float>, int, int,
+            Pointer<Utf8>, Pointer<Uint8>)>(
+      'crispasr_session_transcribe_vad',
+    );
+    final res = fn(_handle, samples, pcm.length, sampleRate, vadPathPtr, optsPtr);
+    calloc.free(samples);
+    calloc.free(vadPathPtr);
+    calloc.free(optsPtr);
+    if (res == nullptr) {
+      throw Exception('crispasr_session_transcribe_vad returned null');
+    }
+
+    try {
+      return _readSegments(res);
+    } finally {
+      final freeFn = _lib.lookupFunction<
+          Void Function(Pointer<Void>),
+          void Function(Pointer<Void>)>('crispasr_session_result_free');
       freeFn(res);
     }
   }

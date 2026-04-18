@@ -375,6 +375,136 @@ impl Session {
         }
         Ok(out)
     }
+
+    /// Transcribe with Silero VAD segmentation + whisper.cpp-style stitching.
+    ///
+    /// Runs VAD on the PCM buffer, merges short / overlong speech slices
+    /// into usable chunks, stitches them into a single buffer with 0.1s
+    /// silence gaps, calls the backend once, then remaps segment + word
+    /// timestamps back to original-audio positions.
+    ///
+    /// `vad_model_path` must point to a Silero GGUF on disk. Passing
+    /// `None` for `opts` uses the library defaults (mirroring
+    /// whisper.cpp's `whisper_vad_default_params`).
+    ///
+    /// Compared to a fixed-chunk loop, stitching preserves cross-segment
+    /// decoder context, which matters for O(T²) backends such as parakeet
+    /// / cohere / canary. Falls back to a plain [`Self::transcribe`] call
+    /// when no speech is detected or the VAD model fails to load.
+    pub fn transcribe_vad(
+        &self,
+        pcm: &[f32],
+        vad_model_path: &str,
+        opts: Option<VadOptions>,
+    ) -> Result<Vec<SessionSegment>, String> {
+        if pcm.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let path_c = CString::new(vad_model_path)
+            .map_err(|e| format!("vad_model_path contains NUL byte: {e}"))?;
+        let abi_opts = opts.unwrap_or_default().to_abi();
+
+        let res = unsafe {
+            crispasr_sys::crispasr_session_transcribe_vad(
+                self.handle,
+                pcm.as_ptr(),
+                pcm.len() as i32,
+                16_000,
+                path_c.as_ptr(),
+                &abi_opts,
+            )
+        };
+        if res.is_null() {
+            return Err(format!(
+                "crispasr_session_transcribe_vad failed for backend {:?}",
+                self.backend()
+            ));
+        }
+
+        let mut out = Vec::new();
+        unsafe {
+            let n = crispasr_sys::crispasr_session_result_n_segments(res);
+            for i in 0..n {
+                let tp = crispasr_sys::crispasr_session_result_segment_text(res, i);
+                let text = if tp.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(tp).to_string_lossy().into_owned()
+                };
+                let t0 = crispasr_sys::crispasr_session_result_segment_t0(res, i) as f64 / 100.0;
+                let t1 = crispasr_sys::crispasr_session_result_segment_t1(res, i) as f64 / 100.0;
+
+                let wn = crispasr_sys::crispasr_session_result_n_words(res, i);
+                let mut words = Vec::with_capacity(wn as usize);
+                for j in 0..wn {
+                    let wtp = crispasr_sys::crispasr_session_result_word_text(res, i, j);
+                    let wt = if wtp.is_null() {
+                        String::new()
+                    } else {
+                        CStr::from_ptr(wtp).to_string_lossy().into_owned()
+                    };
+                    words.push(SessionWord {
+                        text: wt,
+                        start: crispasr_sys::crispasr_session_result_word_t0(res, i, j) as f64
+                            / 100.0,
+                        end: crispasr_sys::crispasr_session_result_word_t1(res, i, j) as f64
+                            / 100.0,
+                    });
+                }
+                out.push(SessionSegment {
+                    text: text.trim().to_string(),
+                    start: t0,
+                    end: t1,
+                    words,
+                });
+            }
+            crispasr_sys::crispasr_session_result_free(res);
+        }
+        Ok(out)
+    }
+}
+
+/// Tunables for [`Session::transcribe_vad`]. Defaults mirror whisper.cpp's
+/// `whisper_vad_default_params` plus the max-chunk fallback the shared
+/// library uses to bound encoder cost on long audio.
+#[derive(Clone, Copy, Debug)]
+pub struct VadOptions {
+    pub threshold: f32,
+    pub min_speech_duration_ms: i32,
+    pub min_silence_duration_ms: i32,
+    pub speech_pad_ms: i32,
+    /// Max merged-segment length (seconds). 0 disables the split.
+    pub chunk_seconds: i32,
+    /// Threads used for Silero VAD inference only; the ASR backend keeps
+    /// the count chosen at session open time.
+    pub n_threads: i32,
+}
+
+impl Default for VadOptions {
+    fn default() -> Self {
+        Self {
+            threshold: 0.5,
+            min_speech_duration_ms: 250,
+            min_silence_duration_ms: 100,
+            speech_pad_ms: 30,
+            chunk_seconds: 30,
+            n_threads: 4,
+        }
+    }
+}
+
+impl VadOptions {
+    fn to_abi(self) -> crispasr_sys::CrispasrVadAbiOpts {
+        crispasr_sys::CrispasrVadAbiOpts {
+            threshold: self.threshold,
+            min_speech_duration_ms: self.min_speech_duration_ms,
+            min_silence_duration_ms: self.min_silence_duration_ms,
+            speech_pad_ms: self.speech_pad_ms,
+            chunk_seconds: self.chunk_seconds,
+            n_threads: self.n_threads,
+        }
+    }
 }
 
 impl Drop for Session {

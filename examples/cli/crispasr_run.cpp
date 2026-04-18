@@ -8,7 +8,7 @@
 // historical whisper-cli behaviour is bit-identical.
 
 #include "crispasr_backend.h"
-#include "crispasr_vad.h"
+#include "crispasr_vad_cli.h"
 #include "crispasr_output.h"
 #include "crispasr_model_mgr.h"
 #include "crispasr_aligner.h"

@@ -71,6 +71,10 @@ void main() {
       'crispasr_detect_language',
       'crispasr_vad_segments',
       'crispasr_vad_free',
+      // Shared VAD-driven session transcribe (0.4.3+). Merges slices,
+      // stitches with 0.1s gaps, remaps timestamps — same algorithm
+      // as the CLI's --vad path, reachable from every binding.
+      'crispasr_session_transcribe_vad',
       // Canonical C-ABI version symbol (was `crispasr_dart_helpers_version`
       // before the file moved to `src/crispasr_c_api.cpp`).
       'crispasr_c_api_version',
