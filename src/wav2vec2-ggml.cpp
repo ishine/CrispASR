@@ -148,7 +148,7 @@ bool wav2vec2_load(const char* fname, wav2vec2_model& model) {
         snprintf(buf, sizeof(buf), "cnn.%u.conv.weight", i);
         model.cnn[i].conv_w = get(buf);
         snprintf(buf, sizeof(buf), "cnn.%u.conv.bias", i);
-        model.cnn[i].conv_b = get(buf);
+        model.cnn[i].conv_b = try_get(buf);
         snprintf(buf, sizeof(buf), "cnn.%u.norm.weight", i);
         model.cnn[i].norm_w = try_get(buf);
         if (model.cnn[i].norm_w) {
@@ -849,7 +849,7 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         } else {
             wdata = (const float*)m.cnn[li].conv_w->data;
         }
-        const float* bdata = (const float*)m.cnn[li].conv_b->data;
+        const float* bdata = m.cnn[li].conv_b ? (const float*)m.cnn[li].conv_b->data : nullptr;
         const float* nw = m.cnn[li].has_norm ? (const float*)m.cnn[li].norm_w->data : nullptr;
         const float* nb = m.cnn[li].has_norm ? (const float*)m.cnn[li].norm_b->data : nullptr;
 
@@ -1185,7 +1185,7 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         } else {
             wdata = (const float*)m.cnn[li].conv_w->data;
         }
-        const float* bdata = (const float*)m.cnn[li].conv_b->data;
+        const float* bdata = m.cnn[li].conv_b ? (const float*)m.cnn[li].conv_b->data : nullptr;
         const float* nw = m.cnn[li].has_norm ? (const float*)m.cnn[li].norm_w->data : nullptr;
         const float* nb = m.cnn[li].has_norm ? (const float*)m.cnn[li].norm_b->data : nullptr;
 

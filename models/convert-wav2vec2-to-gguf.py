@@ -98,7 +98,8 @@ def write_cnn_layers(w: gguf.GGUFWriter, sd: dict, n_layers: int) -> None:
     for i in range(n_layers):
         p = f"wav2vec2.feature_extractor.conv_layers.{i}"
         w.add_tensor(f"cnn.{i}.conv.weight", f32(sd[f"{p}.conv.weight"]))
-        w.add_tensor(f"cnn.{i}.conv.bias", f32(sd[f"{p}.conv.bias"]))
+        if f"{p}.conv.bias" in sd:
+            w.add_tensor(f"cnn.{i}.conv.bias", f32(sd[f"{p}.conv.bias"]))
         has_norm = f"{p}.layer_norm.weight" in sd
         # Store a flag (1 = has norm, 0 = no norm) in metadata
         w.add_uint32(f"wav2vec2.cnn_has_norm_{i}", int(has_norm))
