@@ -85,6 +85,7 @@ bool wav2vec2_load(const char* fname, wav2vec2_model& model) {
     hp.layer_norm_eps = gguf_f32(gctx_meta, "wav2vec2.layer_norm_eps", hp.layer_norm_eps);
     hp.pad_token_id = gguf_u32(gctx_meta, "wav2vec2.pad_token_id", hp.pad_token_id);
     hp.feat_extract_norm_type = gguf_u32(gctx_meta, "wav2vec2.feat_extract_norm_type", hp.feat_extract_norm_type);
+    hp.do_stable_layer_norm = gguf_u32(gctx_meta, "wav2vec2.do_stable_layer_norm", hp.do_stable_layer_norm);
 
     for (uint32_t i = 0; i < hp.num_feat_extract_layers; i++) {
         char key[64];
@@ -418,54 +419,49 @@ static ggml_cgraph* wav2vec2_build_transformer_graph(const wav2vec2_model& m,
     ggml_set_name(cur, "hidden_in");
     ggml_set_input(cur);
 
-    // ---- L × Transformer layers (pre-norm) ----
+    const bool pre_norm = (hp.do_stable_layer_norm != 0);
+
+    // ---- L × Transformer layers ----
+    // pre_norm  (stable/large): LN → attn → add → LN → FFN → add
+    // post_norm (standard/base): attn → add → LN → FFN → add → LN
     for (int il = 0; il < L; il++) {
         const auto& e = m.enc[il];
         ggml_tensor* residual = cur;
 
-        // Pre-attention LayerNorm
-        ggml_tensor* x = ggml_norm(ctx0, cur, ln_eps);
-        x = ggml_mul(ctx0, x, e.ln1_w);
-        x = ggml_add(ctx0, x, e.ln1_b);
+        // Attention input: pre-norm applies LN before, post-norm after.
+        ggml_tensor* attn_in = cur;
+        if (pre_norm) {
+            attn_in = ggml_norm(ctx0, cur, ln_eps);
+            attn_in = ggml_mul(ctx0, attn_in, e.ln1_w);
+            attn_in = ggml_add(ctx0, attn_in, e.ln1_b);
+        }
 
         // Q/K/V projections
-        ggml_tensor* Q = ggml_add(ctx0, ggml_mul_mat(ctx0, e.q_w, x), e.q_b);
-        ggml_tensor* K = ggml_add(ctx0, ggml_mul_mat(ctx0, e.k_w, x), e.k_b);
-        ggml_tensor* V_t = ggml_add(ctx0, ggml_mul_mat(ctx0, e.v_w, x), e.v_b);
-
+        ggml_tensor* Q = ggml_add(ctx0, ggml_mul_mat(ctx0, e.q_w, attn_in), e.q_b);
+        ggml_tensor* K = ggml_add(ctx0, ggml_mul_mat(ctx0, e.k_w, attn_in), e.k_b);
+        ggml_tensor* V_t = ggml_add(ctx0, ggml_mul_mat(ctx0, e.v_w, attn_in), e.v_b);
 
         // Reshape to (head_dim, n_heads, T)
         Q = ggml_reshape_3d(ctx0, Q, head_dim, n_heads, T);
         K = ggml_reshape_3d(ctx0, K, head_dim, n_heads, T);
         V_t = ggml_reshape_3d(ctx0, V_t, head_dim, n_heads, T);
 
-        // Manual multi-head attention (ggml_flash_attn_ext crashes with
-        // nullptr mask on some backends — use standard mul_mat path).
-        // Q,K,V are (head_dim, n_heads, T). Permute for matmul:
-        // Q → (head_dim, T, n_heads): for Q @ K^T
-        // K → (head_dim, T, n_heads): transposed via mul_mat convention
-        // V → (head_dim, T, n_heads): for attn_weights @ V
+        // Permute for matmul: (head_dim, n_heads, T) → (head_dim, T, n_heads)
         Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
         K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
         V_t = ggml_cont(ctx0, ggml_permute(ctx0, V_t, 0, 2, 1, 3));
 
-        // scores = Q^T @ K → (T, T, n_heads)
-        // ggml_mul_mat(A, B) = A^T @ B, so mul_mat(K, Q) = K^T @ Q → (T, T, n_heads)
+        // scores = K^T @ Q → (T, T, n_heads), scaled + softmax
         float attn_scale = 1.0f / sqrtf((float)head_dim);
         ggml_tensor* scores = ggml_mul_mat(ctx0, K, Q);
         scores = ggml_scale(ctx0, scores, attn_scale);
         scores = ggml_soft_max(ctx0, scores);
 
-        // attn_out = scores @ V → for each head: (T,T) @ (T,head_dim) → (T,head_dim)
-        // V_t is (head_dim, T, n_heads). We need V with ne[0]=T for mul_mat.
-        // Permute V_t: (head_dim, T, n_heads) → (T, head_dim, n_heads)
+        // attn_out = V_for_attn^T @ scores
         ggml_tensor* V_for_attn = ggml_cont(ctx0, ggml_permute(ctx0, V_t, 1, 0, 2, 3));
-        // V_for_attn: ne = (T, head_dim, n_heads)
-        // mul_mat(V_for_attn, scores) = V_for_attn^T @ scores
-        //   V_for_attn^T: (head_dim, T) @ scores: (T, T) → (head_dim, T, n_heads)
         ggml_tensor* attn = ggml_mul_mat(ctx0, V_for_attn, scores);
 
-        // attn is (head_dim, T, n_heads). Permute → (head_dim, n_heads, T) → reshape to (H, T)
+        // Reshape back to (H, T)
         attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));
         attn = ggml_reshape_2d(ctx0, attn, H, T);
 
@@ -473,17 +469,32 @@ static ggml_cgraph* wav2vec2_build_transformer_graph(const wav2vec2_model& m,
         attn = ggml_add(ctx0, ggml_mul_mat(ctx0, e.o_w, attn), e.o_b);
         cur = ggml_add(ctx0, residual, attn);
 
-        // Pre-FFN LayerNorm
-        residual = cur;
-        x = ggml_norm(ctx0, cur, ln_eps);
-        x = ggml_mul(ctx0, x, e.ln2_w);
-        x = ggml_add(ctx0, x, e.ln2_b);
+        // Post-attention LayerNorm (post-norm only)
+        if (!pre_norm) {
+            cur = ggml_norm(ctx0, cur, ln_eps);
+            cur = ggml_mul(ctx0, cur, e.ln1_w);
+            cur = ggml_add(ctx0, cur, e.ln1_b);
+        }
 
-        // FFN: fc1 → GELU → fc2
-        x = ggml_add(ctx0, ggml_mul_mat(ctx0, e.fc1_w, x), e.fc1_b);
+        // FFN
+        residual = cur;
+        ggml_tensor* ffn_in = cur;
+        if (pre_norm) {
+            ffn_in = ggml_norm(ctx0, cur, ln_eps);
+            ffn_in = ggml_mul(ctx0, ffn_in, e.ln2_w);
+            ffn_in = ggml_add(ctx0, ffn_in, e.ln2_b);
+        }
+        ggml_tensor* x = ggml_add(ctx0, ggml_mul_mat(ctx0, e.fc1_w, ffn_in), e.fc1_b);
         x = ggml_gelu(ctx0, x);
         x = ggml_add(ctx0, ggml_mul_mat(ctx0, e.fc2_w, x), e.fc2_b);
         cur = ggml_add(ctx0, residual, x);
+
+        // Post-FFN LayerNorm (post-norm only)
+        if (!pre_norm) {
+            cur = ggml_norm(ctx0, cur, ln_eps);
+            cur = ggml_mul(ctx0, cur, e.ln2_w);
+            cur = ggml_add(ctx0, cur, e.ln2_b);
+        }
     }
 
     // ---- Global LayerNorm ----
@@ -886,6 +897,7 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
     std::vector<uint8_t> scratch;
     ggml_linear_f32(scratch, m.fp_w, (const float*)m.fp_b->data, feat.data(), hidden.data(), C_cnn, H, T, n_threads);
 
+
     // ---- 3. Positional conv (manual — grouped conv is hard in ggml) ----
     {
         std::vector<float> hcf(H * T);
@@ -1015,7 +1027,7 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
             }
             ggml_backend_sched_free(sched);
             // Fall through to per-layer path if sched failed
-            fprintf(stderr, "[wav2vec2] sched path failed, using per-layer fallback\n");
+            fprintf(stderr, "[wav2vec2] sched path failed (alloc or compute), using per-layer fallback\n");
         }
     }
 

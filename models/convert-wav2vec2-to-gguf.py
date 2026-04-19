@@ -271,12 +271,19 @@ def main() -> None:
         int(config.num_conv_pos_embedding_groups),
     )
     writer.add_float32(f"{ARCH}.layer_norm_eps", float(config.layer_norm_eps))
-    writer.add_uint32(f"{ARCH}.pad_token_id", int(config.pad_token_id))
+    # CTC blank token is always index 0 in HF wav2vec2 (the <pad> token).
+    # config.pad_token_id may differ (e.g. 1 for base models), but for CTC
+    # greedy decoding we need the actual blank index.
+    ctc_blank_id = 0
+    writer.add_uint32(f"{ARCH}.pad_token_id", ctc_blank_id)
     # 0 = group norm variant (InstanceNorm, e.g. wav2vec2-base), 1 = layer norm variant (e.g. wav2vec2-large)
     feat_norm_type = (
         1 if getattr(config, "feat_extract_norm", "group") == "layer" else 0
     )
     writer.add_uint32(f"{ARCH}.feat_extract_norm_type", feat_norm_type)
+    # 0 = post-norm (standard, base models), 1 = pre-norm (stable, large models)
+    stable_ln = 1 if getattr(config, "do_stable_layer_norm", False) else 0
+    writer.add_uint32(f"{ARCH}.do_stable_layer_norm", stable_ln)
 
     # CNN shape arrays (stored as individual keys for portability)
     for i, (dim, kern, stride) in enumerate(
