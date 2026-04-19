@@ -1143,3 +1143,46 @@ first be diagnosed by (a) checking Event Viewer →
 running the binary against `Dependencies.exe` or
 `dumpbin /dependents` to find the missing import. The codebase
 itself is usually fine.
+
+## Kyutai STT: causal padding, interleaved RoPE, and codec-based ASR
+
+### Causal (left-only) padding in conv1d
+
+moshi/Mimi uses `StreamingConv1d` which prepends
+`pad_left = kernel_size - stride` zeros to the LEFT before conv1d with
+padding=0. Standard symmetric padding produces completely wrong Mimi
+encoder output — the SEANet outputs are numerically different and the
+RVQ codes cascade to garbage.
+
+**Fix:** `ggml_pad_ext(x, pad_left, 0, 0, 0, 0, 0, 0, 0)` before
+`ggml_conv_1d(weight, x, stride, 0, 1)`. After this fix, SEANet output
+was bit-perfect vs the official Python Mimi encoder.
+
+### Interleaved vs NEOX RoPE
+
+Kyutai models use **interleaved** RoPE (`[r0,i0,r1,i1,...]`), which is
+`GGML_ROPE_TYPE_NORMAL = 0`. Not the NEOX layout (`[r0,r1,...,i0,i1,...]`)
+used by Llama/Mistral/Qwen. Using the wrong RoPE type makes the encoder
+transformer output diverge (max diff 0.07) and the LM produce garbage.
+
+**Lesson:** Always check `rope.interleave` in the Python source. The two
+layouts are **not** compatible — there's no graceful degradation, just
+completely wrong output.
+
+### Initial token IDs
+
+The STT LM uses `text_card` (8000) as the initial text token and `card`
+(2048) as the initial audio token — NOT the padding ID (3). These are
+"start-of-sequence" tokens at the end of the vocabulary. The moshi.cpp
+code: `text_initial_token_id = config.text_card; initial_token_id = config.card`.
+
+### Stage-by-stage diff protocol (applied)
+
+1. SEANet: bit-perfect after causal padding fix (max diff = 0.000000)
+2. Encoder transformer: bit-perfect after RoPE + causal mask fix
+3. RVQ codes: 99.3% match (100% codebook-0, FP residual drift on rest)
+4. LM: correct "And so, my fellow Americans..." after all fixes
+
+The causal padding bug was invisible at the architecture level — the
+shapes were correct, the model ran without errors, but every single
+output value was wrong. Only the diff-test protocol caught it.

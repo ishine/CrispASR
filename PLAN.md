@@ -648,6 +648,28 @@ boundary. The `Session` API is safe (C-ABI wrapper catches exceptions).
 | **Done** | #21 CLI→library DRY refactor | VAD, diarize, LID, aligner, cache, registry promoted to src/ behind shared C-ABI | ~2000 LOC moved |
 | **Pending** | #22 Stream + audio decoder in wrappers | Expose `crispasr_audio_decode_*` + streaming session through Dart/Python/Rust bindings | ~150 LOC each |
 | **Pending** | #23 Diarization + LID + align in CrisperWeaver | Swap the MFCC/k-means stopgap for the lib path; wire LID for auto-language; add forced-aligner for LLM backends | ~250 LOC |
+| **Done** | #27 Kyutai STT (13th backend) | Mimi neural audio codec + causal LM, novel codec-based architecture | ~900 LOC |
+
+## 27. Kyutai STT — DONE
+
+13th backend. Architecture: Mimi audio codec encoder (SEANet CNN + 8-layer
+transformer + stride-2 downsample + RVQ with 32 codebooks) → 16-layer causal
+transformer LM (2048d, RoPE, SwiGLU, RMSNorm) → SentencePiece text output.
+
+Key implementation lessons (discovered via stage-by-stage diff testing):
+- Conv1d uses **causal (left-only) padding**: `pad_left = kernel_size - stride`
+  zeros prepended via `ggml_pad_ext`. Symmetric padding breaks the Mimi encoder.
+- RoPE is **interleaved** (`GGML_ROPE_TYPE_NORMAL=0`), not NEOX layout.
+- Encoder transformer attention is **causal with context=250**.
+- Initial tokens: `text_card` (8000) for text, `card` (2048) for audio — NOT
+  the text padding token (3).
+- Codebook embeddings pre-computed from `embedding_sum / cluster_usage` at
+  GGUF conversion time. RVQ CPU nearest-neighbor search at inference.
+- Reference: [moshi.cpp](https://github.com/Codes4Fun/moshi.cpp) (MIT).
+
+Files: `src/kyutai_stt.{h,cpp}`, `models/convert-kyutai-stt-to-gguf.py`,
+`examples/cli/crispasr_backend_kyutai_stt.cpp`,
+`tools/dump_kyutai_stt_reference.py`.
 
 ## 25. Montreal Forced Aligner evaluation — NOT PLANNED
 

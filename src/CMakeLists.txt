@@ -398,6 +398,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# kyutai-stt — Kyutai STT (stt-1b-en_fr, stt-2.6b-en)
+# ---------------------------------------------------------------------------
+add_library(kyutai-stt STATIC kyutai_stt.h kyutai_stt.cpp)
+set_target_properties(kyutai-stt PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(kyutai-stt PUBLIC .)
+target_compile_features   (kyutai-stt PUBLIC cxx_std_17)
+target_link_libraries     (kyutai-stt PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(kyutai-stt PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 add_library(wav2vec2-ggml STATIC wav2vec2-ggml.h wav2vec2-ggml.cpp)
 target_include_directories(wav2vec2-ggml PUBLIC .)
 target_compile_features   (wav2vec2-ggml PUBLIC cxx_std_17)
@@ -534,6 +546,9 @@ if (TARGET wav2vec2-ggml)
 endif()
 if (TARGET glm-asr)
     target_link_libraries(whisper PUBLIC glm-asr)
+endif()
+if (TARGET kyutai-stt)
+    target_link_libraries(whisper PUBLIC kyutai-stt)
 endif()
 # Pyannote segmentation is not a backend; it's consumed by
 # crispasr_diarize.cpp for the "pyannote" method. Still needs linking in
