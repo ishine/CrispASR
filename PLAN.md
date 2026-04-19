@@ -459,18 +459,29 @@ isn't slower than flash_attn on CPU.
 
 ---
 
-## 17. VAD stitching for long audio (whisper.cpp parity)
+## 17. VAD stitching for long audio (whisper.cpp parity) — DONE
+
+**Shipped:** v0.4.3 (CLI-internal stitching) → v0.4.4 (exposed via
+C-ABI as `crispasr_session_transcribe_vad`, so Dart/Python/Rust all
+get it through one call).
 
 **Goal:** Match whisper.cpp's VAD approach for non-whisper backends:
 stitch VAD segments into a contiguous buffer, process as one audio,
 remap timestamps back to original positions.
 
-**Current state (April 2026):**
-- VAD now works (centisecond bug fixed, segment merging added)
-- Each VAD segment is transcribed independently as a separate slice
-- This loses cross-segment context at boundaries
+**Current state:** Done end-to-end. The shared library
+(`src/crispasr_vad.{h,cpp}`) owns slicing + merge/split + stitch +
+remap. The CLI calls it. The C-ABI function
+`crispasr_session_transcribe_vad(session, pcm, n, sr, vad_path, opts)`
+runs the whole pipeline in one FFI hop and every wrapper binds it.
+CrisperWeaver v0.1.7 uses this path for all 9 non-whisper backends.
+
+**Pre-DRY state (for archival context):**
+- VAD worked (centisecond bug fixed, segment merging added)
+- Each VAD segment was transcribed independently as a separate slice
+- This lost cross-segment context at boundaries
 - whisper.cpp stitches segments + builds a `vad_mapping_table` for
-  timestamp remapping — this gives better results
+  timestamp remapping — this gave better results
 
 **How whisper.cpp does it (src/whisper.cpp lines 6895-6980):**
 1. Concatenate all VAD segments into one contiguous float buffer
@@ -504,6 +515,66 @@ across silence gaps).
 **Immediate value:** Current VAD segment merging (min 3s, gap < 1s)
 already handles the common case well. The stitching improvement
 matters most for audio with many short pauses (lectures, interviews).
+
+---
+
+## 21. CLI→library DRY refactor — DONE (v0.4.4–v0.4.8)
+
+**Goal:** End the duplication between `examples/cli/crispasr_*.{h,cpp}`
+and the C-ABI. Each release in this cycle promoted one concern from
+CLI-only into `src/` behind the shared C-ABI, leaving the CLI with
+nothing but arg parsing, output formatting, and thin UX shims.
+
+**Shipped:**
+
+| Release | Moved to `src/` | New C-ABI |
+|---|---|---|
+| v0.4.4 | VAD slicing + stitching + remap (`crispasr_vad.{h,cpp}`) + file rename `crispasr_dart_helpers.cpp` → `crispasr_c_api.cpp` | `crispasr_session_transcribe_vad` |
+| v0.4.5 | 4 in-process diarizers: energy, xcorr, vad-turns, native pyannote (`crispasr_diarize.{h,cpp}`) | `crispasr_diarize_segments_abi` |
+| v0.4.6 | whisper-tiny + silero-native LID with context cache (`crispasr_lid.{h,cpp}`) | `crispasr_detect_language_pcm` |
+| v0.4.7 | canary-CTC + qwen3-forced-aligner (`crispasr_aligner.{h,cpp}`) | `crispasr_align_words_abi` + 5 result accessors |
+| v0.4.8 | HF download + cache (`crispasr_cache.{h,cpp}`) + model registry (`crispasr_model_registry.{h,cpp}`) | `crispasr_cache_ensure_file_abi`, `crispasr_cache_dir_abi`, `crispasr_registry_lookup_abi`, `_by_filename_abi` |
+
+**What stayed in the CLI:**
+- `cli.cpp` — arg parsing + dispatch
+- `crispasr_backend.{h,cpp}` + `crispasr_backend_*.cpp` — the
+  whisper-cli-shaped `CrispasrBackend` wrapper over each model's
+  native C API (the session API in `src/` is the modern path; this
+  one is kept for the historical `whisper-cli`-compatible mode)
+- `crispasr_output.cpp` — TXT/SRT/VTT/CSV/JSON/LRC writers
+- `crispasr_server.cpp` — HTTP server for persistent-model mode
+- `crispasr_diff*.cpp` — diff tool for regression runs
+- `*_cli.{h,cpp}` shims: `crispasr_vad_cli`, `crispasr_lid_cli`,
+  `crispasr_diarize_cli`, `crispasr_model_mgr_cli`, `crispasr_aligner_cli`
+  — all purely UX policy (auto-download from `~/.cache/crispasr`,
+  sherpa-ONNX subprocess fallback, TTY download prompt, format
+  adapter layer)
+
+**Wrapper alignment:** all three bindings bumped to match.
+- `package:crispasr` 0.4.8 (Dart)
+- `crispasr` 0.4.8 (Python)
+- `crispasr` + `crispasr-sys` 0.1.6 (Rust)
+
+Each wrapper gained top-level helpers for every promoted function,
+plus a `*_abi` ABI-POD struct for the parameters where that makes
+sense (VAD opts, diarize opts). The `crispasr_dart_helpers_version`
+C-ABI symbol is kept as a back-compat alias pointing at
+`crispasr_c_api_version`, so 0.4.x-era external consumers keep
+resolving.
+
+**Lessons:**
+- Header basename clashes between `src/crispasr_vad.h` and
+  `examples/cli/crispasr_vad.h` break the build because the whisper
+  target marks `src/` `PUBLIC` on its include path. Fix: rename the
+  CLI header to `crispasr_vad_cli.h` (and same for diarize/lid/
+  model_mgr/aligner).
+- Function-name collisions between CLI and library (e.g. both had a
+  `crispasr_detect_language`) are OK in C++ if argument types
+  differ (different mangled names) but fragile. Safer pattern: CLI
+  shim exposes `crispasr_*_cli(...)` variants.
+- POD ABI structs need explicit `_pad` fields for predictable layout
+  on 32-bit vs 64-bit. We use `int32_t` explicitly and check sizes
+  in the Dart/Python/Rust bindings.
 
 ---
 
@@ -557,3 +628,6 @@ backends that lack native timestamps (voxtral, granite, cohere).
 | **High** | #19 wav2vec2-base support | Fix forward pass for base models (768 hidden, group norm) | ~50 LOC |
 | **Medium** | #20 OGG support on Windows | stb_vorbis not linked or read_audio_data path issue (#10) | ~20 LOC |
 | **Low** | #16 Shaw RPE for granite graph | Add query-dependent position bias to encoder graph | ~80 LOC |
+| **Done** | #21 CLI→library DRY refactor | VAD, diarize, LID, aligner, cache, registry promoted to src/ behind shared C-ABI | ~2000 LOC moved |
+| **Pending** | #22 Stream + audio decoder in wrappers | Expose `crispasr_audio_decode_*` + streaming session through Dart/Python/Rust bindings | ~150 LOC each |
+| **Pending** | #23 Diarization + LID + align in CrisperWeaver | Swap the MFCC/k-means stopgap for the lib path; wire LID for auto-language; add forced-aligner for LLM backends | ~250 LOC |

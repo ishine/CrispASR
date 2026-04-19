@@ -791,3 +791,105 @@ activation type, bias presence). These are silent — the model loads
 and runs without errors, but produces garbage. A debug copy of the
 forward pass (`wav2vec2-ggml-debug.cpp`) with fprintf at each stage
 boundary is kept for future model variant debugging.
+
+---
+
+## CLI ↔ library DRY refactor (April 2026)
+
+v0.4.4–v0.4.8 moved every non-presentation CLI concern into `src/`
+behind the shared C-ABI. Below are the lessons from the five-release
+cycle — things worth remembering the next time a helper turns out to
+be shared across more consumers than its location suggests.
+
+### File names are claims; check them periodically
+
+`examples/cli/crispasr_dart_helpers.cpp` started as Dart-only in
+0.2.0 but by 0.4.0 it was the common FFI surface consumed by the CLI,
+Dart, Python, and Rust. The file name was a documentation bug for
+four releases. The first move (`crispasr_c_api.cpp` + updated header
+comment) was pure churn and should have been done earlier. An
+occasional pass over file/function names vs actual callers is worth
+doing.
+
+### Header basename clashes surface late
+
+`src/crispasr_vad.h` and `examples/cli/crispasr_vad.h` coexisted
+without error until the CLI source that `#include "crispasr_vad.h"`
+happened to compile against the `src/` version (because the whisper
+target is `target_include_directories(... PUBLIC .)`) — producing a
+cryptic type mismatch with the CLI's `whisper_params` usage. Renaming
+the CLI headers to `*_cli.h` (vad/diarize/lid/model_mgr/aligner) is
+the clean fix; guards like `-I` ordering are fragile.
+
+### Function-name collisions are worse than symbol collisions
+
+Both `src/crispasr_lid.cpp` and `examples/cli/crispasr_lid.cpp`
+defined `crispasr_detect_language(...)` as non-member C++ functions.
+Different argument types → different mangled names → the linker is
+happy. But any caller looking at `crispasr_detect_language(samples,
+n, params)` has no idea which one it's getting. The safer pattern is
+to suffix all CLI-shim symbols (`crispasr_detect_language_cli`,
+`crispasr_apply_diarize`, etc.) so the call sites themselves signal
+which layer they belong to.
+
+### Backwards-compat aliases for renamed C-ABI symbols
+
+When we renamed `crispasr_dart_helpers_version()` to
+`crispasr_c_api_version()`, 0.4.x-era binaries already existed that
+probed the old name. The library now exports both — the new function
+is canonical, the old one is a 2-line thunk that calls it. A TODO in
+source marks the removal after the next major version. The Dart
+smoke test asserts **both** resolve and return the same value, so
+we can't accidentally drop the alias early.
+
+### POD ABI structs: be explicit about padding
+
+`crispasr_vad_abi_opts` is `float + 5×int32` = 24 bytes. Clean on
+64-bit with no padding. `crispasr_diarize_seg_abi` would have been
+`int64 + int64 + int32` = 20 bytes with 4 bytes of trailing padding
+on 64-bit — so we added an explicit `int32_t _pad` and documented
+the 24-byte size so Dart/Python/Rust bindings can allocate the
+struct by hand. Always check `sizeof` on both 32- and 64-bit
+platforms when promoting a struct to the ABI.
+
+### Policy stays in the CLI; algorithms go to the library
+
+Every CLI shim follows the same pattern:
+- **CLI-only (stays in `examples/cli/*_cli.{h,cpp}`)**: auto-download
+  from `~/.cache/crispasr`, `isatty()` / TTY prompts,
+  `sherpa-onnx` subprocess spawn, CLI-specific types like
+  `whisper_params` / `crispasr_segment` / `crispasr_word`.
+- **Library (goes to `src/*.{h,cpp}`)**: the actual algorithm —
+  Silero VAD + stitching, diarize methods, whisper encode for LID,
+  canary-CTC Viterbi, the model registry table, the WinHTTP/curl
+  download helper.
+
+This line is obvious in hindsight but we kept crossing it early on.
+Rule of thumb: if a wrapper consumer (Python / Rust / Flutter app)
+could want the function too, it belongs in the library.
+
+### Rust CStr + static buffers for string-returning C-ABI
+
+For the registry lookup (`crispasr_registry_lookup_abi`) we went
+with caller-allocated output buffers (`out_filename`, `out_url`,
+`out_size` as `char* + int cap`) rather than returning an opaque
+handle with accessors. Reasons:
+- Single call rather than 5 round-trips to Python/Dart
+- No lifetime management for the wrappers
+- Registry strings are small (URL up to ~256 chars), so a fixed
+  2 KB stack buffer is fine
+- Easy to detect "buffer too small" (return code 2) and retry
+
+For `crispasr_align_words_abi` we did the opposite — one result can
+contain hundreds of words, each a variable-length string, so we
+kept the `session_result`-style handle + accessors pattern. Choice
+of pattern depends on how bounded the output is.
+
+### A Dart smoke test that only checks `lib.lookup()` catches 90% of binding drift
+
+`flutter/crispasr/test/bindings_smoke_test.dart` just resolves every
+C-ABI symbol by name. It takes 50 ms to run, needs no audio, and
+catches: symbol rename typos, missing `CA_EXPORT`, new backend
+dropping a target from `target_link_libraries(whisper PUBLIC ...)`,
+and stale `.so`/`.dylib` on the test machine. Ran it after every
+release in this cycle; caught one typo that would've shipped.
