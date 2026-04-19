@@ -626,10 +626,17 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, ggml_tensor* x, const f
     if (conv.pre_ln_b)
         h = ggml_add(ctx, h, conv.pre_ln_b);
 
-    // Pointwise conv1: d_model → 2*d_inner (5120 for d=1280)
-    // pw1_w in ggml ne: [1, 1280, 5120] → reshape to [1280, 5120]
-    ggml_tensor* pw1 = ggml_reshape_2d(ctx, conv.pw1_w, conv.pw1_w->ne[1], conv.pw1_w->ne[2]);
-    h = ggml_mul_mat(ctx, pw1, h); // [5120, T]
+    // Pointwise conv1: d_model → 2*d_inner
+    // pw1_w shape in PyTorch: [5120, 1280, 1] (Conv1d with kernel=1)
+    // In ggml ne: depends on F16/F32 storage layout
+    // For matmul: need [in_dim, out_dim] = [1280, 5120]
+    // pw1_w ne: [1, 1280, 5120] → reshape to [1280, 5120] for matmul
+    // Use ggml_view to create a 2D view without reallocating
+    ggml_tensor* pw1_c = ggml_cont(ctx, conv.pw1_w);
+    ggml_tensor* pw1 = ggml_reshape_2d(ctx, pw1_c,
+                                       conv.pw1_w->ne[0] * conv.pw1_w->ne[1],
+                                       conv.pw1_w->ne[2]);
+    h = ggml_mul_mat(ctx, pw1, h);
 
     // GLU: split → sigmoid gate
     int ch = (int)h->ne[0] / 2; // 2560
@@ -638,11 +645,12 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, ggml_tensor* x, const f
     h = ggml_mul(ctx, h1, ggml_sigmoid(ctx, h2)); // [2560, T]
 
     // Depthwise conv1d: groups=2560, kernel=33
-    // Transpose to [T, 2560] for conv1d
-    ggml_tensor* ht = ggml_cont(ctx, ggml_transpose(ctx, h));
+    // Transpose to [T, channels] for conv1d_dw
+    ggml_tensor* ht = ggml_cont(ctx, ggml_transpose(ctx, h)); // [T, 2560]
+    // Causal padding: pad_left = kernel_size - 1 (stride=1)
     int pad_left = kernel_size - 1;
     ht = ggml_pad_ext(ctx, ht, pad_left, 0, 0, 0, 0, 0, 0, 0);
-    ht = ggml_conv_1d(ctx, conv.dw_w, ht, 1, 0, 1);
+    ht = ggml_conv_1d_dw(ctx, conv.dw_w, ht, 1, 0, 1);
     ht = ggml_reshape_2d(ctx, ht, ht->ne[0], ht->ne[1]);
     h = ggml_cont(ctx, ggml_transpose(ctx, ht)); // [2560, T]
 
@@ -655,7 +663,11 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, ggml_tensor* x, const f
     h = swish_act(ctx, h);
 
     // Pointwise conv2: 2560 → 1280
-    ggml_tensor* pw2 = ggml_reshape_2d(ctx, conv.pw2_w, conv.pw2_w->ne[1], conv.pw2_w->ne[2]);
+    // pw2_w ne: [1, 2560, 1280]
+    ggml_tensor* pw2_c = ggml_cont(ctx, conv.pw2_w);
+    ggml_tensor* pw2 = ggml_reshape_2d(ctx, pw2_c,
+                                       conv.pw2_w->ne[0] * conv.pw2_w->ne[1],
+                                       conv.pw2_w->ne[2]);
     h = ggml_mul_mat(ctx, pw2, h); // [1280, T]
 
     return ggml_add(ctx, residual, h);
@@ -858,6 +870,15 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
         // MHSA with relative PE
         x = build_rel_mhsa(ctx0, x, b.mhsa, hp.n_head, hp.head_dim);
         // Conv module
+        if (i == 0 && ctx->params.verbosity >= 1) {
+            fprintf(stderr, "  conv pw1_w: ne=[%lld,%lld,%lld,%lld] nelements=%lld contiguous=%d nb=[%lld,%lld,%lld,%lld]\n",
+                    (long long)b.conv.pw1_w->ne[0], (long long)b.conv.pw1_w->ne[1],
+                    (long long)b.conv.pw1_w->ne[2], (long long)b.conv.pw1_w->ne[3],
+                    (long long)ggml_nelements(b.conv.pw1_w),
+                    ggml_is_contiguous(b.conv.pw1_w),
+                    (long long)b.conv.pw1_w->nb[0], (long long)b.conv.pw1_w->nb[1],
+                    (long long)b.conv.pw1_w->nb[2], (long long)b.conv.pw1_w->nb[3]);
+        }
         x = build_conv_module(ctx0, x, b.conv, hp.d_model, hp.kernel_size);
         // Macaron FFN2 (half-step)
         x = build_macaron_ffn(ctx0, x, b.ffn2);

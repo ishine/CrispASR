@@ -92,35 +92,31 @@ def main():
     print(f"  Vocabulary: {len(vocab)} tokens")
 
     # Load CMVN (binary Kaldi ark format — extract mean and variance)
-    # For now, read as binary and parse the float arrays
+    import struct
     cmvn_mean = None
-    cmvn_var = None
-    try:
-        import struct
-        with open(cmvn_path, "rb") as f:
-            data = f.read()
-        # Kaldi binary ark: skip header, find float matrices
-        # Format: " BDM " header + matrix data
-        # Simple approach: find the float32 arrays
-        # The CMVN file contains mean[80] and variance[80]
-        idx = data.find(b"BDM")
-        if idx >= 0:
-            idx += 4  # skip "BDM " + type byte
-            # Read dimensions
-            # Kaldi format: rows cols then float data
-            # Let's just extract 160 floats (80 mean + 80 var)
-            float_start = idx
-            while float_start < len(data) and data[float_start:float_start+1] not in [b'\x00']:
-                float_start += 1
-            # Try to find 80 consecutive floats
-            n_floats = (len(data) - idx) // 4
-            if n_floats >= 160:
-                all_floats = struct.unpack(f"<{n_floats}f", data[idx:idx + n_floats * 4])
-                # First 80 = sum, next 80 = sum_sq, last = count
-                # Actually CMVN format varies. Let's skip for now and handle in C++
-        print(f"  CMVN: loaded ({len(data)} bytes)")
-    except Exception as e:
-        print(f"  CMVN: skipped ({e})")
+    cmvn_std = None
+    with open(cmvn_path, "rb") as f:
+        data = f.read()
+    for i in range(len(data) - 3):
+        if data[i:i+3] in (b"BDM", b"BFM"):
+            mtype = data[i:i+3]
+            idx = i + 3
+            if data[idx] == 0x20: idx += 1
+            assert data[idx] == 4; idx += 1
+            rows = struct.unpack("<i", data[idx:idx+4])[0]; idx += 4
+            assert data[idx] == 4; idx += 1
+            cols = struct.unpack("<i", data[idx:idx+4])[0]; idx += 4
+            elem_size = 8 if mtype == b"BDM" else 4
+            dtype = "<f8" if mtype == b"BDM" else "<f4"
+            vals = np.frombuffer(data[idx:idx+rows*cols*elem_size], dtype=dtype).reshape(rows, cols)
+            count = vals[0, -1]
+            cmvn_mean = (vals[0, :-1] / count).astype(np.float32)
+            cmvn_var = vals[1, :-1] / count - cmvn_mean.astype(np.float64)**2
+            cmvn_std = np.sqrt(np.maximum(cmvn_var, 1e-10)).astype(np.float32)
+            print(f"  CMVN: mean[0..2]={cmvn_mean[:3]}, std[0..2]={cmvn_std[:3]}")
+            break
+    if cmvn_mean is None:
+        print("  WARNING: CMVN not parsed")
 
     # Create GGUF
     writer = gguf.GGUFWriter(args.output, "firered-asr")
@@ -142,8 +138,16 @@ def main():
     writer.add_uint32("firered.blank_id", hp["blank_id"])
     writer.add_uint32("firered.pad_id", hp["pad_id"])
 
+    # Context padding (for Conv2d subsampling)
+    writer.add_uint32("firered.context", 7)  # 3x3 conv with stride 2: context = 7
+
     # Tokenizer
     writer.add_array("tokenizer.ggml.tokens", vocab)
+
+    # CMVN tensors (baked in for C++ runtime)
+    if cmvn_mean is not None:
+        writer.add_tensor("cmvn.mean", cmvn_mean)
+        writer.add_tensor("cmvn.std", cmvn_std)
 
     # Write tensors
     print(f"\nWriting: {args.output}")
