@@ -437,7 +437,6 @@ extern "C" char* glm_asr_transcribe(struct glm_asr_context* ctx, const float* sa
     const auto& hp = ctx->model.hp;
 
     // 1. Compute mel
-    fprintf(stderr, "glm_asr: step 1 — computing mel...\n");
     int n_mels = 0, T_mel = 0;
     float* mel = glm_asr_compute_mel(ctx, samples, n_samples, &n_mels, &T_mel);
     if (!mel)
@@ -464,24 +463,13 @@ extern "C" char* glm_asr_transcribe(struct glm_asr_context* ctx, const float* sa
         memcpy(mel, padded.data(), padded.size() * sizeof(float));
         T_mel = T_target;
     }
-    fprintf(stderr, "glm_asr: mel done — n_mels=%d T_mel=%d\n", n_mels, T_mel);
-    fprintf(stderr, "glm_asr: mel[0,:4] = [%.6f, %.6f, %.6f, %.6f]\n", mel[0], mel[1], mel[2], mel[3]);
-    fprintf(stderr, "glm_asr: mel[127,:4] = [%.6f, %.6f, %.6f, %.6f]\n", mel[127 * T_mel], mel[127 * T_mel + 1],
-            mel[127 * T_mel + 2], mel[127 * T_mel + 3]);
 
     // 2. Run encoder + projector
-    fprintf(stderr, "glm_asr: step 2 — running encoder...\n");
     int N_enc = 0, enc_dim = 0;
     float* audio_embeds = glm_asr_run_encoder(ctx, mel, n_mels, T_mel, &N_enc, &enc_dim);
     free(mel);
     if (!audio_embeds)
         return nullptr;
-
-    fprintf(stderr, "glm_asr: encoder done — N_enc=%d enc_dim=%d\n", N_enc, enc_dim);
-    fprintf(stderr, "glm_asr: enc[0,:4] = [%.6f, %.6f, %.6f, %.6f]\n", audio_embeds[0], audio_embeds[1],
-            audio_embeds[2], audio_embeds[3]);
-    fprintf(stderr, "glm_asr: enc[1,:4] = [%.6f, %.6f, %.6f, %.6f]\n", audio_embeds[enc_dim], audio_embeds[enc_dim + 1],
-            audio_embeds[enc_dim + 2], audio_embeds[enc_dim + 3]);
 
     // 3. Build prompt: <|user|>\n<|begin_of_audio|><|pad|>×N<|end_of_audio|><|user|>\nPlease transcribe...<|assistant|>\n
     std::vector<int32_t> ids;
@@ -555,12 +543,30 @@ extern "C" char* glm_asr_transcribe(struct glm_asr_context* ctx, const float* sa
         if (is_eos(next))
             break;
 
-        // Append token text
+        // Append token text (with GPT-2 byte-level BPE decoding)
         if (next >= 0 && next < (int)ctx->model.vocab.size()) {
             const auto& tok = ctx->model.vocab[next];
             // Skip special tokens
-            if (tok.size() < 2 || tok[0] != '<' || tok[1] != '|')
-                result += tok;
+            if (tok.size() >= 2 && tok[0] == '<' && tok[1] == '|')
+                continue;
+            // Decode GPT-2 byte-level BPE: Ġ→space, Ċ→newline, etc.
+            for (size_t ci = 0; ci < tok.size();) {
+                unsigned char c = (unsigned char)tok[ci];
+                if (c == 0xC4 && ci + 1 < tok.size()) {
+                    unsigned char c2 = (unsigned char)tok[ci + 1];
+                    if (c2 == 0xA0) {
+                        result += ' '; // Ġ = U+0120 = space
+                        ci += 2;
+                        continue;
+                    } else if (c2 == 0x8A) {
+                        result += '\n'; // Ċ = U+010A = newline
+                        ci += 2;
+                        continue;
+                    }
+                }
+                result += (char)c;
+                ci++;
+            }
         }
 
         // Forward one token
@@ -595,22 +601,8 @@ extern "C" float* glm_asr_compute_mel(struct glm_asr_context* ctx, const float* 
     const auto& hp = ctx->model.hp;
 
     // Get mel_filters and mel_window from model tensors
-    ggml_tensor* mel_fb_t = nullptr;
-    ggml_tensor* mel_win_t = nullptr;
-    auto it = std::find_if(ctx->model.audio.blocks.begin(), ctx->model.audio.blocks.end(),
-                           [](const glm_enc_block&) { return false; }); // dummy
-    // Look up from the ggml context (loaded via core_gguf::load_weights)
-    mel_fb_t = ggml_get_tensor(ctx->model.ctx, "audio.mel_filters");
-    mel_win_t = ggml_get_tensor(ctx->model.ctx, "audio.mel_window");
-    fprintf(stderr, "glm_asr: mel_fb_t=%p mel_win_t=%p\n", (void*)mel_fb_t, (void*)mel_win_t);
-    if (mel_fb_t) {
-        fprintf(stderr, "glm_asr: mel_fb ne=[%lld,%lld] nbytes=%zu\n", (long long)mel_fb_t->ne[0],
-                (long long)mel_fb_t->ne[1], ggml_nbytes(mel_fb_t));
-    }
-    if (mel_win_t) {
-        fprintf(stderr, "glm_asr: mel_win ne=[%lld] nbytes=%zu\n", (long long)mel_win_t->ne[0],
-                ggml_nbytes(mel_win_t));
-    }
+    ggml_tensor* mel_fb_t = ggml_get_tensor(ctx->model.ctx, "audio.mel_filters");
+    ggml_tensor* mel_win_t = ggml_get_tensor(ctx->model.ctx, "audio.mel_window");
 
     if (!mel_fb_t || !mel_win_t) {
         fprintf(stderr, "glm_asr: mel_filters or mel_window not found in model\n");
@@ -618,18 +610,11 @@ extern "C" float* glm_asr_compute_mel(struct glm_asr_context* ctx, const float* 
     }
 
     // Read mel data from backend
-    // mel_filters stored as (n_freqs, n_mels) in HF layout:
-    // ne[0] = n_mels or n_freqs depending on how it was written.
-    // Our converter writes numpy (201, 128) → ggml ne[0]=201, ne[1]=128
-    // OR ne[0]=128, ne[1]=201. Check both dims.
     int n_freqs = (int)mel_fb_t->ne[0];
     int n_mels_fb = (int)mel_fb_t->ne[1];
     if (n_mels_fb == 201) {
-        // Swapped — ne[0]=n_mels, ne[1]=n_freqs
         std::swap(n_freqs, n_mels_fb);
     }
-    fprintf(stderr, "glm_asr: reading mel_fb n_freqs=%d n_mels=%d (%zu floats)\n", n_freqs, n_mels_fb,
-            (size_t)n_freqs * n_mels_fb);
     std::vector<float> mel_fb((size_t)n_freqs * n_mels_fb);
     ggml_backend_tensor_get(mel_fb_t, mel_fb.data(), 0, mel_fb.size() * sizeof(float));
 
@@ -705,8 +690,8 @@ extern "C" float* glm_asr_compute_mel(struct glm_asr_context* ctx, const float* 
         }
     };
 
-    auto mel = core_mel::compute(samples, n_samples, mel_win.data(), win_len, mel_fb.data(), n_freqs, glm_fft, p,
-                                 T_mel);
+    auto mel =
+        core_mel::compute(samples, n_samples, mel_win.data(), win_len, mel_fb.data(), n_freqs, glm_fft, p, T_mel);
     if (mel.empty())
         return nullptr;
 
@@ -847,27 +832,58 @@ static ggml_cgraph* glm_build_encoder(glm_asr_context* ctx, int T_mel) {
         if (b.attn_norm_b)
             x = ggml_add(ctx0, x, b.attn_norm_b);
 
-        // Self-attention with partial RoPE
-        // For simplicity, use encoder_self_attn which already handles biases.
-        // Partial RoPE (factor=0.5) means RoPE on first hd/2 dims only.
-        // For now, apply full RoPE — partial would need splitting Q/K.
-        // TODO: implement partial RoPE for better accuracy.
-        core_attn::EncoderSelfAttnParams eap = {};
-        eap.n_heads = n_heads;
-        eap.n_kv_heads = n_heads; // MHA
-        eap.head_dim = hd;
-        eap.n_kv_grp = 1;
-        eap.attn_scale = scale;
-        eap.n_ctx_orig = hp.enc_max_pos;
-        eap.rope_theta = 10000.0f;
-        eap.permute_cont = true;
+        // Self-attention with partial RoPE (factor=0.5).
+        // RoPE applied to first hd/2 dims only; rest pass through unchanged.
+        {
+            const int rope_dim = (int)(hd * hp.partial_rotary); // 32
+            const int pass_dim = hd - rope_dim;                 // 32
 
-        ggml_tensor* attn = core_attn::encoder_self_attn(
-            ctx0, x, b.attn_q_w, b.attn_q_b, b.attn_k_w, nullptr, // K has no bias in GLM-ASR encoder
-            b.attn_v_w, nullptr,                                  // V has no bias
-            b.attn_out_w, b.attn_out_b, positions, nullptr,       // no mask (bidirectional)
-            eap);
-        cur = ggml_add(ctx0, residual, attn);
+            // Q/K/V projections
+            ggml_tensor* Q = ggml_mul_mat(ctx0, b.attn_q_w, x);
+            if (b.attn_q_b)
+                Q = ggml_add(ctx0, Q, b.attn_q_b);
+            ggml_tensor* K = ggml_mul_mat(ctx0, b.attn_k_w, x);
+            ggml_tensor* V = ggml_mul_mat(ctx0, b.attn_v_w, x);
+
+            // Reshape to (hd, n_heads, T)
+            Q = ggml_reshape_3d(ctx0, Q, hd, n_heads, T_enc);
+            K = ggml_reshape_3d(ctx0, K, hd, n_heads, T_enc);
+            V = ggml_reshape_3d(ctx0, V, hd, n_heads, T_enc);
+
+            // Partial RoPE: split → apply RoPE to first rope_dim → concat
+            // Q/K are (hd, n_heads, T). Split along dim 0 (hd).
+            ggml_tensor* Q_rope = ggml_view_3d(ctx0, Q, rope_dim, n_heads, T_enc, Q->nb[1], Q->nb[2], 0);
+            ggml_tensor* Q_pass =
+                ggml_view_3d(ctx0, Q, pass_dim, n_heads, T_enc, Q->nb[1], Q->nb[2], rope_dim * ggml_type_size(Q->type));
+            ggml_tensor* K_rope = ggml_view_3d(ctx0, K, rope_dim, n_heads, T_enc, K->nb[1], K->nb[2], 0);
+            ggml_tensor* K_pass =
+                ggml_view_3d(ctx0, K, pass_dim, n_heads, T_enc, K->nb[1], K->nb[2], rope_dim * ggml_type_size(K->type));
+
+            // Apply RoPE to the rope part only
+            Q_rope = ggml_rope_ext(ctx0, Q_rope, positions, nullptr, rope_dim, GGML_ROPE_TYPE_NEOX, hp.enc_max_pos,
+                                   10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            K_rope = ggml_rope_ext(ctx0, K_rope, positions, nullptr, rope_dim, GGML_ROPE_TYPE_NEOX, hp.enc_max_pos,
+                                   10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            // Concatenate: (rope_dim + pass_dim, n_heads, T) = (hd, n_heads, T)
+            Q = ggml_concat(ctx0, Q_rope, Q_pass, 0);
+            K = ggml_concat(ctx0, K_rope, K_pass, 0);
+
+            // Permute to flash-attn layout: (hd, T, n_heads)
+            Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+            K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+            V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+
+            // Flash attention (bidirectional, no mask)
+            ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+            attn = ggml_reshape_2d(ctx0, attn, n_heads * hd, T_enc);
+
+            // Output projection
+            attn = ggml_mul_mat(ctx0, b.attn_out_w, attn);
+            if (b.attn_out_b)
+                attn = ggml_add(ctx0, attn, b.attn_out_b);
+            cur = ggml_add(ctx0, residual, attn);
+        }
 
         // Post-attention LayerNorm + FFN (fc1 → GELU → fc2)
         residual = cur;
