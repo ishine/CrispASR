@@ -3,10 +3,11 @@
 //! # Quick start
 //!
 //! ```no_run
-//! use crispasr::CrispASR;
+//! use crispasr::Session;
 //!
-//! let model = CrispASR::new("ggml-base.en.bin").unwrap();
-//! let segments = model.transcribe_pcm(&pcm_f32).unwrap();
+//! let sess = Session::open("model.gguf").unwrap();
+//! let pcm = vec![0.0f32; 16000]; // 1s of silence
+//! let segments = sess.transcribe(&pcm).unwrap();
 //! for seg in &segments {
 //!     println!("[{:.1}s - {:.1}s] {}", seg.start, seg.end, seg.text);
 //! }

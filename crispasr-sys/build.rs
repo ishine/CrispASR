@@ -21,7 +21,19 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={}/lib", dst.display());
     println!("cargo:rustc-link-search=native={}/lib64", dst.display());
+    // Backend .a files live in the cmake build tree, not the install prefix
+    println!("cargo:rustc-link-search=native={}/build/src", dst.display());
+    println!("cargo:rustc-link-search=native={}/build/ggml/src", dst.display());
     println!("cargo:rustc-link-lib=static=whisper");
+    // Backend model libraries (linked into libwhisper in shared builds,
+    // but separate .a files in static builds)
+    for lib in &[
+        "parakeet", "canary", "canary_ctc", "cohere", "qwen3_asr",
+        "voxtral", "voxtral4b", "granite_speech", "wav2vec2-ggml",
+        "crispasr-core", "pyannote-seg", "silero-lid", "ctc-align",
+    ] {
+        println!("cargo:rustc-link-lib=static={lib}");
+    }
     println!("cargo:rustc-link-lib=static=ggml");
     println!("cargo:rustc-link-lib=static=ggml-base");
     println!("cargo:rustc-link-lib=static=ggml-cpu");
@@ -41,6 +53,7 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=stdc++");
             println!("cargo:rustc-link-lib=dylib=m");
             println!("cargo:rustc-link-lib=dylib=pthread");
+            println!("cargo:rustc-link-lib=dylib=gomp"); // OpenMP
         }
         _ => {}
     }

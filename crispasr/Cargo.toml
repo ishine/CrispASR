@@ -13,3 +13,6 @@ default = []
 cuda = ["crispasr-sys/cuda"]
 metal = ["crispasr-sys/metal"]
 vulkan = ["crispasr-sys/vulkan"]
+
+[dev-dependencies]
+hound = "3.5"
