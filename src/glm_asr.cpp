@@ -752,26 +752,34 @@ extern "C" float* glm_asr_embed_tokens(struct glm_asr_context* ctx, const int32_
 extern "C" bool glm_asr_kv_init(struct glm_asr_context* ctx, int max_ctx) {
     if (!ctx || max_ctx <= 0)
         return false;
+    if (ctx->kv_k)
+        return true; // already initialized
     const auto& hp = ctx->model.hp;
     const int hd = hp.llm_head_dim;
     const int n_kv = hp.llm_n_kv_heads;
     const int nl = hp.llm_n_layers;
-    size_t k_size = (size_t)ggml_type_size(GGML_TYPE_F16) * hd * max_ctx * n_kv * nl;
-    size_t total = k_size * 2 + ggml_tensor_overhead() * 2;
 
-    ggml_init_params ip = {total, nullptr, false};
+    // Must use no_alloc=true context + manual buffer allocation,
+    // so the scheduler recognizes KV tensors as pre-allocated.
+    ggml_init_params ip = {ggml_tensor_overhead() * 4 + 1024, nullptr, true};
     ctx->kv_ctx = ggml_init(ip);
     ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd, max_ctx, n_kv, nl);
     ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd, max_ctx, n_kv, nl);
-    ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, ctx->backend);
+    ggml_set_name(ctx->kv_k, "kv_k");
+    ggml_set_name(ctx->kv_v, "kv_v");
+    size_t kb = ggml_nbytes(ctx->kv_k), vb = ggml_nbytes(ctx->kv_v);
+    ctx->kv_buf = ggml_backend_alloc_buffer(ctx->backend, kb + vb);
     if (!ctx->kv_buf) {
         ggml_free(ctx->kv_ctx);
         ctx->kv_ctx = nullptr;
         return false;
     }
+    char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
+    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
+    ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kb);
     glm_asr_kv_reset(ctx);
     if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "glm_asr: kv cache %zu MiB\n", (k_size * 2) >> 20);
+        fprintf(stderr, "glm_asr: kv cache %zu MiB\n", (kb + vb) >> 20);
     }
     return true;
 }
@@ -1044,6 +1052,13 @@ extern "C" float* glm_asr_run_llm_kv(struct glm_asr_context* ctx, const float* i
         return nullptr;
 
     ggml_backend_sched_reset(ctx->sched);
+
+    // Tell scheduler which backend owns the KV cache tensors
+    if (ctx->kv_k)
+        ggml_backend_sched_set_tensor_backend(ctx->sched, ctx->kv_k, ctx->backend);
+    if (ctx->kv_v)
+        ggml_backend_sched_set_tensor_backend(ctx->sched, ctx->kv_v, ctx->backend);
+
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return nullptr;
 
