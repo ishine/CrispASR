@@ -557,34 +557,64 @@ Add `-ojf` (`--output-json-full`) to include per-word `words[]` and per-token `t
 
 ## Language bindings
 
+All three wrappers are thin shells over the same C-ABI surface in
+`src/crispasr_c_api.cpp`. Anything the CLI can do — transcribe, VAD,
+diarize, LID, align, download — is one function call in every
+language.
+
 ### Python
 
 ```python
-from crispasr import CrispASR
+from crispasr import (
+    Session, diarize_segments, detect_language_pcm,
+    align_words, cache_ensure_file, registry_lookup,
+)
 
-model = CrispASR("ggml-base.en.bin")
-segments = model.transcribe("audio.wav")
-for seg in segments:
-    print(f"[{seg.start:.1f}s - {seg.end:.1f}s] {seg.text}")
+# Transcribe (all 10 backends via one session object)
+sess = Session("parakeet-tdt-0.6b-v3-q4_k.gguf")
+segs = sess.transcribe_vad(pcm, "silero-v5.1.2.bin")  # stitched VAD pass
+
+# Run each shared post-step standalone
+lang = detect_language_pcm(pcm, model_path="ggml-tiny.bin")
+diarize_segments(my_segs, pcm, method=DiarizeMethod.VAD_TURNS)
+words = align_words("canary-ctc-aligner.gguf", "hello world", pcm)
+
+# Auto-download a canonical model
+entry = registry_lookup("parakeet")
+path  = cache_ensure_file(entry.filename, entry.url)
 ```
 
 ### Rust
 
 ```rust
-use crispasr::CrispASR;
+use crispasr::{
+    Session, DiarizeMethod, DiarizeOptions, DiarizeSegment,
+    LidMethod, detect_language_pcm, align_words,
+    cache_ensure_file, registry_lookup,
+};
 
-let model = CrispASR::new("ggml-base.en.bin")?;
-let segments = model.transcribe_pcm(&pcm_f32)?;
+let sess = Session::open("cohere-transcribe-q4_k.gguf", 4)?;
+let segs = sess.transcribe_vad(&pcm, "silero-v5.1.2.bin", None)?;
+
+let entry = registry_lookup("canary")?.unwrap();
+let path  = cache_ensure_file(&entry.filename, &entry.url, false, None)?;
 ```
 
 ### Dart / Flutter
 
 ```dart
-final model = CrispASR('ggml-base.en.bin');
-final segments = model.transcribePcm(pcmFloat32);
+import 'package:crispasr/crispasr.dart' as crispasr;
+
+final sess = crispasr.CrispasrSession.open(modelPath, backend: 'parakeet');
+final segs = sess.transcribeVad(pcm, vadModelPath);
+
+final lang = crispasr.detectLanguagePcm(
+  pcm: pcm, method: crispasr.LidMethod.whisper, modelPath: tinyPath);
+final words = crispasr.alignWords(
+  alignerModel: ctcPath, transcript: text, pcm: pcm);
 ```
 
-Reference application: **[CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver)** — a cross-platform Flutter desktop/mobile transcription app built on `package:crispasr`. Ships with model browser + downloader (all 10 backends + quants), drag-and-drop files, mic capture, SRT/VTT/TXT export, per-run performance metrics, and full en/de i18n. macOS and Linux binaries are built in CI; Android/iOS are supported via the mobile toolchains below.
+Reference application: **[CrisperWeaver](https://github.com/CrispStrobe/CrisperWeaver)** — a cross-platform Flutter desktop/mobile transcription app built on `package:crispasr`. Ships with model browser + downloader (all 10 backends + quants), drag-and-drop files, mic capture, SRT/VTT/TXT export, per-run performance metrics, and full en/de i18n. The v0.1.7 release uses the new `transcribeVad` path so every non-whisper backend benefits from stitched Silero VAD with zero CrisperWeaver-side work.
 
 ### Mobile
 
@@ -597,17 +627,21 @@ Reference application: **[CrisperWeaver](https://github.com/CrispStrobe/CrisperW
 
 ## Auto-download (`-m auto`)
 
-When you pass `-m auto` (or `-m default`), CrispASR downloads the default quantized model for the selected backend into `~/.cache/crispasr/` on first use. The registry:
+When you pass `-m auto` (or `-m default`), CrispASR downloads the default quantized model for the selected backend into `~/.cache/crispasr/` on first use. The registry (kept in sync with `src/crispasr_model_registry.cpp`):
 
 | Backend | Download | Approx size |
 |---|---|---|
+| whisper | `ggerganov/whisper.cpp/ggml-base.en.bin` | ~147 MB |
 | parakeet | `cstr/parakeet-tdt-0.6b-v3-GGUF` | ~467 MB |
 | canary | `cstr/canary-1b-v2-GGUF` | ~600 MB |
 | voxtral | `cstr/voxtral-mini-3b-2507-GGUF` | ~2.5 GB |
 | voxtral4b | `cstr/voxtral-mini-4b-realtime-GGUF` | ~3.3 GB |
-| granite | `cstr/granite-4.0-1b-speech-GGUF` | ~900 MB |
+| granite | `cstr/granite-speech-4.0-1b-GGUF` | ~2.94 GB |
+| qwen3 | `cstr/qwen3-asr-0.6b-GGUF` | ~500 MB |
+| cohere | `cstr/cohere-transcribe-03-2026-GGUF` | ~550 MB |
+| wav2vec2 | `cstr/wav2vec2-large-xlsr-53-english-GGUF` | ~212 MB |
 
-Downloads go through `curl` (preferred) with a `wget` fallback — **no Python, no libcurl link dependency**. Works identically on Linux, macOS, and Windows 10+ where `curl` ships in the base system. Models are cached by filename; re-running is a single `stat()` check.
+Downloads go through `curl` (preferred) with a `wget` fallback — **no Python, no libcurl link dependency**. Works identically on Linux, macOS, and Windows 10+ where `curl` ships in the base system. Models are cached by filename; re-running is a single `stat()` check. The same registry + cache helpers are reachable from the wrappers via `crispasr.registry_lookup()` / `crispasr.cache_ensure_file()` so Python/Rust callers can drive `-m auto`-style resolution without re-implementing it.
 
 ---
 
@@ -633,26 +667,43 @@ For anything in the bottom half, the reliable path is `ffmpeg -i in.X -ar 16000 
 
 ## Architecture
 
-CrispASR is structured around two new layers on top of whisper.cpp:
+CrispASR is structured around three layers on top of whisper.cpp. The
+split between `src/` (library) and `examples/cli/` (presentation) is
+deliberate: **every algorithm** — VAD, diarization, LID, CTC alignment,
+HF download/cache, model registry — lives in `src/` behind a stable
+C-ABI (`src/crispasr_c_api.cpp`), and every consumer (CLI, Dart, Python,
+Rust) reaches it through the same symbols. The CLI keeps only
+presentation + UX policy.
 
 ```
 ┌───────────────────────────────────────────────────────────────────┐
-│ examples/cli/crispasr_*                                           │
-│   Backend interface, factory, dispatch, VAD slicing,              │
-│   common output writers, CTC aligner, auto-download, model-mgr    │
-├───────────────────────────────────────────────────────────────────┤
 │ examples/cli/cli.cpp (the crispasr binary)                        │
 │   Parses whisper-cli args, dispatches to backend when --backend   │
 │   is set or GGUF arch is non-whisper; otherwise runs whisper_full │
 │   unchanged                                                        │
 ├───────────────────────────────────────────────────────────────────┤
+│ examples/cli/crispasr_*_cli.{h,cpp}                               │
+│   Thin CLI shims for policy only — auto-download, TTY prompts,    │
+│   sherpa-ONNX subprocess fallbacks. Delegate the algorithmic      │
+│   work to the shared library below.                                │
+├───────────────────────────────────────────────────────────────────┤
+│ src/crispasr_c_api.cpp — C-ABI (shared with Dart / Python / Rust) │
+│   crispasr_vad.{h,cpp}           Silero VAD + whisper.cpp-style   │
+│                                  stitching, timestamp remap       │
+│   crispasr_diarize.{h,cpp}       energy / xcorr / vad-turns /     │
+│                                  native pyannote diarization      │
+│   crispasr_lid.{h,cpp}           whisper-tiny + silero-native LID │
+│   crispasr_aligner.{h,cpp}       canary-CTC + qwen3-forced-aligner│
+│   crispasr_cache.{h,cpp}         HF download + ~/.cache/crispasr  │
+│   crispasr_model_registry.{h,cpp} backend → canonical GGUF URL    │
+├───────────────────────────────────────────────────────────────────┤
 │ src/{whisper,parakeet,canary,canary_ctc,cohere,qwen3_asr,         │
-│      voxtral,voxtral4b,granite_speech}.cpp                        │
+│      voxtral,voxtral4b,granite_speech,silero_lid,pyannote_seg}.cpp│
 │   Per-model runtimes (public C APIs)                              │
 ├───────────────────────────────────────────────────────────────────┤
-│ src/core/      ← NEW shared library: crispasr-core                │
-│   mel.{h,cpp}          log-mel spectrogram (both NeMo + HF clusters)
-│   ffn.h                SwiGLU + SiLU FFN helpers (header-only)    │
+│ src/core/      — shared model primitives (crispasr-core)          │
+│   mel.{h,cpp}          log-mel spectrogram (NeMo + HF clusters)   │
+│   ffn.h                SwiGLU + SiLU FFN helpers                  │
 │   attention.h          Llama-style self-attention + flash-attn    │
 │   gguf_loader.{h,cpp}  Unified GGUF open / weight mmap / lookup   │
 ├───────────────────────────────────────────────────────────────────┤
@@ -660,20 +711,39 @@ CrispASR is structured around two new layers on top of whisper.cpp:
 └───────────────────────────────────────────────────────────────────┘
 ```
 
-### `examples/cli/` — the dispatch layer
+### `src/` — shared library surface
+
+Every algorithm listed below is exposed as `extern "C"` functions
+with a `crispasr_` prefix. The CLI, Python, Rust, and Dart bindings
+all consume the same symbols.
 
 | File | Role |
 |---|---|
-| `cli.cpp` | whisper-cli entry point, extended with `--backend` dispatch branch |
-| `whisper_params.h` | Shared params struct (extracted from cli.cpp, extended) |
-| `crispasr_backend.{h,cpp}` | `CrispasrBackend` abstract class, capability bitmask, factory, GGUF auto-detect |
-| `crispasr_backend_{parakeet,canary,cohere,granite,voxtral,voxtral4b,qwen3}.cpp` | Per-backend thin wrapper over each model's C API |
-| `crispasr_vad.{h,cpp}` | Silero VAD slicing |
-| `crispasr_output.{h,cpp}` | TXT/SRT/VTT/CSV/JSON/LRC writers on `crispasr_segment` |
-| `crispasr_model_mgr.{h,cpp}` | `-m auto` via curl/wget shell-out |
-| `crispasr_aligner.{h,cpp}` | canary_ctc forced alignment wrapper |
-| `crispasr_llm_pipeline.h` | Templated audio-LLM pipeline (mel→encoder→prompt→KV decode) |
-| `crispasr_run.cpp` | Top-level pipeline dispatch: resolve → detect → load → slice → transcribe → write |
+| `crispasr_c_api.cpp` | The C-ABI. Exports session open/close/transcribe, VAD, diarize, LID, alignment, cache, registry — everything a wrapper needs. |
+| `crispasr_vad.{h,cpp}` | Silero VAD slicing + whisper.cpp-style stitching with timestamp remapping. Used by `crispasr_session_transcribe_vad`. |
+| `crispasr_diarize.{h,cpp}` | Four diarizers: energy (stereo), xcorr (stereo, TDOA), vad-turns (mono, timing), pyannote (mono, GGUF). |
+| `crispasr_lid.{h,cpp}` | whisper-tiny + silero-native language ID with process-wide whisper-context cache. |
+| `crispasr_aligner.{h,cpp}` | canary-CTC + Qwen3-ForcedAligner forced alignment behind one entry point; filename-based dispatch. |
+| `crispasr_cache.{h,cpp}` | WinHTTP / curl / wget download into `~/.cache/crispasr/`; zombie-file detection. |
+| `crispasr_model_registry.{h,cpp}` | Backend → canonical GGUF URL table; fuzzy filename lookup for "did you mean …?" hints. |
+| `whisper_params.h` | Shared params struct (extracted from cli.cpp, extended). |
+
+### `examples/cli/` — presentation + policy
+
+| File | Role |
+|---|---|
+| `cli.cpp` | whisper-cli entry point, extended with `--backend` dispatch branch. |
+| `crispasr_backend.{h,cpp}` | `CrispasrBackend` abstract class, capability bitmask, factory, GGUF auto-detect. |
+| `crispasr_backend_{parakeet,canary,cohere,granite,voxtral,voxtral4b,qwen3,fastconformer_ctc,wav2vec2}.cpp` | Per-backend thin wrapper over each model's C API. |
+| `crispasr_output.{h,cpp}` | TXT / SRT / VTT / CSV / JSON / LRC writers on `crispasr_segment`. |
+| `crispasr_vad_cli.{h,cpp}` | Delegates to `src/crispasr_vad`; adds auto-download for the Silero GGUF. |
+| `crispasr_lid_cli.{h,cpp}` | Delegates to `src/crispasr_lid`; adds auto-download + sherpa-ONNX subprocess fallback. |
+| `crispasr_diarize_cli.{h,cpp}` | Delegates to `src/crispasr_diarize`; adds sherpa subprocess fallback + pyannote GGUF auto-download. |
+| `crispasr_model_mgr_cli.{h,cpp}` | Delegates to `src/crispasr_model_registry`; adds "Download now? [Y/n]" prompt on TTY. |
+| `crispasr_aligner_cli.{h,cpp}` | Adapter converting `CrispasrAlignedWord` → the CLI's `crispasr_word` shape. |
+| `crispasr_server.cpp` | HTTP server for the persistent-model mode + OpenAI-compatible endpoints. |
+| `crispasr_llm_pipeline.h` | Templated audio-LLM pipeline (mel → encoder → prompt → KV decode). |
+| `crispasr_run.cpp` | Top-level pipeline dispatch: resolve → detect → load → slice → transcribe → write. |
 
 ### `src/core/` — the shared model primitives
 
