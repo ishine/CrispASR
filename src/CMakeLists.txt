@@ -386,6 +386,18 @@ endif()
 # ---------------------------------------------------------------------------
 # wav2vec2-ggml — Wav2Vec2ForCTC encoder (GGUF, ggml-based)
 # ---------------------------------------------------------------------------
+# glm-asr — GLM-ASR-Nano (zai-org/GLM-ASR-Nano-2512)
+# ---------------------------------------------------------------------------
+add_library(glm-asr STATIC glm_asr.h glm_asr.cpp)
+set_target_properties(glm-asr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(glm-asr PUBLIC .)
+target_compile_features   (glm-asr PUBLIC cxx_std_17)
+target_link_libraries     (glm-asr PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(glm-asr PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 add_library(wav2vec2-ggml STATIC wav2vec2-ggml.h wav2vec2-ggml.cpp)
 target_include_directories(wav2vec2-ggml PUBLIC .)
 target_compile_features   (wav2vec2-ggml PUBLIC cxx_std_17)
@@ -519,6 +531,9 @@ if (TARGET voxtral4b)
 endif()
 if (TARGET wav2vec2-ggml)
     target_link_libraries(whisper PUBLIC wav2vec2-ggml)
+endif()
+if (TARGET glm-asr)
+    target_link_libraries(whisper PUBLIC glm-asr)
 endif()
 # Pyannote segmentation is not a backend; it's consumed by
 # crispasr_diarize.cpp for the "pyannote" method. Still needs linking in
