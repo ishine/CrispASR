@@ -712,3 +712,58 @@ CUDA, Vulkan, CPU. Integration paths:
 
 **Decision:** Deferred but significantly de-risked by moshi.cpp's
 existence. When we do this, option 1 (adapt their code) is fastest.
+
+### Integration analysis (from code review of Codes4Fun/moshi.cpp)
+
+**Code structure (~4500 LOC):**
+- `compression.h` (326L) — Mimi codec: SeanetEncoder → transformer → downsample → RVQ encode
+- `lm.h` (1134L) — language model: multistream transformer with depth-former
+- `seanet.h` (261L) — SEANet encoder/decoder (CNN with residual blocks)
+- `transformer.h` (1373L) — streaming transformer with RoPE, sliding window
+- `vq.h` (120L) — residual vector quantization (32 codebooks)
+- `moshi-stt.cpp` (738L) — STT tool: audio→mimi_encode→lm_send→text
+
+**Key API surface (from moshi.h):**
+```c
+mimi_encode_send(encoder, float* frame);      // 1920 samples (24kHz)
+mimi_encode_receive(encoder, int16_t* tokens); // 32 codebook tokens
+moshi_lm_send2(gen, tokens);                   // feed to LM
+moshi_lm_receive2(gen, text_token, vad);       // get text + VAD
+```
+
+**Dependencies beyond ggml:**
+- SentencePiece (tokenizer) — we already have BPE in core/bpe.h
+- FFmpeg/libav (audio decode + resample to 24kHz) — we have miniaudio
+- SDL2 (mic capture) — we have our own mic path
+
+**Integration approach (option 1 — adapt their code):**
+
+1. **Vendor their core modules** into `src/kyutai_stt/`:
+   - `compression.h` + `seanet.h` + `vq.h` → Mimi codec
+   - `lm.h` + `transformer.h` → STT decoder
+   - Strip their `ScratchContext`/`GraphContext` wrappers, use our
+     `ggml_backend_sched` pattern instead
+
+2. **Write `src/kyutai_stt.{h,cpp}`** — our C API wrapper:
+   - `kyutai_stt_init_from_file()` — loads Mimi codec + STT LM
+   - `kyutai_stt_transcribe()` — full pipeline:
+     a. Resample 16kHz→24kHz (or accept 24kHz)
+     b. Frame loop: audio→mimi_encode→lm_step→accumulate text
+     c. Return transcript
+   - Use their safetensors loader OR write a GGUF converter
+
+3. **Backend adapter** (`crispasr_backend_kyutai_stt.cpp`)
+
+4. **Model conversion**: their code loads safetensors directly with
+   optional GGUF caching. We could either:
+   a. Write a Python GGUF converter (our standard approach)
+   b. Adopt their safetensors→GGUF caching (less work)
+
+**Estimated effort:** ~1 week for a working STT backend.
+The Mimi codec (~700 LOC across seanet+compression+vq) is the novel
+component; everything else maps to patterns we've already implemented.
+
+**Blocker:** SentencePiece dependency. Their tokenizer uses the
+SentencePiece C++ library. We'd need to either bundle it or implement
+a compatible tokenizer reader. Their tokenizer model is a `.model`
+file (protobuf), not JSON like our other backends.
