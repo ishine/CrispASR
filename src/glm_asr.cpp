@@ -530,10 +530,149 @@ extern "C" float* glm_asr_run_encoder(struct glm_asr_context* ctx, const float* 
     return nullptr;
 }
 
+static ggml_cgraph* glm_build_llm_kv(glm_asr_context* ctx, int n_past, int T, bool last_token_only) {
+    const auto& m = ctx->model;
+    const auto& hp = m.hp;
+    const int H = hp.llm_hidden;
+    const int n_heads = hp.llm_n_heads;
+    const int n_kv = hp.llm_n_kv_heads;
+    const int hd = hp.llm_head_dim;
+    const int grp = n_heads / n_kv;
+    const int L = hp.llm_n_layers;
+    const int V = hp.llm_vocab;
+    const float eps = hp.rms_eps;
+    const float scale = 1.0f / std::sqrt((float)hd);
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    ggml_tensor* cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, H, T);
+    ggml_set_name(cur, "llm_input");
+    ggml_set_input(cur);
+
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    // Causal mask for prefill (T > 1). For single-token decode, nullptr.
+    const int Lk = n_past + T;
+    ggml_tensor* causal_mask = nullptr;
+    if (T > 1) {
+        causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
+        ggml_set_name(causal_mask, "causal_mask");
+        ggml_set_input(causal_mask);
+    }
+
+    // L × Llama layers with KV cache
+    for (int il = 0; il < L; il++) {
+        const auto& b = m.llm.blocks[il];
+
+        core_attn::KvSelfAttnParams ap = {};
+        ap.n_heads = n_heads;
+        ap.n_kv_heads = n_kv;
+        ap.head_dim = hd;
+        ap.n_kv_grp = grp;
+        ap.n_ctx_orig = hp.llm_max_pos;
+        ap.rope_theta = 10000.0f;
+        ap.rope_beta_fast = 0.0f;
+        ap.rope_beta_slow = 0.0f;
+        ap.attn_scale = scale;
+        ap.qk_norm_eps = 0.0f;
+        ap.gqa_mode = core_attn::GQA_MANUAL_CONT;
+
+        ggml_tensor* residual = cur;
+
+        // Pre-attention RMSNorm
+        cur = ggml_rms_norm(ctx0, cur, eps);
+        cur = ggml_mul(ctx0, cur, b.attn_norm_w);
+
+        // KV-cached self-attention
+        cur = core_attn::kv_self_attn(ctx0, gf, cur, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_out_w, nullptr,
+                                      nullptr, // no Q/K norm
+                                      positions, causal_mask, ctx->kv_k, ctx->kv_v, il, n_past, ap);
+
+        cur = ggml_add(ctx0, residual, cur);
+
+        // Pre-FFN RMSNorm + SwiGLU
+        residual = cur;
+        cur = ggml_rms_norm(ctx0, cur, eps);
+        cur = ggml_mul(ctx0, cur, b.ffn_norm_w);
+        cur = core_ffn::swiglu(ctx0, cur, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
+        cur = ggml_add(ctx0, residual, cur);
+    }
+
+    // Final RMSNorm
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
+
+    // Last-token-only lm_head (for decode steps)
+    if (last_token_only && T > 1) {
+        cur = ggml_view_2d(ctx0, cur, H, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
+    }
+
+    // LM head
+    cur = ggml_mul_mat(ctx0, m.llm.lm_head_w, cur);
+
+    ggml_set_name(cur, "logits");
+    ggml_build_forward_expand(gf, cur);
+    ggml_free(ctx0);
+    return gf;
+}
+
 extern "C" float* glm_asr_run_llm_kv(struct glm_asr_context* ctx, const float* inputs_embeds, int n_tokens, int n_past,
                                      int* out_n_tokens, int* out_vocab_size) {
-    // TODO: build LLM graph (Llama-style with GQA)
-    // For now, stub
-    fprintf(stderr, "glm_asr: run_llm_kv() not yet implemented\n");
-    return nullptr;
+    if (!ctx || !inputs_embeds || n_tokens <= 0)
+        return nullptr;
+
+    const auto& hp = ctx->model.hp;
+    const int H = hp.llm_hidden;
+    const int V = hp.llm_vocab;
+
+    ggml_cgraph* gf = glm_build_llm_kv(ctx, n_past, n_tokens, true);
+    if (!gf)
+        return nullptr;
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+        return nullptr;
+
+    // Set inputs
+    ggml_tensor* inp = ggml_graph_get_tensor(gf, "llm_input");
+    ggml_backend_tensor_set(inp, inputs_embeds, 0, (size_t)H * n_tokens * sizeof(float));
+
+    ggml_tensor* pos = ggml_graph_get_tensor(gf, "positions");
+    std::vector<int32_t> pos_data(n_tokens);
+    for (int i = 0; i < n_tokens; i++)
+        pos_data[i] = n_past + i;
+    ggml_backend_tensor_set(pos, pos_data.data(), 0, n_tokens * sizeof(int32_t));
+
+    // Causal mask (prefill only)
+    if (n_tokens > 1) {
+        const int Lk = n_past + n_tokens;
+        ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "causal_mask");
+        if (mask_t) {
+            std::vector<ggml_fp16_t> mask_data((size_t)Lk * n_tokens);
+            const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+            const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+            for (int q = 0; q < n_tokens; q++)
+                for (int k = 0; k < Lk; k++)
+                    mask_data[(size_t)q * Lk + k] = (k <= n_past + q) ? zero : neg_inf;
+            ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+        }
+    }
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+        return nullptr;
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
+    int n_out = (int)out->ne[1]; // 1 for last-token-only
+    float* result = (float*)malloc((size_t)V * n_out * sizeof(float));
+    ggml_backend_tensor_get(out, result, 0, (size_t)V * n_out * sizeof(float));
+
+    if (out_n_tokens)
+        *out_n_tokens = n_out;
+    if (out_vocab_size)
+        *out_vocab_size = V;
+    return result;
 }
