@@ -195,12 +195,16 @@ static void compute_fbank_vad(const float* pcm, int n_samples, std::vector<float
             }
         }
     };
+    // FireRedVAD was trained with int16 fbank input.
+    // Scale float32 (-1..1) to int16 range (-32768..32767) before fbank.
+    const float scale_to_i16 = 32768.0f;
+
     for (int t = 0; t < n_frames; t++) {
         int off = t * hop;
         std::vector<float> fr(win);
         float dc = 0;
         for (int i = 0; i < win; i++) {
-            fr[i] = (off + i < n_samples) ? pcm[off + i] : 0;
+            fr[i] = ((off + i < n_samples) ? pcm[off + i] : 0.0f) * scale_to_i16;
             dc += fr[i];
         }
         dc /= win;
@@ -351,14 +355,18 @@ extern "C" int firered_vad_detect(struct firered_vad_context* ctx, const float* 
     cpu_linear(features.data(), m.fc1_w.data(), m.fc1_b.data(), h.data(), T, hp.idim, hp.H);
     cpu_relu(h.data(), T * hp.H);
 
+    fprintf(stderr, "  fc1[0,:5]=[%.2f,%.2f,%.2f,%.2f,%.2f]\n", h[0], h[1], h[2], h[3], h[4]);
     // fc2: [T, 256] → [T, 128] + ReLU
     std::vector<float> p(T * hp.P);
     cpu_linear(h.data(), m.fc2_w.data(), m.fc2_b.data(), p.data(), T, hp.H, hp.P);
     cpu_relu(p.data(), T * hp.P);
+    fprintf(stderr, "  fc2[0,:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", p[0], p[1], p[2], p[3], p[4]);
 
     // fsmn1
     std::vector<float> mem(T * hp.P);
     cpu_fsmn(p.data(), mem.data(), m.fsmn1_lb.data(), m.fsmn1_la.data(), T, hp.P, hp.N1, hp.S1, hp.N2, hp.S2);
+
+    fprintf(stderr, "  fsmn1[0,:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", mem[0], mem[1], mem[2], mem[3], mem[4]);
 
     // FSMN blocks
     std::vector<float> tmp_h(T * hp.H), tmp_p(T * hp.P), tmp_mem(T * hp.P);
@@ -371,10 +379,28 @@ extern "C" int firered_vad_detect(struct firered_vad_context* ctx, const float* 
         cpu_linear(tmp_h.data(), b.fc2_w.data(), nullptr, tmp_p.data(), T, hp.H, hp.P);
         // FSMN
         cpu_fsmn(tmp_p.data(), tmp_mem.data(), b.lb_w.data(), b.la_w.data(), T, hp.P, hp.N1, hp.S1, hp.N2, hp.S2);
+        if (i == 0) {
+            fprintf(stderr, "  b0.fc1[0,:5]=[%.4f,%.4f,%.4f,%.4f,%.4f] nonzero=%d\n", tmp_h[0], tmp_h[1], tmp_h[2],
+                    tmp_h[3], tmp_h[4], [&] {
+                        int c = 0;
+                        for (int j = 0; j < hp.H; j++)
+                            if (tmp_h[j] != 0)
+                                c++;
+                        return c;
+                    }());
+            fprintf(stderr, "  b0.fc2[0,:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", tmp_p[0], tmp_p[1], tmp_p[2], tmp_p[3],
+                    tmp_p[4]);
+            fprintf(stderr, "  b0.fsmn[0,:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", tmp_mem[0], tmp_mem[1], tmp_mem[2],
+                    tmp_mem[3], tmp_mem[4]);
+        }
         // Skip connection
         for (int j = 0; j < T * hp.P; j++)
             mem[j] = tmp_mem[j] + mem[j];
+        if (i == 0)
+            fprintf(stderr, "  block0[0,:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", mem[0], mem[1], mem[2], mem[3], mem[4]);
     }
+
+    fprintf(stderr, "  after_blocks[0,:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", mem[0], mem[1], mem[2], mem[3], mem[4]);
 
     // DNN: [T, P] → [T, H] + ReLU
     cpu_linear(mem.data(), m.dnn_w.data(), m.dnn_b.data(), h.data(), T, hp.P, hp.H);
@@ -385,6 +411,22 @@ extern "C" int firered_vad_detect(struct firered_vad_context* ctx, const float* 
     cpu_linear(h.data(), m.out_w.data(), m.out_b.data(), probs.data(), T, hp.H, 1);
     for (int t = 0; t < T; t++)
         probs[t] = 1.0f / (1.0f + expf(-probs[t]));
+
+    // Debug: show probability stats
+    float max_p = 0, mean_p = 0;
+    int speech_frames = 0;
+    for (int t = 0; t < T; t++) {
+        if (probs[t] > max_p)
+            max_p = probs[t];
+        mean_p += probs[t];
+        if (probs[t] > 0.3f)
+            speech_frames++;
+    }
+    mean_p /= T;
+    fprintf(stderr, "firered_vad: %d frames, max_prob=%.4f, mean_prob=%.4f, speech(>0.3)=%d\n", T, max_p, mean_p,
+            speech_frames);
+    fprintf(stderr, "  fbank[0,:3]=[%.2f,%.2f,%.2f] prob[0:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", features[0], features[1],
+            features[2], probs[0], probs[1], probs[2], probs[3], probs[4]);
 
     // Convert frame probabilities to segments
     float frame_sec = 0.01f; // 10ms per frame
