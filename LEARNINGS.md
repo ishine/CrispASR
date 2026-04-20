@@ -1316,3 +1316,94 @@ instead of "en" for English audio.
 **Lesson:** Encoder and decoder may have DIFFERENT n_head values. Always
 store them separately in the GGUF metadata and read both.
 After fix: LID correctly identifies English on JFK audio.
+
+### GGML_NATIVE=ON on CI runners silently ships AVX-512 to AVX2-only laptops
+
+v0.4.10 Windows prebuilts (CPU / CUDA / Vulkan) all silently exited
+with code 0 and no stderr output on a consumer AVX2 laptop CPU —
+reproducing issue #12's "using cached → nothing" symptom exactly.
+
+**Root cause**: ggml's `GGML_NATIVE` CMake option defaults to `ON`
+unless cross-compiling. On the GitHub Actions `windows-latest`
+runner (Azure Standard_D4_v3 or similar, typically with AVX-512),
+`GGML_NATIVE=ON` detects the host CPU and emits AVX-512 / AVX10
+instructions into `ggml-cpu.dll`. The binary then ships to users on
+any x86-64 machine and the first AVX-512 instruction triggers
+`STATUS_ILLEGAL_INSTRUCTION` (0xc000001d). On Windows, the exception
+handler silently terminates the process — **exit code 0, no stderr,
+no event-log entry that a casual user would find.**
+
+**Isolation protocol** (used here to pin the bug):
+1. Suspect `ggml-cpu.dll` because it's the only binary whose SIMD
+   level changes with host-CPU autodetection.
+2. Confirm with a file-size diff between a locally-built (known-good)
+   DLL and the CI-built one: **42 KB larger on CI** (823 KB vs 780 KB).
+   ~42 KB is the right order of magnitude for additional
+   VEX-512-encoded instructions across a matmul + cpy kernel set.
+3. Swap *only* the CI `ggml-cpu.dll` for the local one in the
+   downloaded zip → the whole pipeline works. Put it back → silent exit.
+
+**Fix** (release.yml, every Windows job): pass
+`-DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON` to
+cmake. AVX2 is the right compat baseline — every x86-64 CPU shipped
+since ~2013 (Intel Haswell / AMD Excavator) supports it. Users on
+older CPUs or those wanting AVX-512 native kernels should build
+from source.
+
+**Alternative (not shipped here)**: set
+`GGML_CPU_ALL_VARIANTS=ON GGML_BACKEND_DL=ON BUILD_SHARED_LIBS=ON` —
+ggml builds one `ggml-cpu-<arch>.dll` per ISA level (x64, sse42,
+sandybridge, haswell, skylakex, cannonlake, cascadelake, icelake,
+cooperlake, zen4) and dispatches at runtime. Proper solution, but
+adds ~10 DLLs to the package and requires `BUILD_SHARED_LIBS=ON`
+which conflicts with our static-CPU prebuilt. Worth revisiting for
+the CUDA / Vulkan variants since they're already shared-libs.
+
+**Lessons** (in decreasing order of load-bearingness):
+
+1. **Never ship CI-built binaries with `GGML_NATIVE=ON`.** The CI
+   runner's CPU is *not* a representative target CPU. Always pin an
+   explicit SIMD baseline for release artifacts. This is the #1
+   "prebuilt works on my machine but nobody else's" footgun in
+   ggml-based projects.
+
+2. Silent SIGILL on Windows looks identical to "the program does
+   nothing" — exit 0, no console output, no crash dialog (unless WER
+   is configured to show them). It's not until you attach a debugger
+   or check `Event Viewer → Windows Logs → Application` for the
+   `Faulting module name: ggml-cpu.dll` entry that the real cause
+   becomes visible. **Assume silent-exit on Windows is an illegal
+   instruction until proven otherwise.**
+
+3. File-size diffs between CI and local builds of the same DLL are
+   a *very* strong signal. Same commit + same CMake flags should
+   produce byte-sized-identical outputs (modulo timestamps, which
+   shouldn't change size). A +42 KB difference in `ggml-cpu.dll`
+   was the only clue we had, and it turned out to be the whole
+   story.
+
+### CUDA `cublas64_XX.dll` imports `cublasLt64_XX.dll` transitively
+
+v0.4.10 CUDA prebuilt trimmed cublasLt64_12.dll (474 MB) on the
+reasoning that `ggml-cuda.dll`'s own PE import table doesn't list
+it — only `cublas64_12.dll`, `cudart64_12.dll`, and driver-loader
+DLLs (`nvcuda.dll`). The reasoning was wrong: **`cublas64_12.dll`
+itself imports `cublasLt64_12.dll`** (verified via PE import scan).
+Without cublasLt, Windows fails `crispasr.exe` at load time with
+`STATUS_DLL_NOT_FOUND` — same silent-exit symptom as the SIGILL
+case above.
+
+Upstream ggml explicitly notes in `ggml-cuda/CMakeLists.txt`:
+
+> As of 12.3.1 CUDA Toolkit for Windows does not offer a static
+> cublas library
+
+so there's no side-stepping this via `GGML_STATIC` on Windows.
+The cublasLt cost is unavoidable unless you're willing to replace
+all ggml's `cublasGemmEx` calls with hand-written CUDA kernels.
+
+**Lesson**: when triaging a Windows "my exe silently exits" bug,
+check **transitive** DLL imports, not just the binary you control.
+`dumpbin /dependents` / PE import parsing only shows first-order
+imports — you need to walk the chain recursively. On this project
+the chain was `crispasr.exe → ggml-cuda.dll → cublas64 → cublasLt`.
