@@ -430,6 +430,12 @@ set_target_properties(ecapa-lid PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(ecapa-lid PUBLIC .)
 target_compile_features   (ecapa-lid PUBLIC cxx_std_17)
 target_link_libraries     (ecapa-lid PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(ecapa-lid PUBLIC OpenMP::OpenMP_CXX)
+    endif()
+endif()
 
 # ---------------------------------------------------------------------------
 # firered-vad — FireRedVAD (DFSMN voice activity detection)
