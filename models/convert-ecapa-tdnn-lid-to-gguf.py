@@ -64,6 +64,28 @@ def main():
 
     print(f"ECAPA-TDNN LID: {len(emb_ckpt)} emb tensors, {len(cls_ckpt)} cls tensors, {len(labels)} labels")
 
+    # Compute the exact SpeechBrain filterbank matrix for embedding in GGUF.
+    # This avoids fbank mismatch at runtime.
+    try:
+        import sys, types
+        ext = types.ModuleType('torchaudio._extension')
+        ext._IS_TORCHAUDIO_EXT_AVAILABLE = False
+        for attr in ['fail_if_no_align','fail_if_no_rnnt','fail_if_no_sox','fail_if_no_kaldi',
+                      '_check_cuda_version','_init_dll_path']:
+            setattr(ext, attr, lambda *a,**kw: None)
+        sys.modules['torchaudio._extension'] = ext
+        import torchaudio
+        from speechbrain.processing.features import Filterbank
+        # Extract the LINEAR filterbank matrix by running with log_mel=False and identity input
+        sb_fb = Filterbank(n_mels=60, n_fft=400, sample_rate=16000, freeze=True, log_mel=False)
+        identity = torch.eye(201).unsqueeze(0)
+        fb_out = sb_fb(identity)  # [1, 201, 60]
+        fb_matrix = fb_out[0].detach().numpy().T.astype(np.float32)  # [60, 201]
+        print(f"  SpeechBrain filterbank matrix: {fb_matrix.shape}")
+    except Exception as e:
+        print(f"  WARNING: could not compute SpeechBrain filterbank: {e}")
+        fb_matrix = None
+
     # Create GGUF
     writer = gguf.GGUFWriter(args.output, "ecapa-tdnn-lid")
     writer.add_name("ECAPA-TDNN-LID-VoxLingua107")
@@ -80,6 +102,12 @@ def main():
 
     # Tokenizer (language labels)
     writer.add_array("tokenizer.ggml.tokens", labels)
+
+    # Embed the SpeechBrain filterbank matrix so C++ runtime doesn't need to recompute it
+    if fb_matrix is not None:
+        writer.add_tensor("mel_filterbank", fb_matrix)
+        writer.add_uint32("ecapa.n_fft", 400)
+        writer.add_uint32("ecapa.fbank_bins", fb_matrix.shape[1])  # 201
 
     def f32(t):
         return t.float().numpy()

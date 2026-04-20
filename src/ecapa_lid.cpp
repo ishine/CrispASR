@@ -162,6 +162,9 @@ struct ecapa_model {
     std::vector<std::string> labels;
     int n_mels = 60;
     int n_classes = 107;
+    int n_fft_orig = 400;  // SpeechBrain's DFT size
+    int fbank_bins = 201;  // n_fft_orig/2 + 1
+    std::vector<float> mel_fb_embedded; // [n_mels * fbank_bins] from GGUF
 };
 
 struct ecapa_lid_context {
@@ -174,20 +177,39 @@ struct ecapa_lid_context {
 // Fbank (60-dim, Hamming window, matching SpeechBrain defaults)
 // ===========================================================================
 
-static void compute_fbank60(const float* pcm, int n_samples, std::vector<float>& features, int& n_frames) {
+static void compute_fbank60(const float* pcm, int n_samples, std::vector<float>& features, int& n_frames,
+                            const std::vector<float>& mel_fb_override = {}, int n_fft_target = 400) {
+    // SpeechBrain Fbank: n_fft=400 (we zero-pad to 512 for our radix-2 FFT).
+    // Mel filterbank uses n_fft_orig=400 for frequency bin spacing.
+    // No preemphasis, f_min=0, Hann window (periodic), center=True (reflect pad).
     const int sr = 16000, n_mels = 60;
-    const int win_len = 400, hop = 160, n_fft = 512;
+    const int win_len = 400, hop = 160;
+    const int N = n_fft_target; // 400 for SpeechBrain (exact DFT, not power-of-2)
     const float low_freq = 0.0f, high_freq = (float)sr / 2;
+    int pad_len = N / 2;
+    int n_padded = n_samples + 2 * pad_len;
+    std::vector<float> pcm_padded(n_padded, 0.0f);
+    memcpy(pcm_padded.data() + pad_len, pcm, n_samples * sizeof(float));
+    // Reflect padding (SpeechBrain default pad_mode='reflect')
+    for (int i = 0; i < pad_len; i++) {
+        pcm_padded[pad_len - 1 - i] = pcm[std::min(i + 1, n_samples - 1)];
+        pcm_padded[pad_len + n_samples + i] = pcm[std::max(n_samples - 2 - i, 0)];
+    }
 
-    n_frames = (n_samples - win_len) / hop + 1;
+    n_frames = (n_padded - win_len) / hop + 1;
     if (n_frames <= 0) {
         n_frames = 0;
         return;
     }
 
-    int bins = n_fft / 2 + 1;
-    std::vector<float> mel_fb(n_mels * bins, 0.0f);
-    {
+    int bins = N / 2 + 1;     // 201
+    std::vector<float> mel_fb;
+    if (!mel_fb_override.empty() && (int)mel_fb_override.size() == n_mels * bins) {
+        // Use the embedded SpeechBrain filterbank — exact match guaranteed
+        mel_fb = mel_fb_override;
+    } else {
+        // Fallback: compute triangular mel filterbank
+        mel_fb.resize(n_mels * bins, 0.0f);
         auto hz2mel = [](float hz) { return 2595.0f * log10f(1.0f + hz / 700.0f); };
         auto mel2hz = [](float m) { return 700.0f * (powf(10.0f, m / 2595.0f) - 1.0f); };
         float ml = hz2mel(low_freq), mh = hz2mel(high_freq);
@@ -196,7 +218,7 @@ static void compute_fbank60(const float* pcm, int n_samples, std::vector<float>&
             c[i] = mel2hz(ml + i * (mh - ml) / (n_mels + 1));
         for (int m = 0; m < n_mels; m++)
             for (int k = 0; k < bins; k++) {
-                float f = (float)k * sr / n_fft;
+                float f = (float)k * sr / N;
                 if (f > c[m] && f <= c[m + 1] && c[m + 1] > c[m])
                     mel_fb[m * bins + k] = (f - c[m]) / (c[m + 1] - c[m]);
                 else if (f > c[m + 1] && f < c[m + 2] && c[m + 2] > c[m + 1])
@@ -204,59 +226,61 @@ static void compute_fbank60(const float* pcm, int n_samples, std::vector<float>&
             }
     }
 
-    // Hamming window
+    // Hann window (SpeechBrain STFT default, periodic=True)
     std::vector<float> window(win_len);
     for (int i = 0; i < win_len; i++)
-        window[i] = 0.54f - 0.46f * cosf(2.0f * (float)M_PI * i / (win_len - 1));
+        window[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / win_len)); // periodic Hann
 
     features.resize(n_frames * n_mels);
-    std::vector<float> fre(n_fft), fim(n_fft);
-    auto fft = [](float* r, float* im, int n) {
-        for (int i = 1, j = 0; i < n; i++) {
-            int b = n >> 1;
-            for (; j & b; b >>= 1)
-                j ^= b;
-            j ^= b;
-            if (i < j) {
-                std::swap(r[i], r[j]);
-                std::swap(im[i], im[j]);
-            }
+
+    // Pre-compute DFT twiddle factors for 400-point DFT (only first 201 bins)
+    // cos_k[k*N+n] = cos(-2*pi*k*n/N), sin_k[k*N+n] = sin(-2*pi*k*n/N)
+    // N already defined above from n_fft_target
+    std::vector<float> cos_tw(bins * N), sin_tw(bins * N);
+    for (int k = 0; k < bins; k++)
+        for (int n = 0; n < N; n++) {
+            float angle = -2.0f * (float)M_PI * k * n / N;
+            cos_tw[k * N + n] = cosf(angle);
+            sin_tw[k * N + n] = sinf(angle);
         }
-        for (int l = 2; l <= n; l <<= 1) {
-            float a = -2.f * (float)M_PI / l, wr = cosf(a), wi = sinf(a);
-            for (int i = 0; i < n; i += l) {
-                float cr = 1, ci = 0;
-                for (int j = 0; j < l / 2; j++) {
-                    float t = r[i + j + l / 2] * cr - im[i + j + l / 2] * ci,
-                          u = r[i + j + l / 2] * ci + im[i + j + l / 2] * cr;
-                    r[i + j + l / 2] = r[i + j] - t;
-                    im[i + j + l / 2] = im[i + j] - u;
-                    r[i + j] += t;
-                    im[i + j] += u;
-                    float nr = cr * wr - ci * wi;
-                    ci = cr * wi + ci * wr;
-                    cr = nr;
-                }
-            }
-        }
-    };
 
     for (int t = 0; t < n_frames; t++) {
         int off = t * hop;
-        std::fill(fre.begin(), fre.end(), 0);
-        std::fill(fim.begin(), fim.end(), 0);
-        for (int i = 0; i < win_len; i++) {
-            float v = (off + i < n_samples) ? pcm[off + i] : 0.0f;
-            fre[i] = v * window[i];
-        }
-        fft(fre.data(), fim.data(), n_fft);
+        // Windowed frame
+        std::vector<float> frame(N);
+        for (int i = 0; i < N; i++)
+            frame[i] = pcm_padded[off + i] * window[i];
+
+        // 400-point DFT: only first 201 bins (0..N/2)
+        // Magnitude = |DFT[k]| = sqrt(Re^2 + Im^2)
+        // Apply mel filterbank on the fly
         for (int m = 0; m < n_mels; m++) {
             float s = 0;
-            for (int k = 0; k < bins; k++)
-                s += (fre[k] * fre[k] + fim[k] * fim[k]) * mel_fb[m * bins + k];
-            features[t * n_mels + m] = logf(std::max(s, 1e-10f));
+            for (int k = 0; k < bins; k++) {
+                if (mel_fb[m * bins + k] == 0) continue;
+                float re = 0, im = 0;
+                for (int n = 0; n < N; n++) {
+                    re += frame[n] * cos_tw[k * N + n];
+                    im += frame[n] * sin_tw[k * N + n];
+                }
+                // SpeechBrain spectral_magnitude(power=1) = |STFT| (amplitude)
+                s += sqrtf(re * re + im * im) * mel_fb[m * bins + k];
+            }
+            // SpeechBrain uses 10*log10 (dB), not ln
+            features[t * n_mels + m] = 10.0f * log10f(std::max(s, 1e-10f));
         }
     }
+
+    // SpeechBrain dynamic range clamping (top_db=80):
+    // x_db = max(x_db, max_over_sequence - 80.0)
+    float global_max = features[0];
+    for (int i = 1; i < n_frames * n_mels; i++)
+        if (features[i] > global_max)
+            global_max = features[i];
+    float floor = global_max - 80.0f;
+    for (int i = 0; i < n_frames * n_mels; i++)
+        if (features[i] < floor)
+            features[i] = floor;
 }
 
 // ===========================================================================
@@ -308,6 +332,8 @@ extern "C" struct ecapa_lid_context* ecapa_lid_init(const char* model_path, int 
     }
     m.n_mels = core_gguf::kv_u32(gctx, "ecapa.n_mels", 60);
     m.n_classes = core_gguf::kv_u32(gctx, "ecapa.n_classes", 107);
+    m.n_fft_orig = core_gguf::kv_u32(gctx, "ecapa.n_fft", 400);
+    m.fbank_bins = core_gguf::kv_u32(gctx, "ecapa.fbank_bins", 201);
 
     // Labels
     const int tok_key = gguf_find_key(gctx, "tokenizer.ggml.tokens");
@@ -428,6 +454,23 @@ extern "C" struct ecapa_lid_context* ecapa_lid_init(const char* model_path, int 
         read_f32(get("cls.out.w.bias"), m.cls_b2);
     }
 
+    // Load embedded SpeechBrain mel filterbank if available
+    {
+        auto it = wl.tensors.find("mel_filterbank");
+        ggml_tensor* fb_t = (it != wl.tensors.end()) ? it->second : nullptr;
+        if (fb_t) {
+            // GGUF stores [bins, n_mels] (column-major), we need [n_mels, bins] row-major
+            std::vector<float> raw;
+            read_f32(fb_t, raw);
+            int bins = m.fbank_bins;
+            m.mel_fb_embedded.resize(m.n_mels * bins);
+            for (int mel = 0; mel < m.n_mels; mel++)
+                for (int k = 0; k < bins; k++)
+                    m.mel_fb_embedded[mel * bins + k] = raw[k * m.n_mels + mel];
+            fprintf(stderr, "ecapa_lid: loaded+transposed filterbank [%d, %d]\n", m.n_mels, bins);
+        }
+    }
+
     // Clean up — keep data in CPU vectors, free ggml context
     ggml_free(wl.ctx);
     ggml_backend_buffer_free(wl.buf);
@@ -458,8 +501,15 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
     // 1. Fbank
     std::vector<float> fbank;
     int T = 0;
-    compute_fbank60(samples, n_samples, fbank, T);
+    compute_fbank60(samples, n_samples, fbank, T, m.mel_fb_embedded, m.n_fft_orig);
     fprintf(stderr, "ecapa_lid: fbank T=%d, n_mels=%d\n", T, m.n_mels);
+    fprintf(stderr, "  fbank[0,:5]=[%.2f,%.2f,%.2f,%.2f,%.2f]\n",
+            fbank[0], fbank[1], fbank[2], fbank[3], fbank[4]);
+    if (T > 50)
+        fprintf(stderr, "  fbank[50,:5]=[%.2f,%.2f,%.2f,%.2f,%.2f]\n",
+                fbank[50*m.n_mels], fbank[50*m.n_mels+1], fbank[50*m.n_mels+2],
+                fbank[50*m.n_mels+3], fbank[50*m.n_mels+4]);
+    fflush(stderr);
     fflush(stderr);
     if (T <= 0)
         return nullptr;
