@@ -1700,182 +1700,261 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
         if (ctx->params.verbosity >= 1)
             fprintf(stderr, "firered_asr: decoder weights cached, K/V pre-computed\n");
 
-        // Self-attention KV cache: per-layer growing history of K and V
-        // cache_k[li][step * d + i], cache_v[li][step * d + i]
-        std::vector<std::vector<float>> sa_cache_k(hp.n_layers_dec);
-        std::vector<std::vector<float>> sa_cache_v(hp.n_layers_dec);
-
-        // Greedy autoregressive decoding
-        std::vector<int> tokens;
-        tokens.push_back(hp.sos_id);
+        // Beam search state
+        int beam_size = 3; // TODO: make configurable via params
+        struct beam_hyp {
+            std::vector<int> tokens;
+            float score = 0;
+            bool finished = false;
+            std::vector<std::vector<float>> sa_k, sa_v; // [n_layers][history]
+        };
+        std::vector<beam_hyp> beams(beam_size);
+        for (auto& b : beams) {
+            b.tokens.push_back(hp.sos_id);
+            b.sa_k.resize(hp.n_layers_dec);
+            b.sa_v.resize(hp.n_layers_dec);
+            b.score = 0;
+        }
+        // Only beam 0 starts active; others start with -inf score
+        for (int b = 1; b < beam_size; b++)
+            beams[b].score = -1e9f;
         int nh_dec = hp.n_head_dec;
         int hd_dec = d / nh_dec;
 
         for (int step = 0; step < max_len; step++) {
-            int cur_token = tokens.back();
+            // Check if all beams finished
+            bool all_done = true;
+            for (auto& b : beams)
+                if (!b.finished) {
+                    all_done = false;
+                    break;
+                }
+            if (all_done)
+                break;
 
-            // Embed: emb[token] * scale + pe[step]
-            std::vector<float> x(d);
-            for (int i = 0; i < d; i++) {
-                x[i] = emb_w[cur_token * d + i] * scale;
-                if (step < (int)(m.dec.pe->ne[1]))
-                    x[i] += pe_dec[step * d + i];
-            }
+            // Collect logits for each active beam
+            struct beam_logits {
+                int bi;
+                std::vector<float> logits;
+            };
+            std::vector<beam_logits> all_logits;
 
-            for (int li = 0; li < hp.n_layers_dec; li++) {
-                auto& c = dec_cache[li];
+            for (int bi = 0; bi < beam_size; bi++) {
+                if (beams[bi].finished)
+                    continue;
+                int cur_token = beams[bi].tokens.back();
 
-                // === Self-attention (causal, attend to history) ===
-                {
+                // Embed
+                std::vector<float> x(d);
+                for (int i = 0; i < d; i++) {
+                    x[i] = emb_w[cur_token * d + i] * scale;
+                    if (step < (int)(m.dec.pe->ne[1]))
+                        x[i] += pe_dec[step * d + i];
+                }
+
+                for (int li = 0; li < hp.n_layers_dec; li++) {
+                    auto& c = dec_cache[li];
+
+                    // === Self-attention (causal, attend to history) ===
+                    {
+                        std::vector<float> xn(d);
+                        cpu_layernorm(x.data(), c.sattn_norm_w.data(), c.sattn_norm_b.data(), xn.data(), 1, d);
+
+                        // Q for current token
+                        std::vector<float> Q_sa(d, 0);
+                        for (int i = 0; i < d; i++) {
+                            double s = 0;
+                            for (int k = 0; k < d; k++)
+                                s += xn[k] * c.sattn_w_qs[i * d + k];
+                            Q_sa[i] = (float)s + (c.sattn_w_qs_b.empty() ? 0 : c.sattn_w_qs_b[i]);
+                        }
+
+                        // K, V for current token → append to cache
+                        std::vector<float> K_cur(d, 0), V_cur(d, 0);
+                        for (int i = 0; i < d; i++) {
+                            double sk = 0, sv = 0;
+                            for (int k = 0; k < d; k++) {
+                                sk += xn[k] * c.sattn_w_ks[i * d + k];
+                                sv += xn[k] * c.sattn_w_vs[i * d + k];
+                            }
+                            K_cur[i] = (float)sk;
+                            V_cur[i] = (float)sv + (c.sattn_w_vs_b.empty() ? 0 : c.sattn_w_vs_b[i]);
+                        }
+                        beams[bi].sa_k[li].insert(beams[bi].sa_k[li].end(), K_cur.begin(), K_cur.end());
+                        beams[bi].sa_v[li].insert(beams[bi].sa_v[li].end(), V_cur.begin(), V_cur.end());
+
+                        int n_hist = (int)(beams[bi].sa_k[li].size() / d); // step + 1
+
+                        // Multi-head attention: Q[d] @ K_history[n_hist, d]
+                        std::vector<float> sa_out(d, 0);
+                        for (int h = 0; h < nh_dec; h++) {
+                            std::vector<float> scores(n_hist);
+                            for (int t = 0; t < n_hist; t++) {
+                                double s = 0;
+                                for (int dd = 0; dd < hd_dec; dd++)
+                                    s += Q_sa[h * hd_dec + dd] * beams[bi].sa_k[li][t * d + h * hd_dec + dd];
+                                scores[t] = (float)(s / sqrt((double)hd_dec));
+                            }
+                            cpu_softmax_rows(scores.data(), 1, n_hist);
+                            for (int dd = 0; dd < hd_dec; dd++) {
+                                double s = 0;
+                                for (int t = 0; t < n_hist; t++)
+                                    s += scores[t] * beams[bi].sa_v[li][t * d + h * hd_dec + dd];
+                                sa_out[h * hd_dec + dd] = (float)s;
+                            }
+                        }
+
+                        // FC + residual
+                        std::vector<float> sa_fc(d, 0);
+                        for (int i = 0; i < d; i++) {
+                            double s = 0;
+                            for (int k = 0; k < d; k++)
+                                s += sa_out[k] * c.sattn_fc_w[i * d + k];
+                            sa_fc[i] = (float)s + (c.sattn_fc_b.empty() ? 0 : c.sattn_fc_b[i]);
+                        }
+                        for (int i = 0; i < d; i++)
+                            x[i] += sa_fc[i];
+                    }
+
+                    // === Cross-attention: attend to encoder output (pre-computed K/V) ===
                     std::vector<float> xn(d);
-                    cpu_layernorm(x.data(), c.sattn_norm_w.data(), c.sattn_norm_b.data(), xn.data(), 1, d);
+                    cpu_layernorm(x.data(), c.xattn_norm_w.data(), c.xattn_norm_b.data(), xn.data(), 1, d);
 
-                    // Q for current token
-                    std::vector<float> Q_sa(d, 0);
+                    // Q = xn @ W_q + b_q [d]
+                    std::vector<float> Qx(d, 0);
                     for (int i = 0; i < d; i++) {
                         double s = 0;
                         for (int k = 0; k < d; k++)
-                            s += xn[k] * c.sattn_w_qs[i * d + k];
-                        Q_sa[i] = (float)s + (c.sattn_w_qs_b.empty() ? 0 : c.sattn_w_qs_b[i]);
+                            s += xn[k] * c.xattn_w_qs[i * d + k];
+                        Qx[i] = (float)s + (c.xattn_w_qs_b.empty() ? 0 : c.xattn_w_qs_b[i]);
                     }
 
-                    // K, V for current token → append to cache
-                    std::vector<float> K_cur(d, 0), V_cur(d, 0);
-                    for (int i = 0; i < d; i++) {
-                        double sk = 0, sv = 0;
-                        for (int k = 0; k < d; k++) {
-                            sk += xn[k] * c.sattn_w_ks[i * d + k];
-                            sv += xn[k] * c.sattn_w_vs[i * d + k];
-                        }
-                        K_cur[i] = (float)sk;
-                        V_cur[i] = (float)sv + (c.sattn_w_vs_b.empty() ? 0 : c.sattn_w_vs_b[i]);
-                    }
-                    sa_cache_k[li].insert(sa_cache_k[li].end(), K_cur.begin(), K_cur.end());
-                    sa_cache_v[li].insert(sa_cache_v[li].end(), V_cur.begin(), V_cur.end());
-
-                    int n_hist = (int)(sa_cache_k[li].size() / d); // step + 1
-
-                    // Multi-head attention: Q[d] @ K_history[n_hist, d]
-                    std::vector<float> sa_out(d, 0);
+                    // Multi-head attention over pre-computed K_enc/V_enc
+                    int nh_dec = hp.n_head_dec;
+                    int hd_dec = d / nh_dec;
+                    std::vector<float> attn_out(d, 0);
                     for (int h = 0; h < nh_dec; h++) {
-                        std::vector<float> scores(n_hist);
-                        for (int t = 0; t < n_hist; t++) {
+                        std::vector<float> scores(T_sub);
+                        for (int t = 0; t < T_sub; t++) {
                             double s = 0;
                             for (int dd = 0; dd < hd_dec; dd++)
-                                s += Q_sa[h * hd_dec + dd] * sa_cache_k[li][t * d + h * hd_dec + dd];
+                                s += Qx[h * hd_dec + dd] * K_enc[li][t * d + h * hd_dec + dd];
                             scores[t] = (float)(s / sqrt((double)hd_dec));
                         }
-                        cpu_softmax_rows(scores.data(), 1, n_hist);
+                        cpu_softmax_rows(scores.data(), 1, T_sub);
                         for (int dd = 0; dd < hd_dec; dd++) {
                             double s = 0;
-                            for (int t = 0; t < n_hist; t++)
-                                s += scores[t] * sa_cache_v[li][t * d + h * hd_dec + dd];
-                            sa_out[h * hd_dec + dd] = (float)s;
+                            for (int t = 0; t < T_sub; t++)
+                                s += scores[t] * V_enc[li][t * d + h * hd_dec + dd];
+                            attn_out[h * hd_dec + dd] = (float)s;
                         }
                     }
 
-                    // FC + residual
-                    std::vector<float> sa_fc(d, 0);
+                    // FC output projection + residual
+                    std::vector<float> fc_out(d, 0);
                     for (int i = 0; i < d; i++) {
                         double s = 0;
                         for (int k = 0; k < d; k++)
-                            s += sa_out[k] * c.sattn_fc_w[i * d + k];
-                        sa_fc[i] = (float)s + (c.sattn_fc_b.empty() ? 0 : c.sattn_fc_b[i]);
+                            s += attn_out[k] * c.xattn_fc_w[i * d + k];
+                        fc_out[i] = (float)s + (c.xattn_fc_b.empty() ? 0 : c.xattn_fc_b[i]);
                     }
                     for (int i = 0; i < d; i++)
-                        x[i] += sa_fc[i];
+                        x[i] += fc_out[i];
+
+                    // MLP: LN → Linear(d→4d) → GELU → Linear(4d→d) + residual
+                    cpu_layernorm(x.data(), c.mlp_norm_w.data(), c.mlp_norm_b.data(), xn.data(), 1, d);
+                    std::vector<float> h_up(c.di, 0);
+                    for (int i = 0; i < c.di; i++) {
+                        double s = 0;
+                        for (int k = 0; k < d; k++)
+                            s += xn[k] * c.mlp_w1[i * d + k];
+                        h_up[i] = (float)s + (c.mlp_b1.empty() ? 0 : c.mlp_b1[i]);
+                    }
+                    for (int i = 0; i < c.di; i++) {
+                        float v = h_up[i];
+                        h_up[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+                    }
+                    std::vector<float> mlp_out(d, 0);
+                    for (int i = 0; i < d; i++) {
+                        double s = 0;
+                        for (int k = 0; k < c.di; k++)
+                            s += h_up[k] * c.mlp_w2[i * c.di + k];
+                        mlp_out[i] = (float)s + (c.mlp_b2.empty() ? 0 : c.mlp_b2[i]);
+                    }
+                    for (int i = 0; i < d; i++)
+                        x[i] += mlp_out[i];
                 }
 
-                // === Cross-attention: attend to encoder output (pre-computed K/V) ===
+                // Final LN + projection
                 std::vector<float> xn(d);
-                cpu_layernorm(x.data(), c.xattn_norm_w.data(), c.xattn_norm_b.data(), xn.data(), 1, d);
-
-                // Q = xn @ W_q + b_q [d]
-                std::vector<float> Qx(d, 0);
-                for (int i = 0; i < d; i++) {
+                cpu_layernorm(x.data(), norm_w.data(), norm_b.data(), xn.data(), 1, d);
+                std::vector<float> logits(odim);
+                for (int i = 0; i < odim; i++) {
                     double s = 0;
                     for (int k = 0; k < d; k++)
-                        s += xn[k] * c.xattn_w_qs[i * d + k];
-                    Qx[i] = (float)s + (c.xattn_w_qs_b.empty() ? 0 : c.xattn_w_qs_b[i]);
+                        s += xn[k] * prj_w[i * d + k];
+                    logits[i] = (float)s;
                 }
 
-                // Multi-head attention over pre-computed K_enc/V_enc
-                int nh_dec = hp.n_head_dec;
-                int hd_dec = d / nh_dec;
-                std::vector<float> attn_out(d, 0);
-                for (int h = 0; h < nh_dec; h++) {
-                    std::vector<float> scores(T_sub);
-                    for (int t = 0; t < T_sub; t++) {
-                        double s = 0;
-                        for (int dd = 0; dd < hd_dec; dd++)
-                            s += Qx[h * hd_dec + dd] * K_enc[li][t * d + h * hd_dec + dd];
-                        scores[t] = (float)(s / sqrt((double)hd_dec));
-                    }
-                    cpu_softmax_rows(scores.data(), 1, T_sub);
-                    for (int dd = 0; dd < hd_dec; dd++) {
-                        double s = 0;
-                        for (int t = 0; t < T_sub; t++)
-                            s += scores[t] * V_enc[li][t * d + h * hd_dec + dd];
-                        attn_out[h * hd_dec + dd] = (float)s;
-                    }
-                }
+                all_logits.push_back({bi, std::move(logits)});
+            } // end per-beam computation
 
-                // FC output projection + residual
-                std::vector<float> fc_out(d, 0);
-                for (int i = 0; i < d; i++) {
-                    double s = 0;
-                    for (int k = 0; k < d; k++)
-                        s += attn_out[k] * c.xattn_fc_w[i * d + k];
-                    fc_out[i] = (float)s + (c.xattn_fc_b.empty() ? 0 : c.xattn_fc_b[i]);
+            // Beam pruning: find top beam_size candidates
+            struct candidate {
+                int src_beam, token;
+                float score;
+            };
+            std::vector<candidate> cands;
+            for (auto& bl : all_logits) {
+                // Log-softmax
+                float mx = *std::max_element(bl.logits.begin(), bl.logits.end());
+                float lse = 0;
+                for (auto& v : bl.logits)
+                    lse += expf(v - mx);
+                lse = mx + logf(lse);
+                // Top-B tokens
+                std::vector<float> lsm(bl.logits.size());
+                for (int i = 0; i < odim; i++)
+                    lsm[i] = bl.logits[i] - lse;
+                for (int b = 0; b < beam_size; b++) {
+                    int best = 0;
+                    for (int i = 1; i < odim; i++)
+                        if (lsm[i] > lsm[best])
+                            best = i;
+                    cands.push_back({bl.bi, best, beams[bl.bi].score + lsm[best]});
+                    lsm[best] = -1e9f;
                 }
-                for (int i = 0; i < d; i++)
-                    x[i] += fc_out[i];
-
-                // MLP: LN → Linear(d→4d) → GELU → Linear(4d→d) + residual
-                cpu_layernorm(x.data(), c.mlp_norm_w.data(), c.mlp_norm_b.data(), xn.data(), 1, d);
-                std::vector<float> h_up(c.di, 0);
-                for (int i = 0; i < c.di; i++) {
-                    double s = 0;
-                    for (int k = 0; k < d; k++)
-                        s += xn[k] * c.mlp_w1[i * d + k];
-                    h_up[i] = (float)s + (c.mlp_b1.empty() ? 0 : c.mlp_b1[i]);
-                }
-                for (int i = 0; i < c.di; i++) {
-                    float v = h_up[i];
-                    h_up[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
-                }
-                std::vector<float> mlp_out(d, 0);
-                for (int i = 0; i < d; i++) {
-                    double s = 0;
-                    for (int k = 0; k < c.di; k++)
-                        s += h_up[k] * c.mlp_w2[i * c.di + k];
-                    mlp_out[i] = (float)s + (c.mlp_b2.empty() ? 0 : c.mlp_b2[i]);
-                }
-                for (int i = 0; i < d; i++)
-                    x[i] += mlp_out[i];
             }
+            for (int bi = 0; bi < beam_size; bi++)
+                if (beams[bi].finished)
+                    cands.push_back({bi, hp.eos_id, beams[bi].score});
 
-            // Final LN + projection
-            std::vector<float> xn(d);
-            cpu_layernorm(x.data(), norm_w.data(), norm_b.data(), xn.data(), 1, d);
-            std::vector<float> logits(odim);
-            for (int i = 0; i < odim; i++) {
-                double s = 0;
-                for (int k = 0; k < d; k++)
-                    s += xn[k] * prj_w[i * d + k];
-                logits[i] = (float)s;
+            std::sort(cands.begin(), cands.end(),
+                      [](const candidate& a, const candidate& b) { return a.score > b.score; });
+            if ((int)cands.size() > beam_size)
+                cands.resize(beam_size);
+
+            // Build new beams
+            std::vector<beam_hyp> new_beams(beam_size);
+            for (int b = 0; b < beam_size && b < (int)cands.size(); b++) {
+                new_beams[b] = beams[cands[b].src_beam];
+                new_beams[b].score = cands[b].score;
+                if (cands[b].token == hp.eos_id)
+                    new_beams[b].finished = true;
+                else {
+                    new_beams[b].tokens.push_back(cands[b].token);
+                    new_beams[b].finished = false;
+                }
             }
+            beams = std::move(new_beams);
+        } // end step loop
 
-            // Greedy argmax
-            int best = 0;
-            for (int i = 1; i < odim; i++)
-                if (logits[i] > logits[best])
-                    best = i;
-
-            if (best == hp.eos_id)
-                break;
-            tokens.push_back(best);
-        }
+        // Select best beam
+        int best_beam = 0;
+        for (int b = 1; b < beam_size; b++)
+            if (beams[b].score > beams[best_beam].score)
+                best_beam = b;
+        auto& tokens = beams[best_beam].tokens;
 
         // Decode tokens
         std::string result;
