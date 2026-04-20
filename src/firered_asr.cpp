@@ -718,11 +718,9 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, ggml_tensor* x, const f
 // Relative-PE multi-head self-attention (simplified — no rel_shift)
 // ===========================================================================
 
-// Simplified MHSA: uses flash_attn with bias_u (no rel_shift).
-// The relative position attention requires row-major reshape (rel_shift)
-// which ggml (column-major) can't express directly. A CPU-side
-// implementation for rel_shift is needed for full accuracy.
-// For now, content attention with pos_bias_u gives partial positional info.
+// MHSA: uses flash_attn with bias_u (content attention only).
+// Full relative position attention (with rel_shift) needs CPU-side computation
+// which will be implemented as a post-processing step.
 static ggml_tensor* build_rel_mhsa(ggml_context* ctx, ggml_tensor* x, ggml_tensor* pos_emb,
                                    const firered_enc_mhsa& mhsa, int n_head, int head_dim) {
     int d = n_head * head_dim;
