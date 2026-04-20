@@ -934,15 +934,14 @@ static void cpu_encoder(const float* subsampled, // [T, 608] row-major
                 }
             // pw1 now [T, half=2560]
 
-            // Depthwise conv1d: kernel=33, groups=2560, causal padding
+            // Depthwise conv1d: kernel=33, groups=2560, SYMMETRIC padding=16
             std::vector<float> dw_out(T * half, 0.0f);
-            // dw_w ggml: ne[0]=33, ne[1]=1, ne[2]=2560 → dw_w[ch * 33 + k]
-            int pad = ks - 1; // causal: pad left
+            int pad_sym = (ks - 1) / 2; // symmetric: 16 on each side
             for (int ch = 0; ch < half; ch++) {
                 for (int t = 0; t < T; t++) {
                     float s = 0;
                     for (int k = 0; k < ks; k++) {
-                        int ti = t - pad + k; // causal: input index
+                        int ti = t - pad_sym + k;
                         if (ti >= 0 && ti < T)
                             s += pw1[ti * half + ch] * dw_w[ch * ks + k];
                     }
@@ -1001,9 +1000,8 @@ static void cpu_encoder(const float* subsampled, // [T, 608] row-major
             read_f32_vec(b.ln_b, ln_b_v);
             cpu_layernorm(x.data(), ln_w.data(), ln_b_v.data(), x.data(), T, d);
         }
-        if (li == 0) {
+        if (li == 0)
             fprintf(stderr, "  CPU b0 after LN: [%.4f,%.4f,%.4f,%.4f]\n", x[0], x[1], x[2], x[3]);
-        }
     }
 
     enc_output = std::move(x);
