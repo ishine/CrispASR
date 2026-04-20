@@ -249,7 +249,22 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     ggml_context* ctx0 = ggml_init(gp);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
 
-    // Input: raw PCM [n_samples, 1] — ggml col-major: ne[0]=n_samples, ne[1]=1
+    // Input normalization: layer_norm(waveform) — zero mean, unit variance
+    // This is a wav2vec2 convention, required for OmniASR.
+    std::vector<float> pcm_norm(n_samples);
+    {
+        double mean = 0;
+        for (int i = 0; i < n_samples; i++) mean += samples[i];
+        mean /= n_samples;
+        double var = 0;
+        for (int i = 0; i < n_samples; i++) var += (samples[i] - mean) * (samples[i] - mean);
+        var /= n_samples;
+        float inv_std = 1.0f / (sqrtf((float)var + 1e-5f));
+        for (int i = 0; i < n_samples; i++)
+            pcm_norm[i] = (samples[i] - (float)mean) * inv_std;
+    }
+
+    // Input: normalized PCM [n_samples, 1]
     ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_samples, 1);
     ggml_set_name(inp, "pcm");
     ggml_set_input(inp);
@@ -332,7 +347,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
             int IC_g  = (int)wv_t->ne[1]; // 64 (input channels per group)
             int OC    = (int)wv_t->ne[2]; // 1024
             int groups = OC / IC_g;        // 16
-            int pad_pos = (K_pos - 1) / 2; // 63
+            int pad_pos = K_pos / 2; // 64 (fairseq2 convention: K//2, then trim output)
 
             // Read the projection output to CPU for pos conv computation
             // h is [d_model=1024, T] in ggml. Mark as output to read after graph.
@@ -353,7 +368,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
                 ggml_free(ctx0);
                 return nullptr;
             }
-            ggml_backend_tensor_set(inp, samples, 0, n_samples * sizeof(float));
+            ggml_backend_tensor_set(inp, pcm_norm.data(), 0, n_samples * sizeof(float));
             if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
                 fprintf(stderr, "omniasr: graph 1 compute failed\n");
                 ggml_free(ctx0);
@@ -528,7 +543,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     }
 
     // Set input
-    ggml_backend_tensor_set(inp, samples, 0, n_samples * sizeof(float));
+    ggml_backend_tensor_set(inp, pcm_norm.data(), 0, n_samples * sizeof(float));
 
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "omniasr: %d samples, computing graph...\n", n_samples);
@@ -581,7 +596,7 @@ read_logits:
 
     // Greedy CTC decode: argmax per frame, collapse repeats, remove blanks
     // Blank token = pad_id = 1 (SentencePiece convention for OmniASR)
-    int blank_id = hp.pad_id; // CTC blank = <pad> = 1
+    int blank_id = hp.bos_id; // CTC blank = <s> = 0 (fairseq2 convention)
     std::vector<int> tokens;
     int prev_id = -1;
     for (int t = 0; t < T; t++) {
