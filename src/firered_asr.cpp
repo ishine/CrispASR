@@ -630,7 +630,347 @@ static void compute_fbank(const float* pcm, int n_samples, std::vector<float>& f
 }
 
 // ===========================================================================
-// Swish activation
+// CPU-side helpers for the encoder
+// ===========================================================================
+
+// Read ggml tensor to float vector (handles F16→F32 conversion)
+static void read_f32_vec(ggml_tensor* t, std::vector<float>& out) {
+    int n = (int)ggml_nelements(t);
+    out.resize(n);
+    if (t->type == GGML_TYPE_F16) {
+        std::vector<uint16_t> tmp(n);
+        ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(uint16_t));
+        ggml_fp16_to_fp32_row((const ggml_fp16_t*)tmp.data(), out.data(), n);
+    } else {
+        ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
+    }
+}
+
+// CPU matmul: C = A @ B^T where A is [M,K], B is [N,K] → C is [M,N]
+// (B stored as [N,K] row-major, like ggml weight [K,N] with ne[0]=K)
+static void cpu_matmul_bt(const float* A, const float* B, float* C, int M, int K, int N) {
+#pragma omp parallel for schedule(static)
+    for (int m = 0; m < M; m++) {
+        for (int n = 0; n < N; n++) {
+            float s = 0;
+            for (int k = 0; k < K; k++)
+                s += A[m * K + k] * B[n * K + k];
+            C[m * N + n] = s;
+        }
+    }
+}
+
+// CPU LayerNorm: out[t,d] = (x[t,d] - mean) / sqrt(var + eps) * w[d] + b[d]
+static void cpu_layernorm(const float* x, const float* w, const float* b, float* out, int T, int d) {
+    for (int t = 0; t < T; t++) {
+        float mean = 0;
+        for (int i = 0; i < d; i++)
+            mean += x[t * d + i];
+        mean /= d;
+        float var = 0;
+        for (int i = 0; i < d; i++) {
+            float v = x[t * d + i] - mean;
+            var += v * v;
+        }
+        var /= d;
+        float inv = 1.0f / sqrtf(var + 1e-5f);
+        for (int i = 0; i < d; i++) {
+            out[t * d + i] = (x[t * d + i] - mean) * inv * w[i];
+            if (b)
+                out[t * d + i] += b[i];
+        }
+    }
+}
+
+// CPU Swish: x * sigmoid(x)
+static void cpu_swish(float* x, int n) {
+    for (int i = 0; i < n; i++)
+        x[i] = x[i] / (1.0f + expf(-x[i]));
+}
+
+// CPU Sigmoid
+static void cpu_sigmoid(float* x, int n) {
+    for (int i = 0; i < n; i++)
+        x[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+
+// CPU softmax along dim (per row)
+static void cpu_softmax_rows(float* x, int rows, int cols) {
+    for (int r = 0; r < rows; r++) {
+        float mx = x[r * cols];
+        for (int c = 1; c < cols; c++)
+            mx = std::max(mx, x[r * cols + c]);
+        float sum = 0;
+        for (int c = 0; c < cols; c++) {
+            x[r * cols + c] = expf(x[r * cols + c] - mx);
+            sum += x[r * cols + c];
+        }
+        for (int c = 0; c < cols; c++)
+            x[r * cols + c] /= sum;
+    }
+}
+
+// ===========================================================================
+// CPU encoder: full Conformer encoder computed on CPU
+// ===========================================================================
+
+// Compute full encoder on CPU. Returns encoder output [T, d_model] row-major.
+static void cpu_encoder(const float* subsampled, // [T, 608] row-major
+                        int T, int flat_dim, const firered_model& m, std::vector<float>& enc_output) {
+    auto& hp = m.hp;
+    int d = hp.d_model;
+    int nh = hp.n_head;
+    int hd = hp.head_dim;
+    int di = hp.d_inner;
+    int ks = hp.kernel_size;
+
+    // Linear projection: [T, 608] @ proj_w^T + proj_b → [T, d_model]
+    std::vector<float> proj_w, proj_b_v;
+    read_f32_vec(m.enc.proj_w, proj_w); // ggml [608, d_model] → read as flat
+    read_f32_vec(m.enc.proj_b, proj_b_v);
+
+    // proj_w in ggml: ne[0]=flat_dim=608, ne[1]=d_model=1280
+    // As row-major: proj_w[row][col] where row < d_model, col < flat_dim
+    // cpu_matmul_bt: A[T,K=608] @ B^T where B[N=1280, K=608] → C[T, 1280]
+    std::vector<float> x(T * d);
+    cpu_matmul_bt(subsampled, proj_w.data(), x.data(), T, flat_dim, d);
+    for (int t = 0; t < T; t++)
+        for (int i = 0; i < d; i++)
+            x[t * d + i] += proj_b_v[i];
+    fprintf(stderr, "  cpu_proj t=0 first 8: [%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n", x[0], x[1], x[2], x[3], x[4],
+            x[5], x[6], x[7]);
+    // Continue to conformer layers below
+
+    // Load PE: ggml [d_model, 9999, 1] → read as [9999, d_model] row-major
+    // Actually ggml ne[0]=d_model is fastest, so flat data is: pe[0,0], pe[1,0], ..., pe[d-1,0], pe[0,1], ...
+    // = for each position p: d values. So row-major [9999, d_model] ← that's what we want.
+    std::vector<float> pe_data;
+    read_f32_vec(m.enc.pe, pe_data);
+    int T_pe = 2 * T - 1;
+    // pe_data is [9999 * d_model] in ggml-flat order: groups of d_model for each position
+    // For relative PE, extract first T_pe positions: pe[0..T_pe-1, 0..d-1]
+    // pe_row_major[p * d + i] = pe_data[p * d + i] (ggml ne[0]=d fastest → same as row-major)
+    // ← Actually no. ggml ne[0]=d=1280 means the first 1280 values are position 0.
+    // So pe_data[p * d + i] = PE at position p, dimension i. This IS row-major [pos, dim].
+
+    // For each conformer block
+    std::vector<float> tmp(T * d), tmp2(T * d), tmp3(T * d);
+
+    for (int li = 0; li < hp.n_layers_enc; li++) {
+        const auto& b = m.enc.blocks[li];
+
+        // === Macaron FFN1: out = 0.5*x + 0.5*ffn1(x) ===
+        {
+            std::vector<float> ln_w, ln_b_v, up_w, up_b_v, down_w, down_b_v;
+            read_f32_vec(b.ffn1.ln_w, ln_w);
+            read_f32_vec(b.ffn1.ln_b, ln_b_v);
+            read_f32_vec(b.ffn1.up_w, up_w);
+            read_f32_vec(b.ffn1.up_b, up_b_v);
+            read_f32_vec(b.ffn1.down_w, down_w);
+            read_f32_vec(b.ffn1.down_b, down_b_v);
+
+            cpu_layernorm(x.data(), ln_w.data(), ln_b_v.data(), tmp.data(), T, d);
+            // up: [T, d] @ up_w^T → [T, di]
+            std::vector<float> h_up(T * di);
+            cpu_matmul_bt(tmp.data(), up_w.data(), h_up.data(), T, d, di);
+            for (int t = 0; t < T; t++)
+                for (int i = 0; i < di; i++)
+                    h_up[t * di + i] += up_b_v[i];
+            cpu_swish(h_up.data(), T * di);
+            // down: [T, di] @ down_w^T → [T, d]
+            cpu_matmul_bt(h_up.data(), down_w.data(), tmp.data(), T, di, d);
+            for (int t = 0; t < T; t++)
+                for (int i = 0; i < d; i++) {
+                    tmp[t * d + i] += down_b_v[i];
+                    x[t * d + i] = 0.5f * x[t * d + i] + 0.5f * tmp[t * d + i];
+                }
+        }
+
+        // === MHSA with relative PE ===
+        {
+            std::vector<float> lnq_w, lnq_b, lnk_w, lnk_b, lnv_w, lnv_b;
+            std::vector<float> wq, wk, wv, fc_w, lp_w, bu, bv;
+            read_f32_vec(b.mhsa.ln_q_w, lnq_w);
+            read_f32_vec(b.mhsa.ln_q_b, lnq_b);
+            read_f32_vec(b.mhsa.ln_k_w, lnk_w);
+            read_f32_vec(b.mhsa.ln_k_b, lnk_b);
+            read_f32_vec(b.mhsa.ln_v_w, lnv_w);
+            read_f32_vec(b.mhsa.ln_v_b, lnv_b);
+            read_f32_vec(b.mhsa.w_qs, wq);
+            read_f32_vec(b.mhsa.w_ks, wk);
+            read_f32_vec(b.mhsa.w_vs, wv);
+            read_f32_vec(b.mhsa.fc_w, fc_w);
+            read_f32_vec(b.mhsa.lin_pos, lp_w);
+            read_f32_vec(b.mhsa.pos_bias_u, bu);
+            read_f32_vec(b.mhsa.pos_bias_v, bv);
+
+            // Q/K/V projections with separate LN
+            std::vector<float> Q(T * d), K(T * d), V(T * d);
+            cpu_layernorm(x.data(), lnq_w.data(), lnq_b.data(), tmp.data(), T, d);
+            cpu_matmul_bt(tmp.data(), wq.data(), Q.data(), T, d, d);
+            cpu_layernorm(x.data(), lnk_w.data(), lnk_b.data(), tmp.data(), T, d);
+            cpu_matmul_bt(tmp.data(), wk.data(), K.data(), T, d, d);
+            cpu_layernorm(x.data(), lnv_w.data(), lnv_b.data(), tmp.data(), T, d);
+            cpu_matmul_bt(tmp.data(), wv.data(), V.data(), T, d, d);
+
+            // Position embedding projection: P = pe @ lin_pos^T → [T_pe, d]
+            std::vector<float> P(T_pe * d);
+            cpu_matmul_bt(pe_data.data(), lp_w.data(), P.data(), T_pe, d, d);
+
+            // Reshape to multi-head: Q[T, nh, hd], K[T, nh, hd], V[T, nh, hd], P[T_pe, nh, hd]
+            // Already in this layout since d = nh * hd
+
+            float scale = 1.0f / sqrtf((float)hd);
+
+            // Attention scores per head
+            std::vector<float> attn_out(T * d, 0.0f);
+
+            for (int h = 0; h < nh; h++) {
+                // Content scores: (Q[t,h,:] + bias_u[h,:]) @ K[t',h,:]^T
+                // Position scores: (Q[t,h,:] + bias_v[h,:]) @ P[t-t'+T-1,h,:]^T
+                std::vector<float> scores(T * T, 0.0f);
+
+                for (int tq = 0; tq < T; tq++) {
+                    for (int tk = 0; tk < T; tk++) {
+                        float content = 0, position = 0;
+                        int pos_idx = tq - tk + T - 1;
+                        for (int dd = 0; dd < hd; dd++) {
+                            float q_val = Q[tq * d + h * hd + dd];
+                            float k_val = K[tk * d + h * hd + dd];
+                            content += (q_val + bu[h * hd + dd]) * k_val;
+                            if (pos_idx >= 0 && pos_idx < T_pe) {
+                                float p_val = P[pos_idx * d + h * hd + dd];
+                                position += (q_val + bv[h * hd + dd]) * p_val;
+                            }
+                        }
+                        scores[tq * T + tk] = (content + position) * scale;
+                    }
+                }
+
+                // Softmax per query
+                cpu_softmax_rows(scores.data(), T, T);
+
+                // Weighted sum: out[tq, h, :] = sum_tk scores[tq,tk] * V[tk, h, :]
+                for (int tq = 0; tq < T; tq++)
+                    for (int dd = 0; dd < hd; dd++) {
+                        float s = 0;
+                        for (int tk = 0; tk < T; tk++)
+                            s += scores[tq * T + tk] * V[tk * d + h * hd + dd];
+                        attn_out[tq * d + h * hd + dd] = s;
+                    }
+            }
+
+            // Output projection: fc(attn_out) + residual
+            std::vector<float> fc_out(T * d);
+            cpu_matmul_bt(attn_out.data(), fc_w.data(), fc_out.data(), T, d, d);
+            for (int i = 0; i < T * d; i++)
+                x[i] += fc_out[i]; // residual connection
+        }
+
+        // === Conv module ===
+        {
+            std::vector<float> pre_ln_w, pre_ln_b_v, pw1_w, dw_w, bn_w, bn_b_v, pw2_w;
+            read_f32_vec(b.conv.pre_ln_w, pre_ln_w);
+            if (b.conv.pre_ln_b)
+                read_f32_vec(b.conv.pre_ln_b, pre_ln_b_v);
+            read_f32_vec(b.conv.pw1_w, pw1_w);
+            read_f32_vec(b.conv.dw_w, dw_w);
+            read_f32_vec(b.conv.bn_w, bn_w);
+            if (b.conv.bn_b)
+                read_f32_vec(b.conv.bn_b, bn_b_v);
+            read_f32_vec(b.conv.pw2_w, pw2_w);
+
+            // Pre-LN
+            cpu_layernorm(x.data(), pre_ln_w.data(), pre_ln_b_v.empty() ? nullptr : pre_ln_b_v.data(), tmp.data(), T,
+                          d);
+
+            // Pointwise conv1: [T, d] @ pw1^T → [T, 2*d_inner]
+            // pw1_w ggml: ne[0]=1, ne[1]=d, ne[2]=5120 → flat is groups of d for each output
+            // For cpu_matmul_bt: B[N=5120, K=d]
+            int pw1_out = (int)(m.enc.blocks[li].conv.pw1_w->ne[2]);
+            std::vector<float> pw1(T * pw1_out);
+            cpu_matmul_bt(tmp.data(), pw1_w.data(), pw1.data(), T, d, pw1_out);
+
+            // GLU: split into two halves, sigmoid gate
+            int half = pw1_out / 2; // 2560
+            for (int t = 0; t < T; t++)
+                for (int i = 0; i < half; i++) {
+                    float gate = 1.0f / (1.0f + expf(-pw1[t * pw1_out + half + i]));
+                    pw1[t * half + i] = pw1[t * pw1_out + i] * gate;
+                }
+            // pw1 now [T, half=2560]
+
+            // Depthwise conv1d: kernel=33, groups=2560, causal padding
+            std::vector<float> dw_out(T * half, 0.0f);
+            // dw_w ggml: ne[0]=33, ne[1]=1, ne[2]=2560 → dw_w[ch * 33 + k]
+            int pad = ks - 1; // causal: pad left
+            for (int ch = 0; ch < half; ch++) {
+                for (int t = 0; t < T; t++) {
+                    float s = 0;
+                    for (int k = 0; k < ks; k++) {
+                        int ti = t - pad + k; // causal: input index
+                        if (ti >= 0 && ti < T)
+                            s += pw1[ti * half + ch] * dw_w[ch * ks + k];
+                    }
+                    dw_out[t * half + ch] = s;
+                }
+            }
+
+            // LayerNorm (called batch_norm)
+            cpu_layernorm(dw_out.data(), bn_w.data(), bn_b_v.empty() ? nullptr : bn_b_v.data(), dw_out.data(), T, half);
+
+            // Swish
+            cpu_swish(dw_out.data(), T * half);
+
+            // Pointwise conv2: [T, 2560] @ pw2^T → [T, d]
+            int pw2_out = (int)(m.enc.blocks[li].conv.pw2_w->ne[2]);
+            std::vector<float> conv_out(T * pw2_out);
+            cpu_matmul_bt(dw_out.data(), pw2_w.data(), conv_out.data(), T, half, pw2_out);
+
+            // Residual
+            for (int i = 0; i < T * d; i++)
+                x[i] += conv_out[i];
+        }
+
+        // === Macaron FFN2: out = 0.5*x + 0.5*ffn2(x) ===
+        {
+            std::vector<float> ln_w, ln_b_v, up_w, up_b_v, down_w, down_b_v;
+            read_f32_vec(b.ffn2.ln_w, ln_w);
+            read_f32_vec(b.ffn2.ln_b, ln_b_v);
+            read_f32_vec(b.ffn2.up_w, up_w);
+            read_f32_vec(b.ffn2.up_b, up_b_v);
+            read_f32_vec(b.ffn2.down_w, down_w);
+            read_f32_vec(b.ffn2.down_b, down_b_v);
+
+            cpu_layernorm(x.data(), ln_w.data(), ln_b_v.data(), tmp.data(), T, d);
+            std::vector<float> h_up(T * di);
+            cpu_matmul_bt(tmp.data(), up_w.data(), h_up.data(), T, d, di);
+            for (int t = 0; t < T; t++)
+                for (int i = 0; i < di; i++)
+                    h_up[t * di + i] += up_b_v[i];
+            cpu_swish(h_up.data(), T * di);
+            cpu_matmul_bt(h_up.data(), down_w.data(), tmp.data(), T, di, d);
+            for (int t = 0; t < T; t++)
+                for (int i = 0; i < d; i++) {
+                    tmp[t * d + i] += down_b_v[i];
+                    x[t * d + i] = 0.5f * x[t * d + i] + 0.5f * tmp[t * d + i];
+                }
+        }
+
+        // === Final LayerNorm ===
+        {
+            std::vector<float> ln_w, ln_b_v;
+            read_f32_vec(b.ln_w, ln_w);
+            read_f32_vec(b.ln_b, ln_b_v);
+            cpu_layernorm(x.data(), ln_w.data(), ln_b_v.data(), x.data(), T, d);
+        }
+    }
+
+    enc_output = std::move(x);
+}
+
+// ===========================================================================
+// Swish activation (ggml graph version)
 // ===========================================================================
 
 static ggml_tensor* swish_act(ggml_context* ctx, ggml_tensor* x) {
@@ -1005,123 +1345,55 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "firered_asr: subsampled to %d frames (608-dim)\n", T_sub);
 
-    // Step 3: Build encoder graph (linear proj + conformer layers + CTC)
+    // Step 3: CPU encoder (Conformer with relative PE attention)
+    int flat_dim = 608; // 32 * 19
+    std::vector<float> enc_output;
+    cpu_encoder(subsampled.data(), T_sub, flat_dim, m, enc_output);
+    // enc_output: [T_sub, d_model] row-major
+
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "  enc_out t=0 first 8: [%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n", enc_output[0],
+                enc_output[1], enc_output[2], enc_output[3], enc_output[4], enc_output[5], enc_output[6],
+                enc_output[7]);
+    }
+
+    // Step 4: CTC head (ggml graph — just a linear + bias)
     struct ggml_init_params gp = {
         /*.mem_size   =*/ctx->compute_meta.size(),
         /*.mem_buffer =*/ctx->compute_meta.data(),
         /*.no_alloc   =*/true,
     };
     ggml_context* ctx0 = ggml_init(gp);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 256, false);
 
-    // Input: subsampled features [608, T_sub]
-    int flat_dim = 32 * ((hp.idim - 3) / 2 + 1 - 3) / 2 + 32; // approximate — use actual
-    flat_dim = 608;                                           // 32 * 19
-    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, flat_dim, T_sub);
-    ggml_set_name(inp, "subsample_out");
-    ggml_set_input(inp);
+    // Input: encoder output [d_model, T_sub] in ggml layout
+    ggml_tensor* enc_inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hp.d_model, T_sub);
+    ggml_set_name(enc_inp, "enc_output");
+    ggml_set_input(enc_inp);
 
-    // Linear projection: 608 → 1280
-    ggml_tensor* x = ggml_mul_mat(ctx0, m.enc.proj_w, inp);
-    if (m.enc.proj_b)
-        x = ggml_add(ctx0, x, m.enc.proj_b);
-    // x: [d_model=1280, T_sub]
-
-    // Dump subsampled+projected output for comparison
-    ggml_set_name(x, "subsampled_proj");
-    ggml_set_output(x);
-
-    // Relative positional encoding: extract [d_model, 2*T_sub-1] from PE tensor
-    // PE is stored as [1, 9999, 1280] in ggml → ne=[1280, 9999, 1]
-    // We need the center 2*T_sub-1 positions
-    int T_pe = 2 * T_sub - 1;
-    // The PE tensor stores positions for up to 9999 frames
-    // For relative PE, we need positions [0, 2*T-1) from the pre-computed table
-    // View: [d_model, T_pe] from the PE tensor
-    ggml_tensor* pos_emb = ggml_view_2d(ctx0, m.enc.pe, m.enc.pe->ne[0], T_pe, m.enc.pe->nb[1], 0);
-
-    // Conformer layers
-    for (int i = 0; i < hp.n_layers_enc; i++) {
-        auto& b = m.enc.blocks[i];
-        // Macaron FFN1 (half-step)
-        x = build_macaron_ffn(ctx0, x, b.ffn1);
-        // MHSA with relative PE
-        x = build_rel_mhsa(ctx0, x, pos_emb, b.mhsa, hp.n_head, hp.head_dim);
-        // Conv module
-        x = build_conv_module(ctx0, x, b.conv, hp.d_model, hp.kernel_size);
-        // Macaron FFN2 (half-step)
-        x = build_macaron_ffn(ctx0, x, b.ffn2);
-        if (i == 0) {
-            ggml_set_name(x, "after_block0");
-            ggml_set_output(x);
-        }
-        // Final LayerNorm
-        x = ggml_norm(ctx0, x, 1e-5f);
-        x = ggml_mul(ctx0, x, b.ln_w);
-        if (b.ln_b)
-            x = ggml_add(ctx0, x, b.ln_b);
-    }
-    // x: [d_model, T_sub]
-
-    // Dump encoder output for diff-testing
-    ggml_set_name(x, "enc_output");
-    ggml_set_output(x);
-
-    // CTC head: linear + log_softmax → greedy decode
-    ggml_tensor* ctc_logits = ggml_mul_mat(ctx0, m.ctc_w, x);
+    ggml_tensor* ctc_logits = ggml_mul_mat(ctx0, m.ctc_w, enc_inp);
     if (m.ctc_b)
         ctc_logits = ggml_add(ctx0, ctc_logits, m.ctc_b);
-    // ctc_logits: [odim, T_sub]
     ggml_set_name(ctc_logits, "ctc_logits");
     ggml_set_output(ctc_logits);
     ggml_build_forward_expand(gf, ctc_logits);
 
-    // Allocate and compute
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-        fprintf(stderr, "firered_asr: failed to alloc encoder graph\n");
+        fprintf(stderr, "firered_asr: failed to alloc CTC graph\n");
         ggml_free(ctx0);
         return nullptr;
     }
 
-    // Set input
-    ggml_backend_tensor_set(inp, subsampled.data(), 0, flat_dim * T_sub * sizeof(float));
+    // The enc_output is [T_sub, d_model] row-major (CPU) but ggml expects [d_model, T_sub] col-major
+    // In ggml col-major: ne[0]=d_model fastest → same memory layout as row-major [T_sub, d_model]
+    // So we can feed it directly!
+    ggml_backend_tensor_set(enc_inp, enc_output.data(), 0, T_sub * hp.d_model * sizeof(float));
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "firered_asr: encoder compute failed\n");
+        fprintf(stderr, "firered_asr: CTC compute failed\n");
         ggml_free(ctx0);
         return nullptr;
-    }
-
-    // Dump subsampled output
-    {
-        ggml_tensor* sp = ggml_graph_get_tensor(gf, "subsampled_proj");
-        if (sp) {
-            float vals[8];
-            ggml_backend_tensor_get(sp, vals, 0, 8 * sizeof(float));
-            fprintf(stderr, "  subsampled_proj t=0 first 8: [%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n", vals[0],
-                    vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
-        }
-    }
-    // Dump block0 output
-    {
-        ggml_tensor* b0 = ggml_graph_get_tensor(gf, "after_block0");
-        if (b0) {
-            float vals[8];
-            ggml_backend_tensor_get(b0, vals, 0, 8 * sizeof(float));
-            fprintf(stderr, "  after_block0 t=0 first 8: [%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n", vals[0], vals[1],
-                    vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
-        }
-    }
-    // Dump encoder output for comparison with reference
-    {
-        ggml_tensor* enc_t = ggml_graph_get_tensor(gf, "enc_output");
-        if (enc_t) {
-            float vals[8];
-            ggml_backend_tensor_get(enc_t, vals, 0, 8 * sizeof(float));
-            fprintf(stderr, "  enc_out t=0 first 8: [%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n", vals[0], vals[1],
-                    vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
-        }
     }
 
     // Read CTC logits and greedy decode
