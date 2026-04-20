@@ -718,7 +718,31 @@ All quants uploaded to `cstr/firered-lid-GGUF` (F16, Q8_0, Q4_K, Q2_K).
 FireRedVAD + FireRedLID wired through C API + Python/Rust/Dart wrappers.
 
 TODO: decoder performance optimization (ggml for matmuls).
-TODO: ECAPA-TDNN or MMS-LID as lightweight LID alternative (~10-50 MB).
+
+### ECAPA-TDNN LID — WIP (blocked)
+
+Converter + C++ runtime built: `models/convert-ecapa-tdnn-lid-to-gguf.py`,
+`src/ecapa_lid.{h,cpp}`. 43 MB GGUF, 107 languages, Apache-2.0.
+CLI: `--lid-backend ecapa` (method=3). Integrated into all 3 wrappers.
+
+**Blocked:** Model predicts "nn" for all inputs (even model's own test file
+when using Python SpeechBrain class). Root cause: fbank features don't match
+what `torchaudio.compliance.kaldi.fbank` produces. Our dev machine has broken
+torchaudio. See LEARNINGS.md for details.
+
+**Path forward:** Test on machine with working torchaudio, or try ONNX export.
+MMS-LID (CC-BY-NC) deprioritized due to license.
+
+### Qwen Omni ASR — NOT PLANNED
+
+Qwen2.5-Omni (3B/7B) and Qwen3-Omni (30B MoE) assessed. Not suitable
+for CrispASR:
+- Split GGUF (mmproj + LLM) incompatible with monolithic pattern
+- 3-30x larger than Qwen3-ASR with no ASR accuracy advantage
+- Already in llama.cpp libmtmd
+- Multimodal complexity (Thinker-Talker, speech gen) with no ASR benefit
+
+Recommendation: use Qwen3-ASR (0.6B/1.7B) for Qwen-based ASR.
 
 ## 29. Ecosystem comparison and new backends — PENDING
 

@@ -1457,3 +1457,44 @@ for simple pruning — unlike Whisper Turbo's decoder-only pruning.
 Q2_K quantization causes confusion between similar languages
 (de→cy, hi→pa, es→gl). Q4_K maintains accuracy. For LID,
 Q4_K (544 MB) is the practical minimum; Q2_K (350 MB) is unreliable.
+
+### ECAPA-TDNN LID: fbank mismatch produces "nn" for everything
+
+SpeechBrain's `lang-id-voxlingua107-ecapa` (Apache-2.0, 43 MB, 107 langs)
+was trained with `torchaudio.compliance.kaldi.fbank`. Replacing this with
+a simple mel fbank (Hamming window, no Kaldi preprocessing) causes the
+model to predict "nn" (Norwegian Nynorsk) for ALL inputs — English, Thai,
+German, even the model's own Thai test file.
+
+Tested fbank variants that all fail:
+- Simple Hamming+FFT (our C++ default)
+- Kaldi-style with preemphasis+Povey window (manual Python)
+- `kaldi_native_fbank` library (proper Kaldi C++ implementation)
+
+All produce "nn" with ~0.1 confidence = near-random. The model
+requires **exact** `torchaudio.compliance.kaldi.fbank` preprocessing.
+Our dev machine has a broken torchaudio (missing CUDA libs), preventing
+verification.
+
+Note: "nn" as a default/wrong prediction was also seen in early
+FireRedLID debugging — may be a common failure mode when fbank
+features are in the wrong distribution (the model learned to map
+out-of-distribution features to a specific class).
+
+**Status:** ECAPA-TDNN is WIP. Infrastructure built (converter, runtime,
+CLI/API integration). Accuracy blocked on fbank compatibility.
+Path forward: test on machine with working torchaudio, or use ONNX
+export (Xenova/ecapa-voxlingua107 may exist).
+
+### Qwen Omni vs Qwen3-ASR: not worth implementing separately
+
+Qwen2.5-Omni (3B/7B) and Qwen3-Omni (30B MoE) are multimodal models
+(audio+vision+text+speech generation). For pure ASR:
+
+- Much larger than Qwen3-ASR (0.6B/1.7B) with no accuracy advantage
+- Split GGUF architecture (mmproj + LLM) — incompatible with our monolithic GGUF
+- Already supported by llama.cpp's libmtmd
+- Thinker-Talker architecture adds complexity with no ASR benefit
+
+**Recommendation:** Stick with Qwen3-ASR for ASR. Omni models are
+for multimodal use cases (speech generation, vision, etc.).
