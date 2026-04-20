@@ -931,3 +931,9 @@ Key ggml ops used:
 - ggml_relu, ggml_sigmoid
 - ggml_view_2d (Res2Net sub-band splitting)
 - ggml_concat (Res2Net + MFA recombination)
+
+### ECAPA-TDNN ggml graph — DONE (update)
+
+Full ggml graph working. Speed: 4.1s (6x vs CPU-only).
+100% accuracy on test languages. Key: no transpose needed between
+ggml and CPU — column-major layout is identical. See LEARNINGS.md.

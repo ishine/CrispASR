@@ -1614,3 +1614,48 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(ecapa-lid PUBLIC OpenMP::OpenMP_CXX)
 endif()
 ```
+
+### CRITICAL: ggml column-major layout = C-style row-major for 2D arrays
+
+This is the most important ggml lesson we keep re-learning:
+
+**ggml 2D tensor `[A, B]`** means `ne[0]=A, ne[1]=B`. The flat data
+layout is `data[b * A + a]` — `ne[0]` changes fastest (column-major).
+
+**C/C++ 2D array `x[B][A]`** or `x[b * A + a]` — also has `A` changing
+fastest (row-major).
+
+**THEY ARE THE SAME LAYOUT.** For a tensor representing `[C, T]` where
+C is channels and T is time:
+- ggml: `ne[0]=C, ne[1]=T`, data at `data[t * C + c]` — C fastest
+- C++: `x[c * T + t]` — WAIT, this has T fastest, not C!
+
+**This is where it gets confusing.** When we store data as `x[c * T + t]`
+in C++, this is a `[C, T]` array where T is the inner (fastest) dimension.
+In ggml, this SAME layout corresponds to `ne[0]=T, ne[1]=C` — because
+ggml's ne[0] is the fastest dimension.
+
+**Rule of thumb:**
+- If C++ stores as `x[outer * inner_size + inner]`
+- Then ggml tensor should have `ne[0]=inner_size, ne[1]=outer_size`
+- The flat data bytes are identical — just copy, don't transpose!
+
+**For `ggml_conv_1d(kernel [K,IC,OC], input [T,IC])` → `[T_out,OC]`:**
+- Input ne[0]=T, ne[1]=IC → flat: `data[ic * T + t]`
+- Our C++ `x[c * T + t]` stores channel c at `data[c * T + t]`
+- SAME layout → just copy x to ggml tensor directly
+
+**For `ggml_mul_mat(a [C_in,C_out], b [C_in,T])` → `[C_out,T]`:**
+- Requires `a.ne[0] == b.ne[0]` (both = C_in)
+- Input `b` must be `[C_in, T]` with ne[0]=C_in
+- If input is from conv1d `[T, C]` with ne[0]=T, transpose first
+
+**For reading ggml output to C++ array:**
+- ggml tensor `[T, C]` (ne[0]=T, ne[1]=C): `data[c * T + t]`
+- C++ wants `x[c * T + t]`
+- SAME layout → just copy, no transpose!
+
+This caused bugs 3 times in ECAPA-TDNN:
+1. Input: incorrectly transposed before feeding to ggml_conv_1d
+2. MFA output: incorrectly treated as row-major when reading to CPU
+3. build_conv1d_k1: unnecessary transpose of already-correct data
