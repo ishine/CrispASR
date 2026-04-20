@@ -1610,7 +1610,304 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                 enc_output[7]);
     }
 
-    // Step 4: CTC head (ggml graph — just a linear + bias)
+    // Step 4: Greedy decoder (Transformer with cross-attention)
+    // If decoder weights are loaded, use decoder path; else fall back to CTC
+    if (m.dec.emb_w && m.dec.prj_w && !m.dec.blocks.empty()) {
+        // Read decoder weights to CPU
+        std::vector<float> emb_w, pe_dec, norm_w, norm_b, prj_w;
+        read_f32_vec(m.dec.emb_w, emb_w); // [odim, d]
+        read_f32_vec(m.dec.pe, pe_dec);   // [pe_maxlen, d] (sinusoidal)
+        read_f32_vec(m.dec.norm_out_w, norm_w);
+        read_f32_vec(m.dec.norm_out_b, norm_b);
+        read_f32_vec(m.dec.prj_w, prj_w); // [odim, d]
+
+        float scale = sqrtf((float)hp.d_model);
+        int max_len = std::min(T_sub * 2, 300); // max output tokens
+        int d = hp.d_model;
+        int odim = hp.odim;
+
+        // Cache all decoder layer weights ONCE before the loop
+        struct dec_layer_cache {
+            std::vector<float> sattn_norm_w, sattn_norm_b;
+            std::vector<float> sattn_w_qs, sattn_w_qs_b, sattn_w_ks, sattn_w_vs, sattn_w_vs_b;
+            std::vector<float> sattn_fc_w, sattn_fc_b;
+            std::vector<float> xattn_norm_w, xattn_norm_b;
+            std::vector<float> xattn_w_qs, xattn_w_qs_b, xattn_w_ks, xattn_w_vs, xattn_w_vs_b;
+            std::vector<float> xattn_fc_w, xattn_fc_b;
+            std::vector<float> mlp_norm_w, mlp_norm_b, mlp_w1, mlp_b1, mlp_w2, mlp_b2;
+            int di = 0;
+        };
+        std::vector<dec_layer_cache> dec_cache(hp.n_layers_dec);
+        for (int li = 0; li < hp.n_layers_dec; li++) {
+            auto& b = m.dec.blocks[li];
+            auto& c = dec_cache[li];
+            read_f32_vec(b.sattn_norm_w, c.sattn_norm_w);
+            read_f32_vec(b.sattn_norm_b, c.sattn_norm_b);
+            read_f32_vec(b.sattn.w_qs, c.sattn_w_qs);
+            if (b.sattn.w_qs_b)
+                read_f32_vec(b.sattn.w_qs_b, c.sattn_w_qs_b);
+            read_f32_vec(b.sattn.w_ks, c.sattn_w_ks);
+            read_f32_vec(b.sattn.w_vs, c.sattn_w_vs);
+            if (b.sattn.w_vs_b)
+                read_f32_vec(b.sattn.w_vs_b, c.sattn_w_vs_b);
+            read_f32_vec(b.sattn.fc_w, c.sattn_fc_w);
+            if (b.sattn.fc_b)
+                read_f32_vec(b.sattn.fc_b, c.sattn_fc_b);
+            read_f32_vec(b.xattn_norm_w, c.xattn_norm_w);
+            read_f32_vec(b.xattn_norm_b, c.xattn_norm_b);
+            read_f32_vec(b.xattn.w_qs, c.xattn_w_qs);
+            if (b.xattn.w_qs_b)
+                read_f32_vec(b.xattn.w_qs_b, c.xattn_w_qs_b);
+            read_f32_vec(b.xattn.w_ks, c.xattn_w_ks);
+            read_f32_vec(b.xattn.w_vs, c.xattn_w_vs);
+            if (b.xattn.w_vs_b)
+                read_f32_vec(b.xattn.w_vs_b, c.xattn_w_vs_b);
+            read_f32_vec(b.xattn.fc_w, c.xattn_fc_w);
+            if (b.xattn.fc_b)
+                read_f32_vec(b.xattn.fc_b, c.xattn_fc_b);
+            read_f32_vec(b.mlp_norm_w, c.mlp_norm_w);
+            read_f32_vec(b.mlp_norm_b, c.mlp_norm_b);
+            read_f32_vec(b.mlp_w1, c.mlp_w1);
+            if (b.mlp_b1)
+                read_f32_vec(b.mlp_b1, c.mlp_b1);
+            read_f32_vec(b.mlp_w2, c.mlp_w2);
+            if (b.mlp_b2)
+                read_f32_vec(b.mlp_b2, c.mlp_b2);
+            c.di = b.mlp_w1 ? (int)b.mlp_w1->ne[1] : hp.d_inner;
+        }
+
+        // Pre-compute cross-attention K/V for encoder output (shared across all steps)
+        // K_enc[li][t*d+i] = sum_k enc[t*d+k] * W_k[i*d+k]
+        // V_enc[li][t*d+i] = sum_k enc[t*d+k] * W_v[i*d+k] + bias
+        std::vector<std::vector<float>> K_enc(hp.n_layers_dec), V_enc(hp.n_layers_dec);
+        for (int li = 0; li < hp.n_layers_dec; li++) {
+            auto& c = dec_cache[li];
+            K_enc[li].resize(T_sub * d);
+            V_enc[li].resize(T_sub * d);
+            cpu_matmul_bt(enc_output.data(), c.xattn_w_ks.data(), K_enc[li].data(), T_sub, d, d);
+            cpu_matmul_bt(enc_output.data(), c.xattn_w_vs.data(), V_enc[li].data(), T_sub, d, d);
+            if (!c.xattn_w_vs_b.empty())
+                for (int t = 0; t < T_sub; t++)
+                    for (int i = 0; i < d; i++)
+                        V_enc[li][t * d + i] += c.xattn_w_vs_b[i];
+        }
+
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "firered_asr: decoder weights cached, K/V pre-computed\n");
+
+        // Self-attention KV cache: per-layer growing history of K and V
+        // cache_k[li][step * d + i], cache_v[li][step * d + i]
+        std::vector<std::vector<float>> sa_cache_k(hp.n_layers_dec);
+        std::vector<std::vector<float>> sa_cache_v(hp.n_layers_dec);
+
+        // Greedy autoregressive decoding
+        std::vector<int> tokens;
+        tokens.push_back(hp.sos_id);
+        int nh_dec = hp.n_head;
+        int hd_dec = d / nh_dec;
+
+        for (int step = 0; step < max_len; step++) {
+            int cur_token = tokens.back();
+
+            // Embed: emb[token] * scale + pe[step]
+            std::vector<float> x(d);
+            for (int i = 0; i < d; i++) {
+                x[i] = emb_w[cur_token * d + i] * scale;
+                if (step < (int)(m.dec.pe->ne[1]))
+                    x[i] += pe_dec[step * d + i];
+            }
+
+            for (int li = 0; li < hp.n_layers_dec; li++) {
+                auto& c = dec_cache[li];
+
+                // === Self-attention (causal, attend to history) ===
+                {
+                    std::vector<float> xn(d);
+                    cpu_layernorm(x.data(), c.sattn_norm_w.data(), c.sattn_norm_b.data(), xn.data(), 1, d);
+
+                    // Q for current token
+                    std::vector<float> Q_sa(d, 0);
+                    for (int i = 0; i < d; i++) {
+                        double s = 0;
+                        for (int k = 0; k < d; k++)
+                            s += xn[k] * c.sattn_w_qs[i * d + k];
+                        Q_sa[i] = (float)s + (c.sattn_w_qs_b.empty() ? 0 : c.sattn_w_qs_b[i]);
+                    }
+
+                    // K, V for current token → append to cache
+                    std::vector<float> K_cur(d, 0), V_cur(d, 0);
+                    for (int i = 0; i < d; i++) {
+                        double sk = 0, sv = 0;
+                        for (int k = 0; k < d; k++) {
+                            sk += xn[k] * c.sattn_w_ks[i * d + k];
+                            sv += xn[k] * c.sattn_w_vs[i * d + k];
+                        }
+                        K_cur[i] = (float)sk;
+                        V_cur[i] = (float)sv + (c.sattn_w_vs_b.empty() ? 0 : c.sattn_w_vs_b[i]);
+                    }
+                    sa_cache_k[li].insert(sa_cache_k[li].end(), K_cur.begin(), K_cur.end());
+                    sa_cache_v[li].insert(sa_cache_v[li].end(), V_cur.begin(), V_cur.end());
+
+                    int n_hist = (int)(sa_cache_k[li].size() / d); // step + 1
+
+                    // Multi-head attention: Q[d] @ K_history[n_hist, d]
+                    std::vector<float> sa_out(d, 0);
+                    for (int h = 0; h < nh_dec; h++) {
+                        std::vector<float> scores(n_hist);
+                        for (int t = 0; t < n_hist; t++) {
+                            double s = 0;
+                            for (int dd = 0; dd < hd_dec; dd++)
+                                s += Q_sa[h * hd_dec + dd] * sa_cache_k[li][t * d + h * hd_dec + dd];
+                            scores[t] = (float)(s / sqrt((double)hd_dec));
+                        }
+                        cpu_softmax_rows(scores.data(), 1, n_hist);
+                        for (int dd = 0; dd < hd_dec; dd++) {
+                            double s = 0;
+                            for (int t = 0; t < n_hist; t++)
+                                s += scores[t] * sa_cache_v[li][t * d + h * hd_dec + dd];
+                            sa_out[h * hd_dec + dd] = (float)s;
+                        }
+                    }
+
+                    // FC + residual
+                    std::vector<float> sa_fc(d, 0);
+                    for (int i = 0; i < d; i++) {
+                        double s = 0;
+                        for (int k = 0; k < d; k++)
+                            s += sa_out[k] * c.sattn_fc_w[i * d + k];
+                        sa_fc[i] = (float)s + (c.sattn_fc_b.empty() ? 0 : c.sattn_fc_b[i]);
+                    }
+                    for (int i = 0; i < d; i++)
+                        x[i] += sa_fc[i];
+                }
+
+                // === Cross-attention: attend to encoder output (pre-computed K/V) ===
+                std::vector<float> xn(d);
+                cpu_layernorm(x.data(), c.xattn_norm_w.data(), c.xattn_norm_b.data(), xn.data(), 1, d);
+
+                // Q = xn @ W_q + b_q [d]
+                std::vector<float> Qx(d, 0);
+                for (int i = 0; i < d; i++) {
+                    double s = 0;
+                    for (int k = 0; k < d; k++)
+                        s += xn[k] * c.xattn_w_qs[i * d + k];
+                    Qx[i] = (float)s + (c.xattn_w_qs_b.empty() ? 0 : c.xattn_w_qs_b[i]);
+                }
+
+                // Multi-head attention over pre-computed K_enc/V_enc
+                int nh_dec = hp.n_head;
+                int hd_dec = d / nh_dec;
+                std::vector<float> attn_out(d, 0);
+                for (int h = 0; h < nh_dec; h++) {
+                    std::vector<float> scores(T_sub);
+                    for (int t = 0; t < T_sub; t++) {
+                        double s = 0;
+                        for (int dd = 0; dd < hd_dec; dd++)
+                            s += Qx[h * hd_dec + dd] * K_enc[li][t * d + h * hd_dec + dd];
+                        scores[t] = (float)(s / sqrt((double)hd_dec));
+                    }
+                    cpu_softmax_rows(scores.data(), 1, T_sub);
+                    for (int dd = 0; dd < hd_dec; dd++) {
+                        double s = 0;
+                        for (int t = 0; t < T_sub; t++)
+                            s += scores[t] * V_enc[li][t * d + h * hd_dec + dd];
+                        attn_out[h * hd_dec + dd] = (float)s;
+                    }
+                }
+
+                // FC output projection + residual
+                std::vector<float> fc_out(d, 0);
+                for (int i = 0; i < d; i++) {
+                    double s = 0;
+                    for (int k = 0; k < d; k++)
+                        s += attn_out[k] * c.xattn_fc_w[i * d + k];
+                    fc_out[i] = (float)s + (c.xattn_fc_b.empty() ? 0 : c.xattn_fc_b[i]);
+                }
+                for (int i = 0; i < d; i++)
+                    x[i] += fc_out[i];
+
+                // MLP: LN → Linear(d→4d) → GELU → Linear(4d→d) + residual
+                cpu_layernorm(x.data(), c.mlp_norm_w.data(), c.mlp_norm_b.data(), xn.data(), 1, d);
+                std::vector<float> h_up(c.di, 0);
+                for (int i = 0; i < c.di; i++) {
+                    double s = 0;
+                    for (int k = 0; k < d; k++)
+                        s += xn[k] * c.mlp_w1[i * d + k];
+                    h_up[i] = (float)s + (c.mlp_b1.empty() ? 0 : c.mlp_b1[i]);
+                }
+                for (int i = 0; i < c.di; i++) {
+                    float v = h_up[i];
+                    h_up[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+                }
+                std::vector<float> mlp_out(d, 0);
+                for (int i = 0; i < d; i++) {
+                    double s = 0;
+                    for (int k = 0; k < c.di; k++)
+                        s += h_up[k] * c.mlp_w2[i * c.di + k];
+                    mlp_out[i] = (float)s + (c.mlp_b2.empty() ? 0 : c.mlp_b2[i]);
+                }
+                for (int i = 0; i < d; i++)
+                    x[i] += mlp_out[i];
+            }
+
+            // Final LN + projection
+            std::vector<float> xn(d);
+            cpu_layernorm(x.data(), norm_w.data(), norm_b.data(), xn.data(), 1, d);
+            std::vector<float> logits(odim);
+            for (int i = 0; i < odim; i++) {
+                double s = 0;
+                for (int k = 0; k < d; k++)
+                    s += xn[k] * prj_w[i * d + k];
+                logits[i] = (float)s;
+            }
+
+            // Greedy argmax
+            int best = 0;
+            for (int i = 1; i < odim; i++)
+                if (logits[i] > logits[best])
+                    best = i;
+
+            if (best == hp.eos_id)
+                break;
+            tokens.push_back(best);
+        }
+
+        // Decode tokens
+        std::string result;
+        for (int i = 1; i < (int)tokens.size(); i++) { // skip SOS
+            int tid = tokens[i];
+            if (tid < (int)m.vocab.size() && tid != hp.pad_id && tid != hp.sos_id && tid != hp.eos_id) {
+                std::string piece = m.vocab[tid];
+                std::string decoded;
+                for (size_t ci = 0; ci < piece.size(); ci++) {
+                    if ((unsigned char)piece[ci] == 0xE2 && ci + 2 < piece.size() &&
+                        (unsigned char)piece[ci + 1] == 0x96 && (unsigned char)piece[ci + 2] == 0x81) {
+                        decoded += ' ';
+                        ci += 2;
+                    } else {
+                        decoded += piece[ci];
+                    }
+                }
+                result += decoded;
+            }
+        }
+
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "firered_asr: decoder produced %d tokens\n", (int)tokens.size() - 1);
+
+        if (!result.empty()) {
+            while (!result.empty() && result.front() == ' ')
+                result.erase(result.begin());
+            while (!result.empty() && result.back() == ' ')
+                result.pop_back();
+            char* out = (char*)malloc(result.size() + 1);
+            memcpy(out, result.c_str(), result.size());
+            out[result.size()] = '\0';
+            return out;
+        }
+    }
+
+    // Step 5: CTC head (fallback if no decoder or decoder fails)
     struct ggml_init_params gp = {
         /*.mem_size   =*/ctx->compute_meta.size(),
         /*.mem_buffer =*/ctx->compute_meta.data(),
