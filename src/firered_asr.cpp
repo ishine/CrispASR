@@ -51,6 +51,7 @@ struct firered_hparams {
     int eos_id = 4;
     int blank_id = 0;
     int pad_id = 2;
+    int n_head_dec = 0; // decoder n_head (0 = same as encoder)
     // Derived
     int head_dim = 64; // d_model / n_head
 };
@@ -292,6 +293,9 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
         hp.eos_id = core_gguf::kv_u32(gctx, "firered.eos_id", hp.eos_id);
         hp.blank_id = core_gguf::kv_u32(gctx, "firered.blank_id", hp.blank_id);
         hp.pad_id = core_gguf::kv_u32(gctx, "firered.pad_id", hp.pad_id);
+        hp.n_head_dec = core_gguf::kv_u32(gctx, "firered.n_head_dec", 0);
+        if (hp.n_head_dec == 0)
+            hp.n_head_dec = hp.n_head; // default: same as encoder
         hp.head_dim = hp.d_model / hp.n_head;
 
         // Tokenizer
@@ -1704,7 +1708,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
         // Greedy autoregressive decoding
         std::vector<int> tokens;
         tokens.push_back(hp.sos_id);
-        int nh_dec = hp.n_head;
+        int nh_dec = hp.n_head_dec;
         int hd_dec = d / nh_dec;
 
         for (int step = 0; step < max_len; step++) {
@@ -1796,7 +1800,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                 }
 
                 // Multi-head attention over pre-computed K_enc/V_enc
-                int nh_dec = hp.n_head;
+                int nh_dec = hp.n_head_dec;
                 int hd_dec = d / nh_dec;
                 std::vector<float> attn_out(d, 0);
                 for (int h = 0; h < nh_dec; h++) {

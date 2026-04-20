@@ -91,6 +91,7 @@ def main():
     # Hyperparameters (encoder same as ASR, decoder is LID-specific)
     writer.add_uint32("firered.d_model", model_args.d_model)
     writer.add_uint32("firered.n_head", model_args.n_head)
+    writer.add_uint32("firered.n_head_dec", model_args.layer_n_head)  # LID decoder uses 8 heads
     writer.add_uint32("firered.d_inner", model_args.d_inner)
     writer.add_uint32("firered.n_layers_enc", model_args.n_layers_enc)
     writer.add_uint32("firered.n_layers_dec", model_args.n_layers_lid_dec)  # LID decoder layers
