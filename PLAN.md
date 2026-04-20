@@ -708,7 +708,7 @@ TODO: Quantization + HF upload.
 |---|---|---|---|
 | [qwen3-asr.cpp](https://github.com/predict-woo/qwen3-asr.cpp) | Qwen3-ASR | Flash Attn 3.7x, selective logits, F16 KV cache, vDSP mel (45x on Apple) | High — adopt optimizations |
 | [RapidSpeech.cpp](https://github.com/RapidAI/RapidSpeech.cpp) | Multi-model | Zero-allocation graphs, edge-focused, advanced quant (Q4_K/Q5_K/Q6_K) | Medium |
-| [moonshine.cpp](https://github.com/csexton-ua/moonshine.cpp) | Moonshine v1/v2 | Lightweight, streaming v2, clean GGML-native | High — implement as backend |
+| [moonshine.cpp](https://github.com/csexton-ua/moonshine.cpp) | Moonshine v1/v2 | Lightweight, streaming v2, clean GGML-native | **Done** — 15th backend |
 | [FunASR-GGML](https://github.com/huaxin0/FunASR-GGML) | SenseVoice (Qwen3) | 3-stage pipeline, CUDA support, KV cache | Medium |
 | [whisper_ggml](https://github.com/sk3llo/whisper_ggml) | Whisper | CoreML leveraging for iOS | Low |
 | koboldcpp | Various | Unknown | Medium — need to check |
