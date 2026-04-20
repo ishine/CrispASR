@@ -282,6 +282,17 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
     compute_fbank60(samples, n_samples, fbank, T, m.mel_fb_embedded, m.n_fft_orig);
     if (T <= 0) return nullptr;
 
+    // Debug: optionally load reference fbank
+    const char* ref_path = getenv("ECAPA_REF_FBANK");
+    if (ref_path && *ref_path) {
+        FILE* f = fopen(ref_path, "rb");
+        if (f) {
+            fread(fbank.data(), sizeof(float), T * m.n_mels, f);
+            fclose(f);
+            fprintf(stderr, "ecapa_lid: LOADED ref fbank from %s\n", ref_path);
+        }
+    }
+
     // Transpose to [n_mels, T] + mean normalize
     std::vector<float> x_data(m.n_mels * T);
     for (int c = 0; c < m.n_mels; c++) {
@@ -311,9 +322,16 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
 
     // Block 0: Conv1d(60→1024, k=5) + ReLU + BN
     ggml_tensor* h = build_conv1d(ctx0, inp, G("emb.blocks.0.conv.weight"), G("emb.blocks.0.conv.bias"), 1, 1);
+    // Debug: output pre-relu conv
+    ggml_set_name(h, "block0_pre_relu");
+    ggml_set_output(h);
+
     h = ggml_relu(ctx0, h);
     h = build_bn(ctx0, h, G("emb.blocks.0.bn.weight"), G("emb.blocks.0.bn.bias"),
                  G("emb.blocks.0.bn.running_mean"), G("emb.blocks.0.bn.running_var"), eps_t);
+
+    ggml_set_name(h, "block0_out");
+    ggml_set_output(h);
 
     // Blocks 1-3: SE-Res2Net
     // Each block: tdnn1(k=1) → Res2Net → tdnn2(k=1) → SE → residual
@@ -421,13 +439,16 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
         return nullptr;
     }
 
-    // Set input — need [T, n_mels] layout for ggml_conv_1d
-    // x_data is [n_mels, T], transpose to [T, n_mels]
-    std::vector<float> x_t(m.n_mels * T);
-    for (int c = 0; c < m.n_mels; c++)
-        for (int t = 0; t < T; t++)
-            x_t[t * m.n_mels + c] = x_data[c * T + t];
+    // Set input — ggml tensor [T, n_mels] is column-major: data[ic * T + t]
+    // x_data is [n_mels, T] row-major: x_data[c * T + t]
+    // For ggml column-major [ne[0]=T, ne[1]=IC]: data[ic * T + t] = x_data[ic * T + t]
+    // They're the SAME layout! Just copy directly.
+    std::vector<float>& x_t = x_data; // no transpose needed!
     ggml_backend_tensor_set(inp, x_t.data(), 0, m.n_mels * T * sizeof(float));
+    fprintf(stderr, "ecapa_lid: inp ne=[%lld,%lld], x_t[:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+            (long long)inp->ne[0], (long long)inp->ne[1],
+            x_t[0], x_t[1], x_t[2], x_t[3], x_t[4]);
+    fflush(stderr);
     float eps_val = 1e-5f;
     ggml_backend_tensor_set(eps_t, &eps_val, 0, sizeof(float));
 
@@ -435,6 +456,21 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
         fprintf(stderr, "ecapa_lid: graph compute failed\n");
         ggml_free(ctx0);
         return nullptr;
+    }
+
+    // Debug: read block0 output
+    {
+        ggml_tensor* pre = ggml_graph_get_tensor(gf, "block0_pre_relu");
+        ggml_tensor* out = ggml_graph_get_tensor(gf, "block0_out");
+        if (pre && out) {
+            float buf[10];
+            ggml_backend_tensor_get(pre, buf, 0, 10 * sizeof(float));
+            fprintf(stderr, "ecapa_lid: block0 pre_relu ne=[%lld,%lld], data[:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                    (long long)pre->ne[0], (long long)pre->ne[1], buf[0], buf[1], buf[2], buf[3], buf[4]);
+            ggml_backend_tensor_get(out, buf, 0, 10 * sizeof(float));
+            fprintf(stderr, "ecapa_lid: block0 out ne=[%lld,%lld], data[:5]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n",
+                    (long long)out->ne[0], (long long)out->ne[1], buf[0], buf[1], buf[2], buf[3], buf[4]);
+        }
     }
 
     // Read MFA output: [T, 3072] in ggml
