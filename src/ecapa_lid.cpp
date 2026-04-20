@@ -90,13 +90,19 @@ static void relu_inplace(float* data, int n) {
             data[i] = 0;
 }
 
-// Pad input symmetrically: [C, T] → [C, T + pad_left + pad_right]
-static void pad_1d(const float* in, int C, int T, int pad_left, int pad_right, float* out) {
+// Pad input symmetrically with reflect mode: [C, T] → [C, T + pad_left + pad_right]
+// SpeechBrain Conv1d uses reflect padding by default.
+static void pad_1d_reflect(const float* in, int C, int T, int pad_left, int pad_right, float* out) {
     int T_new = T + pad_left + pad_right;
     for (int c = 0; c < C; c++) {
         for (int t = 0; t < T_new; t++) {
             int ti = t - pad_left;
-            out[c * T_new + t] = (ti >= 0 && ti < T) ? in[c * T + ti] : 0.0f;
+            if (ti < 0)
+                ti = -ti; // reflect left: -1→1, -2→2
+            else if (ti >= T)
+                ti = 2 * (T - 1) - ti; // reflect right
+            ti = std::max(0, std::min(ti, T - 1));
+            out[c * T_new + t] = in[c * T + ti];
         }
     }
 }
@@ -501,7 +507,7 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
     fprintf(stderr, "ecapa_lid: fbank T=%d, n_mels=%d\n", T, m.n_mels);
     fflush(stderr);
 
-    // Debug: dump fbank to file for Python comparison
+    // Debug: dump/load fbank for Python comparison
     {
         const char* dump_path = getenv("ECAPA_DUMP_FBANK");
         if (dump_path && *dump_path) {
@@ -510,6 +516,17 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
                 fwrite(fbank.data(), sizeof(float), fbank.size(), f);
                 fclose(f);
                 fprintf(stderr, "ecapa_lid: dumped fbank to %s (%zu floats)\n", dump_path, fbank.size());
+            }
+        }
+        // Load reference fbank instead of our computed one (for debugging)
+        const char* ref_path = getenv("ECAPA_REF_FBANK");
+        if (ref_path && *ref_path) {
+            FILE* f = fopen(ref_path, "rb");
+            if (f) {
+                size_t expected = T * m.n_mels;
+                fread(fbank.data(), sizeof(float), expected, f);
+                fclose(f);
+                fprintf(stderr, "ecapa_lid: LOADED reference fbank from %s\n", ref_path);
             }
         }
     }
@@ -536,7 +553,7 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
     // 3. Block 0: Conv1d(60→1024, k=5, d=1) + BN + ReLU
     int pad0 = (m.block0.K - 1) / 2; // symmetric padding for k=5 → pad=2
     std::vector<float> x_pad(m.n_mels * (T + 2 * pad0));
-    pad_1d(x.data(), m.n_mels, T, pad0, pad0, x_pad.data());
+    pad_1d_reflect(x.data(), m.n_mels, T, pad0, pad0, x_pad.data());
     int T0 = 0;
     std::vector<float> h0(1024 * T); // output channels=1024
     fprintf(stderr, "ecapa_lid: block0 K=%d C_in=%d C_out=%d conv_w.size=%zu bn.weight=%zu\n", m.block0.K,
@@ -548,10 +565,17 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
     }
     conv1d(x_pad.data(), m.n_mels, T + 2 * pad0, m.block0.conv_w.data(), m.block0.conv_b.data(), 1024,
            m.block0.K, 1, 1, h0.data(), T0);
-    fprintf(stderr, "ecapa_lid: block0 done, T0=%d\n", T0);
+    fprintf(stderr, "ecapa_lid: block0 conv done T0=%d, pre-BN h0[:5,0]=[%.4f,%.4f,%.4f,%.4f,%.4f]\n", T0,
+            h0[0*T0], h0[1*T0], h0[2*T0], h0[3*T0], h0[4*T0]);
+    fflush(stderr);
     batchnorm1d(h0.data(), 1024, T0, m.block0.bn.weight.data(), m.block0.bn.bias.data(), m.block0.bn.mean.data(),
                 m.block0.bn.var.data());
     relu_inplace(h0.data(), 1024 * T0);
+    fprintf(stderr, "  h0[0,:5,0]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+            h0[0*T0+0], h0[1*T0+0], h0[2*T0+0], h0[3*T0+0], h0[4*T0+0]);
+    fprintf(stderr, "  h0[0,:5,50]=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
+            h0[0*T0+50], h0[1*T0+50], h0[2*T0+50], h0[3*T0+50], h0[4*T0+50]);
+    fflush(stderr);
 
     // 4. SE-Res2Net blocks 1-3
     int C = 1024, scale = 8, sub_c = C / scale; // sub_c = 128
@@ -592,7 +616,7 @@ extern "C" const char* ecapa_lid_detect(struct ecapa_lid_context* ctx, const flo
             // Conv1d(128→128, k=3, dilation=dilation) with causal-style padding
             int pad_r2 = dilation; // padding = dilation for k=3
             std::vector<float> sub_padded(sub_c * (T_cur + 2 * pad_r2));
-            pad_1d(sub_in.data(), sub_c, T_cur, pad_r2, pad_r2, sub_padded.data());
+            pad_1d_reflect(sub_in.data(), sub_c, T_cur, pad_r2, pad_r2, sub_padded.data());
             int T_r2 = 0;
             std::vector<float> sub_out(sub_c * T_cur);
             conv1d(sub_padded.data(), sub_c, T_cur + 2 * pad_r2, blk.subs[si].conv_w.data(),
