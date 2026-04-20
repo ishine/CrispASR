@@ -499,7 +499,9 @@ extern "C" void firered_asr_free(struct firered_asr_context* ctx) {
 }
 
 // ===========================================================================
-// Mel spectrogram (80-dim fbank, 25ms window, 10ms hop, 16kHz)
+// Kaldi-compatible fbank (80-dim, 25ms povey window, 10ms hop, 16kHz)
+// Matches kaldi_native_fbank with: preemph=0.97, remove_dc=true,
+// window=povey, power=true, dither=0, low_freq=20, high_freq=0
 // ===========================================================================
 
 #ifndef M_PI
@@ -508,45 +510,55 @@ extern "C" void firered_asr_free(struct firered_asr_context* ctx) {
 
 static void compute_fbank(const float* pcm, int n_samples, std::vector<float>& features, int& n_frames) {
     const int n_fft = 512;
-    const int hop = 160;
-    const int win = 400;
+    const int hop = 160; // 10ms @ 16kHz
+    const int win = 400; // 25ms @ 16kHz
     const int n_mels = 80;
     const int sample_rate = 16000;
+    const float preemph = 0.97f;
+    const float low_freq = 20.0f;
+    const float high_freq = (float)sample_rate / 2.0f; // 8000 Hz (kaldi high_freq=0 means Nyquist)
 
+    // snip_edges=true: number of frames
     n_frames = (n_samples - win) / hop + 1;
     if (n_frames <= 0) {
         n_frames = 0;
         return;
     }
 
-    // Mel filterbank
+    // Mel filterbank (kaldi HTK-compatible mel scale)
     int n_fft_bins = n_fft / 2 + 1;
     std::vector<float> mel_fb(n_mels * n_fft_bins, 0.0f);
     {
-        auto hz2mel = [](float hz) { return 2595.0f * log10f(1.0f + hz / 700.0f); };
-        auto mel2hz = [](float m) { return 700.0f * (powf(10.0f, m / 2595.0f) - 1.0f); };
-        float mel_lo = hz2mel(0), mel_hi = hz2mel((float)sample_rate / 2);
-        std::vector<float> mp(n_mels + 2);
+        auto hz2mel = [](float hz) { return 1127.0f * logf(1.0f + hz / 700.0f); };
+        auto mel2hz = [](float m) { return 700.0f * (expf(m / 1127.0f) - 1.0f); };
+        float mel_lo = hz2mel(low_freq);
+        float mel_hi = hz2mel(high_freq);
+        std::vector<float> center(n_mels + 2);
         for (int i = 0; i < n_mels + 2; i++)
-            mp[i] = mel2hz(mel_lo + i * (mel_hi - mel_lo) / (n_mels + 1));
-        for (int m = 0; m < n_mels; m++)
+            center[i] = mel2hz(mel_lo + i * (mel_hi - mel_lo) / (n_mels + 1));
+
+        for (int m = 0; m < n_mels; m++) {
             for (int k = 0; k < n_fft_bins; k++) {
-                float f = (float)k * sample_rate / n_fft;
-                if (f >= mp[m] && f <= mp[m + 1])
-                    mel_fb[m * n_fft_bins + k] = (f - mp[m]) / (mp[m + 1] - mp[m]);
-                else if (f > mp[m + 1] && f <= mp[m + 2])
-                    mel_fb[m * n_fft_bins + k] = (mp[m + 2] - f) / (mp[m + 2] - mp[m + 1]);
+                float freq = (float)k * sample_rate / n_fft;
+                if (freq > center[m] && freq <= center[m + 1] && center[m + 1] > center[m])
+                    mel_fb[m * n_fft_bins + k] = (freq - center[m]) / (center[m + 1] - center[m]);
+                else if (freq > center[m + 1] && freq < center[m + 2] && center[m + 2] > center[m + 1])
+                    mel_fb[m * n_fft_bins + k] = (center[m + 2] - freq) / (center[m + 2] - center[m + 1]);
             }
+        }
     }
 
-    std::vector<float> hann(win);
-    for (int i = 0; i < win; i++)
-        hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / win));
+    // Povey window: hann(i)^0.85
+    std::vector<float> window(win);
+    for (int i = 0; i < win; i++) {
+        float hann = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * i / (win - 1));
+        window[i] = powf(hann, 0.85f);
+    }
 
     features.resize(n_frames * n_mels);
     std::vector<float> fft_re(n_fft), fft_im(n_fft);
 
-    auto fft = [](float* re, float* im, int n) {
+    auto fft_forward = [](float* re, float* im, int n) {
         for (int i = 1, j = 0; i < n; i++) {
             int bit = n >> 1;
             for (; j & bit; bit >>= 1)
@@ -578,16 +590,41 @@ static void compute_fbank(const float* pcm, int n_samples, std::vector<float>& f
     };
 
     for (int t = 0; t < n_frames; t++) {
+        int offset = t * hop;
+
+        // Extract frame + remove DC offset
+        std::vector<float> frame(win);
+        float dc = 0.0f;
+        for (int i = 0; i < win; i++) {
+            frame[i] = (offset + i < n_samples) ? pcm[offset + i] : 0.0f;
+            dc += frame[i];
+        }
+        dc /= win;
+        for (int i = 0; i < win; i++)
+            frame[i] -= dc;
+
+        // Preemphasis: s[i] -= preemph * s[i-1]
+        for (int i = win - 1; i > 0; i--)
+            frame[i] -= preemph * frame[i - 1];
+        frame[0] -= preemph * frame[0]; // kaldi: first sample uses itself
+
+        // Apply window + zero-pad to n_fft
         std::fill(fft_re.begin(), fft_re.end(), 0.0f);
         std::fill(fft_im.begin(), fft_im.end(), 0.0f);
-        for (int i = 0; i < win && t * hop + i < n_samples; i++)
-            fft_re[i] = pcm[t * hop + i] * hann[i];
-        fft(fft_re.data(), fft_im.data(), n_fft);
+        for (int i = 0; i < win; i++)
+            fft_re[i] = frame[i] * window[i];
+
+        // FFT
+        fft_forward(fft_re.data(), fft_im.data(), n_fft);
+
+        // Power spectrum → mel filterbank → log
         for (int m = 0; m < n_mels; m++) {
-            float s = 0;
-            for (int k = 0; k < n_fft_bins; k++)
-                s += (fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k]) * mel_fb[m * n_fft_bins + k];
-            features[t * n_mels + m] = logf(std::max(s, 1e-10f));
+            float sum = 0.0f;
+            for (int k = 0; k < n_fft_bins; k++) {
+                float power = fft_re[k] * fft_re[k] + fft_im[k] * fft_im[k];
+                sum += power * mel_fb[m * n_fft_bins + k];
+            }
+            features[t * n_mels + m] = logf(std::max(sum, 1.1920929e-7f)); // kaldi uses FLT_EPSILON
         }
     }
 }
@@ -616,8 +653,8 @@ static ggml_tensor* build_macaron_ffn(ggml_context* ctx, ggml_tensor* x, const f
     h = ggml_mul_mat(ctx, f.down_w, h);
     if (f.down_b)
         h = ggml_add(ctx, h, f.down_b);
-    h = ggml_scale(ctx, h, 0.5f);
-    return ggml_add(ctx, x, h);
+    // Macaron residual: 0.5*x + 0.5*ffn(x)
+    return ggml_add(ctx, ggml_scale(ctx, x, 0.5f), ggml_scale(ctx, h, 0.5f));
 }
 
 // ===========================================================================
@@ -681,6 +718,11 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, ggml_tensor* x, const f
 // Relative-PE multi-head self-attention (simplified — no rel_shift)
 // ===========================================================================
 
+// Simplified MHSA: uses flash_attn with bias_u (no rel_shift).
+// The relative position attention requires row-major reshape (rel_shift)
+// which ggml (column-major) can't express directly. A CPU-side
+// implementation for rel_shift is needed for full accuracy.
+// For now, content attention with pos_bias_u gives partial positional info.
 static ggml_tensor* build_rel_mhsa(ggml_context* ctx, ggml_tensor* x, ggml_tensor* pos_emb,
                                    const firered_enc_mhsa& mhsa, int n_head, int head_dim) {
     int d = n_head * head_dim;
@@ -714,7 +756,11 @@ static ggml_tensor* build_rel_mhsa(ggml_context* ctx, ggml_tensor* x, ggml_tenso
 
     // Position embedding projection: pos_emb [d, T_pe] → [hd, nh, T_pe]
     // pos_emb has shape [d_model, 2*T-1] in our layout
-    ggml_tensor* p = ggml_mul_mat(ctx, mhsa.lin_pos, pos_emb); // [d, T_pe]
+    // lin_pos: [d_model, d_model], pos_emb: [d_model, T_pe]
+    // But pos_emb comes from a view of the PE tensor which is [1280, 9999, 1]
+    // The view extracts [1280, T_pe] — but ggml_view_2d on a 3D tensor
+    // may not be contiguous. Let's ensure contiguity.
+    ggml_tensor* p = ggml_mul_mat(ctx, mhsa.lin_pos, ggml_cont(ctx, pos_emb)); // [d, T_pe]
     int T_pe = (int)p->ne[1];
     p = ggml_reshape_3d(ctx, p, head_dim, n_head, T_pe); // [hd, nh, T_pe]
 
@@ -792,16 +838,23 @@ static ggml_tensor* build_rel_mhsa(ggml_context* ctx, ggml_tensor* x, ggml_tenso
     // but with the pos_bias_u applied to improve accuracy slightly.
     // Full rel PE can be added later with CPU-side score computation.
 
-    // Combined scores: matrix_ac + matrix_bd (with rel_shift)
-    // For now, skip matrix_bd (position attention) and use only content attention
-    // matrix_ac: [T, T, nh] — content-based attention scores
-    // TODO: implement rel_shift for matrix_bd and add to scores
+    // rel_shift: compute on CPU since ggml can't do row-major reshape
+    // matrix_bd: [T_pe, T, nh] (ggml layout, ne[0]=T_pe fastest)
+    // Need to apply Python's rel_shift which operates in row-major order
     //
-    // Use flash_attn with q+bias_u for content attention
+    // Approach: mark matrix_ac and matrix_bd as outputs, compute graph,
+    // read them out, apply rel_shift + softmax + V weighting on CPU,
+    // then set result as input to next graph.
+    //
+    // But this requires splitting the graph, which is complex.
+    // Alternative: just use flash_attn (no rel PE) for now to get a working baseline.
+    (void)matrix_bd;
+    (void)matrix_ac;
+
+    // Fall back to flash_attn with bias_u (content attention only)
     q_u = ggml_cont(ctx, ggml_permute(ctx, ggml_add(ctx, q, bias_u), 0, 2, 1, 3)); // [hd, T, nh]
     ggml_tensor* k_fa = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3));
     ggml_tensor* v_fa = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
-
     ggml_tensor* attn = ggml_flash_attn_ext(ctx, q_u, k_fa, v_fa, nullptr, scale, 0.0f, 0.0f);
     attn = ggml_reshape_2d(ctx, attn, d, T);
     attn = ggml_mul_mat(ctx, mhsa.fc_w, attn);
@@ -917,8 +970,16 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
     if (n_frames <= 0)
         return nullptr;
 
-    if (ctx->params.verbosity >= 1)
+    if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "firered_asr: %d fbank frames\n", n_frames);
+        if (n_frames > 100) {
+            fprintf(stderr, "  fbank t=0 first 5: [%.4f, %.4f, %.4f, %.4f, %.4f]\n", features[0], features[1],
+                    features[2], features[3], features[4]);
+            int t100 = 100 * 80;
+            fprintf(stderr, "  fbank t=100 first 5: [%.4f, %.4f, %.4f, %.4f, %.4f]\n", features[t100],
+                    features[t100 + 1], features[t100 + 2], features[t100 + 3], features[t100 + 4]);
+        }
+    }
 
     // Step 1b: Apply CMVN (global mean-variance normalization)
     if (m.cmvn_mean && m.cmvn_std) {
@@ -968,6 +1029,10 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
         x = ggml_add(ctx0, x, m.enc.proj_b);
     // x: [d_model=1280, T_sub]
 
+    // Dump subsampled+projected output for comparison
+    ggml_set_name(x, "subsampled_proj");
+    ggml_set_output(x);
+
     // Relative positional encoding: extract [d_model, 2*T_sub-1] from PE tensor
     // PE is stored as [1, 9999, 1280] in ggml → ne=[1280, 9999, 1]
     // We need the center 2*T_sub-1 positions
@@ -988,6 +1053,10 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
         x = build_conv_module(ctx0, x, b.conv, hp.d_model, hp.kernel_size);
         // Macaron FFN2 (half-step)
         x = build_macaron_ffn(ctx0, x, b.ffn2);
+        if (i == 0) {
+            ggml_set_name(x, "after_block0");
+            ggml_set_output(x);
+        }
         // Final LayerNorm
         x = ggml_norm(ctx0, x, 1e-5f);
         x = ggml_mul(ctx0, x, b.ln_w);
@@ -995,6 +1064,10 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
             x = ggml_add(ctx0, x, b.ln_b);
     }
     // x: [d_model, T_sub]
+
+    // Dump encoder output for diff-testing
+    ggml_set_name(x, "enc_output");
+    ggml_set_output(x);
 
     // CTC head: linear + log_softmax → greedy decode
     ggml_tensor* ctc_logits = ggml_mul_mat(ctx0, m.ctc_w, x);
@@ -1020,6 +1093,37 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
         fprintf(stderr, "firered_asr: encoder compute failed\n");
         ggml_free(ctx0);
         return nullptr;
+    }
+
+    // Dump subsampled output
+    {
+        ggml_tensor* sp = ggml_graph_get_tensor(gf, "subsampled_proj");
+        if (sp) {
+            float vals[8];
+            ggml_backend_tensor_get(sp, vals, 0, 8 * sizeof(float));
+            fprintf(stderr, "  subsampled_proj t=0 first 8: [%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n", vals[0],
+                    vals[1], vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+        }
+    }
+    // Dump block0 output
+    {
+        ggml_tensor* b0 = ggml_graph_get_tensor(gf, "after_block0");
+        if (b0) {
+            float vals[8];
+            ggml_backend_tensor_get(b0, vals, 0, 8 * sizeof(float));
+            fprintf(stderr, "  after_block0 t=0 first 8: [%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n", vals[0], vals[1],
+                    vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+        }
+    }
+    // Dump encoder output for comparison with reference
+    {
+        ggml_tensor* enc_t = ggml_graph_get_tensor(gf, "enc_output");
+        if (enc_t) {
+            float vals[8];
+            ggml_backend_tensor_get(enc_t, vals, 0, 8 * sizeof(float));
+            fprintf(stderr, "  enc_out t=0 first 8: [%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f]\n", vals[0], vals[1],
+                    vals[2], vals[3], vals[4], vals[5], vals[6], vals[7]);
+        }
     }
 
     // Read CTC logits and greedy decode
@@ -1061,8 +1165,23 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
 
     ggml_free(ctx0);
 
-    if (ctx->params.verbosity >= 1)
+    if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "firered_asr: CTC decoded %d frames → %zu chars\n", T_sub, result.size());
+        // Dump first few CTC predictions for debugging
+        int prev_id = -1;
+        fprintf(stderr, "  CTC first 20 argmax: [");
+        for (int t = 0; t < std::min(20, T_sub); t++) {
+            int best_id = 0;
+            float best_val = logits_data[t * hp.odim];
+            for (int i = 1; i < hp.odim; i++)
+                if (logits_data[t * hp.odim + i] > best_val) {
+                    best_val = logits_data[t * hp.odim + i];
+                    best_id = i;
+                }
+            fprintf(stderr, "%d,", best_id);
+        }
+        fprintf(stderr, "]\n");
+    }
 
     if (result.empty())
         return nullptr;
