@@ -10,7 +10,7 @@ name: Lint
 
 on:
   push:
-    branches: [main, integrated_cli]
+    branches: [main, master, integrated_cli]
     paths:
       - '**.cpp'
       - '**.h'
@@ -21,7 +21,7 @@ on:
       - 'CMakeLists.txt'
       - 'CMakePresets.json'
   pull_request:
-    branches: [main]
+    branches: [main, master]
     paths:
       - '**.cpp'
       - '**.h'
