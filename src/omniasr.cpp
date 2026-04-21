@@ -114,7 +114,8 @@ extern "C" struct omniasr_context_params omniasr_context_default_params(void) {
 // ===========================================================================
 
 static void dump_tensor(ggml_tensor* t, const char* name, const char* dir) {
-    if (!dir || !dir[0] || !t) return;
+    if (!dir || !dir[0] || !t)
+        return;
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
     int n = (int)ggml_nelements(t);
@@ -135,7 +136,8 @@ static void dump_tensor(ggml_tensor* t, const char* name, const char* dir) {
 }
 
 static void dump_cpu(const float* data, int n, const char* name, const char* dir) {
-    if (!dir || !dir[0]) return;
+    if (!dir || !dir[0])
+        return;
     char path[512];
     snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
     FILE* f = fopen(path, "wb");
@@ -415,7 +417,7 @@ static bool omniasr_alloc_kv_cache(omniasr_context* ctx, int max_ctx) {
 // ===========================================================================
 
 static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* samples, int n_samples,
-                                     const std::vector<float>& encoder_out, int d_enc, int T_enc);
+                                    const std::vector<float>& encoder_out, int d_enc, int T_enc);
 
 // ===========================================================================
 // Transcribe
@@ -581,9 +583,11 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
             // Dump CNN output if available
             {
                 ggml_tensor* cnn_t = ggml_graph_get_tensor(gf, "cnn_out");
-                if (cnn_t) dump_tensor(cnn_t, "cnn_out", dump_dir);
+                if (cnn_t)
+                    dump_tensor(cnn_t, "cnn_out", dump_dir);
                 ggml_tensor* proj_t = ggml_graph_get_tensor(gf, "proj_out");
-                if (proj_t) dump_tensor(proj_t, "proj_out_graph1", dump_dir);
+                if (proj_t)
+                    dump_tensor(proj_t, "proj_out_graph1", dump_dir);
             }
 
             // Read h_pre_pos: [d_model, T] ggml col-major: data[t * d_model + c]
@@ -920,9 +924,9 @@ static ggml_cgraph* omniasr_build_dec_graph(omniasr_context* ctx, int n_past, in
 
     const core_attn::KvSelfAttnParams kvp = {
         /*n_heads*/ nh,
-        /*n_kv_heads*/ nh,  // MHA (same as query heads)
+        /*n_kv_heads*/ nh, // MHA (same as query heads)
         /*head_dim*/ hd,
-        /*n_kv_grp*/ 1,     // no GQA
+        /*n_kv_grp*/ 1, // no GQA
         /*n_ctx_orig*/ 0,
         /*rope_theta*/ 10000.0f,
         /*rope_beta_fast*/ 0.0f,
@@ -930,7 +934,7 @@ static ggml_cgraph* omniasr_build_dec_graph(omniasr_context* ctx, int n_past, in
         /*attn_scale*/ 1.0f / sqrtf((float)hd),
         /*qk_norm_eps*/ 0.0f,
         /*gqa_mode*/ core_attn::GQA_NATIVE,
-        /*rope_type*/ GGML_ROPE_TYPE_NORMAL,  // fairseq2 interleaved
+        /*rope_type*/ GGML_ROPE_TYPE_NORMAL, // fairseq2 interleaved
     };
 
     ggml_tensor* cur = embeds;
@@ -943,9 +947,8 @@ static ggml_cgraph* omniasr_build_dec_graph(omniasr_context* ctx, int n_past, in
         cur = ggml_mul(ctx0, cur, b.attn_ln_w);
 
         // KV-cached self-attention
-        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, cur, b.q_w, b.k_w, b.v_w, b.o_w,
-                                                     nullptr, nullptr, positions, causal_mask,
-                                                     ctx->kv_k, ctx->kv_v, il, n_past, kvp);
+        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, cur, b.q_w, b.k_w, b.v_w, b.o_w, nullptr, nullptr,
+                                                    positions, causal_mask, ctx->kv_k, ctx->kv_v, il, n_past, kvp);
         cur = ggml_add(ctx0, residual, attn);
 
         // FFN: RMSNorm + SwiGLU
@@ -1025,7 +1028,7 @@ static bool omniasr_run_dec(omniasr_context* ctx, const float* embeds, int n_tok
 }
 
 static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples*/, int /*n_samples*/,
-                                     const std::vector<float>& encoder_out, int d_enc, int T_enc) {
+                                    const std::vector<float>& encoder_out, int d_enc, int T_enc) {
     auto& m = ctx->model;
     auto& hp = m.hp;
 
@@ -1033,7 +1036,10 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples
 
     // Helper to read tensor to CPU
     auto read_f32 = [](ggml_tensor* t, std::vector<float>& out) {
-        if (!t) { out.clear(); return; }
+        if (!t) {
+            out.clear();
+            return;
+        }
         int n = (int)ggml_nelements(t);
         out.resize(n);
         if (t->type == GGML_TYPE_F32)
@@ -1083,8 +1089,8 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples
     bool use_lang = (hp.n_langs > 0 && !lang_emb_data.empty());
     // Sequence: [audio_embs...] [lid_marker_emb] [lang_emb] [BOS_emb] [generated...]
     // lid_marker is special token at index vocab_size (9812) in text_frontend
-    int lid_marker_id = hp.vocab_size; // 9812 — the extra token in tok_emb (size 9813)
-    int n_lang_tokens = use_lang ? 2 : 0; // lid_marker + lang_emb
+    int lid_marker_id = hp.vocab_size;          // 9812 — the extra token in tok_emb (size 9813)
+    int n_lang_tokens = use_lang ? 2 : 0;       // lid_marker + lang_emb
     int prefix_len = T_enc + n_lang_tokens + 1; // audio + [lid_marker + lang] + BOS
     std::vector<float> prefix(prefix_len * dd);
 
@@ -1122,8 +1128,10 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples
         omniasr_alloc_kv_cache(ctx, max_ctx);
     } else if (ctx->kv_max_ctx < max_ctx) {
         // Reallocate if needed
-        if (ctx->kv_ctx) ggml_free(ctx->kv_ctx);
-        if (ctx->kv_buf) ggml_backend_buffer_free(ctx->kv_buf);
+        if (ctx->kv_ctx)
+            ggml_free(ctx->kv_ctx);
+        if (ctx->kv_buf)
+            ggml_backend_buffer_free(ctx->kv_buf);
         ctx->kv_k = ctx->kv_v = nullptr;
         omniasr_alloc_kv_cache(ctx, max_ctx);
     }
@@ -1148,7 +1156,10 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples
         int best = 0;
         float best_val = lg[0];
         for (int i = 1; i < (int)lg.size(); i++)
-            if (lg[i] > best_val) { best_val = lg[i]; best = i; }
+            if (lg[i] > best_val) {
+                best_val = lg[i];
+                best = i;
+            }
         return best;
     };
 
@@ -1185,7 +1196,8 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples
         }
 
         cur_token = argmax(logits);
-        if (cur_token == hp.eos_id) break;
+        if (cur_token == hp.eos_id)
+            break;
         output_tokens.push_back(cur_token);
 
         if (ctx->params.verbosity >= 2 && step < 5)
