@@ -1,8 +1,8 @@
 // omniasr.cpp — Facebook OmniASR runtime (CTC + LLM variants).
 //
-// CTC: CNN frontend → Transformer encoder → CTC head.
-// LLM: CNN frontend → Transformer encoder → enc_proj → LLaMA decoder.
-// No mel features needed — processes raw 16kHz PCM directly.
+// CTC:  CNN frontend → Transformer encoder → CTC head.
+// LLM:  CNN frontend → Transformer encoder → enc_proj → LLaMA decoder.
+// Input: raw 16kHz PCM (no mel features needed).
 
 #include "omniasr.h"
 #include "core/attention.h"
