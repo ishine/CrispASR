@@ -1804,3 +1804,18 @@ all downstream output garbage. Fix: try both short and long tensor names.
 The reference dump protocol (dump intermediates at each stage, compare cosine
 similarity) caught the bug immediately. CNN output was cos=0.999999, but
 proj_out diverged to cos=0.767. The fix brought all stages to cos>0.9999.
+
+### OmniASR-LLM: quantization requires skipping bridging tensors
+
+Quantizing the OmniASR-LLM decoder with Q4_K/Q8_0 causes immediate EOS
+output (0 generated tokens). Even Q8_0 is broken. Root cause: four
+bridging tensors between encoder and decoder are precision-critical:
+
+- `enc_proj.weight` (1024 -> 4096 projection)
+- `lm_head.weight` (4096 -> 10288 vocabulary logits)
+- `tok_emb.weight` (10289 token embeddings)
+- `lang_emb.weight` (1694 language embeddings)
+
+**Fix**: Skip these tensors during quantization (keep as F16). Added to
+crispasr-quantize skip rules. With this fix, Q4_K (1.1 GB) produces
+identical output to F16 (3.1 GB) — 3x size reduction with no quality loss.
