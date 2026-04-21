@@ -1786,3 +1786,13 @@ Key indices: eng_Latn=414, deu_Latn=365
 `GGML_ROPE_TYPE_NORMAL` (mode 0), NOT NEOX (mode 2). This differs from most
 HuggingFace LLMs which use `rotate_half` (NEOX). Getting this wrong produces
 fluent but wrong-language output (Greek in our case).
+
+**v1 vs v2**: Always use v2 models (`omniASR_LLM_300M_v2`). The v2 uses a
+different tokenizer (`omniASR_tokenizer_written_v2`, 10288 tokens vs 9812)
+and is the only variant that reliably transcribes challenging English audio.
+v2 checkpoints available at `dl.fbaipublicfiles.com/mms/omniASR-LLM-300M-v2.pt`.
+
+**Reference pipeline** (from LEARNINGS entry): works perfectly with
+`ASRInferencePipeline(model_card="omniASR_LLM_300M_v2")` + `lang=["eng_Latn"]`.
+Needs fairseq2 (Python 3.11, specific torch 2.8.x, libsndfile). Produces
+verbatim JFK transcription.

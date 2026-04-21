@@ -46,13 +46,20 @@ def main():
         if not pt_files:
             raise FileNotFoundError(f"No .pt file in {args.input}")
         pt_path = os.path.join(args.input, pt_files[0])
-        tok_path = os.path.join(args.input, "omniASR_tokenizer.model")
-        if not os.path.exists(tok_path):
-            # Try parent directories or CTC model's tokenizer
-            for alt in [os.path.join(args.input, "..", "omniASR_tokenizer.model")]:
-                if os.path.exists(alt):
-                    tok_path = alt
-                    break
+        # Search for tokenizer: prefer v2, fall back to v1
+        tok_candidates = [
+            os.path.join(args.input, "omniASR_tokenizer_written_v2.model"),
+            os.path.join(args.input, "omniASR_tokenizer.model"),
+            os.path.join(args.input, "..", "omniASR_tokenizer_written_v2.model"),
+            os.path.join(args.input, "..", "omniASR_tokenizer.model"),
+        ]
+        tok_path = None
+        for c in tok_candidates:
+            if os.path.exists(c):
+                tok_path = c
+                break
+        if not tok_path:
+            raise FileNotFoundError(f"No tokenizer found in {args.input}")
     else:
         model_name = args.input.split("/")[-1]
         pt_path = hf_hub_download(args.input, f"{model_name}.pt")
