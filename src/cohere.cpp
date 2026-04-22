@@ -1535,8 +1535,8 @@ static void cohere_model_warm_cache(const cohere_model& m) {
 }
 
 struct cohere_context_params cohere_context_default_params(void) {
-    return {.n_threads = 4, .use_flash = false, .use_gpu = true, .no_punctuation = false, .diarize = false,
-            .verbosity = 1};
+    return {
+        .n_threads = 4, .use_flash = false, .use_gpu = true, .no_punctuation = false, .diarize = false, .verbosity = 1};
 }
 
 struct cohere_context* cohere_init_from_file(const char* path_model, struct cohere_context_params params) {
