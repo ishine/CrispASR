@@ -20,6 +20,7 @@ public:
         omniasr_context_params cp = omniasr_context_default_params();
         cp.n_threads = params.n_threads;
         cp.verbosity = params.no_prints ? 0 : 1;
+        cp.use_gpu = params.use_gpu && params.gpu_backend != "cpu";
         if (getenv("OMNIASR_DEBUG"))
             cp.verbosity = 2;
         // Pass language for LLM variant (e.g. "eng_Latn" from -l en)

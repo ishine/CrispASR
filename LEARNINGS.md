@@ -1842,3 +1842,36 @@ bridging tensors between encoder and decoder are precision-critical:
 **Fix**: Skip these tensors during quantization (keep as F16). Added to
 crispasr-quantize skip rules. With this fix, Q4_K (1.1 GB) produces
 identical output to F16 (3.1 GB) — 3x size reduction with no quality loss.
+
+### OmniASR: scheduler must include a CPU fallback backend
+
+OmniASR initialized its ggml scheduler with only the "best" backend:
+
+```cpp
+ctx->sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, ...);
+```
+
+That worked until ggml tightened `ggml_backend_sched_new()` and started
+asserting that the last backend in the scheduler list is CPU when a GPU
+backend is present. On CUDA builds this crashed immediately during
+`omniasr_init_from_file()` with:
+
+`GGML_ASSERT(ggml_backend_dev_type(ggml_backend_get_device(backends[n_backends - 1])) == GGML_BACKEND_DEVICE_TYPE_CPU)`
+
+**Fix:** Mirror the working pattern used by the other backends: keep a
+separate `backend_cpu`, append it to the scheduler backend list when the
+main backend is not CPU, and free it separately on shutdown.
+
+### OmniASR: `-ng` has to be plumbed into backend selection explicitly
+
+The OmniASR CLI adapter ignored `whisper_params.use_gpu`, so `-ng` and
+`--gpu-backend cpu` still called `ggml_backend_init_best()` and tried to
+construct a GPU-first backend stack. After the scheduler fix this no
+longer crashed, but the flag semantics were still wrong.
+
+**Fix:** Add `use_gpu` to `omniasr_context_params` and set it from the
+CLI adapter, treating `--gpu-backend cpu` the same as `-ng`.
+
+**Lesson:** For the non-whisper backends, GPU selection is not automatic
+just because the top-level CLI parsed the flag. Each backend adapter has
+to propagate that intent into its own backend picker.

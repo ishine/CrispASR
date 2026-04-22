@@ -75,6 +75,7 @@ struct omniasr_context {
     omniasr_model model;
     omniasr_context_params params;
     ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     ggml_backend_sched_t sched = nullptr;
     ggml_context* weight_ctx = nullptr;
@@ -106,6 +107,7 @@ extern "C" struct omniasr_context_params omniasr_context_default_params(void) {
     p.n_threads = 4;
     p.verbosity = 1;
     p.language = nullptr;
+    p.use_gpu = true;
     return p;
 }
 
@@ -295,15 +297,30 @@ extern "C" struct omniasr_context* omniasr_init_from_file(const char* path_model
     }
 
     // Load weights
-    ctx->backend = ggml_backend_init_best();
+    if (params.use_gpu) {
+        ctx->backend = ggml_backend_init_best();
+    }
     if (!ctx->backend) {
+        ctx->backend = ggml_backend_cpu_init();
+    }
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    if (!ctx->backend_cpu) {
+        if (ctx->backend) {
+            ggml_backend_free(ctx->backend);
+        }
         delete ctx;
         return nullptr;
+    }
+    ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads > 0 ? params.n_threads : 4);
+    if (ggml_backend_is_cpu(ctx->backend)) {
+        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads > 0 ? params.n_threads : 4);
     }
 
     core_gguf::WeightLoad wl;
     const char* arch = hp.model_type == 1 ? "omniasr-llm" : "omniasr-ctc";
     if (!core_gguf::load_weights(path_model, ctx->backend, arch, wl)) {
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+            ggml_backend_free(ctx->backend_cpu);
         ggml_backend_free(ctx->backend);
         delete ctx;
         return nullptr;
@@ -312,8 +329,14 @@ extern "C" struct omniasr_context* omniasr_init_from_file(const char* path_model
     ctx->buf = wl.buf;
     m.tensors = wl.tensors;
 
-    // Backend scheduler
-    ctx->sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, 65536, false, false);
+    // Backend scheduler: ggml requires the last backend to be CPU when a GPU
+    // backend is present so host-side fallbacks have somewhere to land.
+    ggml_backend_t backends[2] = {ctx->backend, nullptr};
+    int n_backends = 1;
+    if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend) {
+        backends[n_backends++] = ctx->backend_cpu;
+    }
+    ctx->sched = ggml_backend_sched_new(backends, nullptr, n_backends, 65536, false, false);
 
     // LLM decoder: populate block pointers + allocate compute buffer
     if (hp.model_type == 1) {
@@ -365,6 +388,8 @@ extern "C" void omniasr_free(struct omniasr_context* ctx) {
         ggml_free(ctx->weight_ctx);
     if (ctx->buf)
         ggml_backend_buffer_free(ctx->buf);
+    if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+        ggml_backend_free(ctx->backend_cpu);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
     delete ctx;
