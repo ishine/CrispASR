@@ -66,7 +66,7 @@ jobs:
         run: |
           gcc -shared -fPIC -o build/libcrispasr_helpers.so \
             python/crispasr/_helpers.c \
-            -Iinclude -Iggml/include \
+            -Iinclude \
             -Lbuild/src \
             -lwhisper \
             -Wl,-rpath,'$ORIGIN'
@@ -81,8 +81,13 @@ jobs:
           cp python/crispasr/_binding.py "$PKG/"
 
           # Shared libraries — placed alongside __init__.py so _find_lib()
-          # finds them via Path(__file__).parent without LD_LIBRARY_PATH
-          cp build/src/libwhisper.so        "$PKG/"
+          # finds them via Path(__file__).parent without LD_LIBRARY_PATH.
+          # Copy ALL .so files from build/src: libwhisper.so plus the
+          # backend shared libs that are produced when BUILD_SHARED_LIBS=ON
+          # (libparakeet.so, libcanary.so, libqwen3_asr.so, libcohere.so,
+          # libgranite_speech.so, libvoxtral.so, libvoxtral4b.so, etc.).
+          # Backends declared STATIC in CMake are already inside libwhisper.so.
+          find build/src -maxdepth 1 -name '*.so' -exec cp {} "$PKG/" \;
           ln -sf libwhisper.so              "$PKG/libcrispasr.so"
           cp build/ggml/src/libggml.so      "$PKG/" 2>/dev/null || true
           cp build/ggml/src/libggml-base.so "$PKG/" 2>/dev/null || true
