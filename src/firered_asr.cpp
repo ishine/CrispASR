@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1711,7 +1712,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
             std::vector<int> tokens;
             float score = 0;
             bool finished = false;
-            std::vector<std::vector<float>> sa_k, sa_v; // [n_layers][history]
+            std::vector<std::shared_ptr<std::vector<float>>> sa_k, sa_v; // [n_layers][history]
         };
         std::vector<beam_hyp> beams(beam_size);
         for (auto& b : beams) {
@@ -1719,8 +1720,10 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
             b.sa_k.resize(hp.n_layers_dec);
             b.sa_v.resize(hp.n_layers_dec);
             for (int li = 0; li < hp.n_layers_dec; li++) {
-                b.sa_k[li].reserve((size_t)max_len * d);
-                b.sa_v[li].reserve((size_t)max_len * d);
+                b.sa_k[li] = std::make_shared<std::vector<float>>();
+                b.sa_v[li] = std::make_shared<std::vector<float>>();
+                b.sa_k[li]->reserve((size_t)max_len * d);
+                b.sa_v[li]->reserve((size_t)max_len * d);
             }
             b.score = 0;
         }
@@ -1741,6 +1744,174 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
             if (all_done)
                 break;
 
+            if (beam_size == 1) {
+                auto& beam = beams[0];
+                int cur_token = beam.tokens.back();
+
+                // Embed
+                std::vector<float> x(d);
+                for (int i = 0; i < d; i++) {
+                    x[i] = emb_w[cur_token * d + i] * scale;
+                    if (step < (int)(m.dec.pe->ne[1]))
+                        x[i] += pe_dec[step * d + i];
+                }
+
+                for (int li = 0; li < hp.n_layers_dec; li++) {
+                    auto& c = dec_cache[li];
+
+                    // === Self-attention (causal, attend to history) ===
+                    {
+                        std::vector<float> xn(d);
+                        cpu_layernorm(x.data(), c.sattn_norm_w.data(), c.sattn_norm_b.data(), xn.data(), 1, d);
+
+                        std::vector<float> Q_sa(d, 0);
+                        for (int i = 0; i < d; i++) {
+                            double s = 0;
+                            for (int k = 0; k < d; k++)
+                                s += xn[k] * c.sattn_w_qs[i * d + k];
+                            Q_sa[i] = (float)s + (c.sattn_w_qs_b.empty() ? 0 : c.sattn_w_qs_b[i]);
+                        }
+
+                        std::vector<float> K_cur(d, 0), V_cur(d, 0);
+                        for (int i = 0; i < d; i++) {
+                            double sk = 0, sv = 0;
+                            for (int k = 0; k < d; k++) {
+                                sk += xn[k] * c.sattn_w_ks[i * d + k];
+                                sv += xn[k] * c.sattn_w_vs[i * d + k];
+                            }
+                            K_cur[i] = (float)sk;
+                            V_cur[i] = (float)sv + (c.sattn_w_vs_b.empty() ? 0 : c.sattn_w_vs_b[i]);
+                        }
+                        auto& sa_k_hist = *beam.sa_k[li];
+                        auto& sa_v_hist = *beam.sa_v[li];
+                        sa_k_hist.insert(sa_k_hist.end(), K_cur.begin(), K_cur.end());
+                        sa_v_hist.insert(sa_v_hist.end(), V_cur.begin(), V_cur.end());
+
+                        int n_hist = (int)(sa_k_hist.size() / d);
+                        std::vector<float> sa_out(d, 0);
+                        for (int h = 0; h < nh_dec; h++) {
+                            std::vector<float> scores(n_hist);
+                            for (int t = 0; t < n_hist; t++) {
+                                double s = 0;
+                                for (int dd = 0; dd < hd_dec; dd++)
+                                    s += Q_sa[h * hd_dec + dd] * sa_k_hist[t * d + h * hd_dec + dd];
+                                scores[t] = (float)(s / sqrt((double)hd_dec));
+                            }
+                            cpu_softmax_rows(scores.data(), 1, n_hist);
+                            for (int dd = 0; dd < hd_dec; dd++) {
+                                double s = 0;
+                                for (int t = 0; t < n_hist; t++)
+                                    s += scores[t] * sa_v_hist[t * d + h * hd_dec + dd];
+                                sa_out[h * hd_dec + dd] = (float)s;
+                            }
+                        }
+
+                        std::vector<float> sa_fc(d, 0);
+                        for (int i = 0; i < d; i++) {
+                            double s = 0;
+                            for (int k = 0; k < d; k++)
+                                s += sa_out[k] * c.sattn_fc_w[i * d + k];
+                            sa_fc[i] = (float)s + (c.sattn_fc_b.empty() ? 0 : c.sattn_fc_b[i]);
+                        }
+                        for (int i = 0; i < d; i++)
+                            x[i] += sa_fc[i];
+                    }
+
+                    // === Cross-attention: attend to encoder output (pre-computed K/V) ===
+                    std::vector<float> xn(d);
+                    cpu_layernorm(x.data(), c.xattn_norm_w.data(), c.xattn_norm_b.data(), xn.data(), 1, d);
+
+                    std::vector<float> Qx(d, 0);
+                    for (int i = 0; i < d; i++) {
+                        double s = 0;
+                        for (int k = 0; k < d; k++)
+                            s += xn[k] * c.xattn_w_qs[i * d + k];
+                        Qx[i] = (float)s + (c.xattn_w_qs_b.empty() ? 0 : c.xattn_w_qs_b[i]);
+                    }
+
+                    int nh_dec = hp.n_head_dec;
+                    int hd_dec = d / nh_dec;
+                    std::vector<float> attn_out(d, 0);
+                    for (int h = 0; h < nh_dec; h++) {
+                        std::vector<float> scores(T_sub);
+                        for (int t = 0; t < T_sub; t++) {
+                            double s = 0;
+                            for (int dd = 0; dd < hd_dec; dd++)
+                                s += Qx[h * hd_dec + dd] * K_enc[li][t * d + h * hd_dec + dd];
+                            scores[t] = (float)(s / sqrt((double)hd_dec));
+                        }
+                        cpu_softmax_rows(scores.data(), 1, T_sub);
+                        for (int dd = 0; dd < hd_dec; dd++) {
+                            double s = 0;
+                            for (int t = 0; t < T_sub; t++)
+                                s += scores[t] * V_enc[li][t * d + h * hd_dec + dd];
+                            attn_out[h * hd_dec + dd] = (float)s;
+                        }
+                    }
+
+                    std::vector<float> fc_out(d, 0);
+                    for (int i = 0; i < d; i++) {
+                        double s = 0;
+                        for (int k = 0; k < d; k++)
+                            s += attn_out[k] * c.xattn_fc_w[i * d + k];
+                        fc_out[i] = (float)s + (c.xattn_fc_b.empty() ? 0 : c.xattn_fc_b[i]);
+                    }
+                    for (int i = 0; i < d; i++)
+                        x[i] += fc_out[i];
+
+                    cpu_layernorm(x.data(), c.mlp_norm_w.data(), c.mlp_norm_b.data(), xn.data(), 1, d);
+                    std::vector<float> h_up(c.di, 0);
+                    for (int i = 0; i < c.di; i++) {
+                        double s = 0;
+                        for (int k = 0; k < d; k++)
+                            s += xn[k] * c.mlp_w1[i * d + k];
+                        h_up[i] = (float)s + (c.mlp_b1.empty() ? 0 : c.mlp_b1[i]);
+                    }
+                    for (int i = 0; i < c.di; i++) {
+                        float v = h_up[i];
+                        h_up[i] = 0.5f * v * (1.0f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+                    }
+                    std::vector<float> mlp_out(d, 0);
+                    for (int i = 0; i < d; i++) {
+                        double s = 0;
+                        for (int k = 0; k < c.di; k++)
+                            s += h_up[k] * c.mlp_w2[i * c.di + k];
+                        mlp_out[i] = (float)s + (c.mlp_b2.empty() ? 0 : c.mlp_b2[i]);
+                    }
+                    for (int i = 0; i < d; i++)
+                        x[i] += mlp_out[i];
+                }
+
+                std::vector<float> xn(d);
+                cpu_layernorm(x.data(), norm_w.data(), norm_b.data(), xn.data(), 1, d);
+
+                float mx = -1e30f;
+                int best_token = -1;
+                std::vector<float> logits(odim);
+                for (int i = 0; i < odim; i++) {
+                    double s = 0;
+                    for (int k = 0; k < d; k++)
+                        s += xn[k] * prj_w[i * d + k];
+                    logits[i] = (float)s;
+                    if (logits[i] > mx) {
+                        mx = logits[i];
+                        best_token = i;
+                    }
+                }
+
+                float lse = 0.0f;
+                for (int i = 0; i < odim; i++)
+                    lse += expf(logits[i] - mx);
+                lse = mx + logf(lse);
+                beam.score += logits[best_token] - lse;
+                if (best_token == hp.eos_id)
+                    beam.finished = true;
+                else
+                    beam.tokens.push_back(best_token);
+
+                continue;
+            }
+
             // Beam pruning candidates collected directly from each beam's
             // logits pass to avoid storing full-vocab logits for every beam.
             struct candidate {
@@ -1751,7 +1922,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
             cands.reserve(beam_size * beam_size + beam_size);
 
             for (int bi = 0; bi < beam_size; bi++) {
-                if (beams[bi].finished)
+                if (beams[bi].finished || beams[bi].score <= -1e8f)
                     continue;
                 int cur_token = beams[bi].tokens.back();
 
@@ -1791,10 +1962,16 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                             K_cur[i] = (float)sk;
                             V_cur[i] = (float)sv + (c.sattn_w_vs_b.empty() ? 0 : c.sattn_w_vs_b[i]);
                         }
-                        beams[bi].sa_k[li].insert(beams[bi].sa_k[li].end(), K_cur.begin(), K_cur.end());
-                        beams[bi].sa_v[li].insert(beams[bi].sa_v[li].end(), V_cur.begin(), V_cur.end());
+                        if (!beams[bi].sa_k[li].unique())
+                            beams[bi].sa_k[li] = std::make_shared<std::vector<float>>(*beams[bi].sa_k[li]);
+                        if (!beams[bi].sa_v[li].unique())
+                            beams[bi].sa_v[li] = std::make_shared<std::vector<float>>(*beams[bi].sa_v[li]);
+                        auto& sa_k_hist = *beams[bi].sa_k[li];
+                        auto& sa_v_hist = *beams[bi].sa_v[li];
+                        sa_k_hist.insert(sa_k_hist.end(), K_cur.begin(), K_cur.end());
+                        sa_v_hist.insert(sa_v_hist.end(), V_cur.begin(), V_cur.end());
 
-                        int n_hist = (int)(beams[bi].sa_k[li].size() / d); // step + 1
+                        int n_hist = (int)(sa_k_hist.size() / d); // step + 1
 
                         // Multi-head attention: Q[d] @ K_history[n_hist, d]
                         std::vector<float> sa_out(d, 0);
@@ -1803,14 +1980,14 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                             for (int t = 0; t < n_hist; t++) {
                                 double s = 0;
                                 for (int dd = 0; dd < hd_dec; dd++)
-                                    s += Q_sa[h * hd_dec + dd] * beams[bi].sa_k[li][t * d + h * hd_dec + dd];
+                                    s += Q_sa[h * hd_dec + dd] * sa_k_hist[t * d + h * hd_dec + dd];
                                 scores[t] = (float)(s / sqrt((double)hd_dec));
                             }
                             cpu_softmax_rows(scores.data(), 1, n_hist);
                             for (int dd = 0; dd < hd_dec; dd++) {
                                 double s = 0;
                                 for (int t = 0; t < n_hist; t++)
-                                    s += scores[t] * beams[bi].sa_v[li][t * d + h * hd_dec + dd];
+                                    s += scores[t] * sa_v_hist[t * d + h * hd_dec + dd];
                                 sa_out[h * hd_dec + dd] = (float)s;
                             }
                         }
