@@ -793,7 +793,55 @@ No GGUF conversions exist yet. High-impact new backend.
 |---|---|---|---|
 | FireRedVAD | Voice Activity Detection | 97.57% F1 | Beats Silero/TEN/FunASR/WebRTC VAD, streaming support |
 | FireRedLID | Language ID | 97.18% | 100+ languages + 20+ Chinese dialects |
-| FireRedPunc | Punctuation | 78.90% F1 | BERT-based, Chinese+English |
+| FireRedPunc | Punctuation | 78.90% F1 | BERT-based, Chinese+English. Needed for issue #22: FireRedASR2 currently emits uppercase/no-punctuation text; punctuation/casing restoration is not implemented. |
+
+### Issue #22 triage: Vulkan, FireRedASR2, subtitles, hotwords
+
+**NVIDIA + Vulkan:** CrispASR already has a dedicated Windows Vulkan
+build path (`build-vulkan.bat`), which configures `GGML_VULKAN=ON` and
+`GGML_CUDA=OFF` into `build-vulkan\`. A normal CUDA build from
+`build-windows.bat -DGGML_CUDA=ON` is not a Vulkan-capable artifact.
+At runtime, `--gpu-backend vulkan` can force Vulkan only if the binary
+was built with Vulkan support. Documentation/release notes should make
+this clearer: use the Vulkan artifact or `build-vulkan.bat`, then test
+with `build-vulkan\bin\crispasr.exe --gpu-backend vulkan ...`.
+
+**FireRedASR2 punctuation/casing:** The current FireRedASR2 AED path
+does not include punctuation restoration or true casing restoration.
+Best next fix is to port FireRedPunc as a post-processor and expose it
+as an optional backend-agnostic punctuation/casing pass. This is more
+correct than ad-hoc capitalization rules, especially for Chinese/English
+mixed text.
+
+**FireRedASR2 GPU speed:** The implementation is still hybrid. The
+encoder uses ggml/GPU for many matmuls, but the AED decoder/beam loop
+is CPU-side (`src/firered_asr.cpp`), including per-step self-attention,
+cross-attention, MLP, logits, and beam pruning. Users reporting "GPU is
+slow" are likely observing this CPU decoder bottleneck rather than a
+simple GPU selection bug. The real fix is a GPU-resident decoder graph
+or at least ggml graphs for decoder matmuls with minimal readback.
+
+**Subtitle timing:** Parakeet remains the recommended timestamp-critical
+backend because it has native word timestamps. For LLM/no-native-timestamp
+backends, recommend `--vad -am <ctc-aligner.gguf> -osrt --split-on-punct`;
+`--vad` avoids leading-silence timestamp drift.
+
+**Hotwords:** CrispASR has `--prompt` for Whisper-style context, but no
+generic hotword boosting/scoring API. Hotwords should be tracked as a
+new cross-backend feature. Candidate implementation paths:
+1. Prompt/context injection where the model supports it.
+2. Decoder logit bias for LLM backends.
+3. Backend-native support for models that expose hotwords directly.
+
+**New backend candidates from issue #22:**
+- **Fun-ASR-Nano-2512**: 800M, ~2 GB HF repo, supports low-latency ASR
+  and hotwords through its Python/FunASR API. Not a quick GGUF drop-in:
+  checkpoint is PyTorch/custom code, so it needs a converter and native
+  runtime work.
+- **VibeVoice-ASR**: 9B BF16, ~17 GB HF repo, MIT license, Transformers
+  support, long-form 60-minute input, diarization, timestamps, hotwords,
+  and 50+ languages. High feature value but a major backend effort due
+  to size and architecture.
 
 ### VAD alternatives to evaluate:
 - TEN-VAD, FunASR-VAD, WebRTC-VAD — compare accuracy/latency vs our Silero VAD
@@ -801,6 +849,10 @@ No GGUF conversions exist yet. High-impact new backend.
 ### New model backends to consider:
 - **Moonshine** (15th backend) — lightweight, streaming, already has ggml impl
 - **SenseVoice/Paraformer** — via FunASR-GGML reference, Alibaba's ASR family
+- **Fun-ASR-Nano-2512** — issue #22 candidate; hotwords, multilingual,
+  custom PyTorch architecture; needs converter/runtime evaluation
+- **VibeVoice-ASR** — issue #22 candidate; hotwords + timestamps +
+  diarization, but 9B/17 GB makes it a large-backend project
 
 ## 25. Montreal Forced Aligner evaluation — NOT PLANNED
 

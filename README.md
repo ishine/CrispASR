@@ -216,6 +216,11 @@ Produces `build-vulkan\bin\crispasr.exe` with the Vulkan compute backend enabled
 2. Adds `-DGGML_VULKAN=ON -DGGML_CUDA=OFF` so CUDA is not accidentally pulled in if the CUDA toolkit is also installed.
 3. Writes the build into a separate `build-vulkan\` directory so it coexists with a CPU build.
 
+Important:
+- `build-windows.bat -DGGML_CUDA=ON` produces a CUDA build, not a Vulkan build.
+- `--gpu-backend vulkan` only works if the binary was actually built with Vulkan support.
+- On hybrid laptops, Vulkan device `0` may be the integrated GPU. Use `-dev N` to pin the discrete GPU if needed.
+
 ```cmd
 :: Typical usage — VULKAN_SDK is picked up automatically
 build-vulkan.bat
@@ -223,6 +228,9 @@ build-vulkan.bat
 :: Override Vulkan SDK location explicitly
 set VULKAN_SDK=C:\VulkanSDK\1.4.304.1
 build-vulkan.bat
+
+:: Run on Vulkan, pinned to GPU 1 (for example: NVIDIA on a hybrid laptop)
+build-vulkan\bin\crispasr.exe --gpu-backend vulkan -dev 1 -m model.gguf -f audio.wav
 ```
 
 Both scripts exit with a non-zero code and a `[ERROR]` message if any step fails (VS not found, CMake configure error, build error).
@@ -623,6 +631,23 @@ The cached model lives at `~/.cache/crispasr/ggml-silero-v5.1.2.bin` (~885 KB). 
 crispasr --backend parakeet -m parakeet.gguf -f long_audio.wav --vad -osrt --split-on-punct
 ```
 
+**Accurate subtitle timing:**
+
+- **Best timing quality:** use **parakeet**. Its native TDT timestamps are more accurate and more natural than the forced-aligner fallback used by LLM backends.
+- **Best default subtitle flags:** use `--vad --split-on-punct`. VAD segments at natural speech pauses, then CrispASR stitches/remaps timestamps back to the original timeline. This avoids the mid-sentence boundary problems of fixed 30-second chunking.
+- **For backends without native timestamps** (`cohere`, `granite`, `voxtral`, `voxtral4b`, `qwen3`): use a CTC aligner together with `--vad`. Without VAD, leading silence can throw off sentence starts, especially for the qwen3 forced aligner.
+- **If parakeet is too heavy for very long audio:** keep parakeet for timing quality, but cap memory use with fixed chunking:
+
+```bash
+./build/bin/crispasr --backend parakeet -m parakeet.gguf -f long_audio.wav \
+    --chunk-seconds 180 -osrt --split-on-punct
+```
+
+In practice:
+- `parakeet --vad -osrt --split-on-punct` is the best default for subtitle generation
+- `cohere/canary/qwen3/... --vad -am <aligner.gguf> -osrt --split-on-punct` is the best fallback when you need another backend
+- `--chunk-seconds N` is mainly a VRAM-control knob for long audio, not the preferred path for subtitle accuracy
+
 ---
 
 ## Word-level timestamps via CTC alignment
@@ -644,6 +669,18 @@ curl -L -o canary-ctc-aligner.gguf \
 ```
 
 Alignment granularity is one encoder frame, ~80 ms.
+
+For subtitle output, prefer adding `--vad --split-on-punct`:
+
+```bash
+./build/bin/crispasr --backend cohere -m cohere.gguf -f talk.wav \
+    -am canary-ctc-aligner.gguf --vad -osrt --split-on-punct
+```
+
+Notes:
+- The aligner path is a fallback for backends that lack native timestamps.
+- `qwen3-forced-aligner` is more sensitive to leading silence; `--vad` is strongly recommended with it.
+- Parakeet remains the better choice when timestamp quality is the top priority.
 
 ---
 
@@ -1114,6 +1151,9 @@ All backends use `ggml_backend_init_best()` which automatically picks the highes
 # Force Vulkan even when CUDA is available
 crispasr --gpu-backend vulkan -m model.gguf -f audio.wav
 
+# Pin a specific GPU (useful on Vulkan systems with iGPU + dGPU)
+crispasr --gpu-backend vulkan -dev 1 -m model.gguf -f audio.wav
+
 # Force CPU (useful for benchmarking)
 crispasr -ng -m model.gguf -f audio.wav
 
@@ -1122,6 +1162,11 @@ GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 crispasr -m model.gguf -f audio.wav
 ```
 
 Build flags: `-DGGML_CUDA=ON`, `-DGGML_METAL=ON`, `-DGGML_VULKAN=ON`.
+
+Notes:
+- `--gpu-backend vulkan` selects the Vulkan backend, but it does not choose which physical GPU to use. Use `-dev N` to select the Vulkan device index.
+- On some Windows laptops, Vulkan device `0` is the Intel iGPU and the NVIDIA GPU is `1`. If Vulkan looks unexpectedly slow, rerun with `-dev 1`.
+- The Windows convenience script `build-vulkan.bat` creates a separate Vulkan-capable binary at `build-vulkan\bin\crispasr.exe`.
 
 ---
 
