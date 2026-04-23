@@ -98,6 +98,45 @@ struct omniasr_context {
     std::vector<uint8_t> compute_meta;
 };
 
+struct omniasr_perf {
+    int64_t t_total_us = 0;
+    int64_t t_norm_us = 0;
+    int64_t t_enc_alloc_us = 0;
+    int64_t t_enc_compute_us = 0;
+    int64_t t_enc_read_us = 0;
+    int64_t t_prefill_alloc_us = 0;
+    int64_t t_prefill_compute_us = 0;
+    int64_t t_decode_alloc_us = 0;
+    int64_t t_decode_compute_us = 0;
+    int64_t t_decode_logits_us = 0;
+    int n_dec_steps = 0;
+    int enc_nodes = 0;
+    int prefill_nodes = 0;
+    int decode_nodes = 0;
+};
+
+static void omniasr_perf_print(const omniasr_perf& p, int n_samples, int verbosity) {
+    const char* bench = getenv("OMNIASR_BENCH");
+    if (verbosity < 2 && (!bench || !bench[0]))
+        return;
+    const double audio_s = n_samples / 16000.0;
+    fprintf(stderr, "omniasr: =========== performance report ===========\n");
+    fprintf(stderr, "omniasr:  audio          %7.2f s\n", audio_s);
+    fprintf(stderr, "omniasr:  normalize      %7.1f ms\n", p.t_norm_us / 1e3);
+    fprintf(stderr, "omniasr:  enc alloc      %7.1f ms  nodes=%d\n", p.t_enc_alloc_us / 1e3, p.enc_nodes);
+    fprintf(stderr, "omniasr:  enc compute    %7.1f ms\n", p.t_enc_compute_us / 1e3);
+    fprintf(stderr, "omniasr:  enc read       %7.1f ms\n", p.t_enc_read_us / 1e3);
+    fprintf(stderr, "omniasr:  prefill alloc  %7.1f ms  nodes=%d\n", p.t_prefill_alloc_us / 1e3, p.prefill_nodes);
+    fprintf(stderr, "omniasr:  prefill compute%7.1f ms\n", p.t_prefill_compute_us / 1e3);
+    fprintf(stderr, "omniasr:  decode alloc   %7.1f ms  steps=%d nodes=%d\n", p.t_decode_alloc_us / 1e3,
+            p.n_dec_steps, p.decode_nodes);
+    fprintf(stderr, "omniasr:  decode compute %7.1f ms\n", p.t_decode_compute_us / 1e3);
+    fprintf(stderr, "omniasr:  decode logits  %7.1f ms\n", p.t_decode_logits_us / 1e3);
+    fprintf(stderr, "omniasr:  total measured %7.1f ms\n", p.t_total_us / 1e3);
+    if (p.t_total_us > 0)
+        fprintf(stderr, "omniasr:  realtime       %7.2fx\n", audio_s / (p.t_total_us / 1e6));
+}
+
 // ===========================================================================
 // Defaults
 // ===========================================================================
@@ -479,8 +518,8 @@ static bool omniasr_alloc_kv_cache(omniasr_context* ctx, int max_ctx) {
 // LLM transcribe
 // ===========================================================================
 
-static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* samples, int n_samples,
-                                    const std::vector<float>& encoder_out, int d_enc, int T_enc);
+static char* omniasr_transcribe_llm(omniasr_context* ctx, const std::vector<float>& encoder_out, int d_enc, int T_enc,
+                                    omniasr_perf* perf);
 
 // ===========================================================================
 // Transcribe
@@ -489,6 +528,9 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* samples, 
 extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* samples, int n_samples) {
     if (!ctx || !samples || n_samples <= 0)
         return nullptr;
+
+    omniasr_perf perf;
+    const int64_t t_total0 = ggml_time_us();
 
     auto& m = ctx->model;
     auto& hp = m.hp;
@@ -512,6 +554,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     // This is a wav2vec2 convention, required for OmniASR.
     std::vector<float> pcm_norm(n_samples);
     {
+        const int64_t t0 = ggml_time_us();
         double mean = 0;
         for (int i = 0; i < n_samples; i++)
             mean += samples[i];
@@ -523,6 +566,7 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
         float inv_std = 1.0f / (sqrtf((float)var + 1e-5f));
         for (int i = 0; i < n_samples; i++)
             pcm_norm[i] = (samples[i] - (float)mean) * inv_std;
+        perf.t_norm_us += ggml_time_us() - t0;
     }
     dump_cpu(pcm_norm.data(), n_samples, "pcm_norm", dump_dir);
 
@@ -638,14 +682,17 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     }
     ggml_set_output(h);
     ggml_build_forward_expand(gf, h);
+    perf.enc_nodes = ggml_graph_n_nodes(gf);
 
     // Allocate and compute
     ggml_backend_sched_reset(ctx->sched);
+    int64_t t0 = ggml_time_us();
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "omniasr: graph alloc failed\n");
         ggml_free(ctx0);
         return nullptr;
     }
+    perf.t_enc_alloc_us += ggml_time_us() - t0;
 
     // Set input
     ggml_backend_tensor_set(inp, pcm_norm.data(), 0, n_samples * sizeof(float));
@@ -653,25 +700,32 @@ extern "C" char* omniasr_transcribe(struct omniasr_context* ctx, const float* sa
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "omniasr: %d samples, computing graph...\n", n_samples);
 
+    t0 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "omniasr: graph compute failed\n");
         ggml_free(ctx0);
         return nullptr;
     }
+    perf.t_enc_compute_us += ggml_time_us() - t0;
 
     if (hp.model_type == 1) {
         ggml_tensor* enc_out_t = ggml_graph_get_tensor(gf, "enc_out");
         int d_e = (int)enc_out_t->ne[0];
         int T_e = (int)enc_out_t->ne[1];
         std::vector<float> enc_out_data((size_t)d_e * T_e);
+        t0 = ggml_time_us();
         ggml_backend_tensor_get(enc_out_t, enc_out_data.data(), 0, (size_t)d_e * T_e * sizeof(float));
+        perf.t_enc_read_us += ggml_time_us() - t0;
         dump_cpu(enc_out_data.data(), d_e * T_e, "encoder_output", dump_dir);
         ggml_free(ctx0);
 
         if (ctx->params.verbosity >= 1)
             fprintf(stderr, "omniasr-llm: encoder done [%d, %d], running decoder...\n", d_e, T_e);
 
-        return omniasr_transcribe_llm(ctx, samples, n_samples, enc_out_data, d_e, T_e);
+        char* out = omniasr_transcribe_llm(ctx, enc_out_data, d_e, T_e, &perf);
+        perf.t_total_us = ggml_time_us() - t_total0;
+        omniasr_perf_print(perf, n_samples, ctx->params.verbosity);
+        return out;
     }
 
 read_logits:
@@ -776,6 +830,8 @@ read_logits:
         return nullptr;
     memcpy(out, result.c_str(), result.size());
     out[result.size()] = '\0';
+    perf.t_total_us = ggml_time_us() - t_total0;
+    omniasr_perf_print(perf, n_samples, ctx->params.verbosity);
     return out;
 }
 
@@ -878,29 +934,43 @@ static ggml_cgraph* omniasr_build_dec_graph(omniasr_context* ctx, int n_past, in
     return gf;
 }
 
-static bool omniasr_run_dec_token(omniasr_context* ctx, int token_id, int n_past, std::vector<float>& logits) {
+static bool omniasr_run_dec_token(omniasr_context* ctx, int token_id, int n_past, std::vector<float>& logits,
+                                  omniasr_perf* perf) {
     int32_t input_id = token_id;
     int32_t position = n_past;
 
     ggml_cgraph* gf = omniasr_build_dec_graph(ctx, n_past, 1, true);
+    if (perf && perf->decode_nodes == 0)
+        perf->decode_nodes = ggml_graph_n_nodes(gf);
     ggml_backend_sched_reset(ctx->sched);
+    int64_t t0 = ggml_time_us();
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "omniasr-llm: token decoder graph alloc failed\n");
         return false;
     }
+    if (perf)
+        perf->t_decode_alloc_us += ggml_time_us() - t0;
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "input_ids"), &input_id, 0, sizeof(input_id));
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), &position, 0, sizeof(position));
 
+    t0 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "omniasr-llm: token decoder graph compute failed\n");
         return false;
+    }
+    if (perf) {
+        perf->t_decode_compute_us += ggml_time_us() - t0;
+        perf->n_dec_steps++;
     }
 
     ggml_tensor* lt = ggml_graph_get_tensor(gf, "logits");
     int V = (int)lt->ne[0];
     logits.resize(V);
+    t0 = ggml_time_us();
     ggml_backend_tensor_get(lt, logits.data(), 0, V * sizeof(float));
+    if (perf)
+        perf->t_decode_logits_us += ggml_time_us() - t0;
     return true;
 }
 
@@ -956,7 +1026,7 @@ static ggml_cgraph* omniasr_build_prefill_graph(omniasr_context* ctx, int d_enc,
 
 static bool omniasr_run_prefill(omniasr_context* ctx, const std::vector<float>& encoder_out, int d_enc, int T_enc,
                                 bool use_lang, int lang_id, int lid_marker_id, int prefix_len,
-                                std::vector<float>& logits) {
+                                std::vector<float>& logits, omniasr_perf* perf) {
     std::vector<int32_t> positions(prefix_len);
     for (int i = 0; i < prefix_len; i++)
         positions[i] = i;
@@ -973,11 +1043,16 @@ static bool omniasr_run_prefill(omniasr_context* ctx, const std::vector<float>& 
     int32_t bos = ctx->model.hp.bos_id;
 
     ggml_cgraph* gf = omniasr_build_prefill_graph(ctx, d_enc, T_enc, use_lang, prefix_len);
+    if (perf)
+        perf->prefill_nodes = ggml_graph_n_nodes(gf);
     ggml_backend_sched_reset(ctx->sched);
+    int64_t t0 = ggml_time_us();
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "omniasr-llm: prefill graph alloc failed\n");
         return false;
     }
+    if (perf)
+        perf->t_prefill_alloc_us += ggml_time_us() - t0;
 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "encoder_out"), encoder_out.data(), 0,
                             (size_t)d_enc * T_enc * sizeof(float));
@@ -991,20 +1066,26 @@ static bool omniasr_run_prefill(omniasr_context* ctx, const std::vector<float>& 
     ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
                             mask.size() * sizeof(ggml_fp16_t));
 
+    t0 = ggml_time_us();
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "omniasr-llm: prefill graph compute failed\n");
         return false;
     }
+    if (perf)
+        perf->t_prefill_compute_us += ggml_time_us() - t0;
 
     ggml_tensor* lt = ggml_graph_get_tensor(gf, "logits");
     int V = (int)lt->ne[0];
     logits.resize(V);
+    t0 = ggml_time_us();
     ggml_backend_tensor_get(lt, logits.data(), 0, V * sizeof(float));
+    if (perf)
+        perf->t_decode_logits_us += ggml_time_us() - t0;
     return true;
 }
 
-static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples*/, int /*n_samples*/,
-                                    const std::vector<float>& encoder_out, int d_enc, int T_enc) {
+static char* omniasr_transcribe_llm(omniasr_context* ctx, const std::vector<float>& encoder_out, int d_enc, int T_enc,
+                                    omniasr_perf* perf) {
     auto& m = ctx->model;
     auto& hp = m.hp;
 
@@ -1052,7 +1133,8 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples
     ctx->kv_n_used = 0;
     // 4. Prefill decoder with entire prefix
     std::vector<float> logits;
-    if (!omniasr_run_prefill(ctx, encoder_out, d_enc, T_enc, use_lang, lang_id, lid_marker_id, prefix_len, logits)) {
+    if (!omniasr_run_prefill(ctx, encoder_out, d_enc, T_enc, use_lang, lang_id, lid_marker_id, prefix_len, logits,
+                             perf)) {
         fprintf(stderr, "omniasr-llm: prefill failed\n");
         return nullptr;
     }
@@ -1089,7 +1171,7 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const float* /*samples
         }
 
         int n_past = prefix_len + step;
-        if (!omniasr_run_dec_token(ctx, cur_token, n_past, logits)) {
+        if (!omniasr_run_dec_token(ctx, cur_token, n_past, logits, perf)) {
             fprintf(stderr, "omniasr-llm: decode step %d failed\n", step);
             break;
         }
