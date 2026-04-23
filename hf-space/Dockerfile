@@ -2,7 +2,7 @@ FROM ubuntu:22.04 AS build
 WORKDIR /src
 
 RUN apt-get update && \
-  apt-get install -y build-essential cmake git curl && \
+  apt-get install -y build-essential cmake git curl ninja-build && \
   rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 ARG CRISPASR_REPO=https://github.com/CrispStrobe/CrispASR
@@ -12,8 +12,10 @@ RUN git clone --depth 1 "${CRISPASR_REPO}" /src/CrispASR && \
   git -C /src/CrispASR fetch --depth 1 origin "${CRISPASR_REF}" && \
   git -C /src/CrispASR checkout --detach FETCH_HEAD
 WORKDIR /src/CrispASR
-RUN cmake -B build -DWHISPER_BUILD_TESTS=OFF && \
-  cmake --build build -j"$(nproc)" --target whisper-cli
+ARG CRISPASR_BUILD_JOBS
+RUN jobs="${CRISPASR_BUILD_JOBS:-$(nproc)}" && \
+  cmake -S . -B build -G Ninja -DWHISPER_BUILD_TESTS=OFF && \
+  cmake --build build -j"${jobs}" --target whisper-cli
 
 FROM ubuntu:22.04 AS runtime
 WORKDIR /space
@@ -35,6 +37,7 @@ RUN chmod +x /space/start.sh && \
 
 ENV PATH=/opt/crispasr/build/bin:$PATH
 ENV CRISPASR_SERVER_URL=http://127.0.0.1:8080
+ENV CRISPASR_CACHE_DIR=/cache
 ENV GRADIO_SERVER_NAME=0.0.0.0
 ENV GRADIO_SERVER_PORT=7860
 

@@ -401,8 +401,21 @@ curl http://localhost:8080/v1/audio/transcriptions \
 By default the compose stack:
 - builds from `.devops/main.Dockerfile`
 - mounts `./models` into `/models`
-- mounts `./cache` into `/cache`
+- stores auto-downloaded models in the Docker-managed `crispasr-cache` volume at `/cache`
 - serves on `http://localhost:8080`
+
+If you want `/cache` to be a host directory instead, replace the `crispasr-cache:/cache` volume with `./cache:/cache` and make it writable by the container user before startup:
+
+```bash
+mkdir -p cache models
+sudo chown -R "$(id -u):$(id -g)" cache models
+```
+
+You can cap or raise build parallelism with `CRISPASR_BUILD_JOBS`:
+
+```bash
+docker compose build --build-arg CRISPASR_BUILD_JOBS=8
+```
 
 For CUDA builds, use the override file:
 
@@ -431,6 +444,7 @@ You can override the loaded model and startup flags through `.env`:
 - `CRISPASR_BACKEND=parakeet`
 - `CRISPASR_LANGUAGE=auto`
 - `CRISPASR_AUTO_DOWNLOAD=1`
+- `CRISPASR_CACHE_DIR=/cache`
 - `CRISPASR_EXTRA_ARGS=--no-punctuation`
 
 The service is configured to avoid serving as root by default:

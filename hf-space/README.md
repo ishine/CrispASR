@@ -19,6 +19,7 @@ This folder contains a Hugging Face Docker Space wrapper for CrispASR:
 - `CRISPASR_BACKEND=whisper` or another backend name
 - `CRISPASR_LANGUAGE=en`
 - `CRISPASR_AUTO_DOWNLOAD=1`
+- `CRISPASR_CACHE_DIR=/cache`
 - `CRISPASR_EXTRA_ARGS=`
 
 ## Local build
@@ -30,3 +31,15 @@ docker run --rm -p 7860:7860 -p 8080:8080 \
   -v "$PWD/models:/models" \
   crispasr-hf-space
 ```
+
+For auto-downloads, mount a writable cache volume if you want models to survive container restarts:
+
+```bash
+docker volume create crispasr-cache
+docker run --rm -p 7860:7860 -p 8080:8080 \
+  -e CRISPASR_AUTO_DOWNLOAD=1 \
+  -v crispasr-cache:/cache \
+  crispasr-hf-space
+```
+
+Build parallelism can be tuned with `--build-arg CRISPASR_BUILD_JOBS=8`.

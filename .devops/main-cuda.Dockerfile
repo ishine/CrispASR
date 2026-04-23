@@ -15,7 +15,7 @@ ARG CUDA_DOCKER_ARCH=all
 ENV CUDA_DOCKER_ARCH=${CUDA_DOCKER_ARCH}
 
 RUN apt-get update && \
-    apt-get install -y build-essential libsdl2-dev wget cmake git \
+    apt-get install -y build-essential libsdl2-dev wget cmake git ninja-build \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
@@ -24,8 +24,10 @@ ENV CUDA_MAIN_VERSION=13.0
 ENV LD_LIBRARY_PATH /usr/local/cuda-${CUDA_MAIN_VERSION}/compat:$LD_LIBRARY_PATH
 
 COPY . .
-RUN cmake -B build -DWHISPER_BUILD_TESTS=OFF -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="75;80;86;90" && \
-    cmake --build build -j"$(nproc)" --target whisper-cli
+ARG CRISPASR_BUILD_JOBS
+RUN jobs="${CRISPASR_BUILD_JOBS:-$(nproc)}" && \
+    cmake -S . -B build -G Ninja -DWHISPER_BUILD_TESTS=OFF -DGGML_CUDA=1 -DCMAKE_CUDA_ARCHITECTURES="75;80;86;90" && \
+    cmake --build build -j"${jobs}" --target whisper-cli
 
 RUN find /app/build -name "*.o" -delete && \
     find /app/build -name "*.a" -delete && \
@@ -50,5 +52,7 @@ RUN useradd -m -u 1000 crispasr && \
 RUN du -sh /app/*
 RUN find /app -type f -size +100M
 ENV PATH=/app/build/bin:$PATH
+ENV CRISPASR_CACHE_DIR=/cache
 USER crispasr
 ENTRYPOINT [ "bash", "-c" ]
+CMD [ "bash /app/.devops/run-server.sh" ]
