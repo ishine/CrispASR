@@ -50,7 +50,7 @@ except ImportError:
     )
 
 try:
-    from transformers import Wav2Vec2ForCTC
+    from transformers import AutoModelForCTC, AutoConfig
 except ImportError:
     sys.exit("transformers package not found.  Install with: pip install transformers")
 
@@ -58,19 +58,52 @@ except ImportError:
 ARCH = "wav2vec2"
 
 
+def normalize_state_dict(sd: dict) -> dict:
+    """Remap Data2Vec/HuBERT state dict keys to wav2vec2.* prefix."""
+    out = {}
+    for k, v in sd.items():
+        nk = k
+        for prefix in ("data2vec_audio.", "hubert."):
+            if k.startswith(prefix):
+                nk = "wav2vec2." + k[len(prefix):]
+                break
+        out[nk] = v
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Weight-norm helpers
 # ---------------------------------------------------------------------------
 
 
-def remove_weight_norm(model: Wav2Vec2ForCTC) -> None:
+def get_backbone(model):
+    """Get the audio backbone (wav2vec2/data2vec_audio/hubert) from a ForCTC model."""
+    for attr in ("wav2vec2", "data2vec_audio", "hubert"):
+        if hasattr(model, attr):
+            return getattr(model, attr)
+    raise ValueError(f"Cannot find backbone in {type(model).__name__}")
+
+
+def remove_weight_norm(model) -> None:
     """Remove weight_norm from pos_conv_embed so state_dict has plain .weight."""
-    conv = model.wav2vec2.encoder.pos_conv_embed.conv
-    try:
-        torch.nn.utils.remove_weight_norm(conv)
-        print("  Removed weight_norm from pos_conv_embed.conv")
-    except ValueError:
-        print("  pos_conv_embed.conv: weight_norm not present, skipping")
+    backbone = get_backbone(model)
+    pce = backbone.encoder.pos_conv_embed
+    # Wav2Vec2 has pce.conv; Data2Vec/HuBERT has pce.layers[i].conv
+    convs = []
+    if hasattr(pce, "conv"):
+        convs = [pce.conv]
+    elif hasattr(pce, "layers"):
+        for layer in pce.layers:
+            if hasattr(layer, "conv"):
+                convs.append(layer.conv)
+    for conv in convs:
+        try:
+            torch.nn.utils.remove_weight_norm(conv)
+            print(f"  Removed weight_norm from {conv}")
+        except ValueError:
+            pass
+    if not convs:
+        print("  pos_conv_embed: no conv found, skipping weight_norm removal")
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +156,27 @@ def write_feature_projection(w: gguf.GGUFWriter, sd: dict) -> None:
 def write_pos_conv(w: gguf.GGUFWriter, sd: dict, model) -> None:
     # weight_norm (old or new parametrize API) stores raw g/v in state_dict;
     # access the module attribute directly to get the reconstructed weight.
-    conv = model.wav2vec2.encoder.pos_conv_embed.conv
-    pos_w = conv.weight.detach().float()  # [Cout, Cin_per_group, K]
-    pos_b = conv.bias.detach().float()  # [Cout]
-    w.add_tensor("pos_conv.weight", pos_w.numpy().astype(np.float32))
-    w.add_tensor("pos_conv.bias", pos_b.numpy().astype(np.float32))
-    print(f"  pos_conv: {tuple(pos_w.shape)}")
+    backbone = get_backbone(model)
+    pce = backbone.encoder.pos_conv_embed
+    if hasattr(pce, "conv"):
+        conv = pce.conv
+        pos_w = conv.weight.detach().float()
+        pos_b = conv.bias.detach().float()
+        w.add_tensor("pos_conv.weight", pos_w.numpy().astype(np.float32))
+        w.add_tensor("pos_conv.bias", pos_b.numpy().astype(np.float32))
+        print(f"  pos_conv: {tuple(pos_w.shape)}")
+    elif hasattr(pce, "layers"):
+        # Data2Vec/HuBERT: pos_conv_embed.layers[i].conv
+        # Our runtime only supports a single pos_conv. Use the first layer
+        # (the main one — later layers are typically identity or small).
+        conv = pce.layers[0].conv
+        pos_w = conv.weight.detach().float()
+        pos_b = conv.bias.detach().float()
+        w.add_tensor("pos_conv.weight", pos_w.numpy().astype(np.float32))
+        w.add_tensor("pos_conv.bias", pos_b.numpy().astype(np.float32))
+        n_pos_layers = len(pce.layers)
+        w.add_uint32(f"{ARCH}.num_pos_conv_layers", n_pos_layers)
+        print(f"  pos_conv: {tuple(pos_w.shape)} ({n_pos_layers} layers, using first)")
 
 
 def write_encoder_global_ln(w: gguf.GGUFWriter, sd: dict) -> None:
@@ -226,14 +274,15 @@ def main() -> None:
     # Accept both local paths and HF model IDs
 
     print(f"Loading model from: {model_dir}")
-    model = Wav2Vec2ForCTC.from_pretrained(str(model_dir))
+    model = AutoModelForCTC.from_pretrained(str(model_dir), trust_remote_code=True)
     model.eval()
+    print(f"  Model class: {type(model).__name__}")
 
     print("Preprocessing weights:")
     remove_weight_norm(model)
 
     config = model.config
-    sd = model.state_dict()
+    sd = normalize_state_dict(model.state_dict())
 
     # Read vocab (id → token) — try local path first, then HF cache
     vocab_path = model_dir / "vocab.json"
@@ -277,13 +326,25 @@ def main() -> None:
     ctc_blank_id = 0
     writer.add_uint32(f"{ARCH}.pad_token_id", ctc_blank_id)
     # 0 = group norm variant (InstanceNorm, e.g. wav2vec2-base), 1 = layer norm variant (e.g. wav2vec2-large)
+    # Data2Vec and HuBERT always use LayerNorm in CNN + pre-norm (stable LN).
+    model_type = getattr(config, "model_type", "wav2vec2")
+    is_data2vec_or_hubert = model_type in ("data2vec-audio", "hubert")
     feat_norm_type = (
-        1 if getattr(config, "feat_extract_norm", "group") == "layer" else 0
+        1
+        if is_data2vec_or_hubert
+        or getattr(config, "feat_extract_norm", "group") == "layer"
+        else 0
     )
     writer.add_uint32(f"{ARCH}.feat_extract_norm_type", feat_norm_type)
     # 0 = post-norm (standard, base models), 1 = pre-norm (stable, large models)
-    stable_ln = 1 if getattr(config, "do_stable_layer_norm", False) else 0
+    stable_ln = (
+        1
+        if is_data2vec_or_hubert or getattr(config, "do_stable_layer_norm", False)
+        else 0
+    )
     writer.add_uint32(f"{ARCH}.do_stable_layer_norm", stable_ln)
+    if is_data2vec_or_hubert:
+        print(f"  Detected {model_type}: using LayerNorm CNN + pre-norm encoder")
 
     # CNN shape arrays (stored as individual keys for portability)
     for i, (dim, kern, stride) in enumerate(

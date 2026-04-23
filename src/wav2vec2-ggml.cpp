@@ -883,6 +883,21 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
     int T = (int)L_cur;
     int C_cnn = (int)C_cur;
 
+    // Dump CNN output for reference comparison
+    {
+        const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+        if (dump && dump[0]) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/cnn_out.bin", dump);
+            FILE* f = fopen(path, "wb");
+            if (f) {
+                fwrite(cnn_in.data(), sizeof(float), C_cnn * T, f);
+                fclose(f);
+                fprintf(stderr, "  DUMP: cnn_out [%d,%d] → %s\n", C_cnn, T, path);
+            }
+        }
+    }
+
     // Transpose [C_cnn, T] → [T, C_cnn]
     std::vector<float> feat(T * C_cnn);
     for (int t = 0; t < T; t++)
@@ -897,6 +912,17 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
     std::vector<uint8_t> scratch;
     ggml_linear_f32(scratch, m.fp_w, (const float*)m.fp_b->data, feat.data(), hidden.data(), C_cnn, H, T, n_threads);
 
+    // Dump feature projection output
+    {
+        const char* dump = getenv("WAV2VEC2_DUMP_DIR");
+        if (dump && dump[0]) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/feat_proj.bin", dump);
+            FILE* f = fopen(path, "wb");
+            if (f) { fwrite(hidden.data(), sizeof(float), T * H, f); fclose(f); }
+            fprintf(stderr, "  DUMP: feat_proj [%d,%d] → %s\n", T, H, path);
+        }
+    }
 
     // ---- 3. Positional conv (manual — grouped conv is hard in ggml) ----
     {
