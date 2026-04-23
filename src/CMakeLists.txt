@@ -458,6 +458,15 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# vibevoice — Microsoft VibeVoice-ASR (σ-VAE tokenizers + Qwen2 LM)
+# ---------------------------------------------------------------------------
+add_library(vibevoice STATIC vibevoice.h vibevoice.cpp)
+set_target_properties(vibevoice PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(vibevoice PUBLIC .)
+target_compile_features   (vibevoice PUBLIC cxx_std_17)
+target_link_libraries     (vibevoice PUBLIC crispasr-core ggml ggml-base ggml-cpu)
+
+# ---------------------------------------------------------------------------
 # firered-vad — FireRedVAD (DFSMN voice activity detection)
 # ---------------------------------------------------------------------------
 add_library(firered-vad STATIC firered_vad.h firered_vad.cpp)
@@ -639,6 +648,9 @@ if (TARGET firered-lid)
 endif()
 if (TARGET omniasr)
     target_link_libraries(whisper PUBLIC omniasr)
+endif()
+if (TARGET vibevoice)
+    target_link_libraries(whisper PUBLIC vibevoice)
 endif()
 if (TARGET ecapa-lid)
     target_link_libraries(whisper PUBLIC ecapa-lid)
