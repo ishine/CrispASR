@@ -1732,6 +1732,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
             beams[b].score = -1e9f;
         int nh_dec = hp.n_head_dec;
         int hd_dec = d / nh_dec;
+        const float inv_sqrt_hd_dec = 1.0f / sqrtf((float)hd_dec);
 
         for (int step = 0; step < max_len; step++) {
             // Check if all beams finished
@@ -1795,7 +1796,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                                 double s = 0;
                                 for (int dd = 0; dd < hd_dec; dd++)
                                     s += Q_sa[h * hd_dec + dd] * sa_k_hist[t * d + h * hd_dec + dd];
-                                scores[t] = (float)(s / sqrt((double)hd_dec));
+                                scores[t] = (float)s * inv_sqrt_hd_dec;
                             }
                             cpu_softmax_rows(scores.data(), 1, n_hist);
                             for (int dd = 0; dd < hd_dec; dd++) {
@@ -1838,7 +1839,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                             double s = 0;
                             for (int dd = 0; dd < hd_dec; dd++)
                                 s += Qx[h * hd_dec + dd] * K_enc[li][t * d + h * hd_dec + dd];
-                            scores[t] = (float)(s / sqrt((double)hd_dec));
+                            scores[t] = (float)s * inv_sqrt_hd_dec;
                         }
                         cpu_softmax_rows(scores.data(), 1, T_sub);
                         for (int dd = 0; dd < hd_dec; dd++) {
@@ -1885,25 +1886,19 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                 std::vector<float> xn(d);
                 cpu_layernorm(x.data(), norm_w.data(), norm_b.data(), xn.data(), 1, d);
 
-                float mx = -1e30f;
                 int best_token = -1;
-                std::vector<float> logits(odim);
+                float best_logit = -1e30f;
                 for (int i = 0; i < odim; i++) {
                     double s = 0;
                     for (int k = 0; k < d; k++)
                         s += xn[k] * prj_w[i * d + k];
-                    logits[i] = (float)s;
-                    if (logits[i] > mx) {
-                        mx = logits[i];
+                    const float logit = (float)s;
+                    if (logit > best_logit) {
+                        best_logit = logit;
                         best_token = i;
                     }
                 }
 
-                float lse = 0.0f;
-                for (int i = 0; i < odim; i++)
-                    lse += expf(logits[i] - mx);
-                lse = mx + logf(lse);
-                beam.score += logits[best_token] - lse;
                 if (best_token == hp.eos_id)
                     beam.finished = true;
                 else
@@ -1981,7 +1976,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                                 double s = 0;
                                 for (int dd = 0; dd < hd_dec; dd++)
                                     s += Q_sa[h * hd_dec + dd] * sa_k_hist[t * d + h * hd_dec + dd];
-                                scores[t] = (float)(s / sqrt((double)hd_dec));
+                                scores[t] = (float)s * inv_sqrt_hd_dec;
                             }
                             cpu_softmax_rows(scores.data(), 1, n_hist);
                             for (int dd = 0; dd < hd_dec; dd++) {
@@ -2027,7 +2022,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
                             double s = 0;
                             for (int dd = 0; dd < hd_dec; dd++)
                                 s += Qx[h * hd_dec + dd] * K_enc[li][t * d + h * hd_dec + dd];
-                            scores[t] = (float)(s / sqrt((double)hd_dec));
+                            scores[t] = (float)s * inv_sqrt_hd_dec;
                         }
                         cpu_softmax_rows(scores.data(), 1, T_sub);
                         for (int dd = 0; dd < hd_dec; dd++) {
