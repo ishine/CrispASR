@@ -86,6 +86,7 @@ bool wav2vec2_load(const char* fname, wav2vec2_model& model) {
     hp.pad_token_id = gguf_u32(gctx_meta, "wav2vec2.pad_token_id", hp.pad_token_id);
     hp.feat_extract_norm_type = gguf_u32(gctx_meta, "wav2vec2.feat_extract_norm_type", hp.feat_extract_norm_type);
     hp.do_stable_layer_norm = gguf_u32(gctx_meta, "wav2vec2.do_stable_layer_norm", hp.do_stable_layer_norm);
+    hp.global_ln_before_encoder = gguf_u32(gctx_meta, "wav2vec2.global_ln_before_encoder", hp.global_ln_before_encoder);
 
     for (uint32_t i = 0; i < hp.num_feat_extract_layers; i++) {
         char key[64];
@@ -432,9 +433,9 @@ static ggml_cgraph* wav2vec2_build_transformer_graph(const wav2vec2_model& m,
 
     const bool pre_norm = (hp.do_stable_layer_norm != 0);
 
-    // Data2Vec/HuBERT (pre_norm): apply global encoder LN BEFORE transformer layers.
-    // wav2vec2 (post-norm): global LN is applied AFTER all layers instead.
-    if (pre_norm) {
+    // Data2Vec: applies global encoder LN BEFORE transformer layers.
+    // wav2vec2/HuBERT: global LN is applied AFTER all layers instead.
+    if (hp.global_ln_before_encoder) {
         cur = ggml_norm(ctx0, cur, ln_eps);
         cur = ggml_mul(ctx0, cur, m.enc_ln_w);
         cur = ggml_add(ctx0, cur, m.enc_ln_b);
@@ -518,8 +519,8 @@ static ggml_cgraph* wav2vec2_build_transformer_graph(const wav2vec2_model& m,
         }
     }
 
-    // ---- Global LayerNorm (post-norm only — pre-norm applied it before the loop) ----
-    if (!pre_norm) {
+    // ---- Global LayerNorm (skip if already applied before the loop for data2vec) ----
+    if (!hp.global_ln_before_encoder) {
         cur = ggml_norm(ctx0, cur, ln_eps);
         cur = ggml_mul(ctx0, cur, m.enc_ln_w);
         cur = ggml_add(ctx0, cur, m.enc_ln_b);

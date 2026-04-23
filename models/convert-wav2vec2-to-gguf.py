@@ -328,26 +328,25 @@ def main() -> None:
     # greedy decoding we need the actual blank index.
     ctc_blank_id = 0
     writer.add_uint32(f"{ARCH}.pad_token_id", ctc_blank_id)
-    # 0 = group norm variant (InstanceNorm, e.g. wav2vec2-base), 1 = layer norm variant (e.g. wav2vec2-large)
-    # Data2Vec and HuBERT always use LayerNorm in CNN + pre-norm (stable LN).
+    # 0 = group norm, 1 = layer norm in CNN
     model_type = getattr(config, "model_type", "wav2vec2")
-    is_data2vec_or_hubert = model_type in ("data2vec-audio", "hubert")
+    is_data2vec = model_type == "data2vec-audio"
+    is_hubert = model_type == "hubert"
     feat_norm_type = (
-        1
-        if is_data2vec_or_hubert
-        or getattr(config, "feat_extract_norm", "group") == "layer"
-        else 0
+        1 if is_data2vec or is_hubert or getattr(config, "feat_extract_norm", "group") == "layer" else 0
     )
     writer.add_uint32(f"{ARCH}.feat_extract_norm_type", feat_norm_type)
-    # 0 = post-norm (standard, base models), 1 = pre-norm (stable, large models)
-    stable_ln = (
-        1
-        if is_data2vec_or_hubert or getattr(config, "do_stable_layer_norm", False)
-        else 0
-    )
+    # 0 = post-norm, 1 = pre-norm. Data2Vec is POST-norm (despite LayerNorm CNN).
+    # HuBERT is pre-norm (do_stable_layer_norm=True in config).
+    stable_ln = 1 if is_hubert or getattr(config, "do_stable_layer_norm", False) else 0
     writer.add_uint32(f"{ARCH}.do_stable_layer_norm", stable_ln)
-    if is_data2vec_or_hubert:
-        print(f"  Detected {model_type}: using LayerNorm CNN + pre-norm encoder")
+    # Data2Vec applies global encoder LN BEFORE transformer layers (unique to data2vec)
+    global_ln_before = 1 if is_data2vec else 0
+    writer.add_uint32(f"{ARCH}.global_ln_before_encoder", global_ln_before)
+    if is_data2vec:
+        print(f"  Detected data2vec: LayerNorm CNN, POST-norm encoder, global LN before layers")
+    elif is_hubert:
+        print(f"  Detected hubert: LayerNorm CNN, PRE-norm encoder")
 
     # CNN shape arrays (stored as individual keys for portability)
     for i, (dim, kern, stride) in enumerate(

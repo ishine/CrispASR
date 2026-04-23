@@ -45,6 +45,8 @@ struct wav2vec2_hparams {
     // 0 = post-norm (standard, base models): attn → add → LN → FFN → add → LN
     // 1 = pre-norm (stable, large models): LN → attn → add → LN → FFN → add
     uint32_t do_stable_layer_norm = 1; // default 1 for backward compat (existing GGUFs are large models)
+    // Data2Vec: applies global encoder LN BEFORE transformer layers (unique behavior)
+    uint32_t global_ln_before_encoder = 0;
 
     uint32_t conv_dim[7] = {256, 256, 512, 512, 512, 512, 512};
     uint32_t conv_kernel[7] = {10, 3, 3, 3, 3, 2, 2};
