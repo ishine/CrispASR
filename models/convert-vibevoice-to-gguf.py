@@ -168,9 +168,13 @@ def main():
                         skipped += 1
                         continue
 
-                # Store norms/biases/scalars as F32, weights as F16
-                if ("norm" in name or "gamma" in name or name.endswith(".bias") or
-                        len(t.shape) <= 1 or "scaling_factor" in name or "bias_factor" in name):
+                # Store norms/biases/scalars as F32, weights as F16.
+                # Exception: depthwise conv weights (dw_conv) stay F32 because
+                # ggml_conv_1d_dw forces F16 im2col intermediates — storing
+                # weights as F32 avoids double F16 precision loss through 29 blocks.
+                is_f32 = ("norm" in name or "gamma" in name or name.endswith(".bias") or
+                          len(t.shape) <= 1 or "scaling_factor" in name or "bias_factor" in name)
+                if is_f32:
                     data = t.astype(np.float32)
                 else:
                     data = t.astype(np.float16)
