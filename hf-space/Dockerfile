@@ -1,5 +1,5 @@
 FROM ubuntu:22.04 AS build
-WORKDIR /src/CrispASR
+WORKDIR /src
 
 RUN apt-get update && \
   apt-get install -y build-essential cmake git curl && \
@@ -11,6 +11,7 @@ ARG CRISPASR_REF=faf0d1f
 RUN git clone --depth 1 "${CRISPASR_REPO}" /src/CrispASR && \
   git -C /src/CrispASR fetch --depth 1 origin "${CRISPASR_REF}" && \
   git -C /src/CrispASR checkout --detach FETCH_HEAD
+WORKDIR /src/CrispASR
 RUN cmake -B build -DWHISPER_BUILD_TESTS=OFF && \
   cmake --build build -j"$(nproc)" --target whisper-cli
 
