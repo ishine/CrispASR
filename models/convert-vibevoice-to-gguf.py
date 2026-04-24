@@ -102,11 +102,25 @@ def main():
     writer.add_array("vibevoice.encoder_ratios", encoder_ratios)
     writer.add_array("vibevoice.encoder_depths", encoder_depths)
 
-    # Embed Qwen2 vocabulary for token ID → string decoding
+    # Embed Qwen2 vocabulary for token ID → string decoding.
+    # The VibeVoice snapshot itself does not ship tokenizer files; the
+    # official HF converter falls back to Qwen/Qwen2.5-7B.
     try:
         from transformers import AutoTokenizer
-        # Load from the model directory itself — works for both 1.5B and 7B.
-        tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+
+        tok = None
+        tok_errs = []
+        for tok_src in (model_dir, "Qwen/Qwen2.5-7B"):
+            try:
+                tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
+                print(f"  loaded tokenizer from: {tok_src}")
+                break
+            except Exception as e:
+                tok_errs.append(f"{tok_src}: {e}")
+
+        if tok is None:
+            raise RuntimeError(" ; ".join(tok_errs))
+
         vocab_map = tok.get_vocab()
         inv = {v: k for k, v in vocab_map.items()}
         max_id = max(inv.keys())

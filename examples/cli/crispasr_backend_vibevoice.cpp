@@ -50,6 +50,7 @@ public:
     bool init(const whisper_params& p) override {
         vibevoice_context_params cp = vibevoice_context_default_params();
         cp.n_threads = p.n_threads;
+        cp.max_new_tokens = p.max_new_tokens > 0 ? p.max_new_tokens : cp.max_new_tokens;
         cp.verbosity = p.no_prints ? 0 : 1;
         cp.use_gpu = crispasr_backend_should_use_gpu(p);
         ctx_ = vibevoice_init_from_file(p.model.c_str(), cp);

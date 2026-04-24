@@ -663,6 +663,30 @@ static std::string decode_qwen_piece(const std::string& s) {
     return out;
 }
 
+static void vibevoice_dump_i32(const char* dir, const char* name, const int32_t* data, size_t n) {
+    if (!dir || !dir[0] || !name || !data || n == 0)
+        return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
+    FILE* f = fopen(path, "wb");
+    if (!f)
+        return;
+    fwrite(data, sizeof(int32_t), n, f);
+    fclose(f);
+}
+
+static void vibevoice_dump_f32(const char* dir, const char* name, const float* data, size_t n) {
+    if (!dir || !dir[0] || !name || !data || n == 0)
+        return;
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s.bin", dir, name);
+    FILE* f = fopen(path, "wb");
+    if (!f)
+        return;
+    fwrite(data, sizeof(float), n, f);
+    fclose(f);
+}
+
 // ===========================================================================
 // Public stage API
 // ===========================================================================
@@ -756,6 +780,7 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
 
     auto& m = ctx->model;
     auto& hp = m.hp;
+    const char* dump_dir = getenv("VIBEVOICE_DUMP_DIR");
 
     auto G = [&](const std::string& name) -> ggml_tensor* {
         auto it = m.tensors.find(name);
@@ -871,56 +896,63 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: speech features combined: [%d, %d]\n", T_audio, hp.d_lm);
 
-    // 5. Build prompt: system_tokens + <speech_start> + speech_pad × T + <speech_end> + suffix
-    // Token IDs from VibeVoice processor (Qwen2 tokenizer with special tokens)
-    const int SPEECH_START = 151646;
-    const int SPEECH_PAD = 151648;
-    const int SPEECH_END = 151647;
+    // 5. Build prompt matching the current HF VibeVoice ASR processor:
+    // <|im_start|>system ... <|im_end|>
+    // <|im_start|>user
+    // <|object_ref_start|><|box_start|>×N<|object_ref_end|>
+    // This is a X.XX seconds audio, please transcribe it with these keys: ...
+    // <|im_end|>\n
+    //
+    // The HF template does not append an explicit assistant header here.
+    const int AUDIO_BOS = 151646;   // <|object_ref_start|>
+    const int AUDIO_TOKEN = 151648; // <|box_start|>
+    const int AUDIO_EOS = 151647;   // <|object_ref_end|>
     const int EOS_TOKEN = 151643;
     const int IM_START = 151644;
-    // const int IM_END       = 151645;
+    const int IM_END = 151645;
 
-    // Exact prompt template from VibeVoice processor output
-    // System: "You are a helpful assistant that transcribes audio input into text output in JSON format."
+    // System prompt from transformers/models/vibevoice_asr/convert_vibevoice_asr_to_hf.py
     std::vector<int> system_tokens = {
         IM_START, 8948,   198,                                         // <|im_start|>system\n
         2610,     525,    264,  10950,    17847, 429, 1356, 55136,     // You are a helpful assistant that transcribes
         7699,     1946,   1119, 1467,     2550,  304, 4718, 3561,  13, // audio input into text output in JSON format.
-        198,      151645, 198,  IM_START, 872,   198                   // \n<|im_end|>\n<|im_start|>user\n
+        198,      IM_END, 198,  IM_START, 872,   198                   // \n<|im_end|>\n<|im_start|>user\n
     };
-    // After speech tokens: "\nThis is a XX.XX seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n"
+    // After audio placeholder tokens:
+    // "\nThis is a XX.XX seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n"
     float dur = n_samples / 24000.0f;
-    // Tokenize duration character-by-character using Qwen2 single-char token IDs:
-    // '0'–'9' = 15–24, '.' = 13 (verified against "11.00" in VibeVoice processor output)
+    // Duration is inserted as plain text before tokenization by the HF
+    // processor. For Qwen2.5 digits and '.' map to stable single-char ids.
     char dur_str[16];
     snprintf(dur_str, sizeof(dur_str), "%.2f", dur);
     std::vector<int> dur_tokens;
     for (const char* p = dur_str; *p; p++) {
-        if (*p >= '0' && *p <= '9') dur_tokens.push_back(15 + (*p - '0'));
-        else if (*p == '.') dur_tokens.push_back(13);
+        if (*p >= '0' && *p <= '9')
+            dur_tokens.push_back(15 + (*p - '0'));
+        else if (*p == '.')
+            dur_tokens.push_back(13);
     }
     std::vector<int> suffix_tokens = {
-        198,                                                           // \n
-        1986, 374, 264, 220,                                           // This is a<space>
+        198,                 // \n
+        1986, 374, 264, 220, // This is a<space>
     };
     suffix_tokens.insert(suffix_tokens.end(), dur_tokens.begin(), dur_tokens.end());
     std::vector<int> suffix_tail = {
-        6546,     7699,  11,  4587, 38840, 432, 449,   1493,           // seconds audio, please transcribe it with these
-        6894,     25,                                                  // keys:
-        5145,     882,   11,  3972, 882,   11,  29073, 3034, 11, 8883, // Start time, End time, Speaker ID, Content
-        151645,   198,                                                 // <|im_end|>\n
-        IM_START, 77091, 198                                           // <|im_start|>assistant\n
+        6546,   7699, 11, 4587, 38840, 432, 449,   1493,           // seconds audio, please transcribe it with these
+        6894,   25,                                                // keys:
+        5145,   882,  11, 3972, 882,   11,  29073, 3034, 11, 8883, // Start time, End time, Speaker ID, Content
+        IM_END, 198                                                // <|im_end|>\n
     };
     suffix_tokens.insert(suffix_tokens.end(), suffix_tail.begin(), suffix_tail.end());
 
     // Build full token sequence
     std::vector<int> prompt_tokens;
     prompt_tokens.insert(prompt_tokens.end(), system_tokens.begin(), system_tokens.end());
-    prompt_tokens.push_back(SPEECH_START);
+    prompt_tokens.push_back(AUDIO_BOS);
     int speech_start_pos = (int)prompt_tokens.size();
     for (int i = 0; i < T_audio; i++)
-        prompt_tokens.push_back(SPEECH_PAD);
-    prompt_tokens.push_back(SPEECH_END);
+        prompt_tokens.push_back(AUDIO_TOKEN);
+    prompt_tokens.push_back(AUDIO_EOS);
     prompt_tokens.insert(prompt_tokens.end(), suffix_tokens.begin(), suffix_tokens.end());
     int prefix_len = (int)prompt_tokens.size();
 
@@ -931,6 +963,8 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
     // 6. Embed all tokens, then replace speech positions with speech features.
     // Use ggml_get_rows so quantized token embedding tables are handled by the backend.
     std::vector<int32_t> prompt_ids(prompt_tokens.begin(), prompt_tokens.end());
+    vibevoice_dump_i32(dump_dir, "prompt_ids", prompt_ids.data(), prompt_ids.size());
+    vibevoice_dump_f32(dump_dir, "speech_features", speech_features.data(), speech_features.size());
     std::vector<float> prefix_embeds = run_token_embedding_lookup(ctx, prompt_ids.data(), (int)prompt_ids.size());
     if (prefix_embeds.size() != (size_t)prefix_len * hp.d_lm) {
         fprintf(stderr, "vibevoice: token embedding lookup failed\n");
@@ -942,6 +976,7 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         int pos = speech_start_pos + i;
         memcpy(prefix_embeds.data() + pos * hp.d_lm, speech_features.data() + i * hp.d_lm, hp.d_lm * sizeof(float));
     }
+    vibevoice_dump_f32(dump_dir, "prefix_embeds", prefix_embeds.data(), prefix_embeds.size());
 
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: prefix embedded (%d tokens)\n", prefix_len);
@@ -1027,6 +1062,7 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
                 ggml_tensor* o_w = G(std::string(p) + ".attn.o_proj.weight");
                 ggml_tensor* q_b = G(std::string(p) + ".attn.q_proj.bias");
                 ggml_tensor* k_b = G(std::string(p) + ".attn.k_proj.bias");
+                ggml_tensor* v_b = G(std::string(p) + ".attn.v_proj.bias");
 
                 int T_cur = (int)cur->ne[1];
                 int Lk = n_past + T_cur;
@@ -1039,6 +1075,8 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
                 if (k_b)
                     K = ggml_add(ctx0, K, k_b);
                 ggml_tensor* V = ggml_mul_mat(ctx0, v_w, cur);
+                if (v_b)
+                    V = ggml_add(ctx0, V, v_b);
 
                 // Reshape for multi-head
                 Q = ggml_reshape_3d(ctx0, Q, kvp.head_dim, kvp.n_heads, T_cur);
@@ -1160,6 +1198,7 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         return nullptr;
     }
     ctx->kv_n_used = prefix_len;
+    vibevoice_dump_f32(dump_dir, "prefill_logits", logits.data(), logits.size());
 
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: prefill done\n");
@@ -1190,6 +1229,11 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         int n_past = prefix_len + step;
         if (!run_decoder(tok_emb.data(), 1, n_past, logits))
             break;
+        if (step < 4) {
+            char name[64];
+            snprintf(name, sizeof(name), "step_%03d_logits", step);
+            vibevoice_dump_f32(dump_dir, name, logits.data(), logits.size());
+        }
 
         cur_token = argmax(logits);
         if (cur_token == EOS_TOKEN)
@@ -1202,6 +1246,10 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
 
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: generated %d tokens\n", (int)output_tokens.size());
+    if (!output_tokens.empty()) {
+        std::vector<int32_t> output_ids(output_tokens.begin(), output_tokens.end());
+        vibevoice_dump_i32(dump_dir, "generated_ids", output_ids.data(), output_ids.size());
+    }
 
     // 11. Detokenize using embedded vocabulary
     std::string result;
