@@ -1722,7 +1722,7 @@ class PuncModel {
 
   /// Load a FireRedPunc GGUF model.
   static PuncModel open(String modelPath, {String? libPath}) {
-    final lib = DynamicLibrary.open(libPath ?? _defaultLibPath());
+    final lib = DynamicLibrary.open(libPath ?? CrispASR.defaultLibName());
     final initFn = lib.lookupFunction<
         Pointer<Void> Function(Pointer<Utf8>),
         Pointer<Void> Function(Pointer<Utf8>)>('crispasr_punc_init');

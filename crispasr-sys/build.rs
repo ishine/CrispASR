@@ -1,60 +1,39 @@
+// Link to a pre-installed `libcrispasr` (or its legacy `libwhisper` alias).
+//
+// This crate is a thin FFI shim — it does NOT build the native library.
+// The user is expected to have `libcrispasr.{so,dylib,dll}` installed
+// (Homebrew, apt, or built from source). Same pattern as whisper.cpp's
+// language bindings, the Python wrapper in this repo, and the Dart
+// wrapper in `flutter/crispasr/`.
+//
+// Override the search path with `CRISPASR_LIB_DIR=/path/to/lib`.
+// Override the library name with `CRISPASR_LIB_NAME=crispasr` (default)
+// or `CRISPASR_LIB_NAME=whisper` for the legacy alias.
+
 use std::env;
+use std::path::Path;
 
 fn main() {
-    let mut cfg = cmake::Config::new("..");
-    cfg.define("BUILD_SHARED_LIBS", "OFF")
-       .define("WHISPER_BUILD_EXAMPLES", "OFF")
-       .define("WHISPER_BUILD_TESTS", "OFF");
+    println!("cargo:rerun-if-env-changed=CRISPASR_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=CRISPASR_LIB_NAME");
 
-    if cfg!(feature = "cuda") {
-        cfg.define("GGML_CUDA", "ON");
-    }
-    if cfg!(feature = "metal") {
-        cfg.define("GGML_METAL", "ON")
-           .define("GGML_METAL_EMBED_LIBRARY", "ON");
-    }
-    if cfg!(feature = "vulkan") {
-        cfg.define("GGML_VULKAN", "ON");
+    if let Ok(dir) = env::var("CRISPASR_LIB_DIR") {
+        println!("cargo:rustc-link-search=native={dir}");
     }
 
-    let dst = cfg.build();
-
-    println!("cargo:rustc-link-search=native={}/lib", dst.display());
-    println!("cargo:rustc-link-search=native={}/lib64", dst.display());
-    // Backend .a files live in the cmake build tree, not the install prefix
-    println!("cargo:rustc-link-search=native={}/build/src", dst.display());
-    println!("cargo:rustc-link-search=native={}/build/ggml/src", dst.display());
-    println!("cargo:rustc-link-lib=static=whisper");
-    // Backend model libraries (linked into libwhisper in shared builds,
-    // but separate .a files in static builds)
-    for lib in &[
-        "parakeet", "canary", "canary_ctc", "cohere", "qwen3_asr",
-        "voxtral", "voxtral4b", "granite_speech", "wav2vec2-ggml",
-        "crispasr-core", "pyannote-seg", "silero-lid", "ctc-align",
+    // Standard install prefixes — the linker probes these in order.
+    for d in &[
+        "/opt/homebrew/lib", // macOS arm64 Homebrew
+        "/usr/local/lib",    // macOS x64 Homebrew, /usr/local installs
+        "/usr/lib",
+        "/usr/lib/x86_64-linux-gnu", // Debian/Ubuntu multiarch
+        "/usr/lib/aarch64-linux-gnu",
     ] {
-        println!("cargo:rustc-link-lib=static={lib}");
+        if Path::new(d).is_dir() {
+            println!("cargo:rustc-link-search=native={d}");
+        }
     }
-    println!("cargo:rustc-link-lib=static=ggml");
-    println!("cargo:rustc-link-lib=static=ggml-base");
-    println!("cargo:rustc-link-lib=static=ggml-cpu");
 
-    // Platform libs
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    match target_os.as_str() {
-        "macos" | "ios" => {
-            println!("cargo:rustc-link-lib=framework=Accelerate");
-            if cfg!(feature = "metal") {
-                println!("cargo:rustc-link-lib=framework=Metal");
-                println!("cargo:rustc-link-lib=framework=Foundation");
-                println!("cargo:rustc-link-lib=framework=MetalKit");
-            }
-        }
-        "linux" => {
-            println!("cargo:rustc-link-lib=dylib=stdc++");
-            println!("cargo:rustc-link-lib=dylib=m");
-            println!("cargo:rustc-link-lib=dylib=pthread");
-            println!("cargo:rustc-link-lib=dylib=gomp"); // OpenMP
-        }
-        _ => {}
-    }
+    let lib = env::var("CRISPASR_LIB_NAME").unwrap_or_else(|_| "crispasr".to_string());
+    println!("cargo:rustc-link-lib=dylib={lib}");
 }

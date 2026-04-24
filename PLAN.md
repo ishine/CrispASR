@@ -206,9 +206,30 @@ Today the Rust, Dart, and Python wrappers all live in this repo and (for
 Python) require a `pip install -e .` from a clone. Move all three onto
 their language-native registries so users can install with one command.
 
-**Status:** Rust `crispasr` v0.1.7 + `crispasr-sys`, Dart `crispasr` v0.4.9,
-and Python `crispasr` v0.4.9 are versioned but **none are published yet**
-to crates.io / pub.dev / PyPI.
+**Status (2026-04-25):** All three wrappers now have publishable
+metadata + dry-runs pass. The CI workflow `release-wrappers.yml` is
+wired up but cannot run until the **one-time registry setup** below
+is complete.
+
+| Wrapper | Pre-flight | Blocker |
+|---|---|---|
+| Python `crispasr` 0.4.9 | sdist + wheel build clean | PyPI trusted-publisher must be configured |
+| Dart `crispasr` 0.4.9 | `dart pub publish --dry-run` passes (warnings only) | pub.dev automated publishing must be configured |
+| Rust `crispasr-sys` 0.1.7 | `cargo publish --dry-run` clean (5.9 KiB) | needs `CARGO_REGISTRY_TOKEN` repo secret |
+| Rust `crispasr` 0.1.7 | publish-order dependent on `crispasr-sys` | same |
+
+### One-time registry setup (must happen before first tag)
+
+1. **PyPI** — go to https://pypi.org/manage/account/publishing/ and add
+   a "pending publisher": owner `CrispStrobe`, repo `CrispASR`,
+   workflow `release-wrappers.yml`, environment `pypi`. Then push any
+   `v*` tag.
+2. **crates.io** — generate a token at https://crates.io/me, add it
+   as the `CARGO_REGISTRY_TOKEN` secret on the GitHub repo.
+3. **pub.dev** — go to https://pub.dev/packages/crispasr/admin (after
+   first manual publish or claim) → enable automated publishing → set
+   tag pattern `v{{version}}`. Alternatively for the first publish,
+   run `dart pub publish` locally with the package owner's credentials.
 
 ### Pattern (matches whisper.cpp approach)
 
