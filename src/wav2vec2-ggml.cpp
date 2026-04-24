@@ -482,8 +482,7 @@ static ggml_cgraph* wav2vec2_build_transformer_graph(const wav2vec2_model& m,
         // scores = K^T @ Q → (T, T, n_heads), scaled + softmax
         float attn_scale = 1.0f / sqrtf((float)head_dim);
         ggml_tensor* scores = ggml_mul_mat(ctx0, K, Q);
-        scores = ggml_scale(ctx0, scores, attn_scale);
-        scores = ggml_soft_max(ctx0, scores);
+        scores = ggml_soft_max_ext(ctx0, scores, nullptr, attn_scale, 0.0f);
 
         // attn_out = V_for_attn^T @ scores
         ggml_tensor* V_for_attn = ggml_cont(ctx0, ggml_permute(ctx0, V_t, 1, 0, 2, 3));
@@ -610,8 +609,7 @@ static void wav2vec2_debug_attention(const wav2vec2_model& m, const float* hidde
 
     // Attention scores
     ggml_tensor* scores = ggml_mul_mat(ctx, Kp, Qp); // [T, T, n_heads]
-    scores = ggml_scale(ctx, scores, scale);
-    scores = ggml_soft_max(ctx, scores);
+    scores = ggml_soft_max_ext(ctx, scores, nullptr, scale, 0.0f);
     ggml_set_name(scores, "attn_scores");
 
     // attn = scores @ V
@@ -1361,8 +1359,7 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         // Attention
         float scale = 1.0f / sqrtf((float)head_dim);
         ggml_tensor* scores = ggml_mul_mat(lctx, K, Q);
-        scores = ggml_scale(lctx, scores, scale);
-        scores = ggml_soft_max(lctx, scores);
+        scores = ggml_soft_max_ext(lctx, scores, nullptr, scale, 0.0f);
         ggml_tensor* V_perm = ggml_cont(lctx, ggml_permute(lctx, Vt, 1, 0, 2, 3));
         ggml_tensor* attn = ggml_mul_mat(lctx, V_perm, scores);
         attn = ggml_cont(lctx, ggml_permute(lctx, attn, 0, 2, 1, 3));

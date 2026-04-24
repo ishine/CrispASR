@@ -789,11 +789,10 @@ static ggml_cgraph* canary_build_graph_decoder(canary_context* ctx, int n_tokens
         K_full = ggml_cont(ctx0, K_full);
 
         ggml_tensor* KQ = ggml_mul_mat(ctx0, K_full, Q);
-        KQ = ggml_scale(ctx0, KQ, 1.0f / sqrtf((float)head_dim));
         if (n_tokens > 1) {
             KQ = ggml_diag_mask_inf(ctx0, KQ, offset);
         }
-        KQ = ggml_soft_max(ctx0, KQ);
+        KQ = ggml_soft_max_ext(ctx0, KQ, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f);
 
         ggml_tensor* V_full = ggml_view_3d(ctx0, ctx->kv_v, head_dim, L, n_heads, ctx->kv_v->nb[1], ctx->kv_v->nb[2],
                                            il * ctx->kv_v->nb[3]);
@@ -829,8 +828,7 @@ static ggml_cgraph* canary_build_graph_decoder(canary_context* ctx, int n_tokens
         // ca_w = softmax( CK^T @ CQ / sqrt(head_dim) ) → [T_enc, 1, n_heads]
         if (ctx->collect_attn && (int)il == (int)hp.dec_n_layers - 1 && n_tokens == 1) {
             ggml_tensor* ca_w = ggml_mul_mat(ctx0, CK, CQ); // [T_enc, 1, n_heads]
-            ca_w = ggml_scale(ctx0, ca_w, 1.0f / sqrtf((float)head_dim));
-            ca_w = ggml_soft_max(ctx0, ca_w);
+            ca_w = ggml_soft_max_ext(ctx0, ca_w, nullptr, 1.0f / sqrtf((float)head_dim), 0.0f);
             ggml_set_name(ca_w, "ca_attn_w");
             ggml_build_forward_expand(gf, ca_w);
         }
