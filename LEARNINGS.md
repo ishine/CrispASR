@@ -1999,3 +1999,27 @@ blocks, each with a depthwise conv, this accumulates precision loss. Fix options
 1. CPU depthwise conv (simple loop, avoids im2col entirely)
 2. Modify ggml to use F32 im2col when input is F32
 3. Accept lower precision and rely on LM decoder robustness
+
+### VibeVoice decoder: systematic debugging status
+
+The Qwen2 decoder consistently outputs `<|vision_pad|>` (token 151654)
+regardless of input. Confirmed NOT an encoder issue — injecting Python
+reference features (cos=1.0) produces the same wrong output.
+
+**Verified correct:**
+- Embedding tensor values match Python checkpoint
+- Prompt template matches processor output (143 tokens + assistant prefix)
+- LM head uses tied weights (lm.tok_emb.weight)
+- Embedding layout: data[token_id * d_lm + dim] (ggml column-major)
+
+**Likely causes (in order):**
+1. **RoPE theta**: Qwen2 uses theta=1000000.0 (not 10000). Our code sets this
+   but the actual ggml_rope_ext call might interpret it differently.
+2. **GQA native mode**: with n_heads=12, n_kv_heads=2, GQA ratio=6:1.
+   The flash_attn_ext native GQA mode might handle this wrong for Qwen2.
+3. **Causal mask**: the mask construction might be wrong for the prefix-fill case.
+4. **Q/K bias interaction with RoPE**: bias is added before RoPE, which is correct
+   in Python but might interact differently with ggml_rope_ext.
+
+**Next step**: dump decoder layer 0 hidden states from both Python and C++
+and compare. This will immediately pinpoint which operation diverges.
