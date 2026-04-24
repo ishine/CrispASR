@@ -32,6 +32,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True, help="HF model ID or local path")
     parser.add_argument("--output", required=True)
+    parser.add_argument("--include-decoder", action="store_true",
+                        help="Include audio decoder tensors for TTS support")
     args = parser.parse_args()
 
     from safetensors import safe_open
@@ -100,6 +102,7 @@ def main():
     writer.add_uint32("vibevoice.n_filters", n_filters)
     writer.add_uint32("vibevoice.total_downsample", total_downsample)
     writer.add_array("vibevoice.encoder_ratios", encoder_ratios)
+    writer.add_uint32("vibevoice.has_decoder", 1 if args.include_decoder else 0)
     writer.add_array("vibevoice.encoder_depths", encoder_depths)
 
     # Embed Qwen2 vocabulary for token ID → string decoding.
@@ -138,7 +141,12 @@ def main():
         if name.startswith("model."):
             name = name[len("model."):]
         name = name.replace("acoustic_tokenizer.encoder.", "at_enc.")
+        name = name.replace("acoustic_tokenizer.decoder.", "at_dec.")
         name = name.replace("semantic_tokenizer.encoder.", "st_enc.")
+        name = name.replace("semantic_tokenizer.decoder.", "st_dec.")
+        name = name.replace("upsample_layers.", "us.")
+        name = name.replace("convtr.convtr.", "convtr.")
+        name = name.replace("head.conv.conv.", "head.")
         name = name.replace("acoustic_connector.", "at_conn.")
         name = name.replace("semantic_connector.", "se_conn.")
         name = name.replace("language_model.", "lm.")
@@ -174,13 +182,14 @@ def main():
         path = os.path.join(model_dir, shard)
         with safe_open(path, framework="pt") as f:
             for name in sorted(f.keys()):
-                # Skip decoder (synthesis) tensors
-                if "acoustic_tokenizer.decoder" in name:
-                    skipped += 1
-                    continue
-                if "semantic_tokenizer.decoder" in name:
-                    skipped += 1
-                    continue
+                # Skip decoder (synthesis) tensors unless --include-decoder
+                if not args.include_decoder:
+                    if "acoustic_tokenizer.decoder" in name:
+                        skipped += 1
+                        continue
+                    if "semantic_tokenizer.decoder" in name:
+                        skipped += 1
+                        continue
 
                 gguf_name = shorten(name)
 
