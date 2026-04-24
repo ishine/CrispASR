@@ -599,8 +599,8 @@ static void canary_alloc_kv(canary_context* ctx) {
     };
     ctx->kv_ctx = ggml_init(p);
 
-    ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, head_dim, max_ctx, n_heads, n_layers);
-    ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, head_dim, max_ctx, n_heads, n_layers);
+    ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, head_dim, max_ctx, n_heads, n_layers);
+    ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, head_dim, max_ctx, n_heads, n_layers);
     ggml_set_name(ctx->kv_k, "kv_k");
     ggml_set_name(ctx->kv_v, "kv_v");
 

@@ -489,6 +489,8 @@ static bool moonshine_kv_cache_init(moonshine_kv_cache& cache, int n_layers, int
         return false;
 
     for (int i = 0; i < n_layers; i++) {
+        // Moonshine decoder writes F32 directly to cache via ggml_set_*d;
+        // F16 would need explicit casts in the decoder graph. Keep F32.
         cache.k[i] = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, head_dim, max_len, n_kv_heads);
         cache.v[i] = ggml_new_tensor_3d(cache.ctx, GGML_TYPE_F32, head_dim, max_len, n_kv_heads);
     }

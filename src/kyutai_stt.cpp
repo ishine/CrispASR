@@ -514,8 +514,8 @@ static bool kv_cache_init(kyutai_stt_context* ctx, int max_ctx) {
     if (!ctx->kv_ctx)
         return false;
 
-    ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.head_dim, max_ctx, hp.num_heads, hp.num_layers);
-    ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F32, hp.head_dim, max_ctx, hp.num_heads, hp.num_layers);
+    ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hp.head_dim, max_ctx, hp.num_heads, hp.num_layers);
+    ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hp.head_dim, max_ctx, hp.num_heads, hp.num_layers);
 
     ctx->kv_buf = ggml_backend_alloc_ctx_tensors(ctx->kv_ctx, ctx->backend);
     if (!ctx->kv_buf) {
