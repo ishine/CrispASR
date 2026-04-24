@@ -111,6 +111,7 @@ struct whisper_params {
     float vad_max_speech_duration_s = FLT_MAX;
     int vad_speech_pad_ms = 30;
     float vad_samples_overlap = 0.1f;
+    bool vad_stitch = false; // stitch VAD segments into one buffer (legacy, breaks SRT)
 
     // -----------------------------------------------------------------
     // crispasr extensions: fields used only by non-whisper backends.

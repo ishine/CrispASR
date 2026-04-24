@@ -174,7 +174,14 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, wh
     //
     // Skip stitching for whisper backend (it has its own internal VAD+seek)
     // and when there's only one slice (no benefit).
-    const bool use_stitching = slices.size() > 1 && params.vad && params.backend != "whisper";
+    // Stitching concatenates all VAD segments into one buffer for a single
+    // transcribe() call. This preserves cross-segment context but collapses
+    // the output into one big segment — breaking SRT/VTT subtitle output.
+    // Default: use per-slice path (each VAD segment → separate transcript
+    // segment with correct timestamps). Users can opt in to stitching with
+    // --vad-stitch if they want cross-segment context at the cost of
+    // single-segment output.
+    const bool use_stitching = slices.size() > 1 && params.vad && params.backend != "whisper" && params.vad_stitch;
 
     if (use_stitching) {
         auto stitched = crispasr_stitch_vad_slices(samples.data(), (int)samples.size(), SR, slices);

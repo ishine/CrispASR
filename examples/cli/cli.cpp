@@ -393,6 +393,8 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
             params.vad_speech_pad_ms = std::stoi(ARGV_NEXT);
         } else if (arg == "-vo" || arg == "--vad-samples-overlap") {
             params.vad_samples_overlap = std::stof(ARGV_NEXT);
+        } else if (arg == "--vad-stitch") {
+            params.vad_stitch = true;
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             whisper_print_usage(argc, argv, params);
