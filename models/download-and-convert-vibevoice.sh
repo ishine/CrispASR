@@ -111,7 +111,7 @@ echo "  F16 GGUF: $(du -sh "$F16_OUT" | cut -f1)"
 if [[ "$DO_QUANTIZE" -eq 1 ]]; then
     Q4_NAME="${F16_NAME/f16/q4_k}"
     Q4_OUT="$OUT_DIR/$Q4_NAME"
-    QUANTIZE="$REPO_DIR/build/bin/quantize"
+    QUANTIZE="$REPO_DIR/build/bin/crispasr-quantize"
 
     echo ""
     echo "── Step 4: quantize Q4_K_M → $Q4_OUT"

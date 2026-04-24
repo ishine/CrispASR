@@ -87,9 +87,7 @@ VibeVoice-ASR is Microsoft's **7B-parameter speech-LLM** capable of transcribing
 | File | Size | Notes |
 | --- | ---: | --- |
 | `vibevoice-asr-q4_k.gguf` | ~5 GB | **Q4_K_M — recommended default** |
-| `vibevoice-asr-f16.gguf` | ~17 GB | F16 — reference quality |
-
-> Sizes are approximate; exact values depend on final quantisation run.
+| `vibevoice-asr-f16.gguf` | 16 GB | F16 — reference quality |
 
 ## Quick Start
 

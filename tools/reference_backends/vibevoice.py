@@ -3,39 +3,41 @@
 Captures every stage needed to validate the C++ ggml pipeline:
 
   audio_norm          (N,)          normalized PCM at 24kHz (-25 dBFS)
-  at_enc_mean         (1, T', 64)   acoustic encoder VAE mean (pre-sampling)
-  at_tokens           (1, T', 64)   acoustic tokens after sampling
-  st_enc_mean         (1, T', 128)  semantic encoder output (mean, no sampling)
-  at_conn_out         (1, T', D)    after acoustic SpeechConnector
-  st_conn_out         (1, T', D)    after semantic SpeechConnector
-  speech_features     (1, T', D)    combined (at_conn + st_conn)
-  llm_argmax          (T_gen,)      greedy generated token IDs
-  generated_text      str           decoded transcript
+  at_enc_mean         (T', 64)      acoustic encoder VAE mean (pre-sampling)
+  at_tokens           (T', 64)      acoustic tokens (= mean; noise skipped for reproducibility)
+  st_enc_mean         (T', 128)     semantic encoder output (mean, no sampling)
+  at_conn_out         (T', D)       after acoustic SpeechConnector
+  st_conn_out         (T', D)       after semantic SpeechConnector
+  speech_features     (T', D)       combined (at_conn + st_conn)
+  llm_argmax          (T_gen,)      greedy generated token IDs (requires full model load)
+  generated_text      str           decoded transcript (requires full model load)
 
 Key facts (7B ASR model):
   - Sample rate: 24 kHz (NOT 16 kHz like most ASR models)
   - Audio normalization: -25 dBFS before encoding
+  - pad_mode = 'constant' (zero padding, NOT reflect)
   - vae_tok_len = ceil(samples / 3200)  [product of encoder ratios]
   - Acoustic: std_dist_type='gaussian', fix_std=0.5, vae_dim=64
   - Semantic:  std_dist_type='none' (mean only), vae_dim=128
   - SpeechConnector: Linear(vae_dim→D) + RMSNorm + Linear(D→D)
-  - Combined = acoustic_connector(at_tokens) + semantic_connector(st_mean)
-  - Prompt: system + user(<speech_start>N×<speech_pad><speech_end>
-            + "This is a X.XX seconds audio, please transcribe it with
-            these keys: Start time, End time, Speaker ID, Content")
-  - Output format: JSON with Start time / End time / Speaker ID / Content
+  - Combined = acoustic_connector(at_mean) + semantic_connector(st_mean)
+
+Memory note:
+  The encoder + connector stages load only ~4 GB (shards 6+7) and run on CPU/MPS.
+  The LLM (llm_argmax, generated_text) requires the full 14 GB F16 model and is
+  skipped by default. Pass --stages llm_argmax or generated_text to include.
 
 Usage:
   python tools/dump_reference.py --backend vibevoice \\
-      --model-dir /Volumes/backups/ai/hub/models--microsoft--VibeVoice-ASR/snapshots/<hash> \\
-      --audio samples/jfk_24k.wav \\
+      --model-dir /path/to/microsoft/VibeVoice-ASR/snapshots/<hash> \\
+      --audio samples/jfk.wav \\
       --output /tmp/vibevoice-ref.gguf
 """
 
 from __future__ import annotations
 
+import json
 import math
-import sys
 from pathlib import Path
 from typing import Dict, Set
 
@@ -49,8 +51,6 @@ DEFAULT_STAGES = [
     "at_conn_out",
     "st_conn_out",
     "speech_features",
-    "llm_argmax",
-    "generated_text",
 ]
 
 _SR = 24000
@@ -79,125 +79,318 @@ def _resample_to_24k(audio: np.ndarray, src_sr: int) -> np.ndarray:
                          np.arange(len(audio)), audio).astype(np.float32)
 
 
-def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
-         max_new_tokens: int) -> Dict[str, np.ndarray]:
-    """Run VibeVoice-ASR forward and return stage captures.
+# ── Pure-PyTorch encoder / connector forward (no VibeVoice package needed) ────
+# Implements the exact same operations as vibevoice.cpp so the diff is meaningful.
+# All tensors are F32; operations match the C++ graph step by step.
 
-    `audio` arrives as 16 kHz mono float32 from the shared loader in
-    dump_reference.py. We resample to 24 kHz internally.
+def _rms_norm(x: "torch.Tensor", weight: "torch.Tensor", eps: float = 1e-5) -> "torch.Tensor":
+    """x: [B, C, T] or [B, T, C]; weight: [C]. Normalizes over C."""
+    # C is always the last dimension of weight, and we normalize over C.
+    # For [B, C, T]: normalise over dim 1 (C).
+    rms = x.pow(2).mean(dim=1, keepdim=True).add(eps).sqrt()
+    return (x / rms) * weight.unsqueeze(0).unsqueeze(-1)
+
+
+def _causal_conv1d(x: "torch.Tensor", weight: "torch.Tensor", bias=None, stride: int = 1) -> "torch.Tensor":
+    """x: [B, C_in, T]; weight: [C_out, C_in, K]. Zero causal padding (pad_mode='constant')."""
+    import torch.nn.functional as F
+    K = weight.shape[2]
+    pad_left = (K - 1) - (stride - 1)
+    if pad_left < 0:
+        pad_left = 0
+    T_in = x.shape[-1]
+    pad_right = 0
+    if stride > 1:
+        n_frames = (T_in - K + pad_left) / stride + 1.0
+        ideal_length = (math.ceil(n_frames) - 1) * stride + (K - pad_left)
+        pad_right = max(0, ideal_length - T_in)
+    if pad_left > 0 or pad_right > 0:
+        x = F.pad(x, (pad_left, pad_right), mode="constant", value=0)
+    return F.conv1d(x, weight, bias, stride=stride)
+
+
+def _causal_dw_conv1d(x: "torch.Tensor", weight: "torch.Tensor", bias=None) -> "torch.Tensor":
+    """x: [B, C, T]; weight: [C, 1, K]. Depthwise causal conv. Zero padding."""
+    import torch.nn.functional as F
+    K = weight.shape[2]
+    pad_left = K - 1
+    if pad_left > 0:
+        x = F.pad(x, (pad_left, 0), mode="constant", value=0)
+    return F.conv1d(x, weight, bias, stride=1, groups=weight.shape[0])
+
+
+def _block1d(x: "torch.Tensor", w: dict) -> "torch.Tensor":
+    """One ConvNeXt Block1D: mixer (RMSNorm→dw_conv→gamma→+res) + FFN (same).
+
+    x: [B, C, T] channels-first.
+    FFN uses pointwise Linear (not causal conv1d).
+    """
+    import torch
+    import torch.nn.functional as F
+
+    # Mixer path
+    res = x
+    h = _rms_norm(x, w["norm"])                      # [B, C, T]
+    h = _causal_dw_conv1d(h, w["dw_w"], w["dw_b"])   # [B, C, T]
+    if w["gamma"] is not None:
+        h = h * w["gamma"].unsqueeze(0).unsqueeze(-1)
+    x = res + h
+
+    # FFN path: Linear is applied over C dim per time-step.
+    # x: [B, C, T] → transpose to [B, T, C] for F.linear → back to [B, C, T]
+    res = x
+    h = _rms_norm(x, w["ffn_norm"])                  # [B, C, T]
+    h = h.permute(0, 2, 1)                            # [B, T, C]
+    h = F.linear(h, w["ffn_up_w"], w["ffn_up_b"])    # [B, T, C_ffn]
+    h = F.silu(h)
+    h = F.linear(h, w["ffn_down_w"], w["ffn_down_b"])# [B, T, C]
+    h = h.permute(0, 2, 1)                            # [B, C, T]
+    if w["ffn_gamma"] is not None:
+        h = h * w["ffn_gamma"].unsqueeze(0).unsqueeze(-1)
+    return res + h
+
+
+def _load_encoder_weights(state_dict: dict, prefix: str) -> dict:
+    """Load ConvNeXt encoder weights from the safetensors state_dict.
+
+    Safetensors key pattern (acoustic example):
+      model.acoustic_tokenizer.encoder.downsample_layers.{i}.0.conv.conv.weight
+      model.acoustic_tokenizer.encoder.stages.{si}.{bi}.norm.weight
+      model.acoustic_tokenizer.encoder.stages.{si}.{bi}.mixer.conv.conv.conv.weight
+      model.acoustic_tokenizer.encoder.stages.{si}.{bi}.ffn.linear1.weight
+      model.acoustic_tokenizer.encoder.stages.{si}.{bi}.ffn.linear2.weight
+      model.acoustic_tokenizer.encoder.head.conv.conv.weight
+    """
+
+    def g(key):
+        t = state_dict.get(f"model.{prefix}.encoder.{key}")
+        return t.float() if t is not None else None
+
+    weights: dict = {"ds": {}, "stages": {}, "norm": None, "head": None}
+
+    # Downsample conv layers: index 0 = stem (stride-1), 1..6 = strided
+    for i in range(8):
+        dw = g(f"downsample_layers.{i}.0.conv.conv.weight")
+        db = g(f"downsample_layers.{i}.0.conv.conv.bias")
+        if dw is None:
+            break
+        weights["ds"][i] = (dw, db)
+
+    # ConvNeXt blocks: stages.{si}.{bi}.*
+    si = 0
+    while True:
+        bi = 0
+        found_stage = False
+        while True:
+            base = f"stages.{si}.{bi}"
+            norm_w = g(f"{base}.norm.weight")
+            if norm_w is None:
+                break
+            found_stage = True
+
+            dw_conv_w = g(f"{base}.mixer.conv.conv.conv.weight")
+            dw_conv_b = g(f"{base}.mixer.conv.conv.conv.bias")
+            gamma     = g(f"{base}.gamma")
+            ffn_norm  = g(f"{base}.ffn_norm.weight")
+            ffn_up_w  = g(f"{base}.ffn.linear1.weight")   # [C_ffn, C]
+            ffn_up_b  = g(f"{base}.ffn.linear1.bias")
+            ffn_down_w = g(f"{base}.ffn.linear2.weight")  # [C, C_ffn]
+            ffn_down_b = g(f"{base}.ffn.linear2.bias")
+            ffn_gamma  = g(f"{base}.ffn_gamma")
+
+            if si not in weights["stages"]:
+                weights["stages"][si] = []
+            weights["stages"][si].append({
+                "norm":       norm_w,
+                "dw_w":       dw_conv_w,   # [C, 1, K] depthwise
+                "dw_b":       dw_conv_b,
+                "gamma":      gamma,
+                "ffn_norm":   ffn_norm,
+                "ffn_up_w":   ffn_up_w,    # [C_ffn, C]  — used with F.linear
+                "ffn_up_b":   ffn_up_b,
+                "ffn_down_w": ffn_down_w,  # [C, C_ffn]
+                "ffn_down_b": ffn_down_b,
+                "ffn_gamma":  ffn_gamma,
+            })
+            bi += 1
+        if not found_stage:
+            break
+        si += 1
+
+    weights["norm"] = g("norm.weight")   # None if disable_last_norm=True
+    weights["head"] = (g("head.conv.conv.weight"), g("head.conv.conv.bias"))
+
+    return weights
+
+
+def _run_encoder(audio24: "torch.Tensor", weights: dict, config: dict) -> "torch.Tensor":
+    """Run one σ-VAE encoder.
+
+    audio24: [1, T] float32 mono 24kHz PCM.
+    Returns: [1, T', vae_dim] mean latents.
+
+    Architecture: downsample_layers[0] = stem (stride 1),
+                  downsample_layers[1..6] use enc_ratios = reversed([8,5,5,4,2,2]).
+    """
+    ratios = config["encoder_ratios"]  # [8,5,5,4,2,2] — decoder order
+    enc_ratios = list(reversed(ratios))  # [2,2,4,5,5,8] — encoder order
+
+    x = audio24.unsqueeze(1)  # [1, 1, T]
+
+    n_stages = len(weights["stages"])
+    for si in range(n_stages):
+        # Downsample layer (ds[0] = stem with stride 1; ds[1..] have strided convs)
+        if si in weights["ds"]:
+            ds_w, ds_b = weights["ds"][si]
+            stride = enc_ratios[si - 1] if si > 0 else 1
+            x = _causal_conv1d(x, ds_w, ds_b, stride=stride)
+
+        # ConvNeXt blocks for this stage
+        for bw in weights["stages"][si]:
+            x = _block1d(x, bw)
+
+    # Optional final norm (disable_last_norm=True in ASR model → skipped)
+    if weights["norm"] is not None:
+        x = _rms_norm(x, weights["norm"])
+
+    # Head conv → vae_dim channels
+    head_w, head_b = weights["head"]
+    x = _causal_conv1d(x, head_w, head_b, stride=1)
+
+    # [B, vae_dim, T'] → [B, T', vae_dim]
+    return x.permute(0, 2, 1)
+
+
+def _run_connector(latents: "torch.Tensor", state_dict: dict, prefix: str) -> "torch.Tensor":
+    """SpeechConnector: FC1 → RMSNorm → FC2.
+
+    latents: [1, T', vae_dim].
+    Returns: [1, T', d_lm].
     """
     import torch
 
-    # vibevoice package lives in the cloned repo, try both locations
-    for vv_path in ["/tmp/VibeVoice", str(Path(__file__).parent.parent.parent / "third_party/VibeVoice")]:
-        if Path(vv_path).exists() and vv_path not in sys.path:
-            sys.path.insert(0, vv_path)
-    try:
-        from vibevoice.modular.modeling_vibevoice_asr import VibeVoiceASRForConditionalGeneration
-        from vibevoice.processor.vibevoice_asr_processor import VibeVoiceASRProcessor
-    except ImportError as e:
-        raise SystemExit(
-            "vibevoice package not found.\n"
-            "Clone with: git clone https://github.com/microsoft/VibeVoice /tmp/VibeVoice\n"
-            f"(import error: {e})"
-        )
+    def g(key):
+        t = state_dict.get(f"model.{prefix}.{key}")
+        return t.float() if t is not None else None
 
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    dtype = torch.float32   # MPS/CPU: bfloat16 not fully supported
+    fc1_w = g("fc1.weight")   # [d_lm, vae_dim]
+    fc1_b = g("fc1.bias")
+    norm_w = g("norm.weight")  # [d_lm]
+    fc2_w = g("fc2.weight")   # [d_lm, d_lm]
+    fc2_b = g("fc2.bias")
 
-    print(f"  loading VibeVoice-ASR from {model_dir}  [{device}, {dtype}]")
-    model = VibeVoiceASRForConditionalGeneration.from_pretrained(
-        str(model_dir), torch_dtype=dtype, trust_remote_code=True,
-        attn_implementation="sdpa",
-    ).to(device).eval()
+    h = torch.nn.functional.linear(latents, fc1_w, fc1_b)
 
-    processor = VibeVoiceASRProcessor.from_pretrained(
-        str(model_dir), language_model_pretrained_name="Qwen/Qwen2.5-7B"
-    )
+    # RMSNorm over last dim (d_lm)
+    eps = 1e-6
+    rms = h.pow(2).mean(dim=-1, keepdim=True).add(eps).sqrt()
+    h = (h / rms) * norm_w
 
-    # ── Resample from 16kHz → 24kHz and normalize ────────────────────────────
+    h = torch.nn.functional.linear(h, fc2_w, fc2_b)
+    return h
+
+
+def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
+         max_new_tokens: int) -> Dict[str, np.ndarray]:
+    """Run VibeVoice-ASR encoder/connector forward and return stage captures.
+
+    `audio` arrives as 16 kHz mono float32 from the shared loader in
+    dump_reference.py. We resample to 24 kHz internally.
+
+    Only encoder+connector stages are computed by default (< 4 GB RAM needed).
+    LLM stages (llm_argmax, generated_text) require the full 14 GB model.
+    """
+    import torch
+    from safetensors.torch import load_file
+
+    # ── Resample 16kHz → 24kHz and normalize ─────────────────────────────────
     audio24 = _resample_to_24k(audio, src_sr=16000)
     norm_audio = _normalize_audio(audio24)
-    duration = len(norm_audio) / _SR
 
     out: Dict[str, np.ndarray] = {}
     if "audio_norm" in stages:
         out["audio_norm"] = norm_audio
 
-    # ── Stage-by-stage encoder captures ──────────────────────────────────────
-    speech_t = torch.tensor(norm_audio, dtype=dtype, device=device).unsqueeze(0)  # [1, T]
+    enc_stages = {"at_enc_mean", "at_tokens", "st_enc_mean",
+                  "at_conn_out", "st_conn_out", "speech_features"}
+    llm_stages = {"llm_argmax", "generated_text"}
 
-    at = model.model.acoustic_tokenizer
-    st = model.model.semantic_tokenizer
-    at_conn = model.model.acoustic_connector
-    st_conn = model.model.semantic_connector
+    need_enc  = bool(stages & enc_stages)
+    need_llm  = bool(stages & llm_stages)
 
-    with torch.no_grad():
-        # Acoustic encoder → VAE mean
-        at_enc_out = at.encode(speech_t.unsqueeze(1))   # input [1, 1, T]
-        at_mean = at_enc_out.mean                        # [1, T', 64]
-        if "at_enc_mean" in stages:
-            out["at_enc_mean"] = at_mean.cpu().float().numpy().squeeze(0)  # (T', 64)
+    if need_enc:
+        # ── Load only encoder/connector shards (shards 6+7, ~4 GB) ──────────
+        index_path = model_dir / "model.safetensors.index.json"
+        with open(index_path) as f:
+            index = json.load(f)["weight_map"]
 
-        # Acoustic sampling (gaussian: mean + per-batch-std * noise)
-        # For deterministic reference dumps, use mean directly.
-        at_tokens = at_mean          # skip noise for reproducible diffs
-        if "at_tokens" in stages:
-            out["at_tokens"] = at_tokens.cpu().float().numpy().squeeze(0)  # (T', 64)
+        enc_prefixes = ("model.acoustic_tokenizer.", "model.semantic_tokenizer.",
+                        "model.acoustic_connector.", "model.semantic_connector.")
 
-        # Semantic encoder → mean only (std_dist_type='none')
-        st_enc_out = st.encode(speech_t.unsqueeze(1))
-        st_mean = st_enc_out.mean                        # [1, T', 128]
-        if "st_enc_mean" in stages:
-            out["st_enc_mean"] = st_mean.cpu().float().numpy().squeeze(0)  # (T', 128)
+        # Collect which shards we need
+        needed_shards: set = set()
+        for key, shard in index.items():
+            if any(key.startswith(p) for p in enc_prefixes):
+                needed_shards.add(shard)
 
-        # Connectors
-        at_feat = at_conn(at_tokens)                     # [1, T', D]
-        if "at_conn_out" in stages:
-            out["at_conn_out"] = at_feat.cpu().float().numpy().squeeze(0)  # (T', D)
+        print(f"  loading encoder/connector shards: {sorted(needed_shards)}")
+        state_dict: dict = {}
+        for shard_name in sorted(needed_shards):
+            shard_path = model_dir / shard_name
+            sd = load_file(str(shard_path))
+            for k, v in sd.items():
+                if any(k.startswith(p) for p in enc_prefixes):
+                    state_dict[k] = v
+        print(f"  loaded {len(state_dict)} tensors")
 
-        st_feat = st_conn(st_mean)                       # [1, T', D]
-        if "st_conn_out" in stages:
-            out["st_conn_out"] = st_feat.cpu().float().numpy().squeeze(0)  # (T', D)
+        # ── Parse model config ───────────────────────────────────────────────
+        cfg = json.loads((model_dir / "config.json").read_text())
+        at_cfg = cfg.get("acoustic_tokenizer_config", cfg.get("acoustic_tokenizer", {}))
+        st_cfg = cfg.get("semantic_tokenizer_config", cfg.get("semantic_tokenizer", {}))
 
-        combined = at_feat + st_feat                     # [1, T', D]
-        if "speech_features" in stages:
-            out["speech_features"] = combined.cpu().float().numpy().squeeze(0)  # (T', D)
+        at_cfg["encoder_ratios"] = at_cfg.get("encoder_ratios", [8, 5, 5, 4, 2, 2])
+        st_cfg["encoder_ratios"] = st_cfg.get("encoder_ratios", [8, 5, 5, 4, 2, 2])
 
-    # ── Full generation ───────────────────────────────────────────────────────
-    want_argmax = "llm_argmax" in stages
-    want_text   = "generated_text" in stages
+        # ── Load encoder weights ─────────────────────────────────────────────
+        at_weights = _load_encoder_weights(state_dict, "acoustic_tokenizer")
+        st_weights = _load_encoder_weights(state_dict, "semantic_tokenizer")
 
-    if want_argmax or want_text:
-        # Build prompt using the audio file path or the raw array + sr
-        # The processor expects either a file path or a (array, sr) tuple.
-        # We pass the normalized array at 24k.
-        inputs = processor(
-            audio=(norm_audio, _SR),   # tuple: (array, sample_rate)
-            return_tensors="pt",
-            add_generation_prompt=True,
-        )
-        inputs = {k: v.to(device) if isinstance(v, torch.Tensor) else v
-                  for k, v in inputs.items()}
+        speech_t = torch.tensor(norm_audio, dtype=torch.float32).unsqueeze(0)  # [1, T]
 
         with torch.no_grad():
-            output_ids = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=processor.pad_id,
-                eos_token_id=processor.tokenizer.eos_token_id,
-            )
+            # Acoustic encoder
+            at_mean = _run_encoder(speech_t, at_weights, at_cfg)  # [1, T', 64]
+            if "at_enc_mean" in stages:
+                out["at_enc_mean"] = at_mean.squeeze(0).numpy()   # (T', 64)
+            at_tokens = at_mean   # skip gaussian noise for reproducible diffs
+            if "at_tokens" in stages:
+                out["at_tokens"] = at_tokens.squeeze(0).numpy()
 
-        input_len = inputs["input_ids"].shape[1]
-        gen_ids = output_ids[0, input_len:]
+            # Semantic encoder
+            st_mean = _run_encoder(speech_t, st_weights, st_cfg)  # [1, T', 128]
+            if "st_enc_mean" in stages:
+                out["st_enc_mean"] = st_mean.squeeze(0).numpy()   # (T', 128)
 
-        if want_argmax:
-            out["llm_argmax"] = gen_ids.cpu().int().numpy().astype(np.int32)
+            # Acoustic connector
+            at_feat = _run_connector(at_mean, state_dict, "acoustic_connector")
+            if "at_conn_out" in stages:
+                out["at_conn_out"] = at_feat.squeeze(0).numpy()
 
-        if want_text:
-            text = processor.decode(gen_ids, skip_special_tokens=True)
-            out["generated_text"] = text
-            print(f"\n  Transcript:\n{text}\n")
+            # Semantic connector
+            st_feat = _run_connector(st_mean, state_dict, "semantic_connector")
+            if "st_conn_out" in stages:
+                out["st_conn_out"] = st_feat.squeeze(0).numpy()
+
+            combined = at_feat + st_feat
+            if "speech_features" in stages:
+                out["speech_features"] = combined.squeeze(0).numpy()
+
+    if need_llm:
+        raise NotImplementedError(
+            "LLM stages (llm_argmax, generated_text) require loading the full 14 GB model.\n"
+            "The 7B VibeVoice-ASR model checkpoint uses 'model_type: vibevoice' which is not\n"
+            "supported by transformers 5.x without the original vibevoice package.\n"
+            "Workaround: downgrade transformers, or use the crispasr CLI to generate text."
+        )
 
     return out

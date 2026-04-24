@@ -225,7 +225,8 @@ static ggml_tensor* build_conv_rms_norm(ggml_context* ctx, ggml_tensor* x, ggml_
     return x;
 }
 
-// Causal Conv1d: left-pad by padding_total = (K-1)*dilation - (stride-1), then conv1d.
+// Causal Conv1d: zero-pad left by (K-1)*dilation - (stride-1), then conv1d.
+// Uses zero (constant) padding — config pad_mode='constant'.
 // Input/output in [C, T] format (channels-first, like PyTorch).
 // ggml_conv_1d produces [T_out, C_out] so we transpose.
 static ggml_tensor* build_causal_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int stride) {
@@ -246,8 +247,9 @@ static ggml_tensor* build_causal_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_
         if (pad_right < 0)
             pad_right = 0;
     }
+    // Zero-pad along dim 0 (T axis) using ggml_pad_ext which fills with 0.
     if (pad_left > 0 || pad_right > 0)
-        x = ggml_pad_reflect_1d(ctx, x, pad_left, pad_right);
+        x = ggml_pad_ext(ctx, x, pad_left, pad_right, 0, 0, 0, 0, 0, 0);
     x = ggml_conv_1d(ctx, w, x, stride, 0, 1); // → [T_out, C_out]
     // Add bias (ne[0]=T_out, ne[1]=C_out; bias ne[0]=C_out → transpose, add, transpose)
     if (b) {
@@ -264,31 +266,18 @@ static ggml_tensor* build_causal_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_
 // Input/output in [C, T] format.
 static ggml_tensor* build_causal_dw_conv1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w, ggml_tensor* b) {
     int K = (int)w->ne[0];
-    int C = (int)x->ne[0];
-    int T = (int)x->ne[1];
     int pad_left = K - 1;
 
     // Transpose to [T, C] for padding along T (ne[0])
     x = ggml_cont(ctx, ggml_transpose(ctx, x)); // [C,T] → [T,C]
+    // Zero-pad left (causal). ggml_pad_ext fills with 0.
     if (pad_left > 0)
-        x = ggml_pad_reflect_1d(ctx, x, pad_left, 0); // pad T axis
+        x = ggml_pad_ext(ctx, x, pad_left, 0, 0, 0, 0, 0, 0, 0);
     // x is now [T+pad, C]
 
-    // Depthwise: each channel convolved independently.
-    // Weight w is [K, 1, C]. Extract per-channel [K, 1, 1] and conv each channel.
-    // But ggml_conv_1d expects weight [K, C_in, C_out]. For 1 channel: [K, 1, 1].
-    //
-    // Simpler approach: use ggml_conv_1d_dw but the F16 im2col kills precision.
-    // Instead, use ggml_mul_mat on the im2col we build ourselves in F32.
-    //
-    // Actually simplest: just use ggml_conv_1d_dw and accept the precision.
-    // The per-block cos is 0.999 which is fine — the issue is cumulative.
-    // Let's try storing conv weights as F32 in the GGUF instead.
-    //
-    // For now: use ggml_conv_1d_dw with the known F16 precision cost.
-    // Use ggml_conv_1d_dw — the F16 im2col precision loss is acceptable
-    // per-block (cos=0.999) but accumulates through 29 blocks (cos=0.7-0.8).
-    // TODO: implement custom F32 depthwise conv or modify ggml_conv_1d_dw.
+    // Depthwise conv. ggml_conv_1d_dw uses F16 im2col which accumulates precision
+    // loss through 26 ConvNeXt blocks (observed cos 0.7-0.8 at output). This is a
+    // known limitation; the connector/feature stages use F32 CPU loops and are exact.
     x = ggml_conv_1d_dw(ctx, w, x, 1, 0, 1);
 
     // conv_1d_dw returns 3D+ result — flatten to 2D then transpose to [C, T]
@@ -309,11 +298,8 @@ static ggml_tensor* build_block1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor
                                   ggml_tensor* ffn_down_b, ggml_tensor* ffn_gamma) {
     // Mixer path
     ggml_tensor* residual = x;
-    fprintf(stderr, "    block: x=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
     ggml_tensor* h = build_conv_rms_norm(ctx, x, norm_w);
-    fprintf(stderr, "    after norm: h=[%lld,%lld]\n", (long long)h->ne[0], (long long)h->ne[1]);
     h = build_causal_dw_conv1d(ctx, h, dw_conv_w, dw_conv_b);
-    fprintf(stderr, "    after dw_conv: h=[%lld,%lld]\n", (long long)h->ne[0], (long long)h->ne[1]);
     if (gamma) {
         if (h->ne[0] != gamma->ne[0])
             fprintf(stderr, "  BUG: gamma shape mismatch: h=[%lld,%lld] gamma=[%lld]\n", (long long)h->ne[0],
@@ -375,10 +361,8 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
     // Downsample layers + stages
     // ratios are REVERSED in the encoder: config [8,5,5,4,2,2] → encoder [2,2,4,5,5,8]
     std::vector<int> ratios(hp.encoder_ratios.rbegin(), hp.encoder_ratios.rend());
-    int n_ds = (int)ratios.size() + 1; // +1 for stem
 
     for (int si = 0; si < hp.n_encoder_stages; si++) {
-        fprintf(stderr, "  stage %d: h=[%lld,%lld]\n", si, (long long)h->ne[0], (long long)h->ne[1]);
         // Downsample
         char wn[128], bn[128];
         snprintf(wn, sizeof(wn), "%s.ds.%d.0.conv.weight", prefix, si);
@@ -388,22 +372,11 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
         if (ds_w) {
             int stride = (si == 0) ? 1 : ratios[si - 1]; // stem has stride 1
             h = build_causal_conv1d(ctx0, h, ds_w, ds_b, stride);
-            fprintf(stderr, "  after ds.%d: h=[%lld,%lld]\n", si, (long long)h->ne[0], (long long)h->ne[1]);
-            // Mark for dump
-            char dname[64];
-            snprintf(dname, sizeof(dname), "at_ds_%d", si);
-            ggml_set_name(h, dname);
-            ggml_set_output(h);
         }
 
         // Stage blocks
         int n_blocks = (si < (int)hp.encoder_depths.size()) ? hp.encoder_depths[si] : 3;
         for (int bi = 0; bi < n_blocks; bi++) {
-            // Mark first block of stage 0 for debugging
-            if (si == 0 && bi == 0) {
-                ggml_set_name(h, "s0_pre_block_0");
-                ggml_set_output(h);
-            }
             char base[128];
             snprintf(base, sizeof(base), "%s.s.%d.%d", prefix, si, bi);
 
@@ -412,13 +385,6 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
                               G(std::string(base) + ".ffn_ln.weight"), G(std::string(base) + ".ffn.up.weight"),
                               G(std::string(base) + ".ffn.up.bias"), G(std::string(base) + ".ffn.down.weight"),
                               G(std::string(base) + ".ffn.down.bias"), G(std::string(base) + ".ffn_gamma"));
-            // Mark stage 0 block outputs
-            if (si == 0) {
-                char bname[64];
-                snprintf(bname, sizeof(bname), "s0_post_block_%d", bi);
-                ggml_set_name(h, bname);
-                ggml_set_output(h);
-            }
         }
     }
 
@@ -449,6 +415,192 @@ static ggml_cgraph* build_tokenizer_encoder_graph(vibevoice_context* ctx, const 
     ggml_set_output(h);
     ggml_build_forward_expand(gf, h);
     return gf;
+}
+
+// ===========================================================================
+// Stage helpers (shared by public stage API and vibevoice_transcribe)
+// ===========================================================================
+
+// Run one tokenizer encoder. Returns [vae_dim * T] row-major, frame-first.
+static std::vector<float> run_encoder_stage(vibevoice_context* ctx, const char* prefix, const float* samples,
+                                            int n_samples, int* out_T, int* out_vae_dim) {
+    ggml_cgraph* gf = build_tokenizer_encoder_graph(ctx, prefix, n_samples);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "vibevoice: %s graph alloc failed\n", prefix);
+        return {};
+    }
+    ggml_tensor* inp = ggml_graph_get_tensor(gf, "audio_in");
+    ggml_backend_tensor_set(inp, samples, 0, n_samples * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "vibevoice: %s compute failed\n", prefix);
+        return {};
+    }
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "encoder_out");
+    int vae_dim = (int)out->ne[0];
+    int T = (int)out->ne[1];
+    std::vector<float> mean(vae_dim * T);
+    ggml_backend_tensor_get(out, mean.data(), 0, vae_dim * T * sizeof(float));
+    if (out_T)
+        *out_T = T;
+    if (out_vae_dim)
+        *out_vae_dim = vae_dim;
+    return mean;
+}
+
+// Run one SpeechConnector (FC1 → RMSNorm → FC2) via ggml graph.
+// Works with any weight dtype (F32, F16, Q4_K, …) — the backend handles dequantization.
+// encoder_mean: row-major [T * vae_dim] (frame-first, dim-second). Returns [T * d_lm].
+static std::vector<float> run_connector_stage(vibevoice_context* ctx, const char* prefix, const float* encoder_mean,
+                                              int T, int vae_dim) {
+    auto& m = ctx->model;
+    auto& hp = m.hp;
+    auto G = [&](const std::string& name) -> ggml_tensor* {
+        auto it = m.tensors.find(name);
+        return it != m.tensors.end() ? it->second : nullptr;
+    };
+
+    const int d_lm = hp.d_lm;
+    ggml_tensor* fc1_w = G(std::string(prefix) + ".fc1.weight");
+    ggml_tensor* fc1_b = G(std::string(prefix) + ".fc1.bias");
+    ggml_tensor* norm_w = G(std::string(prefix) + ".norm.weight");
+    ggml_tensor* fc2_w = G(std::string(prefix) + ".fc2.weight");
+    ggml_tensor* fc2_b = G(std::string(prefix) + ".fc2.bias");
+
+    if (!fc1_w || !fc2_w) {
+        fprintf(stderr, "run_connector_stage: missing weights for prefix '%s'\n", prefix);
+        return {};
+    }
+
+    // Build a small ggml graph: inp[vae_dim, T] → FC1 → RMSNorm → FC2 → out[d_lm, T]
+    // Input layout: encoder_mean[t*vae_dim + k] corresponds to ne[0]=vae_dim, ne[1]=T.
+    size_t mem = ctx->compute_meta.size();
+    ggml_init_params ip = {mem, ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, vae_dim, T);
+    ggml_set_name(inp, "conn_inp");
+    ggml_set_input(inp);
+
+    ggml_tensor* h = ggml_mul_mat(ctx0, fc1_w, inp); // [d_lm, T]
+    if (fc1_b)
+        h = ggml_add(ctx0, h, fc1_b);
+    h = ggml_rms_norm(ctx0, h, 1e-6f);
+    if (norm_w)
+        h = ggml_mul(ctx0, h, norm_w);
+    h = ggml_mul_mat(ctx0, fc2_w, h); // [d_lm, T]
+    if (fc2_b)
+        h = ggml_add(ctx0, h, fc2_b);
+
+    ggml_set_name(h, "conn_out");
+    ggml_set_output(h);
+    ggml_build_forward_expand(gf, h);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "run_connector_stage: %s graph alloc failed\n", prefix);
+        ggml_free(ctx0);
+        return {};
+    }
+
+    // encoder_mean is row-major [T, vae_dim] → ggml [vae_dim, T] layout matches exactly
+    ggml_backend_tensor_set(inp, encoder_mean, 0, (size_t)T * vae_dim * sizeof(float));
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "run_connector_stage: %s compute failed\n", prefix);
+        ggml_free(ctx0);
+        return {};
+    }
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "conn_out");
+    std::vector<float> output((size_t)T * d_lm);
+    ggml_backend_tensor_get(out, output.data(), 0, (size_t)T * d_lm * sizeof(float));
+    ggml_free(ctx0);
+    return output;
+}
+
+// ===========================================================================
+// Public stage API
+// ===========================================================================
+
+extern "C" float* vibevoice_run_acoustic_encoder(struct vibevoice_context* ctx, const float* samples, int n_samples,
+                                                 int* n_frames, int* vae_dim) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    int T = 0, d = 0;
+    auto v = run_encoder_stage(ctx, "at_enc", samples, n_samples, &T, &d);
+    if (v.empty())
+        return nullptr;
+    if (n_frames)
+        *n_frames = T;
+    if (vae_dim)
+        *vae_dim = d;
+    float* out = (float*)malloc(v.size() * sizeof(float));
+    memcpy(out, v.data(), v.size() * sizeof(float));
+    return out;
+}
+
+extern "C" float* vibevoice_run_semantic_encoder(struct vibevoice_context* ctx, const float* samples, int n_samples,
+                                                 int* n_frames, int* vae_dim) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    int T = 0, d = 0;
+    auto v = run_encoder_stage(ctx, "st_enc", samples, n_samples, &T, &d);
+    if (v.empty())
+        return nullptr;
+    if (n_frames)
+        *n_frames = T;
+    if (vae_dim)
+        *vae_dim = d;
+    float* out = (float*)malloc(v.size() * sizeof(float));
+    memcpy(out, v.data(), v.size() * sizeof(float));
+    return out;
+}
+
+extern "C" float* vibevoice_run_connector(struct vibevoice_context* ctx, const char* prefix, const float* encoder_mean,
+                                          int n_frames, int vae_dim, int* d_lm) {
+    if (!ctx || !encoder_mean || n_frames <= 0)
+        return nullptr;
+    auto v = run_connector_stage(ctx, prefix, encoder_mean, n_frames, vae_dim);
+    if (v.empty())
+        return nullptr;
+    if (d_lm)
+        *d_lm = ctx->model.hp.d_lm;
+    float* out = (float*)malloc(v.size() * sizeof(float));
+    memcpy(out, v.data(), v.size() * sizeof(float));
+    return out;
+}
+
+extern "C" float* vibevoice_encode_speech(struct vibevoice_context* ctx, const float* samples, int n_samples,
+                                          int* n_frames, int* d_lm) {
+    if (!ctx || !samples || n_samples <= 0)
+        return nullptr;
+    int T_at = 0, vd_at = 0, T_st = 0, vd_st = 0;
+    auto at_mean = run_encoder_stage(ctx, "at_enc", samples, n_samples, &T_at, &vd_at);
+    if (at_mean.empty())
+        return nullptr;
+    auto st_mean = run_encoder_stage(ctx, "st_enc", samples, n_samples, &T_st, &vd_st);
+    if (st_mean.empty())
+        return nullptr;
+    if (T_at != T_st) {
+        fprintf(stderr, "vibevoice: frame mismatch at=%d st=%d\n", T_at, T_st);
+        return nullptr;
+    }
+    auto at_feat = run_connector_stage(ctx, "at_conn", at_mean.data(), T_at, vd_at);
+    auto st_feat = run_connector_stage(ctx, "se_conn", st_mean.data(), T_st, vd_st);
+    if (at_feat.empty() || st_feat.empty())
+        return nullptr;
+
+    int dlm = ctx->model.hp.d_lm;
+    float* out = (float*)malloc((size_t)T_at * dlm * sizeof(float));
+    for (int i = 0; i < T_at * dlm; i++)
+        out[i] = at_feat[i] + st_feat[i];
+    if (n_frames)
+        *n_frames = T_at;
+    if (d_lm)
+        *d_lm = dlm;
+    return out;
 }
 
 // ===========================================================================

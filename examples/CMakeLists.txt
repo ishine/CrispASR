@@ -129,6 +129,7 @@ else()
     add_subdirectory(voxtral-test-llm)
     add_subdirectory(voxtral-test-encoder)
     add_subdirectory(voxtral-test-e2e)
+    add_subdirectory(vibevoice-test-stages)
 
     # NOTE: per-model user-facing CLIs (cohere-main, parakeet-main,
     # canary-main, qwen3-asr-main, voxtral-main, voxtral4b-main,
