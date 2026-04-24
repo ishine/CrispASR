@@ -252,8 +252,9 @@ No response. HF model card has no license field.
 
 | # | Optimization | Applies to | Expected gain | Effort |
 |---|---|---|---|---|
-| O1 | `ggml_soft_max_ext` with baked scale | All attention layers (all backends) | ~5% attn (saves 1 op/layer) | Low |
+| O1 | `ggml_soft_max_ext` with baked scale | All attention layers (all backends) | Already done (flash_attn_ext) | — |
 | O2 | Fused QKV pre-merge (single matmul) | LLM decoders (voxtral, qwen3, granite, glm, omniasr-llm) | ~10-15% attn | Medium |
+| **O11** | **wav2vec2 CNN → ggml graph** | wav2vec2 backend | **~10x** (95s→~10s est.) | Medium |
 | O3 | Temperature sampling for more backends | glm-asr, kyutai-stt, moonshine, omniasr-LLM | Feature parity | Low |
 | O4 | Beam search for LLM backends | All Audio-LLM backends (via core_greedy_decode) | Quality improvement | High |
 | O5 | Pipelined mel+encode threading | LLM backends on multi-core CPU | ~15-20% | Medium |
