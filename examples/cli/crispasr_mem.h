@@ -61,8 +61,8 @@ static inline double crispasr_estimate_mem_mb(double audio_seconds, const char* 
 static inline bool crispasr_check_audio_length(double audio_seconds, int chunk_seconds, bool verbose) {
     if (audio_seconds > (double)chunk_seconds * 1.5) {
         if (verbose)
-            fprintf(stderr, "crispasr[mem]: audio %.1fs exceeds chunk limit %ds — will auto-chunk\n",
-                    audio_seconds, chunk_seconds);
+            fprintf(stderr, "crispasr[mem]: audio %.1fs exceeds chunk limit %ds — will auto-chunk\n", audio_seconds,
+                    chunk_seconds);
         return true;
     }
     return false;
