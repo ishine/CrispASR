@@ -167,9 +167,9 @@ each backend. High-value gaps to close:
   (decoder + cross-attention KV caches both use GGML_TYPE_F16).
 
 ### qwen3 / voxtral
-- **[later]** Stop recreating `ggml_backend_sched` on every compute
-  call (encoder, prefill, each decode step). Create once at init with
-  worst-case node budget; use `ggml_backend_sched_reset()` between
+- **[DONE]** ~~Stop recreating `ggml_backend_sched` on every compute
+  call.~~ All backends now create sched once at init and use
+  `ggml_backend_sched_reset()` between
   calls. ~80 LOC per runtime.
 
 ### voxtral4b
