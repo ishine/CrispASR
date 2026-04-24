@@ -135,9 +135,13 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, wh
     const bool want_auto_lang = params.detect_language || params.language == "auto";
     const bool has_native_lid = (backend.capabilities() & CAP_LANGUAGE_DETECT) != 0;
     const bool lid_disabled = params.lid_backend == "off" || params.lid_backend == "none";
+    crispasr_lid_info lid_info; // stored for JSON output
     if (want_auto_lang && !has_native_lid && !lid_disabled) {
         crispasr_lid_result lid;
         if (crispasr_detect_language_cli(samples.data(), (int)samples.size(), params, lid)) {
+            lid_info.lang_code = lid.lang_code;
+            lid_info.confidence = lid.confidence;
+            lid_info.source = lid.source;
             params.language = lid.lang_code;
             if (params.source_lang.empty()) {
                 params.source_lang = lid.lang_code;
@@ -264,7 +268,8 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, wh
             crispasr_write_lrc(crispasr_make_out_path(fname_inp, ".lrc"), disp);
         if (params.output_jsn)
             crispasr_write_json(crispasr_make_out_path(fname_inp, ".json"), all_segs, backend.name(), params.model,
-                                params.language, params.output_jsn_full);
+                                params.language, params.output_jsn_full,
+                                lid_info.lang_code.empty() ? nullptr : &lid_info);
         return 0;
     }
 
@@ -405,7 +410,7 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, wh
         crispasr_write_lrc(crispasr_make_out_path(fname_inp, ".lrc"), disp);
     if (params.output_jsn)
         crispasr_write_json(crispasr_make_out_path(fname_inp, ".json"), all_segs, backend.name(), params.model,
-                            params.language, params.output_jsn_full);
+                            params.language, params.output_jsn_full, lid_info.lang_code.empty() ? nullptr : &lid_info);
 
     return 0;
 }
@@ -905,7 +910,7 @@ int crispasr_run_backend(const whisper_params& params_in) {
             crispasr_write_json(
                 crispasr_make_out_path(fname_inp, ".json"),
                 all_segs, backend->name(), params.model, params.language,
-                params.output_jsn_full);
+                params.output_jsn_full, nullptr);
     }
 }
 #endif

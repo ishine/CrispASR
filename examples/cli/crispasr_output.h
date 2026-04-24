@@ -64,9 +64,16 @@ bool crispasr_write_vtt(const std::string& path, const std::vector<crispasr_disp
 
 bool crispasr_write_csv(const std::string& path, const std::vector<crispasr_disp_segment>& segs);
 
+// Optional LID (language identification) result for JSON output
+struct crispasr_lid_info {
+    std::string lang_code;    // detected language (e.g. "en")
+    float confidence = -1.0f; // [0,1] or -1 if not available
+    std::string source;       // "whisper", "ecapa", "silero", etc.
+};
+
 bool crispasr_write_json(const std::string& path, const std::vector<crispasr_segment>& segs,
                          const std::string& backend_name, const std::string& model_path, const std::string& language,
-                         bool full);
+                         bool full, const crispasr_lid_info* lid = nullptr);
 
 bool crispasr_write_lrc(const std::string& path, const std::vector<crispasr_disp_segment>& segs);
 

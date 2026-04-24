@@ -302,7 +302,7 @@ static inline const std::string json_escape(const std::string& s) {
 
 bool crispasr_write_json(const std::string& path, const std::vector<crispasr_segment>& segs,
                          const std::string& backend_name, const std::string& model_path, const std::string& language,
-                         bool full) {
+                         bool full, const crispasr_lid_info* lid) {
     std::ofstream f(path);
     if (!f) {
         fprintf(stderr, "crispasr: warning: cannot write JSON '%s'\n", path.c_str());
@@ -312,8 +312,13 @@ bool crispasr_write_json(const std::string& path, const std::vector<crispasr_seg
     f << "  \"crispasr\": {\n";
     f << "    \"backend\": \"" << json_escape(backend_name) << "\",\n";
     f << "    \"model\":   \"" << json_escape(model_path) << "\",\n";
-    f << "    \"language\":\"" << json_escape(language) << "\"\n";
-    f << "  },\n";
+    f << "    \"language\":\"" << json_escape(language) << "\"";
+    if (lid && !lid->lang_code.empty()) {
+        f << ",\n    \"language_detected\": \"" << json_escape(lid->lang_code) << "\",\n";
+        f << "    \"language_confidence\": " << lid->confidence << ",\n";
+        f << "    \"language_source\": \"" << json_escape(lid->source) << "\"";
+    }
+    f << "\n  },\n";
     f << "  \"transcription\": [\n";
     for (size_t i = 0; i < segs.size(); i++) {
         const auto& s = segs[i];
