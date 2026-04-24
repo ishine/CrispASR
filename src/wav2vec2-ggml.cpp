@@ -875,6 +875,10 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
     // the next conv1d input [L, Cin].
     t0 = ggml_time_us();
 
+    // Persistent scheduler for CNN layers — reused across all 7 conv layers.
+    ggml_backend_t cnn_bks[1] = {m.backend};
+    ggml_backend_sched_t cnn_sc = ggml_backend_sched_new(cnn_bks, nullptr, 1, 128, false, false);
+
     // cnn_buf holds data in [L, C] layout (ggml conv1d input/output format)
     std::vector<float> cnn_buf(audio.begin(), audio.end());
     uint32_t L_cur = (uint32_t)n_samples, C_cur = 1;
@@ -937,8 +941,7 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         ggml_cgraph* gf_l = ggml_new_graph(cctx);
         ggml_build_forward_expand(gf_l, cur);
 
-        ggml_backend_t bks[1] = {m.backend};
-        ggml_backend_sched_t sc = ggml_backend_sched_new(bks, nullptr, 1, 128, false, false);
+        ggml_backend_sched_t sc = cnn_sc;
         auto asgn = [&](ggml_tensor* t) {
             if (t)
                 ggml_backend_sched_set_tensor_backend(sc, t, m.backend);
@@ -996,11 +999,11 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
                 for (uint32_t c = 0; c < C_out; c++)
                     cnn_buf[t2 * C_out + c] = co[c * L_out + t2];
         }
-        ggml_backend_sched_free(sc);
         ggml_free(cctx);
         L_cur = L_out;
         C_cur = C_out;
     }
+    ggml_backend_sched_free(cnn_sc);
 
     int T = (int)L_cur;
     int C_cnn = (int)C_cur;
