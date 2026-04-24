@@ -208,6 +208,10 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                                           std::mutex& model_mutex, const whisper_params& rp) {
     transcription_result result;
 
+    if (rp.verbose)
+        fprintf(stderr, "crispasr-server: processing '%s' (%zu bytes)\n",
+                audio_file.filename.c_str(), audio_file.content.size());
+
     // Write to a secure temporary file for audio decoding.
     std::string tmp_path = write_temp_audio(audio_file.content.data(), audio_file.content.size());
     if (tmp_path.empty()) {
@@ -232,11 +236,33 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
 
     result.duration_s = (double)pcmf32.size() / 16000.0;
 
-    // Transcribe under the model lock.
+    // Auto-chunk long audio to prevent OOM (#27).
+    // Most backends have O(T²) attention in the encoder — 30s chunks keep
+    // memory bounded. The CLI does this via --vad / --chunk-seconds.
+    const int SR = 16000;
+    const int max_chunk_samples = rp.chunk_seconds * SR; // default 30s = 480000
+    const int n_samples = (int)pcmf32.size();
+
     {
         std::lock_guard<std::mutex> lock(model_mutex);
         auto t0 = std::chrono::steady_clock::now();
-        result.segs = backend->transcribe(pcmf32.data(), (int)pcmf32.size(), 0, rp);
+
+        if (n_samples <= max_chunk_samples) {
+            // Short audio — single pass
+            result.segs = backend->transcribe(pcmf32.data(), n_samples, 0, rp);
+        } else {
+            // Chunk long audio into fixed segments
+            if (rp.verbose)
+                fprintf(stderr, "crispasr-server: chunking %.1fs audio into %ds segments\n",
+                        result.duration_s, rp.chunk_seconds);
+            for (int offset = 0; offset < n_samples; offset += max_chunk_samples) {
+                int chunk_len = std::min(max_chunk_samples, n_samples - offset);
+                int64_t t_offset_cs = (int64_t)((double)offset / SR * 100.0);
+                auto chunk_segs = backend->transcribe(pcmf32.data() + offset, chunk_len, t_offset_cs, rp);
+                result.segs.insert(result.segs.end(), chunk_segs.begin(), chunk_segs.end());
+            }
+        }
+
         auto t1 = std::chrono::steady_clock::now();
         result.elapsed_s = std::chrono::duration<double>(t1 - t0).count();
     }
@@ -531,6 +557,13 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     });
 
     // -----------------------------------------------------------------------
+    // Log unmatched requests (helps debug wrong endpoints like /audio/transcriptions)
+    svr.set_error_handler([&](const Request& req, Response& res) {
+        fprintf(stderr, "crispasr-server: %s %s → 404 (no matching route)\n",
+                req.method.c_str(), req.path.c_str());
+        res.set_content("{\"error\": \"not found. Use POST /v1/audio/transcriptions\"}", "application/json");
+    });
+
     // Start
     // -----------------------------------------------------------------------
     fprintf(stderr, "\ncrispasr-server: listening on %s:%d\n", host.c_str(), port);
