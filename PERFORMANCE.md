@@ -1,139 +1,66 @@
-# CrispASR — Performance benchmarks
+# CrispASR — Performance Benchmarks
 
-Benchmarks comparing CrispASR's multi-backend inference against
-[antirez/voxtral.c](https://github.com/antirez/voxtral.c), the
-single-model C implementation of Voxtral Realtime 4B.
+All benchmarks on jfk.wav (11.0s, 16kHz mono), 4 threads, CPU-only
+(no GPU), Q4_K quantization where available. Machine: x86_64, 7.6 GB RAM.
 
----
+Date: 2026-04-24
 
-## Test setup
+## Summary table
 
-**Audio:** `samples/jfk.wav` — 11 seconds of JFK's "And so, my fellow
-Americans" speech (16 kHz mono PCM).
+| Backend | Model | Params | Size (Q4_K) | Time (s) | Realtime | Notes |
+|---|---|---|---|---|---|---|
+| **parakeet** | parakeet-tdt-0.6b-v3 | 600M | 466 MB | **4.2** | **2.6x** | FastConformer + TDT |
+| **canary** | canary-1b-v2 | 1B | 673 MB | **4.4** | **2.5x** | FastConformer + Transformer dec |
+| **data2vec** | data2vec-audio-base-960h | 95M | 79 MB | **5.6** | **2.0x** | 12L, d=768 |
+| **qwen3** | Qwen3-ASR-0.6B | 600M | 513 MB | **5.9** | **1.9x** | Whisper enc + Qwen3 LLM |
+| **wav2vec2-base** | wav2vec2-base-voxpopuli-it | 95M | 81 MB | **6.0** | **1.8x** | 12L, d=768 |
+| **omniasr-300m** | omniASR-CTC-300M | 300M | 194 MB | **7.3** | **1.5x** | 24L, d=1024, ggml graph |
+| **cohere** | cohere-transcribe | 2B | 1.5 GB | **9.4** | **1.2x** | Conformer + Transformer dec |
+| **hubert** | hubert-large-ls960-ft | 316M | 212 MB | **10.6** | **1.0x** | 24L, d=1024 |
+| **wav2vec2** | wav2vec2-large-xlsr-53-en | 315M | 212 MB | **11.1** | **1.0x** | 24L, d=1024 |
+| **omniasr-1b** | omniASR-CTC-1B | 1B | 551 MB | **17.6** | **0.6x** | 48L, d=1280 |
+| **omniasr-llm** | omniASR-LLM-300M-v2 | 1.5B | 1.1 GB | **29.2** | **0.4x** | Enc + LLaMA decoder |
 
-**CrispASR hardware:** Intel Xeon (Skylake), 4 vCPUs, 7.6 GiB RAM,
-no GPU. NFS-mounted storage. 4 threads (default).
+## Per-phase analysis: wav2vec2 family
 
-**voxtral.c hardware (from their README):** Apple M3 Max, 40-core GPU,
-128 GB RAM, 400 GB/s bandwidth.
+All wav2vec2-family models (wav2vec2, data2vec, HuBERT) share the same pipeline:
 
----
+```
+raw PCM → CNN (7 layers) → pos_conv → transformer encoder → LM head → CTC decode
+```
 
-## CrispASR — all backends on CPU (jfk.wav, 11s)
+| Model | CNN | Pos conv | Encoder | Total |
+|---|---|---|---|---|
+| wav2vec2-large (24L, d=1024) | 2.3s | 2.1s | 6.7s | 11.1s |
+| hubert-large (24L, d=1024) | 2.3s | 1.9s | 6.3s | 10.6s |
+| wav2vec2-base (12L, d=768) | 2.6s | 1.3s | 2.1s | 6.0s |
+| data2vec-base (12L, d=768) | 2.1s | 0.9s | 2.5s | 5.6s |
 
-| Backend | Model | Quant | Size | Wall time | Realtime factor | Transcript correct |
-|---|---|---|---|---:|---:|:---:|
-| **qwen3** | Qwen3-ASR-0.6B | Q4_K | 513 MB | 10.5 s | 0.95x | yes |
-| **parakeet** | Parakeet-TDT-0.6B-v3 | F16 | 1.2 GB | 11.3 s | 1.03x | yes |
-| **whisper** | Whisper small | F16 | 464 MB | 11.6 s | 1.05x | yes |
-| **canary** | Canary-1B-v2 | F16 | 1.9 GB | 15.5 s | 1.41x | yes |
-| **cohere** | Cohere Transcribe | Q5_0 | 1.7 GB | 23.5 s | 2.14x | yes |
-| **granite** | Granite 4.0-1B | Q5_0 | 2.5 GB | 33.8 s | 3.07x | yes |
-| **voxtral** | Voxtral-Mini-3B | Q4_K | 2.5 GB | 75.6 s | 6.87x | yes |
-| **voxtral4b** | Voxtral-Mini-4B-RT | F16 | 8.3 GB | 172.5 s | 15.7x | yes |
+### Optimization history (wav2vec2-large)
 
-**Notes:**
-- "Realtime factor" = wall_time / audio_duration. Values < 1.0 mean
-  faster-than-realtime transcription.
-- voxtral4b (8.3 GB F16) is the same model as antirez/voxtral.c targets,
-  but running on CPU instead of GPU. With Q4_K quantisation this would
-  drop to ~2.5 GB and be significantly faster.
-- qwen3 at Q4_K is the fastest backend overall — faster-than-realtime
-  on this 4-vCPU machine with 30+ language support.
-- All backends produce correct transcripts for this sample.
+| Change | CNN | Pos conv | Encoder | Total | Cumul speedup |
+|---|---|---|---|---|---|
+| Baseline (manual C++) | 95.2s | 6.8s | 6.3s | 108.4s | 1.0x |
+| ggml F32 im2col CNN | 2.4s | 6.8s | 6.3s | 15.5s | 7.0x |
+| + OpenMP pos_conv | 2.3s | 2.1s | 6.7s | 11.1s | **9.8x** |
 
----
+## Per-phase analysis: OmniASR family
 
-## Comparison with antirez/voxtral.c
+Fully on ggml graphs. Scales linearly with layer count:
 
-antirez/voxtral.c is a purpose-built C implementation of the Voxtral
-Realtime 4B model with Apple Metal (MPS) GPU acceleration. CrispASR
-runs the same model via ggml with automatic backend selection.
+| Model | Layers | d_model | Enc compute | Total |
+|---|---|---|---|---|
+| CTC-300M | 24 | 1024 | 7.2s | 7.3s |
+| CTC-1B | 48 | 1280 | 17.0s | 17.6s |
+| LLM-300M | 24+12 | 1024+4096 | 7.2s+12s | 29.2s |
 
-### Architecture differences
+## Reproduce
 
-| | CrispASR | voxtral.c |
-|---|---|---|
-| **Models** | 11 backends (whisper, parakeet, canary, cohere, granite, voxtral, voxtral4b, qwen3, fc-ctc, wav2vec2, canary_ctc) | 1 (Voxtral Realtime 4B only) |
-| **Weight format** | GGUF (F16/Q4_K/Q5_0/Q8_0) | BF16 raw safetensors |
-| **Quantisation** | Full ggml quantisation support (2-8 bit) | None (BF16 only) |
-| **GPU backends** | CUDA, Metal, Vulkan, SYCL (via ggml) | Apple MPS only |
-| **Streaming** | Generic `--stream`/`--mic`/`--live` for all 11 backends | Native voxtral4b streaming with configurable latency |
-| **Binary size** | Single `crispasr` binary for all backends | Single binary, voxtral4b only |
-| **Dependencies** | ggml (bundled) | Apple Accelerate/MPS |
+```bash
+# Per-backend with timing
+WAV2VEC2_BENCH=1 crispasr --backend wav2vec2 -m model.gguf -f samples/jfk.wav -l en
+OMNIASR_BENCH=1 crispasr --backend omniasr -m model.gguf -f samples/jfk.wav -l en
 
-### Same-hardware comparison (Xeon 4-core CPU, no GPU)
-
-Both tools tested on identical hardware (Intel Xeon Skylake, 4 vCPU,
-7.6 GiB RAM, no GPU), same audio file (jfk.wav, 11 seconds), same
-model (Voxtral Realtime 4B). Both produce correct transcripts.
-
-| Metric | voxtral.c (BLAS) | CrispASR (ggml) |
-|---|---|---|
-| **Model format** | 8.9 GB BF16 safetensors | 8.3 GB F16 GGUF |
-| **Total (11s jfk.wav)** | **660 s (11m 0s)** | **172.5 s (2m 52s)** |
-| **Realtime factor** | 60x slower than RT | 15.7x slower than RT |
-| **Speedup** | baseline | **3.8x faster** |
-| **Quantisation option** | none | Q4_K → ~2.5 GB, much faster |
-
-**CrispASR is 3.8x faster on CPU** for the same model. This is
-attributable to ggml's optimised matmul kernels (AVX2/FMA on x86,
-NEON on ARM) vs voxtral.c's OpenBLAS dependency.
-
-### GPU comparison (voxtral.c's published M3 Max numbers)
-
-| Metric | voxtral.c (M3 Max MPS) | CrispASR (Xeon CPU) |
-|---|---|---|
-| **Encoder (3.6s audio)** | 284 ms | ~15 s |
-| **Decoder per-step** | 23.5-31.6 ms | ~800 ms |
-| **Total (11s jfk.wav)** | ~5 s (estimated) | 172.5 s |
-| **Realtime factor** | ~2.5x faster than RT | 15.7x slower than RT |
-
-These numbers are not directly comparable — M3 Max GPU vs Xeon CPU.
-CrispASR with ggml Metal/CUDA on equivalent GPU hardware would
-narrow this gap significantly.
-
-### Where CrispASR wins
-
-1. **Model variety:** 11 backends vs 1. For the same 11s clip, qwen3
-   at Q4_K (513 MB) transcribes in 10.5s on CPU — faster than
-   voxtral4b on GPU with 17x less memory.
-
-2. **Quantisation:** Q4_K reduces voxtral4b from 8.3 GB to ~2.5 GB
-   with minimal quality loss. voxtral.c has no quantisation support.
-
-3. **Cross-platform GPU:** ggml supports CUDA, Metal, Vulkan, SYCL.
-   voxtral.c is Apple MPS only.
-
-4. **Feature completeness:** Word timestamps (via CTC/forced aligner),
-   speaker diarisation, language identification, VAD, SRT/VTT output,
-   temperature sampling, best-of-N — all work across backends.
-
-### Where voxtral.c wins
-
-1. **Raw GPU speed on Apple Silicon:** Hand-tuned MPS kernels for this
-   specific model architecture outperform generic ggml Metal dispatch.
-
-2. **Native streaming latency:** Purpose-built 240ms-2.4s latency
-   streaming protocol vs CrispASR's generic chunked streaming.
-
-3. **Simplicity:** Single-model focus means less code, fewer
-   abstractions, easier to understand and modify.
-
----
-
-## Backend selection guide (by speed on CPU)
-
-For CPU-only deployment, pick the smallest model that meets your
-accuracy needs:
-
-| Need | Best pick | Speed |
-|---|---|---|
-| Fastest, 30+ languages | **qwen3** Q4_K (513 MB) | ~1x RT |
-| English-only, word timestamps | **parakeet** F16 (1.2 GB) | ~1x RT |
-| Battle-tested, all features | **whisper** small (464 MB) | ~1x RT |
-| Best multilingual accuracy | **canary** F16 (1.9 GB) | ~1.4x RT |
-| Lowest English WER | **cohere** Q5_0 (1.7 GB) | ~2.1x RT |
-
-For GPU deployment, the larger models (voxtral, voxtral4b, granite)
-become viable — the LLM decoder parallelises well on GPU.
+# All backends
+bash tools/benchmark_all.sh 4
+```
