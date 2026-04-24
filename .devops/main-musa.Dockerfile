@@ -29,7 +29,7 @@ FROM ${BASE_MUSA_RUN_CONTAINER} AS runtime
 WORKDIR /app
 
 RUN apt-get update && \
-    apt-get install -y curl ffmpeg wget cmake git && \
+    apt-get install -y curl passwd ffmpeg wget cmake git && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/*
 
@@ -42,4 +42,4 @@ RUN useradd -m -u 1000 crispasr && \
 
 ENV PATH=/app/build/bin:$PATH
 USER crispasr
-ENTRYPOINT [ "bash", "-c" ]
+ENTRYPOINT [ "bash", "/app/.devops/run-server.sh" ]

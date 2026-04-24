@@ -21,7 +21,7 @@ FROM intel/oneapi-basekit:$ONEAPI_VERSION AS runtime
 WORKDIR /app
 
 RUN apt-get update && \
-  apt-get install -y curl ffmpeg libsdl2-dev wget cmake git \
+  apt-get install -y curl passwd ffmpeg libsdl2-dev wget cmake git \
   && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 COPY --from=build /app /app
@@ -30,4 +30,4 @@ RUN useradd -m -u 1000 crispasr && \
   chown -R crispasr:crispasr /app /cache /models
 ENV PATH=/app/build/bin:$PATH
 USER crispasr
-ENTRYPOINT [ "bash", "-c" ]
+ENTRYPOINT [ "bash", "/app/.devops/run-server.sh" ]
