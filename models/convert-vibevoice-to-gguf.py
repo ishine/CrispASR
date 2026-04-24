@@ -19,6 +19,7 @@ import os
 import sys
 
 import numpy as np
+import torch
 
 try:
     import gguf
@@ -80,8 +81,9 @@ def main():
     print(f"  vocab={vocab_size}, rope_theta={rope_theta}, head_dim={head_dim}")
 
     # Create GGUF
+    model_name = os.path.basename(args.input.rstrip("/"))
     writer = gguf.GGUFWriter(args.output, "vibevoice-asr")
-    writer.add_name("VibeVoice-ASR-1.5B")
+    writer.add_name(model_name)
 
     # Hyperparameters
     writer.add_uint32("vibevoice.d_lm", d_lm)
@@ -103,7 +105,8 @@ def main():
     # Embed Qwen2 vocabulary for token ID → string decoding
     try:
         from transformers import AutoTokenizer
-        tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B", trust_remote_code=True)
+        # Load from the model directory itself — works for both 1.5B and 7B.
+        tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
         vocab_map = tok.get_vocab()
         inv = {v: k for k, v in vocab_map.items()}
         max_id = max(inv.keys())
@@ -165,27 +168,29 @@ def main():
                     skipped += 1
                     continue
 
-                t = f.get_tensor(name).float().numpy()
                 gguf_name = shorten(name)
 
                 if len(gguf_name) >= 64:
-                    # Further shorten
                     gguf_name = gguf_name.replace("layers.", "l.")
                     if len(gguf_name) >= 64:
                         print(f"  WARNING: name too long ({len(gguf_name)}): {gguf_name}")
                         skipped += 1
                         continue
 
+                # Load in native dtype to avoid doubling peak RAM.
+                # (7B token embedding is ~600 MB BF16; .float() first would be 1.2 GB)
+                raw = f.get_tensor(name)
+
                 # Store norms/biases/scalars as F32, weights as F16.
                 # Exception: depthwise conv weights (dw_conv) stay F32 because
                 # ggml_conv_1d_dw forces F16 im2col intermediates — storing
                 # weights as F32 avoids double F16 precision loss through 29 blocks.
                 is_f32 = ("norm" in name or "gamma" in name or name.endswith(".bias") or
-                          len(t.shape) <= 1 or "scaling_factor" in name or "bias_factor" in name)
+                          raw.ndim <= 1 or "scaling_factor" in name or "bias_factor" in name)
                 if is_f32:
-                    data = t.astype(np.float32)
+                    data = raw.to(torch.float32).numpy()
                 else:
-                    data = t.astype(np.float16)
+                    data = raw.to(torch.float16).numpy()
 
                 writer.add_tensor(gguf_name, data)
                 tensor_count += 1
