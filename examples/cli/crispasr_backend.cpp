@@ -16,6 +16,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_voxtral4b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_qwen3_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastconformer_ctc_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_wav2vec2_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_vibevoice_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_glm_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_kyutai_stt_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_firered_asr_backend();
@@ -56,6 +57,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_fastconformer_ctc_backend();
     if (name == "wav2vec2")
         return crispasr_make_wav2vec2_backend();
+    if (name == "vibevoice")
+        return crispasr_make_vibevoice_backend();
     if (name == "glm-asr" || name == "glmasr")
         return crispasr_make_glm_asr_backend();
     if (name == "kyutai-stt" || name == "kyutai" || name == "moshi-stt")
@@ -74,7 +77,7 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
 std::vector<std::string> crispasr_list_backends() {
     return {
         "whisper",           "parakeet", "canary",  "cohere",     "granite",     "voxtral",   "voxtral4b", "qwen3",
-        "fastconformer-ctc", "wav2vec2", "glm-asr", "kyutai-stt", "firered-asr", "moonshine", "omniasr",
+        "fastconformer-ctc", "wav2vec2", "vibevoice", "glm-asr", "kyutai-stt", "firered-asr", "moonshine", "omniasr",
     };
 }
 
@@ -199,6 +202,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "omniasr";
     if (contains_ci("wav2vec2"))
         return "wav2vec2";
+    if (contains_ci("vibevoice"))
+        return "vibevoice";
     if (contains_ci("canary"))
         return "canary";
     if (contains_ci("cohere"))
@@ -259,6 +264,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "granite";
             else if (a == "wav2vec2" || a == "wav2vec2-ctc")
                 result = "wav2vec2";
+            else if (a == "vibevoice" || a == "vibevoice-asr" || a == "vibevoice_asr")
+                result = "vibevoice";
             else if (a == "fastconformer-ctc" || a == "stt-fastconformer-ctc" || a == "stt_fastconformer_ctc")
                 result = "fastconformer-ctc";
             else if (a == "glmasr" || a == "glm-asr" || a == "glm_asr")

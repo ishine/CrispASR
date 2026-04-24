@@ -26,6 +26,7 @@ add_executable(${TARGET}
     crispasr_backend_qwen3.cpp
     crispasr_backend_fastconformer_ctc.cpp
     crispasr_backend_wav2vec2.cpp
+    crispasr_backend_vibevoice.cpp
     crispasr_backend_glm_asr.cpp
     crispasr_backend_kyutai_stt.cpp
     crispasr_backend_firered_asr.cpp
@@ -108,6 +109,7 @@ target_link_libraries(${TARGET} PRIVATE
     qwen3_asr
     canary_ctc
     wav2vec2-ggml
+    vibevoice
     silero-lid
     pyannote-seg
     ${FFMPEG_LIBRARIES}

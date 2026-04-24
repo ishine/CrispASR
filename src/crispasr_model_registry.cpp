@@ -40,6 +40,8 @@ constexpr Entry k_registry[] = {
     {"wav2vec2", "wav2vec2-xlsr-en-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
      "~212 MB"},
+    {"vibevoice", "vibevoice-asr-q4_k.gguf",
+     "https://huggingface.co/cstr/vibevoice-asr-GGUF/resolve/main/vibevoice-asr-q4_k.gguf", "~4.5 GB"},
 };
 
 const Entry* find_by_backend(const std::string& backend) {

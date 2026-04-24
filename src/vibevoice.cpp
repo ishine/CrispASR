@@ -62,6 +62,7 @@ struct vibevoice_context {
     vibevoice_model model;
     vibevoice_context_params params;
     ggml_backend_t backend = nullptr;
+    ggml_backend_t backend_cpu = nullptr;
     ggml_backend_buffer_t buf = nullptr;
     ggml_backend_sched_t sched = nullptr;
     ggml_context* weight_ctx = nullptr;
@@ -156,9 +157,18 @@ extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_m
                 hp.vae_dim_semantic, hp.total_downsample);
     }
 
-    // Load weights
+    // Backend selection: GPU first, CPU fallback. The scheduler requires
+    // a CPU backend to be present as the final backend when the primary
+    // backend is Metal/CUDA/Vulkan.
     ctx->backend =
         hp.d_lm > 0 ? (params.use_gpu ? ggml_backend_init_best() : ggml_backend_cpu_init()) : ggml_backend_cpu_init();
+    if (!ctx->backend)
+        ctx->backend = ggml_backend_cpu_init();
+    ctx->backend_cpu = ggml_backend_cpu_init();
+    if (ctx->backend_cpu)
+        ggml_backend_cpu_set_n_threads(ctx->backend_cpu, params.n_threads > 0 ? params.n_threads : 4);
+    if (ctx->backend && ggml_backend_is_cpu(ctx->backend))
+        ggml_backend_cpu_set_n_threads(ctx->backend, params.n_threads > 0 ? params.n_threads : 4);
     if (!ctx->backend) {
         delete ctx;
         return nullptr;
@@ -174,7 +184,14 @@ extern "C" struct vibevoice_context* vibevoice_init_from_file(const char* path_m
     ctx->buf = wl.buf;
     m.tensors = wl.tensors;
 
-    ctx->sched = ggml_backend_sched_new(&ctx->backend, nullptr, 1, 65536, false, false);
+    {
+        int n_be = 0;
+        ggml_backend_t backends[2];
+        backends[n_be++] = ctx->backend;
+        if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+            backends[n_be++] = ctx->backend_cpu;
+        ctx->sched = ggml_backend_sched_new(backends, nullptr, n_be, 65536, false, false);
+    }
     ctx->compute_meta.resize(ggml_tensor_overhead() * 8192 + ggml_graph_overhead_custom(65536, false));
 
     if (params.verbosity >= 1)
@@ -202,6 +219,8 @@ extern "C" void vibevoice_free(struct vibevoice_context* ctx) {
         ggml_backend_buffer_free(ctx->buf);
     if (ctx->backend)
         ggml_backend_free(ctx->backend);
+    if (ctx->backend_cpu && ctx->backend_cpu != ctx->backend)
+        ggml_backend_free(ctx->backend_cpu);
     delete ctx;
 }
 
@@ -520,6 +539,130 @@ static std::vector<float> run_connector_stage(vibevoice_context* ctx, const char
     return output;
 }
 
+// Token embedding lookup via ggml_get_rows so quantized embedding tables
+// (Q4_K, etc.) work correctly.
+static std::vector<float> run_token_embedding_lookup(vibevoice_context* ctx, const int32_t* ids, int n_ids) {
+    if (!ctx || !ids || n_ids <= 0)
+        return {};
+
+    auto& m = ctx->model;
+    auto it = m.tensors.find("lm.tok_emb.weight");
+    if (it == m.tensors.end() || !it->second)
+        return {};
+
+    size_t mem = ctx->compute_meta.size();
+    ggml_init_params ip = {mem, ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    ggml_tensor* inp = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_ids);
+    ggml_set_name(inp, "tok_ids");
+    ggml_set_input(inp);
+
+    ggml_tensor* out = ggml_get_rows(ctx0, it->second, inp); // [d_lm, n_ids]
+    ggml_set_name(out, "tok_emb_out");
+    ggml_set_output(out);
+    ggml_build_forward_expand(gf, out);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        ggml_free(ctx0);
+        return {};
+    }
+
+    ggml_backend_tensor_set(inp, ids, 0, (size_t)n_ids * sizeof(int32_t));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx0);
+        return {};
+    }
+
+    std::vector<float> embeds((size_t)n_ids * ctx->model.hp.d_lm);
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "tok_emb_out"), embeds.data(), 0, embeds.size() * sizeof(float));
+    ggml_free(ctx0);
+    return embeds;
+}
+
+// GPT-2/Qwen-style byte decoder. Qwen2 tokenizer pieces are UTF-8 strings
+// that represent raw bytes through this remapping.
+static std::vector<int>& qwen_byte_decoder() {
+    static std::vector<int> dec(0x200, -1);
+    static bool initialized = false;
+    if (initialized)
+        return dec;
+
+    std::vector<int> bs, cs;
+    for (int b = 0x21; b <= 0x7e; ++b) {
+        bs.push_back(b);
+        cs.push_back(b);
+    }
+    for (int b = 0xa1; b <= 0xac; ++b) {
+        bs.push_back(b);
+        cs.push_back(b);
+    }
+    for (int b = 0xae; b <= 0xff; ++b) {
+        bs.push_back(b);
+        cs.push_back(b);
+    }
+
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        bool present = false;
+        for (int x : bs) {
+            if (x == b) {
+                present = true;
+                break;
+            }
+        }
+        if (!present) {
+            bs.push_back(b);
+            cs.push_back(256 + n);
+            ++n;
+        }
+    }
+
+    for (size_t i = 0; i < bs.size(); ++i) {
+        if ((size_t)cs[i] < dec.size())
+            dec[(size_t)cs[i]] = bs[i];
+    }
+    initialized = true;
+    return dec;
+}
+
+static std::string decode_qwen_piece(const std::string& s) {
+    auto& dec = qwen_byte_decoder();
+    std::string out;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = (unsigned char)s[i];
+        int cp = 0;
+        int len = 1;
+        if (c < 0x80) {
+            cp = c;
+            len = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            cp = c & 0x1F;
+            len = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            cp = c & 0x0F;
+            len = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            cp = c & 0x07;
+            len = 4;
+        } else {
+            ++i;
+            continue;
+        }
+        if (i + (size_t)len > s.size())
+            break;
+        for (int k = 1; k < len; ++k)
+            cp = (cp << 6) | (s[i + (size_t)k] & 0x3F);
+        i += (size_t)len;
+        if (cp >= 0 && cp < (int)dec.size() && dec[(size_t)cp] >= 0)
+            out.push_back((char)dec[(size_t)cp]);
+    }
+    return out;
+}
+
 // ===========================================================================
 // Public stage API
 // ===========================================================================
@@ -688,19 +831,6 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         return nullptr;
     }
 
-    auto read_f32 = [](ggml_tensor* t, std::vector<float>& out) {
-        if (!t) { out.clear(); return; }
-        int n = (int)ggml_nelements(t);
-        out.resize(n);
-        if (t->type == GGML_TYPE_F32)
-            ggml_backend_tensor_get(t, out.data(), 0, n * sizeof(float));
-        else if (t->type == GGML_TYPE_F16) {
-            std::vector<uint16_t> tmp(n);
-            ggml_backend_tensor_get(t, tmp.data(), 0, n * sizeof(uint16_t));
-            ggml_fp16_to_fp32_row((const ggml_fp16_t*)tmp.data(), out.data(), n);
-        }
-    };
-
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: connectors done: acoustic=[%d,%d] semantic=[%d,%d]\n", T_audio, hp.d_lm, T_sem,
                 hp.d_lm);
@@ -798,18 +928,13 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         fprintf(stderr, "vibevoice: prompt: %d tokens (speech at %d-%d)\n", prefix_len, speech_start_pos,
                 speech_start_pos + T_audio - 1);
 
-    // 6. Embed all tokens, then replace speech positions with speech features
-    // Read token embeddings from model
-    std::vector<float> tok_emb_data;
-    read_f32(G("lm.tok_emb.weight"), tok_emb_data);
-    int tok_emb_vocab = (int)(tok_emb_data.size() / hp.d_lm);
-
-    std::vector<float> prefix_embeds(prefix_len * hp.d_lm);
-    for (int i = 0; i < prefix_len; i++) {
-        int tid = prompt_tokens[i];
-        if (tid < tok_emb_vocab) {
-            memcpy(prefix_embeds.data() + i * hp.d_lm, tok_emb_data.data() + tid * hp.d_lm, hp.d_lm * sizeof(float));
-        }
+    // 6. Embed all tokens, then replace speech positions with speech features.
+    // Use ggml_get_rows so quantized token embedding tables are handled by the backend.
+    std::vector<int32_t> prompt_ids(prompt_tokens.begin(), prompt_tokens.end());
+    std::vector<float> prefix_embeds = run_token_embedding_lookup(ctx, prompt_ids.data(), (int)prompt_ids.size());
+    if (prefix_embeds.size() != (size_t)prefix_len * hp.d_lm) {
+        fprintf(stderr, "vibevoice: token embedding lookup failed\n");
+        return nullptr;
     }
     // Replace speech positions with combined features (no scaling — ASR variant
     // doesn't apply speech_scaling_factor; that's only in the base TTS model)
@@ -1057,10 +1182,10 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         fprintf(stderr, "  prefill → token=%d\n", cur_token);
 
     for (int step = 0; step < max_gen && cur_token != EOS_TOKEN; step++) {
-        // Embed token
-        std::vector<float> tok_emb(hp.d_lm);
-        if (cur_token < tok_emb_vocab)
-            memcpy(tok_emb.data(), tok_emb_data.data() + cur_token * hp.d_lm, hp.d_lm * sizeof(float));
+        const int32_t tid = cur_token;
+        std::vector<float> tok_emb = run_token_embedding_lookup(ctx, &tid, 1);
+        if (tok_emb.size() != (size_t)hp.d_lm)
+            break;
 
         int n_past = prefix_len + step;
         if (!run_decoder(tok_emb.data(), 1, n_past, logits))
@@ -1086,11 +1211,9 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
             // Skip special tokens (start with <| and end with |>)
             if (piece.size() >= 4 && piece[0] == '<' && piece[1] == '|')
                 continue;
-            result += piece;
+            result += decode_qwen_piece(piece);
         }
     }
-    // Qwen2 BPE uses byte-level encoding — tokens starting with Ġ represent space
-    // For now just output as-is; the BPE pieces concatenate directly
 
     if (result.empty())
         return nullptr;

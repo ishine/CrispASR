@@ -653,6 +653,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "canary-ctc";
     else if (strcmp(arch, "wav2vec2") == 0)
         backend = "wav2vec2";
+    else if (strcmp(arch, "vibevoice-asr") == 0 || strcmp(arch, "vibevoice") == 0)
+        backend = "vibevoice";
 
     std::strncpy(out_name, backend, out_cap - 1);
     out_name[out_cap - 1] = '\0';
@@ -713,6 +715,9 @@ struct crispasr_session {
     // wav2vec2_model is a C++ struct by-value; we heap-allocate it so
     // Dart can carry a pointer. `nullptr` means this slot is unused.
     wav2vec2_model* wav2vec2_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_VIBEVOICE
+    vibevoice_context* vibevoice_ctx = nullptr;
 #endif
 };
 
@@ -868,6 +873,20 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->backend == "vibevoice") {
+        vibevoice_context_params p = vibevoice_context_default_params();
+        p.n_threads = s->n_threads;
+        p.verbosity = 0;
+        p.use_gpu = false;
+        s->vibevoice_ctx = vibevoice_init_from_file(model_path, p);
+        if (!s->vibevoice_ctx) {
+            delete s;
+            return nullptr;
+        }
+        return s;
+    }
+#endif
 
     // Unknown or unsupported-in-this-build backend.
     delete s;
@@ -933,6 +952,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_WAV2VEC2
     list += ",wav2vec2";
+#endif
+#ifdef CA_HAVE_VIBEVOICE
+    list += ",vibevoice";
 #endif
     std::strncpy(out_csv, list.c_str(), out_cap - 1);
     out_csv[out_cap - 1] = '\0';
@@ -1288,6 +1310,33 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
         r->segments.push_back(std::move(seg));
         return r;
+    }
+#endif
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->backend == "vibevoice" && s->vibevoice_ctx) {
+        auto resample_16k_to_24k = [](const float* in, int n_in) {
+            std::vector<float> out;
+            if (!in || n_in <= 0)
+                return out;
+
+            const int n_out = (int)((double)n_in * 24000.0 / 16000.0);
+            out.resize((size_t)n_out);
+            for (int i = 0; i < n_out; ++i) {
+                const double pos = (double)i * 16000.0 / 24000.0;
+                int i0 = (int)pos;
+                int i1 = i0 + 1;
+                if (i0 < 0)
+                    i0 = 0;
+                if (i1 >= n_in)
+                    i1 = n_in - 1;
+                const float frac = (float)(pos - (double)i0);
+                out[(size_t)i] = in[i0] * (1.0f - frac) + in[i1] * frac;
+            }
+            return out;
+        };
+
+        const std::vector<float> pcm24 = resample_16k_to_24k(pcm, n_samples);
+        return run_char_transcribe(vibevoice_transcribe(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size()));
     }
 #endif
 #ifdef CA_HAVE_CTC
@@ -1759,6 +1808,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
         // ggml_context, backend buffer, and tensors.
         delete s->wav2vec2_ctx;
     }
+#endif
+#ifdef CA_HAVE_VIBEVOICE
+    if (s->vibevoice_ctx)
+        vibevoice_free(s->vibevoice_ctx);
 #endif
     delete s;
 }
