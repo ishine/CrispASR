@@ -65,11 +65,19 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 | **glm-asr** | [`zai-org/GLM-ASR-Nano-2512`](https://huggingface.co/zai-org/GLM-ASR-Nano-2512) | Whisper encoder (partial RoPE) + 4-frame projector + Llama 1.5B LLM (GQA) | 17 (Mandarin, English, Cantonese, ...) | MIT |
 | **kyutai-stt** | [`kyutai/stt-1b-en_fr`](https://huggingface.co/kyutai/stt-1b-en_fr) | Mimi neural audio codec (SEANet + 8L transformer + RVQ) + 16L causal LM (SwiGLU, RMSNorm) | en, fr | MIT |
 | **firered-asr** | [`FireRedTeam/FireRedASR2-AED`](https://huggingface.co/FireRedTeam/FireRedASR2-AED) | Conformer encoder + CTC + beam search decoder; also LID (120 languages via FireRedLID GGUF) | Mandarin, English, 20+ Chinese dialects | Apache-2.0 |
-| **moonshine** | [`UsefulSensors/moonshine-tiny`](https://huggingface.co/UsefulSensors/moonshine-tiny) | Conv stem + 6L transformer encoder + 6L decoder (288d, partial RoPE, SiLU) | English | MIT |
-| **omniasr** | [`facebook/omniASR-CTC-300M`](https://huggingface.co/facebook/omniASR-CTC-300M) | wav2vec2-style CNN + 24L transformer + CTC head (194 MB Q4_K) | **1600+** | Apache-2.0 |
-| **omniasr** | [`omniASR-LLM-300M-v2`](https://dl.fbaipublicfiles.com/mms/omniASR-LLM-300M-v2.pt) | Same encoder + 12L LLaMA decoder (SwiGLU, RoPE); autoregressive, best quality | **1600+** | Apache-2.0 |
+| **moonshine** | [`UsefulSensors/moonshine-{tiny,base}`](https://huggingface.co/cstr/moonshine-base-GGUF) | Conv stem + 6L transformer encoder + 6L decoder (288–416d, partial RoPE, SiLU); multilingual variants (ja, ko, zh, ar, vi, uk) | English + 6 langs | MIT |
+| **omniasr** | [`facebook/omniASR-CTC-{300M,1B}`](https://huggingface.co/cstr/omniASR-CTC-1B-GGUF) | wav2vec2-style CNN + 24–48L transformer + CTC head | **1600+** | Apache-2.0 |
+| **omniasr** | [`omniASR-LLM-300M-v2`](https://huggingface.co/cstr/omniasr-llm-300m-v2-GGUF) | Same encoder + 12L LLaMA decoder (SwiGLU, RoPE); autoregressive, best quality | **1600+** | Apache-2.0 |
+| **vibevoice** | [`microsoft/VibeVoice-ASR`](https://huggingface.co/cstr/vibevoice-asr-GGUF) | σ-VAE ConvNeXt encoders + Qwen2.5-7B decoder; timestamps, diarization, hotwords | 50+ | MIT |
 
-All seventeen runtimes share ggml-based inference. The speech-LLM backends (**qwen3**, **voxtral**, **voxtral4b**, **granite**, **glm-asr**, **kyutai-stt**) inject audio encoder frames directly into an autoregressive language model's input embeddings, instead of using a dedicated CTC/transducer/seq2seq decoder. The **fastconformer-ctc** backend hosts the NeMo FastConformer-CTC standalone ASR family (small through xxlarge, same architecture as the canary aligner) with greedy CTC decoding.
+**Post-processing models** (work with all backends):
+
+| Model | Task | Architecture | Languages | License | HuggingFace |
+|---|---|---|---|---|---|
+| **FireRedPunc** | Punctuation restoration | BERT-base (12L, d=768), 5 classes | Chinese + English | Apache-2.0 | [`cstr/fireredpunc-GGUF`](https://huggingface.co/cstr/fireredpunc-GGUF) |
+| **fullstop-punc** | Punctuation restoration | XLM-RoBERTa-large (24L, d=1024), 6 classes | EN, DE, FR, IT | MIT | [`cstr/fullstop-punc-multilang-GGUF`](https://huggingface.co/cstr/fullstop-punc-multilang-GGUF) |
+
+All eighteen runtimes share ggml-based inference. The speech-LLM backends (**qwen3**, **voxtral**, **voxtral4b**, **granite**, **glm-asr**, **kyutai-stt**) inject audio encoder frames directly into an autoregressive language model's input embeddings, instead of using a dedicated CTC/transducer/seq2seq decoder. The **fastconformer-ctc** backend hosts the NeMo FastConformer-CTC standalone ASR family (small through xxlarge, same architecture as the canary aligner) with greedy CTC decoding.
 
 ## Feature matrix
 
@@ -81,23 +89,25 @@ Run `crispasr --list-backends` to see it live. Each backend declares capabilitie
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | Native timestamps | ✔ | ✔ | ✔ | ✔ | | | | | | | | | | | |
 | CTC timestamps | | | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | ✔ | | ✔ |
-| Word-level timing | ✔ | ✔ | ✔ | ✔ | `-am` | `-am` | `-am` | `-am` | | | | | | | |
+| Word-level timing | ✔ | ✔ | ✔ | ✔ | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | `-am` | | `-am` | `-am` | `-am` |
 | Per-token confidence | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | | | | | |
 | Language auto-detect | ✔ | ✔ | LID | LID | LID | LID | LID | ✔ | LID | LID | ✔ | LID | LID | LID | LID |
 | Speech translation | ✔ | | ✔ | | ✔ | ✔ | | ✔ | | | | | | | |
 | Speaker diarization | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | all | all | all | all | all | all | all |
 | Grammar (GBNF) | ✔ | | | | | | | | | | | | | | |
 | Temperature sampling | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | | | | |
-| Beam search | ✔ | | | | | ✔ | | | | | | | ✔ | | |
+| Beam search | ✔ | | | | | | | | | | | | ✔ | | |
 | Best-of-N (`--best-of`) | ✔ | | | | ✔ | ✔ | ✔ | ✔ | | | | | | | |
-| Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | | ✔ | | | ✔ |
+| Flash attention | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | ✔ | ✔ | ✔ |
+| KV cache | ✔ | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | ✔ | ✔ | * |
 | Punctuation toggle | | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | | | | | |
+| Punc restoration | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp | pp |
 | Source / target language | | | ✔ | | ✔ | ✔ | | ✔ | | | | | | | |
 | Audio Q&A (`--ask`) | | | | | * | ✔ | | * | | | | | | | |
 | Streaming (`--stream/--mic/--live`) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ |
-| Auto-download (`-m auto`) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | ✔ | ✔ | |
+| Auto-download (`-m auto`) | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | ✔ | | | ✔ | ✔ | ✔ | ✔ | ✔ |
 
-**Key:** ✔ = native/built-in, `-am` = via CTC forced aligner (`-am canary-ctc-aligner.gguf` or `-am qwen3-forced-aligner.gguf`), **LID** = via external language identification pre-step (`-l auto`), **all** = via `--diarize` post-step (not declared by backend but always available), * = flag accepted but model is ASR-tuned and may just transcribe.
+**Key:** ✔ = native/built-in, `-am` = via CTC forced aligner (`-am canary-ctc-aligner.gguf` or `-am qwen3-forced-aligner.gguf`), **LID** = via external language identification pre-step (`-l auto`), **all** = via `--diarize` post-step (not declared by backend but always available), **pp** = via `--punc-model` post-processor (FireRedPunc or fullstop-punc), * = omniasr-LLM has KV cache (CTC variant does not).
 
 **Speaker diarization** is available for all backends as a post-processing step via `--diarize`:
 - `--diarize-method energy` / `xcorr` — stereo-only, no extra deps
@@ -108,6 +118,65 @@ Run `crispasr --list-backends` to see it live. Each backend declares capabilitie
 **Language identification** for backends without native LID: `--lid-backend whisper` (default, 75 MB ggml-tiny.bin), `--lid-backend silero` (native GGUF, 16 MB, 95 languages), or `--lid-backend firered` (FireRedLID, 1.7 GB, 120 languages — Conformer encoder + Transformer decoder).
 
 **Voice activity detection**: `--vad` uses the default Silero VAD (~885 KB, auto-downloaded). Each VAD segment is transcribed independently, producing separate SRT/VTT entries with correct timestamps. Use `--vad --split-on-punct` for best subtitle output. Pass `--vad-model <path>` to use an alternative model — if the filename contains "firered-vad", FireRedVAD (DFSMN, 2.4 MB) is used automatically.
+
+**Punctuation restoration** (`--punc-model`): CTC-based backends (wav2vec2, omniasr, fastconformer-ctc, firered-asr) output **lowercase text without punctuation**. Add `--punc-model <model>.gguf` to restore punctuation and capitalization via a BERT-based post-processor. Works with **all** backends — LLM backends already produce punctuated output, so the punc model is a no-op for those. Two models are supported:
+
+| Model | License | Languages | Size (Q4_K) | HuggingFace |
+|---|---|---|---|---|
+| **FireRedPunc** | Apache-2.0 | Chinese + English | 56 MB (Q4_K) / 104 MB (Q8_0) | [`cstr/fireredpunc-GGUF`](https://huggingface.co/cstr/fireredpunc-GGUF) |
+| **fullstop-punctuation-multilingual** | MIT | English, German, French, Italian | 254 MB (Q4_K) | [`cstr/fullstop-punc-multilang-GGUF`](https://huggingface.co/cstr/fullstop-punc-multilang-GGUF) |
+
+FireRedPunc uses BERT-base (12L, d=768, 5 classes: comma/period/question/exclamation). Fullstop uses XLM-RoBERTa-large (24L, d=1024, 6 classes including dash and colon). Both auto-detect Latin script and output ASCII punctuation for English/European text.
+
+```bash
+# CTC backend + punc model → proper output
+crispasr --backend wav2vec2 -m wav2vec2.gguf --punc-model fireredpunc-q8_0.gguf -f audio.wav
+# Output: "And so my fellow americans, ask not what your country can do for you."
+
+# Multilingual punc (German/French/Italian)
+crispasr --backend omniasr -m omniasr.gguf --punc-model fullstop-punc-q4_k.gguf -f audio_de.wav
+```
+
+Also available via the Python/Rust/Dart wrappers:
+```python
+import crispasr
+with crispasr.PuncModel("fireredpunc-q8_0.gguf") as punc:
+    text = punc.process("and so my fellow americans ask not")
+    # -> "And so my fellow americans, ask not..."
+```
+
+<details>
+<summary>Which backends produce punctuation natively?</summary>
+
+| Backend | Punctuation | Capitalization | Notes |
+|---|:-:|:-:|---|
+| whisper | ✔ | ✔ | Full punctuation and casing |
+| parakeet | ✔ | ✔ | |
+| canary | ✔ | ✔ | |
+| cohere | ✔ | ✔ | Toggleable via `--no-punctuation` |
+| granite | ✔ | ✔ | LLM output |
+| voxtral | ✔ | ✔ | LLM output |
+| voxtral4b | ✔ | ✔ | LLM output |
+| qwen3 | ✔ | ✔ | LLM output |
+| glm-asr | ✔ | ✔ | LLM output |
+| kyutai-stt | ✔ | ✔ | LLM output |
+| moonshine | ✔ | ✔ | Encoder-decoder output |
+| **fastconformer-ctc** | **no** | **no** | CTC — add `--punc-model` |
+| **wav2vec2** | **no** | **no** | CTC — add `--punc-model` |
+| **firered-asr** | **no** | **no** | CTC — add `--punc-model` |
+| **omniasr** (CTC) | **no** | **no** | CTC — add `--punc-model` |
+| **omniasr** (LLM) | ✔ | ✔ | Autoregressive decoder |
+
+Other freely-licensed alternatives that could be added: [felflare/bert-restore-punctuation](https://huggingface.co/felflare/bert-restore-punctuation) (MIT, English, includes truecasing), [xashru/punctuation-restoration](https://github.com/xashru/punctuation-restoration) (Apache-2.0, 40+ languages, BiLSTM-CRF).
+
+</details>
+
+**Progressive subtitle output** (`--flush-after`): By default, non-whisper backends buffer all segments and print output at the end. For real-time subtitle consumption (PotPlayer, custom media players), use `--flush-after 1` to print each SRT entry to stdout immediately after its VAD segment is transcribed:
+
+```bash
+crispasr --backend parakeet -m parakeet.gguf --vad --flush-after 1 -osrt -f long_audio.wav
+# SRT entries appear progressively as each segment finishes
+```
 
 **JSON output with language detection**: When using `-l auto -oj`, the JSON output includes detected language info:
 ```json
@@ -811,6 +880,10 @@ When you pass `-m auto` (or `-m default`), CrispASR downloads the default quanti
 | qwen3 | `cstr/qwen3-asr-0.6b-GGUF` | ~500 MB |
 | cohere | `cstr/cohere-transcribe-03-2026-GGUF` | ~550 MB |
 | wav2vec2 | `cstr/wav2vec2-large-xlsr-53-english-GGUF` | ~212 MB |
+| omniasr | `cstr/omniASR-CTC-1B-GGUF` | ~551 MB |
+| omniasr-llm | `cstr/omniasr-llm-300m-v2-GGUF` | ~580 MB |
+| hubert | `cstr/hubert-large-ls960-ft-GGUF` | ~200 MB |
+| data2vec | `cstr/data2vec-audio-960h-GGUF` | ~60 MB |
 
 Downloads go through `curl` (preferred) with a `wget` fallback — **no Python, no libcurl link dependency**. Works identically on Linux, macOS, and Windows 10+ where `curl` ships in the base system. Models are cached by filename; re-running is a single `stat()` check. The same registry + cache helpers are reachable from the wrappers via `crispasr.registry_lookup()` / `crispasr.cache_ensure_file()` so Python/Rust callers can drive `-m auto`-style resolution without re-implementing it.
 
@@ -943,6 +1016,45 @@ Every `src/core/` migration commit includes a `md5sum`-level regression test aga
 - **ffn extraction**: bit-identical on qwen3, voxtral, voxtral4b, granite.
 - **gguf_loader extraction**: bit-identical on all 8 non-whisper models.
 - **attention extraction**: bit-identical on voxtral (only consumer so far).
+
+### Backend internals
+
+<details>
+<summary>Optimization and graph survey (all backends)</summary>
+
+| Backend | Arch pattern | ggml graph | Flash attn | KV cache | GPU | Shared core modules |
+|---|---|:-:|:-:|:-:|:-:|---|
+| whisper | Enc-dec transformer | ✔ | ✔ | ✔ | CUDA/Metal | (upstream) |
+| parakeet | FastConformer + TDT | ✔ | ✔ | partial | CPU | mel, fastconformer |
+| canary | FastConformer + Transformer dec | ✔ | ✔ | ✔ | CUDA/Metal | mel, fastconformer |
+| cohere | Conformer + Transformer dec | ✔ | ✔ | ✔ | CUDA/Metal | mel |
+| granite | Conformer + Q-Former + LLM | ✔ | ✔ | ✔ | CPU | mel, kv_self_attn, swiglu, greedy_decode, bpe |
+| voxtral | Whisper enc + Mistral LLM | ✔ | ✔ | ✔ | CUDA/Metal | mel, kv_self_attn, encoder_self_attn, swiglu, greedy_decode, bpe |
+| voxtral4b | RoPE enc + 3.4B LLM | ✔ | ✔ | ✔ | CPU | mel, kv_self_attn, encoder_self_attn, swiglu, greedy_decode, bpe |
+| qwen3 | Whisper enc + Qwen3 LLM | ✔ | ✔ | ✔ | CUDA/Metal | mel, kv_self_attn, swiglu, greedy_decode, bpe |
+| fc-ctc | FastConformer + CTC | ✔ | ✔ | — | CPU | mel, fastconformer |
+| wav2vec2 | CNN + Transformer + CTC | ✔ | — | — | CUDA/Metal | gguf_loader |
+| glm-asr | Whisper enc + Llama LLM | ✔ | ✔ | ✔ | CPU | mel, kv_self_attn, swiglu, greedy_decode, bpe |
+| kyutai-stt | Mimi codec + causal LM | ✔ | ✔ | ✔ | CPU | gguf_loader |
+| firered-asr | Conformer + CTC + beam dec | ✔ | ✔ | ✔ | CPU | mel, gguf_loader |
+| moonshine | Conv + 6L enc-dec | ✔ | ✔ | ✔ | CPU | (vendored) |
+| omniasr | wav2vec2 enc + CTC/LLM | ✔ | ✔ | CTC:— LLM:✔ | CPU | gguf_loader, kv_self_attn, swiglu |
+| vibevoice | σ-VAE + Qwen2 7B | ✔ | ✔ | ✔ | CUDA/Metal | gguf_loader |
+
+**Architecture families:**
+- **Feedforward CTC** (wav2vec2, omniasr-CTC, fc-ctc, firered-asr): No decoder, no KV cache. Fastest. No native punctuation.
+- **Encoder-decoder** (whisper, canary, cohere, moonshine): Cross-attention KV cache, autoregressive text decoder.
+- **Audio-LLM** (granite, voxtral, voxtral4b, qwen3, glm-asr, omniasr-LLM, vibevoice): Audio features injected into LLM embedding space, KV-cached autoregressive decoding.
+- **Transducer** (parakeet): LSTM predictor + joint network, frame-synchronous TDT decoding.
+- **Codec + LM** (kyutai-stt): Neural audio codec (RVQ) → token-based LM.
+
+**Optimization opportunities:**
+- **Beam search** could be added to all encoder-decoder and Audio-LLM backends (currently only whisper + firered-asr)
+- **Fused QKV** (single matmul for Q/K/V projections) — used in CrispEmbed, applicable to all attention layers
+- **Temperature sampling** could be added to glm-asr, kyutai-stt, firered-asr, moonshine, omniasr-LLM via `core_greedy_decode`
+- **GPU offload** for CPU-only backends (parakeet, granite, voxtral4b, etc.) — needs ggml_backend_sched with GPU primary
+
+</details>
 
 ---
 
