@@ -902,8 +902,7 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
     // <|object_ref_start|><|box_start|>×N<|object_ref_end|>
     // This is a X.XX seconds audio, please transcribe it with these keys: ...
     // <|im_end|>\n
-    //
-    // The HF template does not append an explicit assistant header here.
+    // <|im_start|>assistant\n   (add_generation_prompt=True)
     const int AUDIO_BOS = 151646;   // <|object_ref_start|>
     const int AUDIO_TOKEN = 151648; // <|box_start|>
     const int AUDIO_EOS = 151647;   // <|object_ref_end|>
@@ -1137,12 +1136,16 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         cur = ggml_rms_norm(ctx0, cur, 1e-6f);
         cur = ggml_mul(ctx0, cur, G("lm.norm.weight"));
 
-        // LM head (lm.tok_emb.weight is tied — no separate lm_head)
+        // LM head: VibeVoice-ASR-7B has a SEPARATE lm_head.weight (not tied to tok_emb).
+        // Fall back to tok_emb if lm_head is absent (older 1.5B converts may tie).
         if (n_tokens > 1) {
             cur = ggml_view_1d(ctx0, cur, hp.d_lm, (size_t)(n_tokens - 1) * hp.d_lm * sizeof(float));
             cur = ggml_reshape_2d(ctx0, cur, hp.d_lm, 1);
         }
-        cur = ggml_mul_mat(ctx0, G("lm.tok_emb.weight"), cur); // tied weights
+        ggml_tensor* lm_head_w = G("lm_head.weight");
+        if (!lm_head_w)
+            lm_head_w = G("lm.tok_emb.weight");
+        cur = ggml_mul_mat(ctx0, lm_head_w, cur);
 
         ggml_set_name(cur, "logits");
         ggml_set_output(cur);
