@@ -6,12 +6,10 @@
 # --backend flag. When --backend is omitted or set to "whisper" the
 # historical whisper-cli code path is used unchanged.
 #
-# The CMake target is kept as `whisper-cli` so tests/CMakeLists.txt and any
-# other CMake rules referring to $<TARGET_FILE:whisper-cli> continue to
-# work. The produced binary is renamed to `crispasr` via OUTPUT_NAME, and a
-# `whisper-cli` symlink is created next to it for backward compatibility.
+# The CMake target was renamed from `whisper-cli` to `crispasr`.
+# A backward-compat `whisper-cli` symlink is created for legacy scripts.
 
-set(TARGET whisper-cli)
+set(TARGET crispasr)
 
 add_executable(${TARGET}
     cli.cpp

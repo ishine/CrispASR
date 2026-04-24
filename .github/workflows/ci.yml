@@ -28,7 +28,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_OPENBLAS=ON
 
       - name: Build
-        run: cmake --build build --target whisper-cli -j $(nproc)
+        run: cmake --build build --target crispasr -j $(nproc)
 
       - name: Smoke test - help
         run: ./build/bin/crispasr --help
@@ -64,7 +64,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON
 
       - name: Build
-        run: cmake --build build --target whisper-cli -j $(nproc)
+        run: cmake --build build --target crispasr -j $(nproc)
 
       - name: Smoke test
         run: ./build/bin/crispasr --list-backends
@@ -83,7 +83,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON
 
       - name: Build
-        run: cmake --build build --target whisper-cli -j $(sysctl -n hw.logicalcpu)
+        run: cmake --build build --target crispasr -j $(sysctl -n hw.logicalcpu)
 
       - name: Smoke test
         run: ./build/bin/crispasr --list-backends
@@ -102,7 +102,7 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release --target whisper-cli -j $env:NUMBER_OF_PROCESSORS
+        run: cmake --build build --config Release --target crispasr -j $env:NUMBER_OF_PROCESSORS
 
       - name: Smoke test
         run: .\build\bin\Release\crispasr.exe --list-backends
