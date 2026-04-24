@@ -7,34 +7,36 @@ Date: 2026-04-24
 
 ## Summary (11s audio)
 
-| # | Backend | Model | RT factor | Time | RSS |
+| # | Backend | Model | RT factor | Time | Notes |
 |---|---|---|---|---|---|
-| 1 | **parakeet** | parakeet-tdt-0.6b-v3 | **2.9x** | 3.8s | |
-| 2 | **canary** | canary-1b-v2 | **2.7x** | 4.0s | |
-| 3 | **data2vec** | data2vec-audio-base | **2.1x** | 5.2s | |
-| 4 | **qwen3** | Qwen3-ASR-0.6B | **1.7x** | 6.5s | |
-| 5 | **wav2vec2-base** | wav2vec2-base-voxpopuli | **1.8x** | 6.0s | |
-| 6 | **omniasr-300m** | omniASR-CTC-300M | **1.4x** | 7.7s | |
-| 7 | **cohere** | cohere-transcribe | **1.4x** | 7.7s | |
-| 8 | **wav2vec2** | wav2vec2-large-xlsr | **1.1x** | 9.9s | 220 MB |
-| 9 | **hubert** | hubert-large-ls960 | **1.0x** | 10.6s | |
-| 10 | **omniasr-1b** | omniASR-CTC-1B | **0.7x** | 15.7s | |
-| 11 | **omniasr-llm** | omniASR-LLM-300M-v2 | **0.4x** | 29.2s | |
-| 12 | **firered** | FireRedASR2-AED | **0.1x** | 123.0s | 934 MB |
+| 1 | **moonshine** | moonshine-tiny | **16.8x** | 0.7s | Tiny (27M), English only |
+| 2 | **fc-ctc** | stt-en-fc-ctc-large | **9.4x** | 1.2s | NeMo CTC, English only |
+| 3 | **parakeet** | parakeet-tdt-0.6b-v3 | **2.9x** | 3.8s | TDT, 25 EU languages |
+| 4 | **canary** | canary-1b-v2 | **2.7x** | 4.0s | Seq2seq, 25 EU languages |
+| 5 | **data2vec** | data2vec-audio-base | **2.1x** | 5.2s | CTC, English only |
+| 6 | **qwen3** | Qwen3-ASR-0.6B | **1.7x** | 6.5s | LLM, 30+ languages |
+| 7 | **omniasr-300m** | omniASR-CTC-300M | **1.4x** | 7.7s | CTC, 1600+ languages |
+| 8 | **cohere** | cohere-transcribe | **1.4x** | 7.7s | Seq2seq, 13 languages |
+| 9 | **wav2vec2** | wav2vec2-large-xlsr | **1.1x** | 9.9s | CTC, per-model language |
+| 10 | **omniasr-1b** | omniASR-CTC-1B | **0.7x** | 15.7s | CTC, 1600+ languages |
+| 11 | **omniasr-llm** | omniASR-LLM-300M-v2 | **0.4x** | 29.2s | LLM, 1600+ languages |
+| 12 | **firered** | FireRedASR2-AED | **0.1x** | 123.0s | CPU decoder bottleneck |
 
 ## Long audio scaling (55s = 5× the 11s clip)
 
-| Backend | 11s | 55s | Scale factor | Notes |
+| Backend | 11s | 55s | Scale | Notes |
 |---|---|---|---|---|
+| moonshine | 0.7s | 5.8s | 8.3x | Superlinear (decoder grows with output) |
+| fc-ctc | 1.2s | 5.2s | 4.3x | Sublinear (efficient encoder) |
 | parakeet | 3.8s | 18.2s | 4.8x | Near-linear |
 | canary | 4.0s | 20.7s | 5.2x | Near-linear |
 | data2vec | 5.2s | 25.9s | 5.0x | Linear |
-| qwen3 | 6.5s | 29.8s | 4.6x | Good scaling |
-| wav2vec2 | 9.9s | 57.4s | 5.8x | Slight superlinear (pos_conv) |
+| qwen3 | 6.5s | 29.8s | 4.6x | Good |
+| wav2vec2 | 9.9s | 57.4s | 5.8x | Slight superlinear (pos_conv O(T)) |
 | omniasr-300m | 7.7s | 37.5s | 4.9x | Linear |
 | omniasr-1b | 15.7s | 80.8s | 5.1x | Linear |
 | cohere | 7.7s | 41.5s | 5.4x | Near-linear |
-| firered | 123s | >180s | TIMEOUT | CPU decoder bottleneck |
+| firered | 123s | **TIMEOUT** | — | CPU decoder, needs ggml graph |
 
 Auto-chunking at 30s keeps all backends memory-bounded. No OOM on 55s.
 
