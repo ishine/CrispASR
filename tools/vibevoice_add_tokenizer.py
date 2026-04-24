@@ -109,28 +109,18 @@ def main():
     writer.add_array("tokenizer.ggml.tokens", vocab_list)
     writer.add_uint32("vibevoice.has_tokenizer", 1)
 
-    # Copy every tensor by streaming raw bytes from the input file.
-    # We must NOT rely on t.data for quantized types — GGUFReader's numpy view
-    # may truncate block-quantized data (Q4_K is ~0.56 bytes/weight, but
-    # shape × element_size(dtype) computes a different count).
+    # Copy every tensor byte-for-byte from the input.
+    # GGUFReader's t.data is a numpy view into the mmap'd file. For quantized
+    # types its .shape reflects the logical tensor dims, not byte dims. The
+    # gguf writer's add_tensor with raw_dtype calls quant_shape_from_byte_shape
+    # which expects shape to be in *byte* units. Fix: flatten to a 1D uint8
+    # array so shape=(nbytes,) and the quant shape inference works correctly.
     import numpy as np
 
-    # Open the original file for raw byte reads.
-    with open(args.input, "rb") as fin:
-        # data_offset = where tensor data starts in the input file
-        # GGUFReader stores each tensor's offset relative to data start.
-        data_offset = reader.data.offset if hasattr(reader.data, 'offset') else reader.tensors[0].data.ctypes.data - np.array(reader.data).ctypes.data if len(reader.tensors) > 0 else 0
-
-        for t in reader.tensors:
-            # Compute exact byte count from the tensor's ggml type + shape.
-            n_elements = 1
-            for d in t.shape:
-                n_elements *= int(d)
-            # For block-quantized types, use ggml block size.
-            # Simpler: just compute from the actual data buffer length.
-            raw_bytes = bytes(t.data)
-            writer.add_tensor(t.name, np.frombuffer(raw_bytes, dtype=np.uint8),
-                              raw_shape=t.shape, raw_dtype=t.tensor_type)
+    for t in reader.tensors:
+        # Flatten to contiguous uint8 so nbytes == len == actual byte count
+        raw = np.frombuffer(t.data.tobytes(), dtype=np.uint8)
+        writer.add_tensor(t.name, raw, raw_dtype=t.tensor_type)
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
