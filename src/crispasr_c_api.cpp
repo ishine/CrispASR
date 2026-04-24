@@ -66,6 +66,10 @@
 #include "wav2vec2-ggml.h"
 #define CA_HAVE_WAV2VEC2 1
 #endif
+#if __has_include("vibevoice.h")
+#include "vibevoice.h"
+#define CA_HAVE_VIBEVOICE 1
+#endif
 
 #ifdef _WIN32
 #define CA_EXPORT extern "C" __declspec(dllexport)

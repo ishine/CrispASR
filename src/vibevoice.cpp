@@ -655,62 +655,6 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         fprintf(stderr, "vibevoice: acoustic encoder: [%d, %d] (vae_dim=%d, frames=%d)\n", vae_dim_at, T_audio,
                 vae_dim_at, T_audio);
 
-    // Dump per-stage intermediates for reference comparison
-    const char* dump_dir = getenv("VIBEVOICE_DUMP_DIR");
-    if (dump_dir && dump_dir[0]) {
-        // Dump stage intermediates
-        auto dump_graph_tensor = [&](const char* tname) {
-            ggml_tensor* t = ggml_graph_get_tensor(gf_at, tname);
-            if (!t)
-                return;
-            int n = (int)ggml_nelements(t);
-            std::vector<float> d(n);
-            ggml_backend_tensor_get(t, d.data(), 0, n * sizeof(float));
-            char path[512];
-            snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, tname);
-            FILE* f = fopen(path, "wb");
-            if (f) {
-                fwrite(d.data(), sizeof(float), n, f);
-                fclose(f);
-            }
-            fprintf(stderr, "  DUMP: %s [%lld,%lld] → %s\n", tname, (long long)t->ne[0], (long long)t->ne[1], path);
-        };
-        // Block outputs
-        dump_graph_tensor("s0_pre_block_0");
-        for (int bi = 0; bi < 3; bi++) {
-            char bname[64];
-            snprintf(bname, sizeof(bname), "s0_post_block_%d", bi);
-            dump_graph_tensor(bname);
-        }
-        for (int si = 0; si < hp.n_encoder_stages; si++) {
-            char tname[64], path[512];
-            snprintf(tname, sizeof(tname), "at_ds_%d", si);
-            ggml_tensor* t = ggml_graph_get_tensor(gf_at, tname);
-            if (t) {
-                int n = (int)ggml_nelements(t);
-                std::vector<float> d(n);
-                ggml_backend_tensor_get(t, d.data(), 0, n * sizeof(float));
-                snprintf(path, sizeof(path), "%s/%s.bin", dump_dir, tname);
-                FILE* f = fopen(path, "wb");
-                if (f) {
-                    fwrite(d.data(), sizeof(float), n, f);
-                    fclose(f);
-                }
-                fprintf(stderr, "  DUMP: %s [%lld,%lld] → %s\n", tname, (long long)t->ne[0], (long long)t->ne[1], path);
-            }
-        }
-    }
-    if (dump_dir && dump_dir[0]) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/acoustic_mean.bin", dump_dir);
-        FILE* f = fopen(path, "wb");
-        if (f) {
-            fwrite(acoustic_mean.data(), sizeof(float), vae_dim_at * T_audio, f);
-            fclose(f);
-            fprintf(stderr, "  DUMP: acoustic_mean [%d,%d] → %s\n", vae_dim_at, T_audio, path);
-        }
-    }
-
     // 2. Run semantic tokenizer encoder
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: running semantic encoder...\n");
@@ -736,14 +680,16 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: semantic encoder: [%d, %d]\n", vae_dim_st, T_sem);
 
-    // 3. Run connectors on CPU: FC1 → RMSNorm → FC2
-    // acoustic: [vae_dim_at=64] → [d_lm=1536]
-    // semantic: [vae_dim_st=128] → [d_lm=1536]
+    // 3. Run connectors via ggml graph (handles Q4_K and any quantized weight type)
+    auto acoustic_features = run_connector_stage(ctx, "at_conn", acoustic_mean.data(), T_audio, vae_dim_at);
+    auto semantic_features = run_connector_stage(ctx, "se_conn", semantic_mean.data(), T_sem, vae_dim_st);
+    if (acoustic_features.empty() || semantic_features.empty()) {
+        fprintf(stderr, "vibevoice: connector failed\n");
+        return nullptr;
+    }
+
     auto read_f32 = [](ggml_tensor* t, std::vector<float>& out) {
-        if (!t) {
-            out.clear();
-            return;
-        }
+        if (!t) { out.clear(); return; }
         int n = (int)ggml_nelements(t);
         out.resize(n);
         if (t->type == GGML_TYPE_F32)
@@ -755,84 +701,9 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         }
     };
 
-    auto run_connector = [&](const char* prefix, const float* input, int dim_in, int T, std::vector<float>& output) {
-        // FC1: [dim_in → d_lm] per frame
-        std::vector<float> fc1_w, fc1_b, norm_w, fc2_w, fc2_b;
-        read_f32(G(std::string(prefix) + ".fc1.weight"), fc1_w);
-        read_f32(G(std::string(prefix) + ".fc1.bias"), fc1_b);
-        read_f32(G(std::string(prefix) + ".norm.weight"), norm_w);
-        read_f32(G(std::string(prefix) + ".fc2.weight"), fc2_w);
-        read_f32(G(std::string(prefix) + ".fc2.bias"), fc2_b);
-
-        int d_lm = hp.d_lm;
-        output.resize(T * d_lm);
-
-        for (int t = 0; t < T; t++) {
-            // FC1: input[t*dim_in...] @ fc1_w[dim_in, d_lm] + fc1_b
-            std::vector<float> h1(d_lm);
-            for (int i = 0; i < d_lm; i++) {
-                double s = fc1_b.empty() ? 0 : fc1_b[i];
-                for (int k = 0; k < dim_in; k++)
-                    s += input[t * dim_in + k] * fc1_w[i * dim_in + k];
-                h1[i] = (float)s;
-            }
-            // RMSNorm (no activation — connector is FC1→RMSNorm→FC2, no SiLU)
-            float ss = 0;
-            for (int i = 0; i < d_lm; i++)
-                ss += h1[i] * h1[i];
-            float scale = 1.0f / sqrtf(ss / d_lm + 1e-6f);
-            for (int i = 0; i < d_lm; i++)
-                h1[i] = h1[i] * scale * (norm_w.empty() ? 1.0f : norm_w[i]);
-            // FC2: h1 @ fc2_w[d_lm, d_lm] + fc2_b
-            for (int i = 0; i < d_lm; i++) {
-                double s = fc2_b.empty() ? 0 : fc2_b[i];
-                for (int k = 0; k < d_lm; k++)
-                    s += h1[k] * fc2_w[i * d_lm + k];
-                output[t * d_lm + i] = (float)s;
-            }
-        }
-    };
-
-    // Acoustic connector: [T_audio, 64] → [T_audio, 1536]
-    // Need to transpose from ggml [C, T] to [T, C] first
-    std::vector<float> at_tc(T_audio * vae_dim_at);
-    for (int t = 0; t < T_audio; t++)
-        for (int c = 0; c < vae_dim_at; c++)
-            at_tc[t * vae_dim_at + c] = acoustic_mean[t * vae_dim_at + c]; // ggml col-major: data[t*C+c]
-
-    std::vector<float> acoustic_features;
-    run_connector("at_conn", at_tc.data(), vae_dim_at, T_audio, acoustic_features);
-
-    // Semantic connector: [T_sem, 128] → [T_sem, 1536]
-    std::vector<float> st_tc(T_sem * vae_dim_st);
-    for (int t = 0; t < T_sem; t++)
-        for (int c = 0; c < vae_dim_st; c++)
-            st_tc[t * vae_dim_st + c] = semantic_mean[t * vae_dim_st + c];
-
-    std::vector<float> semantic_features;
-    run_connector("se_conn", st_tc.data(), vae_dim_st, T_sem, semantic_features);
-
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "vibevoice: connectors done: acoustic=[%d,%d] semantic=[%d,%d]\n", T_audio, hp.d_lm, T_sem,
                 hp.d_lm);
-
-    // Dump connector outputs
-    if (dump_dir && dump_dir[0]) {
-        char path[512];
-        snprintf(path, sizeof(path), "%s/acoustic_features.bin", dump_dir);
-        FILE* f = fopen(path, "wb");
-        if (f) {
-            fwrite(acoustic_features.data(), sizeof(float), T_audio * hp.d_lm, f);
-            fclose(f);
-        }
-        snprintf(path, sizeof(path), "%s/semantic_features.bin", dump_dir);
-        f = fopen(path, "wb");
-        if (f) {
-            fwrite(semantic_features.data(), sizeof(float), T_sem * hp.d_lm, f);
-            fclose(f);
-        }
-        fprintf(stderr, "  DUMP: connector outputs saved\n");
-    }
 
     // 4. Combine acoustic + semantic features (element-wise sum)
     // Debug: optionally inject Python reference features
@@ -889,17 +760,28 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
     };
     // After speech tokens: "\nThis is a XX.XX seconds audio, please transcribe it with these keys: Start time, End time, Speaker ID, Content<|im_end|>\n"
     float dur = n_samples / 24000.0f;
-    // Duration as string tokens (simplified — just use "11.00" for now)
+    // Tokenize duration character-by-character using Qwen2 single-char token IDs:
+    // '0'–'9' = 15–24, '.' = 13 (verified against "11.00" in VibeVoice processor output)
+    char dur_str[16];
+    snprintf(dur_str, sizeof(dur_str), "%.2f", dur);
+    std::vector<int> dur_tokens;
+    for (const char* p = dur_str; *p; p++) {
+        if (*p >= '0' && *p <= '9') dur_tokens.push_back(15 + (*p - '0'));
+        else if (*p == '.') dur_tokens.push_back(13);
+    }
     std::vector<int> suffix_tokens = {
         198,                                                           // \n
-        1986,     374,   264, 220,  16,    16,  13,    15,   15,       // This is a 11.00
+        1986, 374, 264, 220,                                           // This is a<space>
+    };
+    suffix_tokens.insert(suffix_tokens.end(), dur_tokens.begin(), dur_tokens.end());
+    std::vector<int> suffix_tail = {
         6546,     7699,  11,  4587, 38840, 432, 449,   1493,           // seconds audio, please transcribe it with these
         6894,     25,                                                  // keys:
         5145,     882,   11,  3972, 882,   11,  29073, 3034, 11, 8883, // Start time, End time, Speaker ID, Content
         151645,   198,                                                 // <|im_end|>\n
         IM_START, 77091, 198                                           // <|im_start|>assistant\n
     };
-    (void)dur;
+    suffix_tokens.insert(suffix_tokens.end(), suffix_tail.begin(), suffix_tail.end());
 
     // Build full token sequence
     std::vector<int> prompt_tokens;
