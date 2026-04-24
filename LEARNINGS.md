@@ -2160,3 +2160,28 @@ firered-asr, moonshine, omniasr. Pattern: `#ifdef CA_HAVE_*` guards in
 `crispasr_c_api.cpp` for open/transcribe/close. All backends now
 reachable from Python (`crispasr.Session`), Rust (`crispasr::Session`),
 and Dart (`CrispasrSession`).
+
+## VibeVoice-ASR prompt template verification (April 2026)
+
+**Verified against HF transformers + microsoft/VibeVoice GitHub repo:**
+
+1. **Special tokens**: `<|object_ref_start|>` (151646), `<|box_start|>` (151648),
+   `<|object_ref_end|>` (151647). The HF processor defines these as `audio_bos_token`,
+   `audio_token`, `audio_eos_token`.
+
+2. **Assistant header required**: The HF processor calls `apply_chat_template` with
+   `add_generation_prompt=True`. Qwen2.5's chat template appends `<|im_start|>assistant\n`
+   when this flag is set. Without it, the model doesn't know the generation boundary.
+   A prior commit incorrectly removed it; restored in 665b5d6.
+
+3. **Qwen2.5-7B attention biases**: `q_proj.bias=True, k_proj.bias=True, v_proj.bias=True,
+   o_proj.bias=False`. Our GGUF has all 3 biases stored. The V bias was missing in the
+   C++ runtime — fixed in fd4862b.
+
+4. **Tokenizer not in GGUF**: The pre-existing Q4_K on HF (`cstr/vibevoice-asr-GGUF`) has
+   `has_tokenizer=0` because the converter couldn't find tokenizer files in the VibeVoice
+   snapshot. The converter now falls back to `Qwen/Qwen2.5-7B` for the tokenizer. The GGUF
+   needs re-conversion on a machine with ≥16 GB RAM to embed the 152K-token vocab.
+
+5. **Duration format**: The processor inserts audio duration as plain text (e.g., "11.00")
+   before tokenization. Qwen2.5 maps digits '0'-'9' to token IDs 15-24, '.' to 13.
