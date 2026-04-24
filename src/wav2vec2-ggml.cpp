@@ -845,6 +845,8 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
                                                  int n_threads) {
     const auto& hp = m.hparams;
     const int H = (int)hp.hidden_size;
+    const bool bench = (getenv("WAV2VEC2_BENCH") && getenv("WAV2VEC2_BENCH")[0]);
+    int64_t t_cnn = 0, t_proj = 0, t_pos = 0, t_enc = 0, t_lm = 0, t0;
 
     // ---- 0. Normalize ----
     std::vector<float> audio(raw_audio, raw_audio + n_samples);
@@ -861,6 +863,7 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
     }
 
     // ---- 1. CNN feature extractor (manual C++) ----
+    t0 = ggml_time_us();
     uint32_t L_cur = (uint32_t)n_samples, C_cur = 1;
     std::vector<float> cnn_in(audio.begin(), audio.end()), cnn_out;
 
@@ -928,7 +931,9 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         for (int c = 0; c < C_cnn; c++)
             feat[t * C_cnn + c] = cnn_in[c * T + t];
 
+    t_cnn = ggml_time_us() - t0;
     // ---- 2. Feature projection: LN + Linear ----
+    t0 = ggml_time_us();
     layer_norm(feat.data(), feat.data(), (const float*)m.fp_ln_w->data, (const float*)m.fp_ln_b->data, T, C_cnn,
                hp.layer_norm_eps);
 
@@ -951,7 +956,9 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         }
     }
 
+    t_proj = ggml_time_us() - t0;
     // ---- 3. Positional conv (manual — grouped conv is hard in ggml) ----
+    t0 = ggml_time_us();
     // Single-layer (wav2vec2): one grouped conv + gelu, then add residual
     // Multi-layer (Data2Vec): N grouped conv layers, each with gelu, then add residual
     {
@@ -1066,7 +1073,9 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         }
     }
 
+    t_pos = ggml_time_us() - t0;
     // ---- 4. Transformer + LN + LM head via ggml graph ----
+    t0 = ggml_time_us();
     // hidden is [T, H] row-major: data[t*H + h].
     // ggml [H, T] stores data[h + t*H] = data[t*H + h] — SAME layout!
     // No transpose needed.
@@ -1186,6 +1195,19 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
                                 }
                             }
                             ggml_backend_sched_free(sched);
+                            t_enc = ggml_time_us() - t0;
+                            if (bench) {
+                                fprintf(stderr, "wav2vec2: =========== performance report ===========\n");
+                                fprintf(stderr, "wav2vec2:  audio         %7.2f s\n", n_samples / 16000.0);
+                                fprintf(stderr, "wav2vec2:  CNN extract   %7.1f ms\n", t_cnn / 1e3);
+                                fprintf(stderr, "wav2vec2:  feat proj     %7.1f ms\n", t_proj / 1e3);
+                                fprintf(stderr, "wav2vec2:  pos conv      %7.1f ms\n", t_pos / 1e3);
+                                fprintf(stderr, "wav2vec2:  encoder graph %7.1f ms  (%d layers, sched path)\n",
+                                        t_enc / 1e3, L);
+                                fprintf(stderr, "wav2vec2:  total        %7.1f ms\n",
+                                        (t_cnn + t_proj + t_pos + t_enc) / 1e3);
+                                fprintf(stderr, "wav2vec2: ================================================\n");
+                            }
                             return logits_tv;
                         }
                     }
@@ -1277,7 +1299,9 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
     }
 
     // Global LayerNorm + LM head — use ggml_linear_f32 helper (proven working)
+    t_enc = ggml_time_us() - t0;
     // Global LayerNorm + LM head
+    t0 = ggml_time_us();
     {
         // hidden_ht is [T, H] layout (same as ggml [H, T] data layout)
         layer_norm(hidden_ht.data(), hidden_ht.data(), (const float*)m.enc_ln_w->data, (const float*)m.enc_ln_b->data,
@@ -1288,6 +1312,19 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         std::vector<uint8_t> scratch;
         ggml_linear_f32(scratch, m.lm_w, m.lm_b ? (const float*)m.lm_b->data : nullptr, hidden_ht.data(), logits.data(),
                         H, V_size, T, n_threads);
+        t_lm = ggml_time_us() - t0;
+
+        if (bench) {
+            fprintf(stderr, "wav2vec2: =========== performance report ===========\n");
+            fprintf(stderr, "wav2vec2:  audio         %7.2f s\n", n_samples / 16000.0);
+            fprintf(stderr, "wav2vec2:  CNN extract   %7.1f ms\n", t_cnn / 1e3);
+            fprintf(stderr, "wav2vec2:  feat proj     %7.1f ms\n", t_proj / 1e3);
+            fprintf(stderr, "wav2vec2:  pos conv      %7.1f ms\n", t_pos / 1e3);
+            fprintf(stderr, "wav2vec2:  transformer   %7.1f ms  (%d layers)\n", t_enc / 1e3, (int)hp.num_hidden_layers);
+            fprintf(stderr, "wav2vec2:  LN + LM head  %7.1f ms\n", t_lm / 1e3);
+            fprintf(stderr, "wav2vec2:  total        %7.1f ms\n", (t_cnn + t_proj + t_pos + t_enc + t_lm) / 1e3);
+            fprintf(stderr, "wav2vec2: ================================================\n");
+        }
 
         return logits;
     }
