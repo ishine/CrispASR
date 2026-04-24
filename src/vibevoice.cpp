@@ -744,25 +744,17 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
                    hp.d_lm * sizeof(float));
         }
     }
-    // Replace speech positions with combined features
-    // speech_features * scaling_factor + speech_bias_factor
-    // Read scaling/bias factors
-    float speech_scale = 1.0f, speech_bias = 0.0f;
-    {
-        ggml_tensor* sf = G("speech_scaling_factor");
-        ggml_tensor* bf = G("speech_bias_factor");
-        if (sf) ggml_backend_tensor_get(sf, &speech_scale, 0, sizeof(float));
-        if (bf) ggml_backend_tensor_get(bf, &speech_bias, 0, sizeof(float));
-    }
+    // Replace speech positions with combined features (no scaling — ASR variant
+    // doesn't apply speech_scaling_factor; that's only in the base TTS model)
     for (int i = 0; i < T_audio; i++) {
         int pos = speech_start_pos + i;
-        for (int d = 0; d < hp.d_lm; d++)
-            prefix_embeds[pos * hp.d_lm + d] = speech_features[i * hp.d_lm + d] * speech_scale + speech_bias;
+        memcpy(prefix_embeds.data() + pos * hp.d_lm,
+               speech_features.data() + i * hp.d_lm,
+               hp.d_lm * sizeof(float));
     }
 
     if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "vibevoice: prefix embedded (%d tokens), scale=%.4f, bias=%.4f\n",
-                prefix_len, speech_scale, speech_bias);
+        fprintf(stderr, "vibevoice: prefix embedded (%d tokens)\n", prefix_len);
 
     // 7. Allocate KV cache for Qwen2 decoder
     int max_gen = ctx->params.max_new_tokens > 0 ? ctx->params.max_new_tokens : 512;
