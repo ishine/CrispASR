@@ -6,6 +6,13 @@
 // Two parallel CNN tokenizer encoders (ConvNeXt blocks with depthwise conv),
 // projected to LM space via FC connectors, then autoregressive Qwen2 decoder.
 
+// MSVC's <cmath>/<math.h> only exposes M_PI when this is defined BEFORE
+// the very first include in the translation unit (any transitive
+// #include <math.h> in vibevoice.h or the ggml headers commits the
+// macro state — defining it later is a no-op). Linux/macOS get M_PI
+// via libc compat; Windows CI fails with C2065 without this.
+#define _USE_MATH_DEFINES
+
 #include "vibevoice.h"
 #include "core/attention.h"
 #include "core/ffn.h"
@@ -15,11 +22,6 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
-
-// MSVC's <cmath> only exposes M_PI when this is defined first (POSIX
-// extension). Linux/macOS define it via libc compatibility — without
-// this, the Windows CI build fails with C2065: 'M_PI': undeclared.
-#define _USE_MATH_DEFINES
 
 #include <algorithm>
 #include <cassert>
