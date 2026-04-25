@@ -370,8 +370,10 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
             params.tts_voice = ARGV_NEXT;
         } else if (arg == "--tts-steps") {
             params.tts_steps = std::stoi(ARGV_NEXT);
-            if (params.tts_steps < 1) params.tts_steps = 1;
-            if (params.tts_steps > 100) params.tts_steps = 100;
+            if (params.tts_steps < 1)
+                params.tts_steps = 1;
+            if (params.tts_steps > 100)
+                params.tts_steps = 100;
         } else if (arg == "--auto-download") {
             params.auto_download = true;
         } else if (arg == "--server") {
@@ -1402,7 +1404,8 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (explicit_backend || model_is_auto || auto_detected_non_whisper || params.stream || !params.tts_text.empty()) {
+        if (explicit_backend || model_is_auto || auto_detected_non_whisper || params.stream ||
+            !params.tts_text.empty()) {
             const int rc = crispasr_run_backend(params);
 #if defined(_WIN32)
             // Bypass global C++ destructors (ggml Vulkan device teardown can

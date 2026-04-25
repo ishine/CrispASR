@@ -3688,9 +3688,10 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     // 6. Scale and decode
     const auto t_ar_done = std::chrono::high_resolution_clock::now();
     if (getenv("VIBEVOICE_BENCH") && lm_step_count > 0) {
-        fprintf(stderr, "  BENCH LM step (%d calls): build=%.0fms (%.1f/call), alloc=%.0fms (%.1f/call), compute=%.0fms (%.1f/call)\n",
-                lm_step_count, lm_build_ms, lm_build_ms / lm_step_count,
-                lm_alloc_ms, lm_alloc_ms / lm_step_count,
+        fprintf(stderr,
+                "  BENCH LM step (%d calls): build=%.0fms (%.1f/call), alloc=%.0fms (%.1f/call), compute=%.0fms "
+                "(%.1f/call)\n",
+                lm_step_count, lm_build_ms, lm_build_ms / lm_step_count, lm_alloc_ms, lm_alloc_ms / lm_step_count,
                 lm_compute_ms, lm_compute_ms / lm_step_count);
     }
     int actual_frames = total_latent / vae_dim;

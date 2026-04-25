@@ -658,8 +658,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
         // Convert float → int16
         for (size_t i = 0; i < audio.size(); i++) {
             float s = audio[i];
-            if (s > 1.0f) s = 1.0f;
-            if (s < -1.0f) s = -1.0f;
+            if (s > 1.0f)
+                s = 1.0f;
+            if (s < -1.0f)
+                s = -1.0f;
             int16_t v = (int16_t)(s * 32767.0f);
             fwrite(&v, 2, 1, fout);
         }

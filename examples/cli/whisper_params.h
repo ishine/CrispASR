@@ -213,7 +213,7 @@ struct whisper_params {
     // TTS mode: synthesize speech from text (vibevoice backend only).
     // --tts "text" -m vibevoice-tts.gguf --voice voice.gguf -o output.wav
     std::string tts_text;
-    std::string tts_output;     // output WAV file path (default: tts_output.wav)
-    std::string tts_voice;      // voice prompt GGUF path
-    int         tts_steps = 20; // DPM-Solver++ inference steps (10-20, default 20)
+    std::string tts_output; // output WAV file path (default: tts_output.wav)
+    std::string tts_voice;  // voice prompt GGUF path
+    int tts_steps = 20;     // DPM-Solver++ inference steps (10-20, default 20)
 };

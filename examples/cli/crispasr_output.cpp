@@ -209,7 +209,8 @@ std::vector<crispasr_disp_segment> crispasr_make_disp_segments(const std::vector
             if (!cur.text.empty()) {
                 // Check last codepoint of current text
                 size_t last = cur.text.size() - 1;
-                while (last > 0 && (cur.text[last] & 0xC0) == 0x80) last--;
+                while (last > 0 && (cur.text[last] & 0xC0) == 0x80)
+                    last--;
                 unsigned char b = (unsigned char)cur.text[last];
                 prev_is_cjk = (b >= 0xE0); // CJK chars are 3+ bytes in UTF-8
             }
