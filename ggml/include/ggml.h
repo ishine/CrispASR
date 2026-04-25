@@ -524,7 +524,8 @@ extern "C" {
         GGML_OP_ROPE_BACK,
         GGML_OP_CLAMP,
         GGML_OP_CONV_TRANSPOSE_1D,
-        GGML_OP_CONV_1D_CF,  // channels-first 1D convolution (no im2col)
+        GGML_OP_CONV_1D_CF,    // channels-first 1D convolution (no im2col)
+        GGML_OP_CONV_1D_GROUP, // grouped 1D convolution (fused per-group matmul)
         GGML_OP_IM2COL,
         GGML_OP_IM2COL_BACK,
         GGML_OP_IM2COL_3D,
@@ -1980,6 +1981,20 @@ extern "C" {
             int                   s0,  // stride
             int                   p0,  // padding
             int                   d0); // dilation
+
+    // Grouped 1D convolution.
+    // a: kernel [K, C_in/groups, C_out]
+    // b: data   [T, C_in]               (time-major, same as ggml_conv_1d)
+    // Returns   [T_out, C_out]
+    // Fused per-group im2col+matmul, supports "same" padding.
+    GGML_API struct ggml_tensor * ggml_conv_1d_group(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,   // convolution kernel [K, C_in/G, C_out]
+            struct ggml_tensor  * b,   // data [T, C_in]
+            int                   s0,  // stride
+            int                   p0,  // padding
+            int                   d0,  // dilation
+            int                   groups); // number of groups
 
     // depthwise
     // TODO: this is very likely wrong for some cases! - needs more testing

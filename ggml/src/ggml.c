@@ -1006,6 +1006,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "CLAMP",
     "CONV_TRANSPOSE_1D",
     "CONV_1D_CF",
+    "CONV_1D_GROUP",
     "IM2COL",
     "IM2COL_BACK",
     "IM2COL_3D",
@@ -1058,7 +1059,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 96");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1117,6 +1118,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "clamp(x)",
     "conv_transpose_1d(x)",
     "conv_1d_cf(x)",
+    "conv_1d_group(x)",
     "im2col(x)",
     "im2col_back(x)",
     "im2col_3d(x)",
@@ -1169,7 +1171,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 98, "GGML_OP_COUNT != 96");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -4581,6 +4583,50 @@ struct ggml_tensor * ggml_conv_1d_dw_cf(
     ggml_set_op_params(result, params, sizeof(params));
 
     result->op     = GGML_OP_CONV_1D_CF;
+    result->src[0] = a;
+    result->src[1] = b;
+
+    return result;
+}
+
+// ggml_conv_1d_group — grouped 1D convolution
+//
+// a: kernel [K, C_in/G, C_out]
+// b: data   [T, C_in]               (time-major, ne[0]=T, ne[1]=C_in)
+// out:      [T_out, C_out]          (time-major)
+//
+// Each of G groups computes independently:
+//   group g: kernel[:, :, g*cout_pg:(g+1)*cout_pg] convolves
+//            data[:, g*cin_pg:(g+1)*cin_pg]
+
+struct ggml_tensor * ggml_conv_1d_group(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        int                   s0,
+        int                   p0,
+        int                   d0,
+        int                   groups) {
+    // a: [K, C_in/G, C_out], b: [ne0, C_in, ...]
+    // Allow non-matrix b (e.g. from ggml_pad_ext which returns 4D)
+    const int64_t C_in  = b->ne[1];
+    const int64_t T_in  = b->ne[0];
+    const int64_t C_out = a->ne[2];
+    GGML_ASSERT(a->ne[3] == 1);
+    GGML_ASSERT(C_in  % groups == 0);
+    GGML_ASSERT(C_out % groups == 0);
+    GGML_ASSERT(a->ne[1] == C_in / groups);
+
+    const int64_t T_out = ggml_calc_conv_output_size(T_in, a->ne[0], s0, p0, d0);
+    GGML_ASSERT(T_out > 0);
+
+    const int64_t ne[4] = { T_out, C_out, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    int32_t params[] = { s0, p0, d0, groups };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_CONV_1D_GROUP;
     result->src[0] = a;
     result->src[1] = b;
 
