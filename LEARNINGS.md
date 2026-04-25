@@ -2298,205 +2298,12 @@ than OpenMP-parallelized F32 matmul. The memory bandwidth savings alone
 
 ---
 
-## VibeVoice-1.5B TTS Pipeline (April 2026)
+## VibeVoice-Realtime-0.5B TTS (April 2026)
 
-### Architecture
+Full text-to-speech pipeline implemented and verified via ASR round-trip.
+17 bugs found and fixed through systematic stage-by-stage diff methodology.
 
-The VibeVoice TTS pipeline has three stages:
-
-1. **Text conditioning**: Text → Qwen2 LM → hidden states [d_lm=1536]
-2. **Flow matching denoiser**: Iterative noise prediction → acoustic latents [vae_dim=64, T_frames]
-3. **σ-VAE decoder**: Latent codes → 24 kHz mono PCM audio
-
-### Prediction Head (Flow Matching)
-
-4 layers of AdaLN-modulated SwiGLU blocks:
-
-```
-Input: noisy_latent[64] + condition[1536]
-  → noisy_proj(64→1536) + cond_proj(1536→1536)
-  → 4× [AdaLN(t_emb→shift,scale,gate) → RMSNorm → modulate → SwiGLU → gate → residual]
-  → final AdaLN(shift,scale) → Linear(1536→64)
-Output: predicted_epsilon[64]
-```
-
-Key: AdaLN modulation formula: `h = norm(x) * (1 + scale) + shift`. Gate is DiT-style (no sigmoid).
-
-Time embedding: sinusoidal[256] → Linear(256→1536) → SiLU → Linear(1536→1536).
-
-### σ-VAE Decoder (Transposed ConvNeXt)
-
-Mirrors the encoder architecture in reverse:
-- Stem: Conv1d(64→2048, K=7, stride=1)
-- 6 upsample stages: ConvTranspose1d with strides [8, 5, 5, 4, 2, 2]
-- Each stage followed by 3-8 ConvNeXt blocks (Block1D: depthwise conv + SiLU FFN)
-- Head: Conv1d(32→1, K=7) → mono audio
-- Total upsample: 8×5×5×4×2×2 = 3200x
-
-### ggml_conv_transpose_1d Layout
-
-```
-Kernel: ne[0]=K, ne[1]=C_out, ne[2]=C_in (from PyTorch ConvTranspose1d [C_in, C_out, K])
-Input:  ne[0]=T, ne[1]=C_in
-Output: ne[0]=T_out, ne[1]=C_out (4D: [T_out, C_out, 1, 1])
-
-Output trimming (causal): T_target = T_in × stride, trim = K - stride from end
-```
-
-### Latent Scaling
-
-Before decoder: `z_scaled = z / scaling_factor - bias_factor`
-- scaling_factor ≈ 0.196 (stored as `speech_scaling_factor` tensor)
-- bias_factor ≈ -0.049 (stored as `speech_bias_factor` tensor)
-
-### Known Issues
-
-1. **Conditioning quality**: VibeVoice-ASR uses the same Qwen2 LM for both ASR and TTS pretraining, but production TTS inference requires a separate TTS-specific language model (`tts_language_model`) that generates per-frame conditions autoregressively. Our implementation uses the ASR LM's last hidden state broadcast to all frames, which produces functional but not high-quality audio.
-
-2. **Diffusion schedule**: The DDIM schedule parameters (beta_start=0.00085, beta_end=0.012, scaled linear) are standard defaults. VibeVoice may use different values — check `scheduler_config.json` in the HF model.
-
-3. **Byte-level tokenization**: Without BPE merge rules, we tokenize at byte level (one token per byte). This produces ~2x more tokens than proper BPE but is semantically valid.
-
-### GGUF Tensor Summary (TTS-specific)
-
-```
-pred.t_emb.{0,2}.weight          — timestep MLP (256→1536, 1536→1536)
-pred.noisy_proj.weight            — project noisy latent (64→1536)
-pred.cond.weight                  — project LM condition (1536→1536)
-pred.layers.{0-3}.{adaln,norm,ffn.*}  — 4 AdaLN + SwiGLU layers
-pred.final.{adaln,linear}.weight  — final projection (1536→64)
-at_dec.us.{0-6}.*                 — upsample layers (stem conv + 6 transposed convs)
-at_dec.s.{0-6}.{0-7}.*           — ConvNeXt decoder blocks
-at_dec.head.{weight,bias}         — final conv to mono
-speech_scaling_factor              — 0.196
-speech_bias_factor                 — -0.049
-```
-
-### VibeVoice-Realtime TTS Debugging (stage-by-stage diff methodology)
-
-Followed the same stage-by-stage diff protocol as wav2vec2/FireRedPunc debugging:
-
-1. **Token IDs**: EXACT MATCH (greedy longest-match tokenizer produces same as BPE for this input)
-2. **Base LM hidden**: cos=1.000000 (4-layer base LM matches Python reference perfectly)
-3. **TTS condition**: cos=0.999999 (after fixing 3 bugs — see below)
-4. **Latent frame 0**: cos=0.71 (expected divergence from different RNG seeds)
-
-**Bugs found and fixed via diff-testing:**
-
-1. **Type embedding ordering**: The reference does embed → type_embed → splice (splice overwrites type at text positions). Our C++ did embed → splice → type (type gets added to spliced positions too). Fix: add type embedding FIRST, then splice base LM hidden states. This single fix improved cos from 0.62 → 0.999999.
-
-2. **Base LM scope**: Initially ran base LM on all 33 prompt tokens (wrong context). Reference runs base LM on just the 2 text tokens. The 4-layer base LM produces very different hidden states with different attention context. Fix: run on text_ids only, splice at tail positions.
-
-3. **Realtime model layer count**: Config says n_lm_layers=24 (full Qwen2.5-0.5B spec) but the Realtime model only has 4 base LM layers + 20 TTS LM layers. Needed runtime detection from tensor presence.
-
-**Key architectural insight**: VibeVoice-Realtime-0.5B has TWO language models:
-- Base LM: 4-layer Qwen2 (no final norm) — processes text, produces hidden states
-- TTS LM: 20-layer Qwen2 (with final norm) — generates speech conditioning from text+speech embeddings
-- Type embeddings: `tts_input_types[2, d_lm]` — 1 for text, 0 for speech
-- The base LM hidden states are spliced into TTS LM input at text positions
-
-**Remaining work for production quality:**
-- Match PyTorch MT19937 random seed for deterministic noise
-- Proper negative conditioning for CFG (using `<|image_pad|>` token)
-- Full TTS LM KV cache update per speech frame (currently same condition for all frames)
-
-### VibeVoice TTS — Dual KV Cache CFG Fix (cont.)
-
-**The dual KV cache for CFG was the breakthrough that made TTS produce intelligible speech.**
-
-Before: single static negative condition → audio clips, no speech content
-After: per-frame updated negative condition via separate KV cache → clear English speech
-
-ASR round-trip results:
-- "Hello, how are you today?" → parakeet hears: "Oh yeah, I'm seeing that."
-- The speech IS intelligible English but content doesn't match input text
-- Root cause: different RNG produces different (but valid) speech tokens
-- PyTorch uses 64-bit MT19937, our C++ uses 32-bit → completely different noise sequences
-- With matching RNG, the content would match (conditioning is verified cos=0.9999)
-
-**Architecture now fully verified:**
-1. Base LM (4 layers): cos=1.000000
-2. TTS LM (20 layers): cos=0.999999 
-3. Prediction head: correct (AdaLN + SwiGLU, v-prediction)
-4. DDIM: correct (cosine schedule, v-prediction step)
-5. CFG: correct (dual KV cache, per-frame update)
-6. VAE decoder: correct (transposed ConvNeXt, 3200x upsample)
-7. Type embeddings: correct (text=1, speech=0)
-8. Base LM splice: correct (last n_text positions, after type embed)
-
-### VibeVoice TTS — Voice Prompt Integration (in progress)
-
-**Key discovery: voice prompts are REQUIRED for correct TTS.**
-
-The official VibeVoice-Realtime-0.5B model REQUIRES a voice prompt (.pt file) containing
-pre-computed KV caches that establish speaker identity. Without it, the model generates
-random speech-like audio (intelligible but wrong content).
-
-Official pipeline verified: "Hello, how are you today?" → parakeet: exact match.
-C++ without voice: same text → parakeet: "Did you know?" (wrong content).
-
-**Voice prompt structure (from .pt files):**
-- `lm`: 4-layer base LM KV cache [2, seq_len=74, 64]
-- `tts_lm`: 20-layer TTS LM KV cache [2, seq_len=251, 64]
-- `neg_lm`: 4-layer negative base LM KV [2, seq_len=1, 64]
-- `neg_tts_lm`: 20-layer negative TTS LM KV [2, seq_len=1, 64]
-
-**Implementation progress:**
-1. GGUF converter for voice .pt → voice.gguf (2.7 MB) ✓
-2. `vibevoice_load_voice()` API ✓
-3. `--voice` CLI flag ✓
-4. KV pre-fill with per-head stride-matched copy ✓
-5. Separate neg_n_past tracking for negative path ✓
-
-**Remaining:** Stage-by-stage diff of TTS LM condition WITH voice prompt.
-The KV data is verified correct in the GGUF (cos=1.0 with reference),
-but the runtime copy into the KV cache may have data layout issues.
-Need to dump TTS LM hidden state with voice prompt and compare against
-Python reference using the same voice.
-
-### VibeVoice TTS — AdaLN SiLU Fix (CRITICAL BUG)
-
-**The missing SiLU activation in AdaLN modulation was the final critical bug.**
-
-The prediction head's `adaLN_modulation` is a Sequential(SiLU, Linear), not just Linear.
-Our C++ did `adaln = linear(c)` but should do `adaln = linear(silu(c))`.
-This applies to ALL 4 HeadLayers AND the FinalLayer.
-
-Without SiLU: latent rms DIVERGES (1.0 → 2.4 over 20 DPM steps), producing noise.
-With SiLU: latent rms CONVERGES (1.0 → 0.9 over 20 DPM steps), producing speech.
-
-Bug found via deep methodology:
-1. Verified DPM solver formula matches diffusers (step-by-step cos=1.0 on test vectors)
-2. Verified solver matches when using official z (per-step isolated comparison = exact)
-3. Found solver diverges when using its own z (feedback amplifies error)
-4. Traced to prediction head output magnitude: ours=0.65 vs official=0.26
-5. Hooked official model internals: saw `adaLN_modulation = Sequential(SiLU, Linear)`
-6. Our code was `linear(c)`, should be `linear(silu(c))`
-
-**Also found: DPM-Solver++ 2nd-order r ratio sign was wrong** (λ_previous - λ_current instead of λ_current - λ_previous). Fixed: `h_0 = λ_current - λ_previous`, `r = h_0 / h`.
-
-**Also found: cosine schedule missing beta clipping** to max 0.999. Without clipping, α_cumprod[999]=1e-20 instead of 2.4e-9, causing λ miscalculation.
-
-### Final ASR round-trip results (VibeVoice-Realtime-0.5B + Emma voice):
-
-| Input | Parakeet ASR |
-|-------|-------------|
-| "Hello, how are you today?" | "Hello, hello, how are you today?" |
-| "The quick brown fox jumps over the lazy dog" | "The quick brown fox jumps over the laser." |
-| "This is a test of text to speech" | "This is just test of text is text to text." |
-
-The core text content matches. Remaining artifacts (word doubling, end truncation) need:
-- EOS classifier integration for automatic length detection
-- Fine-tuning of speech_window/text_window interleaving timing
-
-### VibeVoice TTS — FINAL WORKING (17 bugs total)
-
-**Bug #17: Text tokenization missing trailing newline.**
-
-The official `VibeVoiceTextTokenizerFast` appends "\n" to text before tokenization.
-This changes the last token: "?" (ID 30) → "?\n" (ID 5267).
-Without the newline, the model generates doubled/incorrect speech content.
-With the newline, ALL test cases produce exact ASR round-trip matches:
+### Final Results
 
 | Input | Parakeet ASR |
 |-------|-------------|
@@ -2505,22 +2312,134 @@ With the newline, ALL test cases produce exact ASR round-trip matches:
 | "The quick brown fox jumps over the lazy dog" | "The quick brown fox jumps over the lazy dog." |
 | "Good morning everyone" | "Good morning everyone." |
 
-**All 17 bugs found via systematic stage-by-stage diff methodology:**
+### Architecture
 
-1. Cosine schedule (linear → cosine)
-2. v-prediction (epsilon → velocity)
-3. Condition routing (x += cond → c = cond + t_emb for AdaLN)
-4. Greedy tokenizer (byte-level → longest match)
-5. Type embedding ordering (embed→splice→type → embed→type→splice)
-6. Base LM scope (full prompt → text tokens only)
-7. Realtime model 4-layer base LM detection
-8. Dual KV cache for CFG (static neg → per-frame update)
-9. Voice prompt KV pre-fill (missing → per-head stride copy)
-10. Text windowing (all-at-once → 5-token windows with interleaving)
-11. Base LM voice KV cache (no KV → temp KV from voice.lm)
-12. Type embedding in voice mode (overwritten → re-added after splice)
-13. Neg base LM forward (direct pad embed → base LM on pad tokens)
-14. DPM-Solver++ r ratio sign (λ_s - λ_t → λ_t - λ_s)
-15. Beta schedule clipping (no clip → max 0.999)
-16. **AdaLN SiLU activation (linear(c) → linear(silu(c)))** — caused divergence
-17. **Text newline append (text → text + "\n")** — caused word doubling
+VibeVoice-Realtime-0.5B has a two-LM architecture:
+
+```
+Text → Base LM (4L Qwen2, no final norm) → hidden states
+  ↓ splice into TTS LM input + type_emb[text=1]
+TTS LM (20L Qwen2, with norm) → per-frame condition
+  ↓ + DPM-Solver++ (20 steps, cosine schedule, v-prediction)
+Prediction head (4× AdaLN+SwiGLU layers) → acoustic latent [64]
+  ↓ acoustic connector → TTS LM feedback + type_emb[speech=0]
+σ-VAE decoder (7-stage transposed ConvNeXt, 3200x) → 24kHz mono PCM
+```
+
+Key components:
+- **Voice prompts**: Pre-computed KV caches (`.pt` → `.gguf`, ~2.7 MB) establish
+  speaker identity. Required for correct output. Contains `lm` (74 tokens),
+  `tts_lm` (251 tokens), `neg_lm` (1 token), `neg_tts_lm` (1 token).
+- **CFG (Classifier-Free Guidance)**: Dual KV cache — positive path uses text
+  conditioning, negative path uses `<|image_pad|>` tokens through neg base LM.
+  Both updated per-frame. `cfg_scale=3.0`.
+- **Text/speech interleaving**: TTS_TEXT_WINDOW_SIZE=5 tokens, then
+  TTS_SPEECH_WINDOW_SIZE=6 frames, alternating. Matches official pipeline.
+- **EOS classifier**: `FC1(896→896) → SiLU → FC2(896→1) → sigmoid > 0.5`.
+  Triggers at the correct frame for each text length.
+- **Tokenization**: Greedy longest-match on Qwen2 vocab. Text must end with `\n`
+  (the official VibeVoiceTextTokenizerFast appends newline).
+
+### Prediction Head Detail
+
+```
+AdaLN modulation = Sequential(SiLU, Linear)  ← NOT just Linear!
+Input: noisy_latent[64]
+  → noisy_proj(64→d_lm)
+Condition: c = cond_proj(condition) + t_embedder(timestep)
+  where t_embedder = sinusoidal[256] → Linear → SiLU → Linear → [d_lm]
+4× HeadLayer:
+  adaln_params = linear(silu(c)) → [3*d_lm] → split to shift, scale, gate
+  h = rms_norm(x, weight, eps=1e-5) * (1 + scale) + shift
+  h = SwiGLU_FFN(h)
+  x = x + gate * h
+FinalLayer:
+  adaln_params = linear(silu(c)) → [2*d_lm] → shift, scale
+  h = rms_norm(x, eps=1e-5)  (NO affine weight!)
+  h = h * (1 + scale) + shift
+  output = linear(h) → [vae_dim=64]
+```
+
+### DPM-Solver++ Implementation
+
+Cosine beta schedule with clipping:
+```
+beta_t = min(1 - cos²((t+1)/T+s)/(1+s) * π/2) / cos²((t/T+s)/(1+s) * π/2), 0.999)
+alpha_cumprod = cumulative_product(1 - beta)
+```
+The `max_beta=0.999` clipping is critical — without it, `α[999]=1e-20` instead of `2.4e-9`.
+
+First-order (steps 0 and 19):
+```
+x_target = (σ_target/σ_source) * x - α_target * (exp(-h) - 1) * x0_pred
+```
+
+Second-order midpoint (steps 1-18):
+```
+h = λ_target - λ_current,  h_0 = λ_current - λ_previous
+r = h_0 / h
+D0 = x0_current,  D1 = (1/r) * (x0_current - x0_previous)
+x_target = (σ_target/σ_current) * x - α_target*(exp(-h)-1)*D0 - 0.5*α_target*(exp(-h)-1)*D1
+```
+
+Where `λ = log(α/σ)`, `α = sqrt(α_cumprod)`, `σ = sqrt(1-α_cumprod)`.
+
+### ggml_conv_transpose_1d
+
+```
+Kernel: ne[0]=K, ne[1]=C_out, ne[2]=C_in
+Input:  ne[0]=T, ne[1]=C_in
+Output: ne[0]=T_out, ne[1]=C_out (4D: [T_out, C_out, 1, 1])
+Causal trim: remove K-stride samples from end → T_out = T_in × stride
+```
+
+### Voice KV Cache Pre-fill
+
+Voice GGUF tensors store per-layer K/V as `[hd, seq_len, n_kv_heads]` in F16.
+Runtime KV cache is `[hd, max_ctx, n_kv_heads, n_layers]`.
+Copy per-head with stride matching: each head's `hd × seq_len` slice goes into
+the cache at `layer_off + head × (hd × max_ctx × sizeof_f16)`.
+
+### 17 Bugs Found (stage-by-stage diff)
+
+| # | Bug | Impact | How found |
+|---|-----|--------|-----------|
+| 1 | Cosine schedule (was linear) | Wrong noise levels | Config comparison |
+| 2 | v-prediction (was epsilon) | Wrong denoising direction | Config: `prediction_type` |
+| 3 | Condition routing: `x += cond` → `c = cond + t_emb` for AdaLN | Wrong conditioning | Reference code reading |
+| 4 | Byte-level tokenizer → greedy longest-match | Token mismatch (11 vs 2) | Token ID comparison |
+| 5 | Type embed ordering: embed→splice→type → embed→type→splice | cos 0.62→0.9999 | Forward pass tracing |
+| 6 | Base LM scope: full prompt → text tokens only | Wrong context | Input dimension comparison |
+| 7 | Realtime model: 4 base LM layers (config says 24) | Missing layers crash | Tensor name scan |
+| 8 | Dual KV cache for CFG | Non-speech → speech | Reference code reading |
+| 9 | Voice KV pre-fill: per-head stride copy | Garbage KV data | KV data dump comparison |
+| 10 | Text windowing: 5+6 interleaving | cos 0.988→0.9999 | Official `generate()` tracing |
+| 11 | Base LM voice KV cache | Wrong base hidden | KV cache comparison |
+| 12 | Type embed in voice mode: re-add after splice | cos 0.27→0.988 | Forward pass tracing |
+| 13 | Neg base LM forward: pad → base LM → TTS LM | cos -0.01→0.9999 | Condition comparison |
+| 14 | DPM r-ratio sign: `h_0 = λ_cur - λ_prev` | 2nd-order correction wrong | Formula comparison |
+| 15 | Beta clipping: max 0.999 | α[999] off by 10¹¹ | Schedule value comparison |
+| **16** | **AdaLN SiLU: `linear(silu(c))` not `linear(c)`** | **Solver diverges** | **Internal hook comparison** |
+| **17** | **Text newline: append `\n`** | **Word doubling** | **Token ID comparison** |
+
+### Debugging Methodology
+
+Same protocol as wav2vec2, FireRedPunc, and Kyutai STT debugging:
+
+1. **Build Python reference** from model weights (not HF transformers — manual forward)
+2. **Dump intermediates** at every stage boundary (token IDs, hidden states, latents)
+3. **Compare stage-by-stage** with C++ output using cosine similarity
+4. **Find first divergence** — the bug is always at the first cos < 0.999 stage
+5. **Read the reference source** (`inspect.getsource`) to find the exact difference
+6. **Hook internal modules** (`register_forward_hook`) to capture per-layer values
+7. **Verify fix** by re-running comparison after each fix
+
+Key lesson: when each intermediate matches (cos=0.9999) but output is wrong,
+the bug is in a later stage or in accumulated precision loss. Keep adding
+comparison points until the exact divergent operation is isolated.
+
+For the AdaLN SiLU bug (#16): even with cos=1.0 on test vectors, the DPM solver
+diverged in practice. The fix was found by comparing prediction head MAGNITUDE
+(rms 0.65 vs 0.26), not direction (cos was misleading). Then hooking the official
+model's `adaLN_modulation` module revealed the Sequential(SiLU, Linear) structure
+that our manual reimplementation had missed.
