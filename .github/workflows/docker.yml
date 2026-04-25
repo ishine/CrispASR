@@ -27,6 +27,10 @@ jobs:
           - { tag: "main-musa", dockerfile: ".devops/main-musa.Dockerfile", platform: "linux/amd64" }
           - { tag: "main-intel", dockerfile: ".devops/main-intel.Dockerfile", platform: "linux/amd64" }
           - { tag: "main-cuda", dockerfile: ".devops/main-cuda.Dockerfile", platform: "linux/amd64" }
+          # main-cuda-12 = legacy CUDA 12.4 build for hosts with NVIDIA driver R510-R534
+          # (RHEL/older Ubuntu/enterprise clusters). main-cuda needs R535+. Caps at sm_90;
+          # RTX 50xx (sm_120, Blackwell) is unsupported here — those users want main-cuda.
+          - { tag: "main-cuda-12", dockerfile: ".devops/main-cuda-12.Dockerfile", platform: "linux/amd64" }
           - { tag: "main-vulkan", dockerfile: ".devops/main-vulkan.Dockerfile", platform: "linux/amd64" }
 
     steps:

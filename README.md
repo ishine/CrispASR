@@ -507,6 +507,22 @@ For CUDA builds, use the override file:
 docker compose -f docker-compose.yml -f docker-compose.cuda.yml up --build
 ```
 
+### Prebuilt CUDA images — choosing a tag
+
+We publish two CUDA tags on `ghcr.io/crispstrobe/crispasr`. Pick the one that matches your host driver:
+
+| Tag | CUDA | Min NVIDIA driver | Supported arches | Notes |
+|---|---|---|---|---|
+| `main-cuda` | 13.0 | **R535+** (R580+ for full features) | sm_75…sm_120 incl. RTX 50xx (Blackwell) | Default. Pull this on modern hosts. |
+| `main-cuda-12` | 12.4 | **R510+** | sm_75…sm_90 (RTX 20/30/40-series, Hopper) | Legacy compat — use on RHEL 7/8, older Ubuntu LTS, or any host that hasn't updated drivers in a while. RTX 50xx is **not** supported here. |
+
+Quick check: `nvidia-smi` shows your driver version in the top-right. If it's R535 or higher, pull `main-cuda`. If it's R510–R534, pull `main-cuda-12`. If it's older than R510, update your driver — neither image will work.
+
+```bash
+docker pull ghcr.io/crispstrobe/crispasr:main-cuda      # modern hosts
+docker pull ghcr.io/crispstrobe/crispasr:main-cuda-12   # legacy driver
+```
+
 ### Hugging Face Space wrapper
 
 There is also a Gradio-based Hugging Face Space wrapper under [`hf-space/`](hf-space/README.md). It starts the CrispASR HTTP server inside the container and provides a small browser UI on top of the OpenAI-compatible transcription endpoint.
