@@ -137,6 +137,8 @@ No response. HF model card has no license field.
 | OmniASR larger (1B/3B/7B) | Apache-2.0 | Same converter, bigger models | Medium |
 | NeMo Canary-Qwen-2.5b | Apache-2.0 | FastConformer + Qwen2.5 decoder | Medium |
 | Paza / Phi-4 | MIT | 14B multimodal, defer to llama.cpp | Low |
+| **XiaomiMiMo/MiMo-V2.5-ASR** | TBD (check) | LLM-style multimodal speech (similar to Qwen3-ASR pattern) | Medium — user-requested in #35 |
+| **google/gemma-4-E2B** | Gemma terms | Conformer + Gemma 4 decoder; matches "Gemma 4 Audio" entry below | Medium — user-requested in #35 |
 
 ### From llama.cpp (MIT)
 
