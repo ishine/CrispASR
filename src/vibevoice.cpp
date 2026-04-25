@@ -2017,6 +2017,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int d_lm = hp.d_lm;
     const char* dump_dir = getenv("VIBEVOICE_TTS_DUMP");
 
+    // Detect model type: Realtime (has TTS LM) vs Base (single LM)
+    bool is_base_model = (hp.tts_n_layers == 0);
+
     // 1. Tokenize text (append newline — VibeVoice TTS tokenizer does this)
     std::string text_with_nl = std::string(text) + "\n";
     std::vector<int32_t> text_ids = tokenize_text_greedy(m, text_with_nl.c_str());
@@ -2026,7 +2029,450 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     }
 
     if (verbosity >= 1)
-        fprintf(stderr, "vibevoice TTS: %d tokens from %d chars\n", (int)text_ids.size(), (int)strlen(text));
+        fprintf(stderr, "vibevoice TTS: %d tokens from %d chars (%s model)\n", (int)text_ids.size(), (int)strlen(text),
+                is_base_model ? "1.5B/7B base" : "Realtime");
+
+    // ── 1.5B/7B Base Model TTS Path ──
+    // Single-LM autoregressive generation: the LM produces text + speech control tokens.
+    // When it emits speech_diffusion_id, we run diffusion → audio.
+    if (is_base_model) {
+        // VibeVoice reuses Qwen2 vision tokens for speech:
+        const int SPEECH_START = 151652;     // <|vision_start|>
+        const int SPEECH_DIFFUSION = 151654; // <|vision_pad|> — triggers diffusion
+        const int SPEECH_END = 151653;       // <|vision_end|>
+        const int EOS_TOKEN = 151643;
+
+        // Build TTS prompt:
+        // "{system_prompt} Voice input:\n <speech_start> [voice_embeds] <speech_end>
+        //  Text input:\n Speaker 1: {text} Speech output:\n <speech_start>"
+        std::string sys = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n";
+        std::string voice_prefix = " Voice input:\n";
+        std::string text_prefix = " Text input:\n Speaker 1: ";
+        std::string speech_prefix = " Speech output:\n";
+
+        auto sys_ids = tokenize_text_greedy(m, sys.c_str());
+        auto vp_ids = tokenize_text_greedy(m, voice_prefix.c_str());
+        auto tp_ids = tokenize_text_greedy(m, (text_prefix + text_with_nl).c_str());
+        auto sp_ids = tokenize_text_greedy(m, speech_prefix.c_str());
+
+        // If --voice provides a WAV file for the 1.5B model, encode it as voice reference
+        // The voice embeds go between <speech_start> and <speech_end> in the voice section
+        std::vector<float> voice_embeds;
+        int n_voice_frames = 0;
+
+        // Try loading voice audio from the voice GGUF path (reused as audio path for 1.5B)
+        // For the 1.5B, --voice points to a reference .wav (not a .gguf KV cache)
+        if (ctx->voice.tts_seq_len == 0) {
+            // No voice GGUF loaded — check VIBEVOICE_VOICE_AUDIO env for a reference wav
+            const char* voice_wav = getenv("VIBEVOICE_VOICE_AUDIO");
+            if (voice_wav && voice_wav[0]) {
+                // Load 24kHz mono PCM from WAV file
+                FILE* fv = fopen(voice_wav, "rb");
+                if (fv) {
+                    // Skip 44-byte WAV header, read as int16
+                    fseek(fv, 44, SEEK_SET);
+                    fseek(fv, 0, SEEK_END);
+                    long fsize = ftell(fv) - 44;
+                    fseek(fv, 44, SEEK_SET);
+                    int n_samples_ref = (int)(fsize / 2);
+                    std::vector<int16_t> raw16(n_samples_ref);
+                    size_t rd = fread(raw16.data(), 2, n_samples_ref, fv);
+                    fclose(fv);
+                    (void)rd;
+                    // Convert to float and resample to 24kHz if needed
+                    std::vector<float> ref_pcm(n_samples_ref);
+                    for (int i = 0; i < n_samples_ref; i++)
+                        ref_pcm[i] = (float)raw16[i] / 32767.0f;
+
+                    // Encode through acoustic + semantic encoders + connectors
+                    float* speech_feat = vibevoice_encode_speech(ctx, ref_pcm.data(), n_samples_ref,
+                                                                  &n_voice_frames, nullptr);
+                    if (speech_feat && n_voice_frames > 0) {
+                        voice_embeds.assign(speech_feat, speech_feat + n_voice_frames * d_lm);
+                        free(speech_feat);
+                        if (verbosity >= 1)
+                            fprintf(stderr, "  encoded voice reference: %d frames from %s\n",
+                                    n_voice_frames, voice_wav);
+                    }
+                }
+            }
+        }
+
+        // Build prompt tokens
+        std::vector<int32_t> prompt;
+        prompt.insert(prompt.end(), sys_ids.begin(), sys_ids.end());
+
+        int voice_embed_start = -1;
+        if (n_voice_frames > 0) {
+            // Voice section: " Voice input:\n" + <speech_start> + [placeholders] + <speech_end>
+            prompt.insert(prompt.end(), vp_ids.begin(), vp_ids.end());
+            prompt.push_back(SPEECH_START);
+            voice_embed_start = (int)prompt.size();
+            for (int i = 0; i < n_voice_frames; i++)
+                prompt.push_back(SPEECH_DIFFUSION); // placeholder tokens for voice frames
+            prompt.push_back(SPEECH_END);
+        }
+
+        prompt.insert(prompt.end(), tp_ids.begin(), tp_ids.end());
+        prompt.insert(prompt.end(), sp_ids.begin(), sp_ids.end());
+        prompt.push_back(SPEECH_START);
+        int prefix_len = (int)prompt.size();
+
+        if (verbosity >= 1)
+            fprintf(stderr, "vibevoice TTS (base): prompt %d tokens (%d voice frames)\n", prefix_len, n_voice_frames);
+
+        // Embed prompt tokens
+        auto prefix_embeds = run_token_embedding_lookup(ctx, prompt.data(), prefix_len);
+        if ((int)prefix_embeds.size() != prefix_len * d_lm) {
+            fprintf(stderr, "vibevoice TTS: embedding failed\n");
+            return nullptr;
+        }
+
+        // Replace voice placeholder embeddings with actual speech features
+        if (voice_embed_start >= 0 && n_voice_frames > 0) {
+            for (int i = 0; i < n_voice_frames; i++)
+                memcpy(prefix_embeds.data() + (size_t)(voice_embed_start + i) * d_lm,
+                       voice_embeds.data() + (size_t)i * d_lm, d_lm * sizeof(float));
+        }
+
+        // Allocate KV cache
+        int max_gen = ctx->params.max_new_tokens > 0 ? ctx->params.max_new_tokens : 512;
+        int max_ctx = prefix_len + max_gen;
+        if (!ctx->kv_k || ctx->kv_max_ctx < max_ctx) {
+            if (ctx->kv_ctx) ggml_free(ctx->kv_ctx);
+            if (ctx->kv_buf) ggml_backend_buffer_free(ctx->kv_buf);
+            int hd = hp.head_dim, nkv = hp.n_kv_heads, nl = hp.n_lm_layers;
+            size_t k_size = (size_t)ggml_type_size(GGML_TYPE_F16) * hd * max_ctx * nkv * nl;
+            ggml_init_params kp = {2 * ggml_tensor_overhead(), nullptr, true};
+            ctx->kv_ctx = ggml_init(kp);
+            ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd, max_ctx, nkv, nl);
+            ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd, max_ctx, nkv, nl);
+            ctx->kv_buf = ggml_backend_alloc_buffer(ctx->backend, 2 * k_size);
+            uint8_t* base = (uint8_t*)ggml_backend_buffer_get_base(ctx->kv_buf);
+            ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
+            ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + k_size);
+            ctx->kv_max_ctx = max_ctx;
+        }
+        ggml_backend_buffer_clear(ctx->kv_buf, 0);
+
+        // Reuse the existing ASR decoder infrastructure
+        // build_decoder_graph and run_decoder are defined inside vibevoice_transcribe
+        // For the base model TTS, we need the same graph but output hidden states
+        // at each step instead of (or in addition to) logits.
+
+        // For simplicity, use the existing transcribe infrastructure:
+        // Prefill, then autoregressive generate. On speech_diffusion_id, run diffusion.
+
+        // Prefill
+        if (verbosity >= 1)
+            fprintf(stderr, "vibevoice TTS (base): prefilling %d tokens...\n", prefix_len);
+
+        std::vector<float> logits;
+        // Use the existing build_decoder_graph lambda from vibevoice_transcribe
+        // Actually we can't access it since it's inside another function.
+        // Let me use run_lm_hidden_states for prefill (no KV cache though).
+        // Better: duplicate the decoder graph builder inline.
+
+        // Actually, the simplest approach: call vibevoice_transcribe with a special prompt
+        // that triggers TTS generation. But that's hacky.
+
+        // For now: use the prediction head + DPM solver from the Realtime path.
+        // The base model's LM produces hidden states. We run the LM autoregressively,
+        // and at each step check if the argmax token is SPEECH_DIFFUSION.
+        // This requires the full decoder graph with logits output.
+
+        // Build decoder graph (inline, same as vibevoice_transcribe)
+        auto build_dec = [&](int n_tokens, int n_past) -> ggml_cgraph* {
+            size_t mem = ctx->compute_meta.size();
+            ggml_init_params ip = {mem, ctx->compute_meta.data(), true};
+            ggml_context* ctx0 = ggml_init(ip);
+            ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
+
+            ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hp.d_lm, n_tokens);
+            ggml_set_name(embeds, "dec_input");
+            ggml_set_input(embeds);
+            ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+            ggml_set_name(positions, "positions");
+            ggml_set_input(positions);
+            ggml_tensor* causal_mask = nullptr;
+            if (n_tokens > 1) {
+                causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_past + n_tokens, n_tokens);
+                ggml_set_name(causal_mask, "causal_mask");
+                ggml_set_input(causal_mask);
+            }
+
+            ggml_tensor* cur = embeds;
+            for (int il = 0; il < hp.n_lm_layers; il++) {
+                char p[64];
+                snprintf(p, sizeof(p), "lm.layers.%d", il);
+                ggml_tensor* residual = cur;
+                cur = ggml_rms_norm(ctx0, cur, 1e-6f);
+                cur = ggml_mul(ctx0, cur, G(std::string(p) + ".attn_ln.weight"));
+                {
+                    int T_cur = n_tokens, Lk = n_past + T_cur;
+                    ggml_tensor* Q = ggml_mul_mat(ctx0, G(std::string(p) + ".attn.q_proj.weight"), cur);
+                    auto* qb = G(std::string(p) + ".attn.q_proj.bias"); if (qb) Q = ggml_add(ctx0, Q, qb);
+                    ggml_tensor* K = ggml_mul_mat(ctx0, G(std::string(p) + ".attn.k_proj.weight"), cur);
+                    auto* kb = G(std::string(p) + ".attn.k_proj.bias"); if (kb) K = ggml_add(ctx0, K, kb);
+                    ggml_tensor* V = ggml_mul_mat(ctx0, G(std::string(p) + ".attn.v_proj.weight"), cur);
+                    auto* vb = G(std::string(p) + ".attn.v_proj.bias"); if (vb) V = ggml_add(ctx0, V, vb);
+                    Q = ggml_reshape_3d(ctx0, Q, hp.head_dim, hp.n_heads, T_cur);
+                    K = ggml_reshape_3d(ctx0, K, hp.head_dim, hp.n_kv_heads, T_cur);
+                    V = ggml_reshape_3d(ctx0, V, hp.head_dim, hp.n_kv_heads, T_cur);
+                    Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX,
+                                      0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                    K = ggml_rope_ext(ctx0, K, positions, nullptr, hp.head_dim, GGML_ROPE_TYPE_NEOX,
+                                      0, hp.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                    ggml_tensor* Kp = ggml_permute(ctx0, K, 0, 2, 1, 3);
+                    ggml_tensor* Vp = ggml_permute(ctx0, V, 0, 2, 1, 3);
+                    auto* kv = ggml_view_4d(ctx0, ctx->kv_k, hp.head_dim, T_cur, hp.n_kv_heads, 1,
+                                            ctx->kv_k->nb[1], ctx->kv_k->nb[2], ctx->kv_k->nb[3],
+                                            (size_t)il * ctx->kv_k->nb[3] + (size_t)n_past * ctx->kv_k->nb[1]);
+                    auto* vv = ggml_view_4d(ctx0, ctx->kv_v, hp.head_dim, T_cur, hp.n_kv_heads, 1,
+                                            ctx->kv_v->nb[1], ctx->kv_v->nb[2], ctx->kv_v->nb[3],
+                                            (size_t)il * ctx->kv_v->nb[3] + (size_t)n_past * ctx->kv_v->nb[1]);
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kp, kv));
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vp, vv));
+                    auto* Kf = ggml_cont(ctx0, ggml_view_3d(ctx0, ctx->kv_k, hp.head_dim, Lk, hp.n_kv_heads,
+                                                             ctx->kv_k->nb[1], ctx->kv_k->nb[2], (size_t)il * ctx->kv_k->nb[3]));
+                    auto* Vf = ggml_cont(ctx0, ggml_view_3d(ctx0, ctx->kv_v, hp.head_dim, Lk, hp.n_kv_heads,
+                                                             ctx->kv_v->nb[1], ctx->kv_v->nb[2], (size_t)il * ctx->kv_v->nb[3]));
+                    Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+                    float scale = 1.0f / sqrtf((float)hp.head_dim);
+                    auto* attn = ggml_flash_attn_ext(ctx0, Q, Kf, Vf, causal_mask, scale, 0.0f, 0.0f);
+                    attn = ggml_reshape_2d(ctx0, attn, hp.d_lm, T_cur);
+                    attn = ggml_mul_mat(ctx0, G(std::string(p) + ".attn.o_proj.weight"), attn);
+                    cur = ggml_add(ctx0, residual, attn);
+                }
+                residual = cur;
+                cur = ggml_rms_norm(ctx0, cur, 1e-6f);
+                cur = ggml_mul(ctx0, cur, G(std::string(p) + ".ffn_ln.weight"));
+                auto* ffn = core_ffn::swiglu(ctx0, cur, G(std::string(p) + ".ffn.gate.weight"),
+                                              G(std::string(p) + ".ffn.up.weight"), G(std::string(p) + ".ffn.down.weight"));
+                cur = ggml_add(ctx0, residual, ffn);
+            }
+            // Final norm
+            cur = ggml_rms_norm(ctx0, cur, 1e-6f);
+            ggml_tensor* norm_w = G("lm.norm.weight");
+            if (norm_w) cur = ggml_mul(ctx0, cur, norm_w);
+
+            // Output both hidden states AND logits
+            // Hidden: last token, before LM head
+            ggml_tensor* hidden = cur;
+            if (n_tokens > 1)
+                hidden = ggml_view_1d(ctx0, cur, hp.d_lm, (size_t)(n_tokens - 1) * hp.d_lm * sizeof(float));
+            ggml_set_name(hidden, "hidden_out");
+            ggml_set_output(hidden);
+
+            // Logits: last token through LM head
+            ggml_tensor* last = hidden;
+            if (n_tokens > 1)
+                last = ggml_reshape_2d(ctx0, last, hp.d_lm, 1);
+            ggml_tensor* lm_head = G("lm_head.weight");
+            if (!lm_head) lm_head = G("lm.tok_emb.weight");
+            ggml_tensor* logits_out = ggml_mul_mat(ctx0, lm_head, last);
+            ggml_set_name(logits_out, "logits");
+            ggml_set_output(logits_out);
+
+            ggml_build_forward_expand(gf, logits_out);
+            return gf;
+        };
+
+        auto run_dec = [&](const float* embeds, int n_tokens, int n_past,
+                           std::vector<float>& logits_out, std::vector<float>& hidden_out) -> bool {
+            std::vector<int32_t> pos(n_tokens);
+            for (int i = 0; i < n_tokens; i++) pos[i] = n_past + i;
+            std::vector<ggml_fp16_t> mask;
+            if (n_tokens > 1) {
+                int Lk = n_past + n_tokens;
+                mask.resize((size_t)n_tokens * Lk, ggml_fp32_to_fp16(0.0f));
+                ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+                for (int q = 0; q < n_tokens; q++)
+                    for (int k = n_past + q + 1; k < Lk; k++)
+                        mask[(size_t)q * Lk + k] = neg_inf;
+            }
+            ggml_cgraph* gf = build_dec(n_tokens, n_past);
+            ggml_backend_sched_reset(ctx->sched);
+            if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) return false;
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "dec_input"), embeds, 0,
+                                    (size_t)hp.d_lm * n_tokens * sizeof(float));
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), pos.data(), 0, pos.size() * sizeof(int32_t));
+            if (n_tokens > 1)
+                ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
+                                        mask.size() * sizeof(ggml_fp16_t));
+            if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) return false;
+
+            auto* lt = ggml_graph_get_tensor(gf, "logits");
+            logits_out.resize((int)lt->ne[0]);
+            ggml_backend_tensor_get(lt, logits_out.data(), 0, logits_out.size() * sizeof(float));
+            hidden_out.resize(hp.d_lm);
+            ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "hidden_out"), hidden_out.data(), 0,
+                                    hp.d_lm * sizeof(float));
+            return true;
+        };
+
+        // Prefill
+        std::vector<float> logits_v, hidden_v;
+        if (!run_dec(prefix_embeds.data(), prefix_len, 0, logits_v, hidden_v)) {
+            fprintf(stderr, "vibevoice TTS (base): prefill failed\n");
+            return nullptr;
+        }
+        int n_past = prefix_len;
+
+        // Autoregressive generation
+        ddim_schedule sched = make_ddim_schedule(20);
+        float scaling_factor = 0.196f, bias_factor = -0.049f;
+        {
+            auto* sf = G("speech_scaling_factor");
+            auto* bf = G("speech_bias_factor");
+            if (sf) ggml_backend_tensor_get(sf, &scaling_factor, 0, sizeof(float));
+            if (bf) ggml_backend_tensor_get(bf, &bias_factor, 0, sizeof(float));
+        }
+
+        std::vector<float> all_latents;
+        mt19937_state rng;
+        mt19937_seed(rng, 42);
+        float cfg_scale = 1.5f; // Lower CFG for base model (no proper negative conditioning)
+        int speech_frames = 0;
+        int max_speech_frames = std::max(12, (int)(text_ids.size() * 3));
+
+        if (verbosity >= 1)
+            fprintf(stderr, "vibevoice TTS (base): generating speech autoregressively...\n");
+
+        for (int step = 0; step < max_gen && speech_frames < max_speech_frames; step++) {
+            // Argmax on logits
+            int best = 0;
+            for (int i = 1; i < (int)logits_v.size(); i++)
+                if (logits_v[i] > logits_v[best]) best = i;
+
+            if (verbosity >= 2 || (verbosity >= 1 && step < 10)) {
+                const char* piece = (best >= 0 && best < (int)m.vocab.size()) ? m.vocab[best].c_str() : "?";
+                fprintf(stderr, "  step %d: token=%d (%s)\n", step, best, piece);
+            }
+
+            if (best == SPEECH_END || best == EOS_TOKEN) {
+                if (verbosity >= 1)
+                    fprintf(stderr, "  stop at step %d (token %d), %d speech frames\n", step, best, speech_frames);
+                break;
+            }
+
+            if (best == SPEECH_DIFFUSION) {
+                // Run diffusion: hidden_v is the LM hidden state at this position
+                std::vector<float> z(vae_dim);
+                std::vector<float> prev_x0(vae_dim, 0.0f);
+                fill_gaussian_noise(z.data(), vae_dim, rng);
+
+                // Simple CFG with zero negative condition (no separate neg LM for base model)
+                std::vector<float> neg_cond(d_lm, 0.0f);
+
+                for (int si = 0; si < 20; si++) {
+                    float t = (float)sched.timesteps[si];
+                    std::vector<float> t_sin(256);
+                    compute_sinusoidal_embed(t, t_sin.data(), 256);
+
+                    ggml_cgraph* gf = build_pred_head_graph(ctx, 2);
+                    ggml_backend_sched_reset(ctx->sched);
+                    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) break;
+                    std::vector<float> z_pair(vae_dim * 2);
+                    memcpy(z_pair.data(), z.data(), vae_dim * sizeof(float));
+                    memcpy(z_pair.data() + vae_dim, z.data(), vae_dim * sizeof(float));
+                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_noisy"), z_pair.data(), 0,
+                                            vae_dim * 2 * sizeof(float));
+                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_t_sin"), t_sin.data(), 0, 256 * sizeof(float));
+                    std::vector<float> cond_pair((size_t)d_lm * 2);
+                    memcpy(cond_pair.data(), hidden_v.data(), d_lm * sizeof(float));
+                    memcpy(cond_pair.data() + d_lm, neg_cond.data(), d_lm * sizeof(float));
+                    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pred_condition"), cond_pair.data(), 0,
+                                            (size_t)d_lm * 2 * sizeof(float));
+                    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) break;
+                    std::vector<float> v_both(vae_dim * 2);
+                    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "pred_output"), v_both.data(), 0,
+                                            vae_dim * 2 * sizeof(float));
+                    std::vector<float> v_cfg(vae_dim);
+                    for (int i = 0; i < vae_dim; i++)
+                        v_cfg[i] = v_both[vae_dim + i] + cfg_scale * (v_both[i] - v_both[vae_dim + i]);
+
+                    int t_cur = sched.timesteps[si];
+                    std::vector<float> x0(vae_dim);
+                    v_to_x0(z.data(), v_cfg.data(), x0.data(), vae_dim, sched.alphas_cumprod[t_cur]);
+                    bool is_last = (si == 19);
+                    if (si == 0 || is_last) {
+                        dpm_first_order(sched, si, z.data(), x0.data(), vae_dim);
+                    } else {
+                        dpm_second_order(sched, si, z.data(), x0.data(), prev_x0.data(), si - 1, vae_dim);
+                    }
+                    prev_x0 = x0;
+                }
+
+                all_latents.insert(all_latents.end(), z.begin(), z.end());
+                speech_frames++;
+
+                if (verbosity >= 1 && (speech_frames <= 3 || speech_frames % 5 == 0))
+                    fprintf(stderr, "  frame %d (step %d)\n", speech_frames, step);
+
+                // Feed speech latent back via acoustic connector
+                auto speech_embed = run_connector_stage(ctx, "at_conn", z.data(), 1, vae_dim);
+                if (speech_embed.empty()) break;
+
+                // LM step with speech embedding
+                if (!run_dec(speech_embed.data(), 1, n_past, logits_v, hidden_v)) break;
+                n_past++;
+            } else {
+                // Regular text token — embed and feed to LM
+                const int32_t tid = best;
+                auto tok_emb = run_token_embedding_lookup(ctx, &tid, 1);
+                if (tok_emb.size() != (size_t)hp.d_lm) break;
+                if (!run_dec(tok_emb.data(), 1, n_past, logits_v, hidden_v)) break;
+                n_past++;
+            }
+        }
+
+        if (all_latents.empty()) {
+            fprintf(stderr, "vibevoice TTS (base): no speech frames generated\n");
+            return nullptr;
+        }
+
+        // Scale and decode
+        int total_latent = (int)all_latents.size();
+        int actual_frames = total_latent / vae_dim;
+        std::vector<float> scaled(total_latent);
+        for (int i = 0; i < total_latent; i++)
+            scaled[i] = all_latents[i] / scaling_factor - bias_factor;
+
+        ggml_cgraph* dec_gf = build_vae_decoder_graph(ctx, actual_frames);
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, dec_gf)) return nullptr;
+        ggml_backend_tensor_set(ggml_graph_get_tensor(dec_gf, "dec_latent"), scaled.data(), 0,
+                                total_latent * sizeof(float));
+        if (ggml_backend_sched_graph_compute(ctx->sched, dec_gf) != GGML_STATUS_SUCCESS) return nullptr;
+
+        ggml_tensor* audio_out = ggml_graph_get_tensor(dec_gf, "dec_audio");
+        int total_audio = (int)audio_out->ne[0] * (int)audio_out->ne[1];
+        std::vector<float> raw_audio((size_t)total_audio);
+        ggml_backend_tensor_get(audio_out, raw_audio.data(), 0, (size_t)total_audio * sizeof(float));
+
+        // Trim leading silence
+        int trim_start = 0;
+        for (int i = 0; i < total_audio; i++) {
+            if (fabsf(raw_audio[i]) > 0.005f) {
+                trim_start = std::max(0, i - 800);
+                break;
+            }
+        }
+        int trimmed_len = total_audio - trim_start;
+
+        if (verbosity >= 1)
+            fprintf(stderr, "vibevoice TTS (base): %d frames → %d samples (%.2f sec)\n",
+                    actual_frames, trimmed_len, trimmed_len / 24000.0f);
+
+        float* out_buf = (float*)malloc((size_t)trimmed_len * sizeof(float));
+        if (!out_buf) return nullptr;
+        memcpy(out_buf, raw_audio.data() + trim_start, (size_t)trimmed_len * sizeof(float));
+        if (out_n_samples) *out_n_samples = trimmed_len;
+        return out_buf;
+    }
+
+    // ── Realtime-0.5B Streaming Model TTS Path (below) ──
     vibevoice_dump_i32(dump_dir, "tts_token_ids", text_ids.data(), text_ids.size());
 
     // Build TTS prompt: system + user with text + assistant start
