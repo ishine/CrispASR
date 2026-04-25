@@ -257,7 +257,33 @@ def main():
         writer.add_string("vibevoice.beta_schedule", diff_cfg.get("ddpm_beta_schedule", "cosine"))
         writer.add_uint32("vibevoice.ddpm_num_steps", diff_cfg.get("ddpm_num_steps", 1000))
         writer.add_uint32("vibevoice.ddpm_inference_steps", diff_cfg.get("ddpm_num_inference_steps", 20))
-    writer.add_uint32("vibevoice.has_tokenizer", 0)
+    # Embed Qwen2.5 tokenizer for TTS text input. Without this the runtime
+    # has no way to tokenize the user's text → "model lacks tokenizer".
+    try:
+        from transformers import AutoTokenizer
+
+        tok = None
+        for tok_src in (model_dir, "Qwen/Qwen2.5-7B"):
+            try:
+                tok = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
+                print(f"  loaded tokenizer from: {tok_src}")
+                break
+            except Exception:
+                pass
+        if tok:
+            vocab_map = tok.get_vocab()
+            inv = {v: k for k, v in vocab_map.items()}
+            max_id = max(inv.keys())
+            vocab_list = [inv.get(i, f"<unk_{i}>") for i in range(max_id + 1)]
+            writer.add_array("tokenizer.ggml.tokens", vocab_list)
+            writer.add_uint32("vibevoice.has_tokenizer", 1)
+            print(f"  tokenizer: {len(vocab_list)} tokens embedded")
+        else:
+            writer.add_uint32("vibevoice.has_tokenizer", 0)
+            print("  tokenizer not embedded: no source available")
+    except Exception as e:
+        writer.add_uint32("vibevoice.has_tokenizer", 0)
+        print(f"  tokenizer not embedded: {e}")
 
     for gguf_name, _shard, _orig, shape, qtype, nbytes in plan:
         np_dtype = NUMPY_DTYPE_FOR[qtype]
