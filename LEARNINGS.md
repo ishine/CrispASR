@@ -2560,3 +2560,71 @@ the same auto-detection kicks in once `hf_xet` is in the env.
 **Cost of getting this wrong:** ~30 minutes of failed retries +
 partial-file curl loops + searching for non-xet mirrors that don't
 exist. Single one-liner away from working downloads.
+
+---
+
+## ggml conv1d: channels-first ops eliminate transpose overhead (April 2026)
+
+### The problem
+
+ggml's `ggml_conv_1d` expects input in `[T, C_in]` layout (time-major),
+but audio pipelines naturally work in `[C, T]` layout (channels-first,
+matching PyTorch convention). Every conv call in the codebase required:
+
+1. `ggml_cont(ggml_transpose(x))` — copy+transpose [C,T] → [T,C]
+2. `ggml_conv_1d(kernel, x_transposed)` — the actual convolution
+3. `ggml_cont(ggml_transpose(result))` — copy+transpose back to [C,T]
+
+Each `ggml_cont` on a transposed tensor is a full memcpy. For the
+VibeVoice σ-VAE decoder (26 ConvNeXt blocks, 6 upsample stages), this
+meant ~224 extra transpose/cont ops on tensors up to 51200 elements.
+The depthwise conv path (`ggml_conv_1d_dw`) additionally used F16
+im2col, causing precision loss through 26 blocks (cosine sim 0.7-0.8
+at output vs 1.0 in F32).
+
+### The solution: `ggml_conv_1d_cf` + `ggml_conv_1d_dw_cf`
+
+New `GGML_OP_CONV_1D_CF` op added to ggml with:
+- `ggml_conv_1d_cf(kernel, data, stride, pad, dilation)` — regular conv
+  with data `[C_in, T]` (channels-first), output `[C_out, T_out]`
+- `ggml_conv_1d_dw_cf(kernel, data, stride, pad, dilation)` — depthwise
+  variant, kernel `[K, 1, C]`, same I/O layout
+
+Implementation: direct F32 loop (no im2col), multi-threaded over output
+channels. Handles F16/BF16 kernel weights via on-the-fly dequant with
+per-channel kernel pre-load (K is typically 7 — fits in a stack buffer).
+
+### Results on VibeVoice TTS VAE decoder
+
+| Metric | Before | After | Change |
+|---|---|---|---|
+| Op count | 700 | 476 | -32% |
+| VAE compute | 5875ms | 4172ms | **-29%** |
+| Total TTS | 10.7s | 9.1s | -15% |
+| Realtime factor | 0.39x | 0.45x | +15% |
+
+Combined with `--tts-steps 10` (DPM-Solver++ can use fewer steps at
+identical quality): 7.3s total, 0.56x realtime — **32% faster** than
+baseline.
+
+### Where to use conv1d_cf
+
+Use `ggml_conv_1d_cf` / `ggml_conv_1d_dw_cf` whenever:
+- Data is channels-first `[C, T]` (most audio pipelines)
+- Kernel is F16/F32 (not block-quantized — K is usually too small)
+- You want F32 precision (no im2col F16 accumulation)
+
+Don't use when:
+- Data is naturally time-major `[T, C]` (whisper mel, some NeMo paths)
+- Kernel is block-quantized (Q4_K/Q8_0) — need dequant support
+- GPU acceleration is needed (CPU-only kernel for now)
+
+### Backends that benefit from migration
+
+| Backend | Conv pattern | Expected gain |
+|---|---|---|
+| wav2vec2-ggml.cpp | 7-layer CNN stem, each with transpose | **High** |
+| firered_asr.cpp | 1 depthwise conv with 2 transposes | Medium |
+| kyutai_stt.cpp | 1 conv | Low |
+| ecapa_lid.cpp | 1 conv | Low |
+| vibevoice.cpp | Done (encoder + decoder) | **Done** |

@@ -879,7 +879,8 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
     ggml_backend_t cnn_bks[1] = {m.backend};
     ggml_backend_sched_t cnn_sc = ggml_backend_sched_new(cnn_bks, nullptr, 1, 128, false, false);
 
-    // cnn_buf holds data in [L, C] layout (ggml conv1d input/output format)
+    // cnn_buf holds data in ggml [L, C] format = memory layout data[l + c*L]
+    // which is channel-first in C row-major terms: data[c * L + l].
     std::vector<float> cnn_buf(audio.begin(), audio.end());
     uint32_t L_cur = (uint32_t)n_samples, C_cur = 1;
 
@@ -895,33 +896,28 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
         struct ggml_init_params gp = {gmem, nullptr, true};
         ggml_context* cctx = ggml_init(gp);
 
-        // Input: [L_cur, C_cur] — matches ggml_conv_1d expected layout
+        // Input: [L_cur, C_cur] in ggml terms (ne[0]=L, ne[1]=C)
+        // Memory: data[l + c*L] = channel-first C array data[c*L + l]
         ggml_tensor* inp = ggml_new_tensor_2d(cctx, GGML_TYPE_F32, (int64_t)L_cur, (int64_t)C_cur);
         ggml_set_name(inp, "cnn_in");
         ggml_set_input(inp);
 
-        // Use F32 im2col + mul_mat instead of ggml_conv_1d (which forces F16
-        // im2col, causing precision loss through 7 CNN layers).
+        // F32 im2col + mul_mat (cache-friendly for large C_in × C_out matmuls).
+        // im2col output: [IC*K, L_out]; kernel reshaped: [IC*K, OC]
+        // mul_mat gives [OC, L_out] — already channels-first, no transpose needed!
         ggml_tensor* im2c = ggml_im2col(cctx, m.cnn[li].conv_w, inp, (int)S, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
-        // im2col output: [IC*K, OL] ; kernel reshaped: [IC*K, OC]
-        // mul_mat(kernel_2d, im2col) → [OC, OL] ... but ggml_conv_1d does
-        // [L_out, OC] via a specific reshape. Let me match that:
         ggml_tensor* kw = m.cnn[li].conv_w;
         int64_t IC_K = kw->ne[0] * kw->ne[1]; // K * Cin
         int64_t OC = kw->ne[2];
         ggml_tensor* kw_2d = ggml_reshape_2d(cctx, kw, IC_K, OC);
         ggml_tensor* cur = ggml_mul_mat(cctx, kw_2d, im2c); // [OC, L_out]
-        // Transpose to match ggml_conv_1d output layout [L_out, OC]
-        cur = ggml_cont(cctx, ggml_transpose(cctx, cur));
+        // ^^^ This is already channels-first [OC, L_out] — no transpose needed!
 
-        // Transpose [L_out, OC] → [OC, L_out] so bias/norm operate on ne[0]=OC
-        cur = ggml_cont(cctx, ggml_transpose(cctx, cur));
-
-        // Bias: [OC] adds to [OC, L_out] along ne[0]
+        // Bias: [OC] adds to [OC, L_out] along ne[0]=OC
         if (m.cnn[li].conv_b)
             cur = ggml_add(cctx, cur, m.cnn[li].conv_b);
 
-        // Norm: ggml_norm over ne[0]=OC — matches LayerNorm/GroupNorm over channels
+        // Norm: ggml_norm over ne[0]=OC
         if (m.cnn[li].has_norm) {
             cur = ggml_norm(cctx, cur, hp.layer_norm_eps);
             if (m.cnn[li].norm_w)
@@ -932,7 +928,8 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
 
         cur = ggml_gelu(cctx, cur);
 
-        // Transpose back [OC, L_out] → [L_out, OC] for next layer's conv1d input
+        // Output is [OC, L_out] in ggml (ne[0]=OC). For next layer's im2col,
+        // we need [L_out, OC] (ne[0]=L_out). Transpose once.
         cur = ggml_cont(cctx, ggml_transpose(cctx, cur));
 
         ggml_set_name(cur, "cnn_out");
@@ -1008,8 +1005,9 @@ std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m, const 
     int T = (int)L_cur;
     int C_cnn = (int)C_cur;
 
-    // cnn_buf data from ggml is in [C, T] channel-first layout (ne[0]=L_out
-    // is the fast dimension). Transpose to [T, C] row-major for downstream code.
+    // cnn_buf data from ggml [L_out, OC] tensor is in memory as data[l + c*L],
+    // which is channel-first C array layout data[c*L + l].
+    // Transpose to [T, C] row-major for downstream transformer code.
     {
         std::vector<float> tc(T * C_cnn);
         for (int t2 = 0; t2 < T; t2++)
