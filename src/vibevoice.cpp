@@ -3243,6 +3243,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         vibevoice_dump_f32(dump_dir, "tts_prefill_hidden", hidden.data(), hidden.size());
     }
 
+    const auto t_prefill_done = std::chrono::high_resolution_clock::now();
     if (verbosity >= 1)
         fprintf(stderr, "vibevoice TTS: generating frames with text/speech interleaving...\n");
 
@@ -3621,6 +3622,7 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     }
 
     // 6. Scale and decode
+    const auto t_ar_done = std::chrono::high_resolution_clock::now();
     int actual_frames = total_latent / vae_dim;
     std::vector<float> scaled_latent(total_latent);
     for (int i = 0; i < total_latent; i++)
@@ -3646,12 +3648,22 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     int n_audio = (int)audio_out->ne[1];
     int total_audio = n_ch * n_audio;
 
+    const auto tts_t1 = std::chrono::high_resolution_clock::now();
     if (verbosity >= 1) {
-        const auto tts_t1 = std::chrono::high_resolution_clock::now();
         double tts_ms = std::chrono::duration<double, std::milli>(tts_t1 - tts_t0).count();
         double audio_sec = total_audio / 24000.0;
         fprintf(stderr, "vibevoice TTS: output %d samples (%.2f sec at 24kHz) in %.1f ms (%.2fx realtime)\n",
                 total_audio, audio_sec, tts_ms, audio_sec / (tts_ms / 1000.0));
+    }
+    if (getenv("VIBEVOICE_BENCH")) {
+        double prefill_ms = std::chrono::duration<double, std::milli>(t_prefill_done - tts_t0).count();
+        double ar_ms = std::chrono::duration<double, std::milli>(t_ar_done - t_prefill_done).count();
+        double vae_ms = std::chrono::duration<double, std::milli>(tts_t1 - t_ar_done).count();
+        double total_ms = std::chrono::duration<double, std::milli>(tts_t1 - tts_t0).count();
+        fprintf(stderr, "  BENCH phases: prefill=%.0fms (%.0f%%), AR=%.0fms (%.0f%%), VAE=%.0fms (%.0f%%)\n",
+                prefill_ms, 100.0 * prefill_ms / total_ms,
+                ar_ms, 100.0 * ar_ms / total_ms,
+                vae_ms, 100.0 * vae_ms / total_ms);
     }
 
     std::vector<float> raw_audio((size_t)total_audio);
