@@ -108,8 +108,12 @@ def target_dtype(name, shape, raw_dtype_str):
     if nd == 2:
         if "tok_emb" in name or "embed_tokens" in name:
             return GGMLQuantizationType.F16
-        if shape[-1] % 256 == 0 and shape[0] >= 32:
-            return GGMLQuantizationType.Q4_K
+        # Q4_0 block size is 32 along the last dim. (Note: original goal was
+        # Q4_K but gguf-py ships only stubs for k-quants; quants.quantize()
+        # raises NotImplementedError. Q4_0 has identical compression ratio
+        # — 4.5 bits/weight — only the per-block scale granularity differs.)
+        if shape[-1] % 32 == 0 and shape[0] >= 32:
+            return GGMLQuantizationType.Q4_0
         return GGMLQuantizationType.F16
     return GGMLQuantizationType.F16
 
@@ -119,7 +123,7 @@ def target_dtype(name, shape, raw_dtype_str):
 NUMPY_DTYPE_FOR = {
     GGMLQuantizationType.F32: np.float32,
     GGMLQuantizationType.F16: np.float16,
-    GGMLQuantizationType.Q4_K: np.uint8,  # opaque packed bytes
+    GGMLQuantizationType.Q4_0: np.uint8,  # opaque packed bytes
 }
 
 
@@ -209,12 +213,16 @@ def main():
                         continue
                 slice_meta = f.get_slice(name)
                 shape = tuple(slice_meta.get_shape())
+                # Promote 0-d scalars to (1,) — gguf has no concept of 0-d
+                # and quant_shape_to_byte_shape() crashes on empty shapes.
+                if not shape:
+                    shape = (1,)
                 qtype = target_dtype(gguf_name, shape, slice_meta.get_dtype())
                 nbytes = quantized_nbytes(shape, qtype)
                 plan.append((gguf_name, shard, name, shape, qtype, nbytes))
 
     n_total = len(plan)
-    n_q4k = sum(1 for p in plan if p[4] == GGMLQuantizationType.Q4_K)
+    n_q4k = sum(1 for p in plan if p[4] == GGMLQuantizationType.Q4_0)
     n_f16 = sum(1 for p in plan if p[4] == GGMLQuantizationType.F16)
     n_f32 = sum(1 for p in plan if p[4] == GGMLQuantizationType.F32)
     total_bytes = sum(p[5] for p in plan)
@@ -253,7 +261,15 @@ def main():
 
     for gguf_name, _shard, _orig, shape, qtype, nbytes in plan:
         np_dtype = NUMPY_DTYPE_FOR[qtype]
-        writer.add_tensor_info(gguf_name, shape, np_dtype, nbytes, raw_dtype=qtype)
+        # add_tensor_info ONLY applies quant_shape_from_byte_shape() when
+        # tensor_dtype == np.uint8 (quantized). For F16/F32 it stores the
+        # passed shape as-is. So pass byte_shape only for quantized types,
+        # logical shape for unquantized.
+        if np_dtype is np.uint8:
+            shape_arg = quants.quant_shape_to_byte_shape(shape, qtype)
+        else:
+            shape_arg = shape
+        writer.add_tensor_info(gguf_name, shape_arg, np_dtype, nbytes, raw_dtype=qtype)
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -278,13 +294,16 @@ def main():
                 arr = raw.to(torch.float32).numpy()
             elif qtype == GGMLQuantizationType.F16:
                 arr = raw.to(torch.float16).numpy()
-            elif qtype == GGMLQuantizationType.Q4_K:
+            elif qtype == GGMLQuantizationType.Q4_0:
                 src = raw.to(torch.float32).numpy()
                 arr = quants.quantize(src, qtype)  # uint8 packed bytes
                 del src
             else:
                 raise RuntimeError(f"unsupported qtype {qtype} for {gguf_name}")
             del raw
+            # Promote 0-d scalars to (1,) here too — must match the plan's shape.
+            if arr.ndim == 0:
+                arr = arr.reshape(1)
 
             assert arr.nbytes == nbytes, f"size mismatch for {gguf_name}: declared {nbytes} got {arr.nbytes}"
             writer.write_tensor_data(arr)
