@@ -121,8 +121,11 @@ if has_gpu:
                        capture_output=True)
 
     print("GPU: CUDA detected, attempting CUDA build...")
+    # GGML_CUDA_NO_VMM=ON avoids linking CUDA::cuda_driver (libcuda.so),
+    # which is missing on Kaggle (driver is loaded at runtime, not via stubs).
     r = subprocess.run(
-        f"cmake -S {CRISPASR_DIR} -B {BUILD_DIR} -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON "
+        f"cmake -S {CRISPASR_DIR} -B {BUILD_DIR} -DCMAKE_BUILD_TYPE=Release "
+        f"-DGGML_CUDA=ON -DGGML_CUDA_NO_VMM=ON "
         f"-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc",
         shell=True, capture_output=True, text=True
     )
