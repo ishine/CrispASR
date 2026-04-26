@@ -1,11 +1,20 @@
 name: Publish Docker image
 
+# Silenced for everyday pushes — this workflow takes ~45 min per image,
+# 5 images in parallel, and was failing/timing out repeatedly. Re-enable
+# the per-push trigger by uncommenting the `branches:` block below.
+# Until then, fire it explicitly via:
+#   - a v* tag push (release flow)
+#   - GitHub Actions UI → Run workflow (workflow_dispatch)
 on:
-  pull_request:
   push:
-    branches:
-      - master
-      - main
+    tags: ['v*']
+  workflow_dispatch:
+  # pull_request:
+  # push:
+  #   branches:
+  #     - master
+  #     - main
 
 permissions:
   contents: read
