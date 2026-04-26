@@ -587,7 +587,7 @@ static int run_encoder(moonshine_streaming_context* ctx, const float* frontend_o
         fn = ggml_mul_mat(ctx0, L.ffn_fc1_w, fn);
         if (L.ffn_fc1_b)
             fn = ggml_add(ctx0, fn, L.ffn_fc1_b);
-        fn = ggml_gelu(ctx0, fn);
+        fn = ggml_gelu_erf(ctx0, fn);  // exact GELU (erf variant) matching PyTorch default
         fn = ggml_mul_mat(ctx0, L.ffn_fc2_w, fn);
         if (L.ffn_fc2_b)
             fn = ggml_add(ctx0, fn, L.ffn_fc2_b);
