@@ -26,7 +26,7 @@ are in `LEARNINGS.md`. Full roadmap in `PLAN.md`.
 - **WebSocket streaming server** — `/ws` endpoint for real-time transcription
 - **Audio format support** — fix `.m4a`/`.mp4`/`.webm` crash in ffmpeg path
 - ~~**Japanese punctuation split (#29)**~~ **FIXED** — CJK clause-break + 42-char fallback
-- **Moonshine multilingual** — converter works, but base models crash (head_dim=52 padding issue); tiny multilingual models work
+- **Moonshine multilingual** — converter works but runtime crashes (F16 tensors passed to mul_mat as data instead of weights). Base models also crash (head_dim=52 padding). Needs moonshine.cpp fix to dequantize F16 encoder/decoder tensors to F32 before use
 - **Moonshine streaming** — different architecture, needs new runtime
 - **VibeVoice-ASR 7B** — blocked on ≥16 GB RAM for conversion
 - ~~**VibeVoice TTS**~~ — **DONE**: Realtime-0.5B (17 bugs, perfect round-trip) + 1.5B base model (voice cloning). HF: `cstr/vibevoice-realtime-0.5b-GGUF`, `cstr/vibevoice-1.5b-GGUF`
