@@ -37,10 +37,17 @@ def main():
     from huggingface_hub import hf_hub_download
 
     model_name = args.input.split("/")[-1]
-    pt_file = next(f for f in [f"{model_name}.pt", "model.pt"]
-                   if True)  # just use the first
-    pt_path = hf_hub_download(args.input, f"{model_name}.pt")
-    tok_path = hf_hub_download(args.input, "omniASR_tokenizer.model")
+    is_local = os.path.isdir(args.input)
+
+    if is_local:
+        # Local directory: find .pt file
+        pt_files = [f for f in os.listdir(args.input) if f.endswith(".pt")]
+        pt_path = os.path.join(args.input, pt_files[0])
+        tok_path = os.path.join(args.input, "omniASR_tokenizer.model")
+    else:
+        from huggingface_hub import hf_hub_download
+        pt_path = hf_hub_download(args.input, f"{model_name}.pt")
+        tok_path = hf_hub_download(args.input, "omniASR_tokenizer.model")
 
     ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
     sd = ckpt["model"]

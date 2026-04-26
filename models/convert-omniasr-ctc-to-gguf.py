@@ -37,7 +37,12 @@ def main():
     model_name = args.input.split("/")[-1]
 
     # Detect format: v1 (fairseq2 .pt) vs v2 (HF transformers safetensors)
-    repo_files = list_repo_files(args.input)
+    # Support both HF repo IDs and local directories
+    is_local = os.path.isdir(args.input)
+    if is_local:
+        repo_files = os.listdir(args.input)
+    else:
+        repo_files = list_repo_files(args.input)
     is_v2 = "model.safetensors" in repo_files and "config.json" in repo_files
     is_v1 = any(f.endswith(".pt") for f in repo_files)
 
@@ -92,8 +97,12 @@ def main():
         import sentencepiece as spm
 
         pt_file = next(f for f in repo_files if f.endswith(".pt"))
-        pt_path = hf_hub_download(args.input, pt_file)
-        tok_path = hf_hub_download(args.input, "omniASR_tokenizer.model")
+        if is_local:
+            pt_path = os.path.join(args.input, pt_file)
+            tok_path = os.path.join(args.input, "omniASR_tokenizer.model")
+        else:
+            pt_path = hf_hub_download(args.input, pt_file)
+            tok_path = hf_hub_download(args.input, "omniASR_tokenizer.model")
 
         ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
         sd = ckpt["model"]
