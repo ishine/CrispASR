@@ -1379,17 +1379,13 @@ static ggml_tensor* build_conv_module(ggml_context* ctx, ggml_tensor* x, const f
     h = ggml_mul(ctx, h1, ggml_sigmoid(ctx, h2)); // [2560, T]
 
     // Depthwise conv1d: groups=2560, kernel=33, SYMMETRIC padding=16
-    // Use ggml_conv_1d_dw (im2col) — works on ALL backends (Metal/CUDA/CPU).
-    // h is [C=2560, T], transpose → [T, C] for conv_1d_dw → transpose back.
-    {
-        int pad_sym = (kernel_size - 1) / 2;
-        ggml_tensor* ht = ggml_cont(ctx, ggml_transpose(ctx, h)); // [T, 2560]
-        ht = ggml_pad_ext(ctx, ht, pad_sym, pad_sym, 0, 0, 0, 0, 0, 0);
-        ht = ggml_conv_1d_dw(ctx, conv.dw_w, ht, 1, 0, 1);
-        if (ggml_n_dims(ht) > 2)
-            ht = ggml_reshape_2d(ctx, ht, ht->ne[0], ht->ne[2]);
-        h = ggml_cont(ctx, ggml_transpose(ctx, ht)); // [channels, T]
-    }
+    ggml_tensor* ht = ggml_cont(ctx, ggml_transpose(ctx, h)); // [T, 2560]
+    int pad_sym = (kernel_size - 1) / 2;                      // 16 on each side
+    ht = ggml_pad_ext(ctx, ht, pad_sym, pad_sym, 0, 0, 0, 0, 0, 0);
+    ht = ggml_conv_1d_dw(ctx, conv.dw_w, ht, 1, 0, 1);
+    // Output is [OL, 1, channels, 1] — reshape to [OL, channels]
+    ht = ggml_reshape_2d(ctx, ht, ht->ne[0], ht->ne[2]);
+    h = ggml_cont(ctx, ggml_transpose(ctx, ht)); // [channels, T]
 
     // LayerNorm (named batch_norm in checkpoint)
     h = ggml_norm(ctx, h, 1e-5f);
@@ -1692,11 +1688,7 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
     // Step 3: CPU encoder (Conformer with relative PE attention)
     int flat_dim = 608; // 32 * 19
     std::vector<float> enc_output;
-    auto t_enc0 = ggml_time_us();
     hybrid_encoder(subsampled.data(), T_sub, flat_dim, ctx, enc_output);
-    auto t_enc1 = ggml_time_us();
-    if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "firered_asr: encoder %d layers in %.1fms\n", hp.n_layers_enc, (t_enc1 - t_enc0) / 1e3);
     // enc_output: [T_sub, d_model] row-major
 
     if (ctx->params.verbosity >= 1) {
