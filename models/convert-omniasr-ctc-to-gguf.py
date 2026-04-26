@@ -32,19 +32,82 @@ def main():
     args = parser.parse_args()
 
     import torch
-    import sentencepiece as spm
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import hf_hub_download, list_repo_files
 
-    # Download model + tokenizer
     model_name = args.input.split("/")[-1]
-    pt_path = hf_hub_download(args.input, f"{model_name}.pt")
-    tok_path = hf_hub_download(args.input, "omniASR_tokenizer.model")
 
-    ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
-    sd = ckpt["model"]
-    print(f"Loaded {len(sd)} tensors from {model_name}")
+    # Detect format: v1 (fairseq2 .pt) vs v2 (HF transformers safetensors)
+    repo_files = list_repo_files(args.input)
+    is_v2 = "model.safetensors" in repo_files and "config.json" in repo_files
+    is_v1 = any(f.endswith(".pt") for f in repo_files)
 
-    # Infer architecture
+    if is_v2:
+        print(f"Detected HF transformers format (v2): {args.input}")
+        from safetensors.torch import load_file
+        import json
+
+        sf_path = hf_hub_download(args.input, "model.safetensors")
+        cfg_path = hf_hub_download(args.input, "config.json")
+        vocab_path = hf_hub_download(args.input, "vocab.json")
+
+        sd_raw = load_file(sf_path)
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        with open(vocab_path) as f:
+            vocab_json = json.load(f)
+
+        # Map v2 tensor names to v1 names for unified processing
+        sd = {}
+        for v2_name, tensor in sd_raw.items():
+            v1 = v2_name
+            # Top-level replacements (order matters — longest prefix first)
+            v1 = v1.replace("wav2vec2.feature_extractor.conv_layers.", "encoder_frontend.feature_extractor.layers.")
+            v1 = v1.replace("wav2vec2.feature_projection.projection.", "encoder_frontend.model_dim_proj.")
+            v1 = v1.replace("wav2vec2.feature_projection.layer_norm.", "encoder_frontend.post_extract_layer_norm.")
+            v1 = v1.replace("wav2vec2.encoder.pos_conv_embed.conv.", "encoder_frontend.pos_encoder.conv.")
+            v1 = v1.replace("wav2vec2.encoder.layer_norm.", "encoder.layer_norm.")
+            v1 = v1.replace("wav2vec2.encoder.layers.", "encoder.layers.")
+            v1 = v1.replace("lm_head.", "final_proj.")
+            # Sub-module replacements
+            v1 = v1.replace(".attention.", ".self_attn.")
+            v1 = v1.replace(".out_proj.", ".output_proj.")
+            v1 = v1.replace(".feed_forward.intermediate_dense.", ".ffn.inner_proj.")
+            v1 = v1.replace(".feed_forward.output_dense.", ".ffn.output_proj.")
+            v1 = v1.replace(".final_layer_norm.", ".ffn_layer_norm.")
+            # v2 has .layer_norm per encoder layer = self_attn_layer_norm in v1
+            if "encoder.layers." in v1 and ".layer_norm." in v1 and "ffn" not in v1:
+                v1 = v1.replace(".layer_norm.", ".self_attn_layer_norm.")
+            sd[v1] = tensor
+
+        # Build vocab from vocab.json
+        vocab = [""] * len(vocab_json)
+        for token, idx in vocab_json.items():
+            if idx < len(vocab):
+                vocab[idx] = token
+
+        print(f"Loaded {len(sd)} tensors from {model_name} (v2 format)")
+        print(f"Vocab: {len(vocab)} tokens from vocab.json")
+
+    elif is_v1:
+        import sentencepiece as spm
+
+        pt_file = next(f for f in repo_files if f.endswith(".pt"))
+        pt_path = hf_hub_download(args.input, pt_file)
+        tok_path = hf_hub_download(args.input, "omniASR_tokenizer.model")
+
+        ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
+        sd = ckpt["model"]
+
+        sp = spm.SentencePieceProcessor()
+        sp.Load(tok_path)
+        vocab = [sp.IdToPiece(i) for i in range(sp.GetPieceSize())]
+
+        print(f"Loaded {len(sd)} tensors from {model_name} (v1 format)")
+    else:
+        print(f"ERROR: unrecognized model format in {args.input}")
+        sys.exit(1)
+
+    # Infer architecture (works for both v1 and v2 after name mapping)
     n_enc = max(int(k.split('.')[2]) for k in sd if k.startswith("encoder.layers.")) + 1
     d_model = sd["encoder.layers.0.self_attn.q_proj.weight"].shape[0]
     d_ffn = sd["encoder.layers.0.ffn.inner_proj.weight"].shape[0]
@@ -64,10 +127,22 @@ def main():
     strides = [5] + [2] * (n_cnn - 1)  # layer 0: stride 5, rest: stride 2
     print(f"  CNN: {[(f'{oc}x{ic}xk{k}s{s}') for (oc,ic,k), s in zip(cnn_info, strides)]}")
 
-    # Tokenizer
-    sp = spm.SentencePieceProcessor()
-    sp.Load(tok_path)
-    vocab = [sp.IdToPiece(i) for i in range(sp.GetPieceSize())]
+    # Tokenizer: already loaded as `vocab` list for both v1 and v2
+
+    # For v2: token IDs from config.json
+    if is_v2:
+        bos_id = cfg.get("bos_token_id", 0)
+        eos_id = cfg.get("eos_token_id", 2)
+        pad_id = cfg.get("pad_token_id", 0)
+        unk_id = 3  # standard
+    else:
+        import sentencepiece as spm
+        sp_obj = spm.SentencePieceProcessor()
+        sp_obj.Load(tok_path)
+        bos_id = sp_obj.bos_id()
+        eos_id = sp_obj.eos_id()
+        pad_id = sp_obj.pad_id()
+        unk_id = sp_obj.unk_id()
 
     # Create GGUF
     writer = gguf.GGUFWriter(args.output, "omniasr-ctc")
@@ -78,10 +153,11 @@ def main():
     writer.add_uint32("omniasr.n_enc_layers", n_enc)
     writer.add_uint32("omniasr.n_cnn_layers", n_cnn)
     writer.add_uint32("omniasr.vocab_size", vocab_size)
-    writer.add_uint32("omniasr.bos_id", sp.bos_id())
-    writer.add_uint32("omniasr.eos_id", sp.eos_id())
-    writer.add_uint32("omniasr.pad_id", sp.pad_id())
-    writer.add_uint32("omniasr.unk_id", sp.unk_id())
+    writer.add_uint32("omniasr.bos_id", bos_id)
+    writer.add_uint32("omniasr.eos_id", eos_id)
+    writer.add_uint32("omniasr.pad_id", pad_id)
+    writer.add_uint32("omniasr.unk_id", unk_id)
+    writer.add_uint32("omniasr.model_type", 0)  # 0=CTC
     # Store CNN strides for runtime
     writer.add_array("omniasr.cnn_strides", strides)
 
@@ -110,9 +186,24 @@ def main():
         return name
 
     # Pre-compute weight normalization for pos_encoder conv
-    # fairseq2 stores weight_g and weight_v separately
+    # v1 (fairseq2) stores weight_g and weight_v separately
+    # v2 (HF) stores parametrizations.weight.original0 (g) and original1 (v)
     # Combined weight = g * v / ||v|| per output channel
-    if "encoder_frontend.pos_encoder.conv.weight_v" in sd:
+    # Handle v2 parametrizations format
+    pg_key = "encoder_frontend.pos_encoder.conv.parametrizations.weight.original0"
+    pv_key = "encoder_frontend.pos_encoder.conv.parametrizations.weight.original1"
+    if pg_key in sd and pv_key in sd:
+        wg = sd[pg_key]
+        wv = sd[pv_key]
+        v_norm = wv.reshape(wv.shape[0], -1).norm(dim=1).reshape(-1, 1, 1)
+        w_combined = (wg / (v_norm + 1e-12)) * wv
+        sd["pos_conv.weight"] = w_combined
+        sd["pos_conv.bias"] = sd["encoder_frontend.pos_encoder.conv.bias"]
+        print(f"  Pre-computed pos_conv weight (v2 parametrizations): {w_combined.shape}")
+        del sd[pg_key]
+        del sd[pv_key]
+        del sd["encoder_frontend.pos_encoder.conv.bias"]
+    elif "encoder_frontend.pos_encoder.conv.weight_v" in sd:
         wv = sd["encoder_frontend.pos_encoder.conv.weight_v"]  # [OC, IC/G, K]
         wg = sd["encoder_frontend.pos_encoder.conv.weight_g"]  # [1, 1, K] or similar
         # Weight normalization: w = g * v / ||v||
