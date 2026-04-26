@@ -2628,3 +2628,263 @@ Don't use when:
 | kyutai_stt.cpp | 1 conv | Low |
 | ecapa_lid.cpp | 1 conv | Low |
 | vibevoice.cpp | Done (encoder + decoder) | **Done** |
+
+---
+
+## Apple's GPU interactivity watchdog kills heavy compute on Metal (April 2026)
+
+**Symptom:** any sustained Metal compute (TTS synthesis with σ-VAE
+decoder, VibeVoice 7B base LM forward at frame ~10) aborts with:
+
+```
+error: Impacting Interactivity (0000000e:kIOGPUCommandBufferCallbackErrorImpactingInteractivity)
+ggml_metal_synchronize: error: command buffer 1 failed with status 5
+ggml_metal_graph_compute: backend is in error state from a previous command buffer failure - recreate the backend to recover
+```
+
+This is **not a ggml bug**. macOS's GPU scheduler kills processes whose
+command buffers hold the GPU long enough to starve the windowserver
+of frames (~5 sec budget). The threshold is hard-coded in the kernel
+extension; you can't disable it from userspace. NVIDIA Windows TDR is
+the analogue (default 2 sec, but tunable via registry or compute mode).
+
+**Things that don't fix it:**
+- `ggml_backend_synchronize` between graph computes — implicit
+  `ggml_backend_tensor_get` already syncs; the watchdog fires
+  *during* a single submit, not between them.
+- Bumping `ggml_metal_set_n_cb` from 1 to 4 — splits the graph across
+  more command buffers, but the heavy ops remain in single buffers.
+  Helps a little for medium graphs, doesn't save you on big ones.
+- Reducing the cache (graph reuse) — tested by reverting to pre-cache
+  vibevoice; same watchdog. Caching is orthogonal.
+- Removing custom ggml ops (e.g. `conv_1d_cf`) — tested; same watchdog.
+
+**What actually fixes it:** route the offending graph (or its hot
+sub-graph) to the CPU backend. Per-tensor backend hints work great:
+
+```cpp
+for (int i = 0; i < ggml_graph_n_nodes(dec_gf); i++) {
+    ggml_backend_sched_set_tensor_backend(
+        ctx->sched, ggml_graph_node(dec_gf, i), ctx->backend_cpu);
+}
+ggml_backend_sched_alloc_graph(ctx->sched, dec_gf);
+```
+
+The scheduler handles weight copies from Metal-resident buffers
+automatically. Encoders, LM, diffusion all stay on Metal — only the
+problematic graph runs CPU.
+
+For VibeVoice TTS this means routing only the σ-VAE decoder to CPU.
+Cost on M1: ~10–15% of TTS wall time; alternative is the entire
+process aborting. End-to-end TTS time still beats real-time
+(0.57× RT for Realtime-0.5B).
+
+**Don't preemptively force-CPU on every GPU backend.** The watchdog
+is a desktop-display-attached-GPU thing. Linux servers without X
+have no watchdog at all; datacenter NVIDIA GPUs have no TDR. Make
+it conditional + env-overridable:
+
+```cpp
+const char* env = getenv("VIBEVOICE_VAE_BACKEND");  // cpu|gpu|auto
+bool force_cpu = env && !strcmp(env, "cpu") ? true
+               : env && !strcmp(env, "gpu") ? false
+               : backend_is_metal(ctx->backend);   // auto: Metal → CPU
+```
+
+---
+
+## ggml-metal scheduler doesn't preserve view-tensor backend mapping across sched_reset (April 2026)
+
+**Symptom:** `GGML_ASSERT(src_backend_id != -1)` in
+`ggml_backend_sched_split_graph` on Metal, on the *second* call to
+`ggml_backend_sched_alloc_graph` after `ggml_backend_sched_reset`, when
+the graph contains views of intermediate tensors (e.g.
+`ggml_view_2d(ctx, adaln_out, ...)` over the output of a prior matmul).
+
+**Pattern that triggers it:** caching a graph (saving the
+`ggml_cgraph*` + `ggml_context*`) for reuse across multiple
+`sched_reset()` cycles. Specifically: when the cached graph lives in
+its **own dedicated meta_buf** separate from `ctx->compute_meta` that
+other graph builders use.
+
+VibeVoice's `get_pred_head_graph` did this for ~25% TTS speedup. Asserts
+on Metal at the second invocation. CPU/CUDA tolerate it.
+
+**Fix that works:** build the graph into the **shared `compute_meta`
+buffer** (the same one every other builder uses) on Metal, dedicated
+buffer only on CPU/CUDA. Other graph builders that survive sched_reset
+on Metal (`run_dec`, `run_connector_stage`, `build_decoder_graph`) all
+use compute_meta — that's the existence proof that this pattern is
+Metal-safe. The CPU/CUDA dedicated-buffer + cache path keeps the
+speedup where it works.
+
+```cpp
+// On Metal: build fresh into shared compute_meta (same as every other
+// builder that survives sched_reset). On CPU/CUDA: dedicated buffer
+// keeps the cached graph reusable across diffusion sub-steps.
+std::vector<uint8_t>* meta = backend_is_metal(ctx->backend)
+                                 ? &ctx->compute_meta
+                                 : &ctx->pred_graph_meta;
+```
+
+**Backend name detection:** Metal devices register as `"MTL0"`, `"MTL1"`,
+etc — **not** `"Metal"`. Match the `MTL` prefix:
+
+```cpp
+static bool backend_is_metal(ggml_backend_t b) {
+    if (!b) return false;
+    const char* name = ggml_backend_name(b);
+    return name && std::strncmp(name, "MTL", 3) == 0;
+}
+```
+
+CPU is `"CPU"`, CUDA is `"CUDA0"`, Vulkan is `"Vulkan0"` — all
+unambiguous.
+
+---
+
+## gguf-py only ships Python implementations for non-K quants (April 2026)
+
+The `gguf` PyPI package's `quants.quantize(arr, qtype)` works for:
+- F32, F16
+- Q4_0, Q4_1
+- Q5_0, Q5_1
+- Q8_0
+
+Everything else — **Q4_K, Q5_K, Q6_K, Q2_K, Q3_K, IQ4_NL, IQ4_XS, IQ2_*,
+IQ3_S, MXFP4, BF16** — has Python class skeletons but `quantize_blocks`
+raises `NotImplementedError`. The actual implementations live in
+llama.cpp's C code; gguf-py defers to them at runtime via a separate
+binding that isn't shipped on PyPI.
+
+**Implication for streaming converters:** if you want a memory-safe
+single-pass converter that quantizes per-tensor (avoiding the F16
+intermediate that needs the whole model in RAM), you can only target
+the implemented quants. Q4_0 is the closest substitute for Q4_K (same
+4.5 bits/weight, only the per-block scale granularity differs); for
+ASR/TTS it's perceptually fine.
+
+For real K-quants from Python you need to either (a) ship the F16
+intermediate and run llama.cpp's `quantize` binary on it (the canonical
+path; needs a 32 GB host for 7B+), or (b) write a C extension binding
+to ggml's `ggml_quantize_chunk` (~50 LOC + build setup).
+
+---
+
+## GGUFWriter.add_tensor_info conditional shape conversion gotcha (April 2026)
+
+`gguf.GGUFWriter.add_tensor_info(name, tensor_shape, tensor_dtype,
+tensor_nbytes, raw_dtype=None)` applies
+`quant_shape_from_byte_shape(tensor_shape, raw_dtype)` to the passed
+`tensor_shape` — but **only when `tensor_dtype == np.uint8`** (i.e.
+quantized).
+
+For F16 / F32 (where `tensor_dtype` is `np.float16` / `np.float32`),
+the shape is stored as-is.
+
+**Implication:** when streaming-writing with `add_tensor_info` directly
+(not via the high-level `add_tensor` which infers the right shape from
+the numpy array), you must pass:
+
+| Target type | What to pass as `tensor_shape` |
+|---|---|
+| Q4_0/Q4_1/Q5_*/Q8_0 (uint8 packed) | byte_shape from `quants.quant_shape_to_byte_shape()` |
+| F16 / F32 | logical shape directly |
+
+Got this wrong once → produced a GGUF with all F16 dimensions doubled,
+which loaded fine but had wrong tensor offsets ("expected 2.18 GB got
+1.09 GB on tensor 1"). The C++ loader's `gguf_init_from_file_ptr`
+catches it and refuses to open the file.
+
+---
+
+## MSVC `_USE_MATH_DEFINES` must come BEFORE the very first include (April 2026)
+
+POSIX `M_PI` etc are extensions — MSVC's `<math.h>` only exposes them
+when `_USE_MATH_DEFINES` is defined **before the first time `<math.h>`
+is transitively included anywhere in the translation unit**. Once any
+header (a project `.h`, a ggml header, anything that pulls `<math.h>`
+or `<cmath>` even indirectly) commits the macro state, defining the
+flag later is a no-op.
+
+Wrong:
+```cpp
+#include "vibevoice.h"     // transitively pulls <math.h>
+#include "ggml.h"
+#include <cmath>           // already too late
+#define _USE_MATH_DEFINES  // ineffective
+```
+
+Right:
+```cpp
+#define _USE_MATH_DEFINES  // FIRST line of code in the file
+#include "vibevoice.h"
+#include "ggml.h"
+#include <cmath>
+```
+
+Linux/macOS have `M_PI` in their libc implementations of `<math.h>`
+unconditionally, so the bug is invisible there — Windows CI is the only
+place it surfaces. We had two patches in a row that put the define in
+"the right-looking spot" but not actually first; the second patch was a
+clean no-op until I moved the define above all `#include` lines.
+
+---
+
+## clang-format-18 patch versions disagree (April 2026)
+
+CI pins `clang-format-18` (Ubuntu apt → 18.1.3). Homebrew's default
+`clang-format` keg is on the latest LLVM (v22.x), and `pip install
+'clang-format'` defaults to 18.1.8. Even within the v18 series, 18.1.3
+and 18.1.8 disagree on subtle formatting (extra braces, for-loop init
+spacing, long-line breaks at slightly different columns).
+
+**Pin the local toolchain to match CI exactly:**
+
+```bash
+pip install 'clang-format==18.1.3'    # match Ubuntu's apt build
+```
+
+Then put `~/Library/Python/3.11/bin/` (or your platform's pip user-bin)
+ahead of `/opt/homebrew/bin` on `PATH`, or alias `clang-format` to that
+pinned binary. Without this, every `clang-format -i` you run locally
+will silently introduce drift that the lint job rejects.
+
+Documented in README's "Adding a new backend" section so future
+contributors don't trip on the same v22-vs-v18 mismatch we hit several
+times in one session.
+
+---
+
+## Per-platform fast iterative builds: Ninja + ccache + libomp (April 2026)
+
+Local build was Unix Makefiles + no ccache + tests=ON. Cold rebuild
+was ~90 sec, single-file edit ~30 sec.
+
+After `scripts/dev-setup.sh` (auto-detects platform):
+
+| Platform | Installs | Cold build | Touch one file |
+|---|---|---|---|
+| macOS | brew: `libomp ninja ccache cmake` | 39s → **26s** with libomp | <0.5s |
+| Linux | apt: `+ mold libomp-dev ninja ccache` | similar gains + mold linker | <0.5s |
+| Windows | choco: `ninja ccache` (manual) | varies | varies |
+
+Three changes carry the speedup:
+1. **Ninja** (vs Unix Makefiles): better dependency tracking, lower
+   per-target overhead. Single biggest factor for incremental builds.
+2. **ccache**: caches compiler output across rebuilds. Massive win on
+   touch-one-file cycles. ggml's CMakeLists auto-detects via
+   `find_program(GGML_CCACHE_FOUND ccache)`.
+3. **libomp**: not a build speedup but a runtime gain (Apple clang
+   needs explicit `-DOpenMP_ROOT=/opt/homebrew/opt/libomp`); enables
+   multi-threaded matmul on CPU. Worth the install slot anyway.
+
+`mold` linker (Linux only — macOS port doesn't ship a Mach-O linker)
+saves additional seconds on the linking step, which dominates
+incremental rebuilds when ccache eliminates the compile cost.
+
+Per-platform-aware scripts at `scripts/dev-{setup,build}.{sh,ps1}` —
+detect via `uname -s` (Darwin/Linux/MINGW*/MSYS*/CYGWIN*) and apply
+only the flags that platform's toolchain accepts. None of these flags
+go into CMakeLists.txt itself, so CI/Docker/release builds are
+unaffected.

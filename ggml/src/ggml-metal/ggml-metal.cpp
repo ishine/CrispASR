@@ -599,16 +599,18 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    // Default n_cb=4: split big graphs (e.g. vibevoice σ-VAE decoder) across
-    // more Metal command buffers so no single submit holds the GPU long
-    // enough to trigger Apple's interactivity watchdog
-    // (kIOGPUCommandBufferCallbackErrorImpactingInteractivity). The
-    // upstream default of 1 puts essentially the whole graph in one buffer,
-    // which works fine for LLaMA-shaped decode but kills TTS-shaped graphs.
-    // Override per-process via GGML_METAL_NCB env (see set_n_cb call below).
+    // Default n_cb=1 (matches upstream — set_n_cb's own warning notes
+    // that "n_cb > 2 is not recommended and can degrade performance"
+    // for LLaMA-shaped decode). Earlier this session bumped the default
+    // to 4 hoping to dodge Apple's interactivity watchdog on TTS-shaped
+    // graphs by splitting submits — turned out the watchdog fires per
+    // command buffer regardless of how many there are. The proper fix
+    // for VibeVoice TTS was per-tensor backend routing of the σ-VAE
+    // decoder to CPU (see vibevoice.cpp). Keep the env-override knob
+    // in case someone hits a different big-graph case later.
     {
         const char* ncb_env = getenv("GGML_METAL_NCB");
-        int ncb = ncb_env ? atoi(ncb_env) : 4;
+        int ncb = ncb_env ? atoi(ncb_env) : 1;
         if (ncb < 1) ncb = 1;
         ggml_backend_metal_set_n_cb(backend, ncb);
     }
@@ -705,16 +707,18 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    // Default n_cb=4: split big graphs (e.g. vibevoice σ-VAE decoder) across
-    // more Metal command buffers so no single submit holds the GPU long
-    // enough to trigger Apple's interactivity watchdog
-    // (kIOGPUCommandBufferCallbackErrorImpactingInteractivity). The
-    // upstream default of 1 puts essentially the whole graph in one buffer,
-    // which works fine for LLaMA-shaped decode but kills TTS-shaped graphs.
-    // Override per-process via GGML_METAL_NCB env (see set_n_cb call below).
+    // Default n_cb=1 (matches upstream — set_n_cb's own warning notes
+    // that "n_cb > 2 is not recommended and can degrade performance"
+    // for LLaMA-shaped decode). Earlier this session bumped the default
+    // to 4 hoping to dodge Apple's interactivity watchdog on TTS-shaped
+    // graphs by splitting submits — turned out the watchdog fires per
+    // command buffer regardless of how many there are. The proper fix
+    // for VibeVoice TTS was per-tensor backend routing of the σ-VAE
+    // decoder to CPU (see vibevoice.cpp). Keep the env-override knob
+    // in case someone hits a different big-graph case later.
     {
         const char* ncb_env = getenv("GGML_METAL_NCB");
-        int ncb = ncb_env ? atoi(ncb_env) : 4;
+        int ncb = ncb_env ? atoi(ncb_env) : 1;
         if (ncb < 1) ncb = 1;
         ggml_backend_metal_set_n_cb(backend, ncb);
     }
