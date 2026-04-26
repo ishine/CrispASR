@@ -65,8 +65,9 @@ BACKENDS = [
     ("omniasr",           "OmniASR CTC 1B v2",      120, "Q4_K, 975M params"),
     ("omniasr-llm",       "OmniASR LLM 300M",       120, "Q4_K, 300M+1.3B params"),
     ("glm-asr",           "GLM ASR Nano",            180, "Q4_K, 1.3B params"),
-    ("firered-asr",       "FireRed ASR2 AED",        300, "Q4_K, 900M params"),
+    ("firered-asr",       "FireRed ASR2 AED",        600, "Q4_K, 900M params"),
     ("kyutai-stt",        "Kyutai STT 1B",           120, "Q4_K, 1B params"),
+    ("vibevoice",         "VibeVoice ASR",           180, "Q4_K, 4.5B params"),
 ]
 
 # Slow / large backends (only test if BENCHMARK_SLOW=1)
@@ -254,13 +255,11 @@ def benchmark_backend(backend, display_name, timeout, notes):
         "model_size_mb": None,
     }
 
-    # Run transcription — stderr contains crispasr's own timing line:
-    #   "crispasr: transcribed X.Xs audio in Y.Ys (Z.Zx realtime)"
-    # This is pure inference time (excludes model download/load).
-    # CRISPASR_VERBOSE=1 enables all backend-specific verbose/bench flags
-    env_prefix = "CRISPASR_VERBOSE=1 WAV2VEC2_VERBOSE=1 VIBEVOICE_BENCH=1 FIRERED_BENCH=1 "
-    cmd = (f"{env_prefix}{CRISPASR} --backend {backend} -m auto --auto-download "
-           f"-f {JFK_WAV} --no-prints")
+    # Run transcription. -v activates verbose logging on stderr (backend
+    # diagnostics, timing, GPU device info). --no-prints suppresses the
+    # normal progress output but keeps -v diagnostics.
+    cmd = (f"CRISPASR_VERBOSE=1 {CRISPASR} --backend {backend} -m auto --auto-download "
+           f"-f {JFK_WAV} --no-prints -v")
     t0 = time.time()
     ok, stdout, stderr, elapsed = run(cmd, timeout=timeout)
     result["wall_s"] = round(elapsed, 2)
@@ -280,14 +279,14 @@ def benchmark_backend(backend, display_name, timeout, notes):
     if not ok:
         result["status"] = "TIMEOUT" if "TIMEOUT" in stderr else "CRASH"
         print(f"  ✗ {result['status']} after {elapsed:.1f}s  (wall)")
-        # Show stderr for diagnostics — assertions appear before the stack trace
+        # Show useful stderr lines (skip download progress bars)
         if stderr:
             lines = stderr.strip().split("\n")
-            # Show assertion/error lines + last 3 lines of stack trace
-            for line in lines:
-                if any(k in line.lower() for k in ["assert", "error", "fail", "abort", "fatal", "ggml_"]):
-                    print(f"    stderr: {line[:150]}")
-            for line in lines[-3:]:
+            useful = [l for l in lines if any(k in l.lower() for k in
+                      ["assert", "error", "fail", "abort", "fatal", "ggml_",
+                       "crispasr", "backend", "loaded", "encoder", "decoder",
+                       "model", "cache", "kv", "segfault", "signal"])]
+            for line in (useful or lines[-5:])[:8]:
                 print(f"    stderr: {line[:150]}")
         # Still clean up any downloaded model to free disk
         _cleanup_cache(backend)
@@ -327,6 +326,12 @@ def benchmark_backend(backend, display_name, timeout, notes):
     print(f"  {status_icon} WER={w:.1%}  RT={result['realtime_factor']:.1f}x  "
           f"Inference={inference_s:.1f}s  Model={sz_str}{dl_note}")
     print(f"    Output: {transcript[:100]}")
+    # Show key diagnostic lines from verbose stderr
+    if stderr:
+        for line in stderr.strip().split("\n"):
+            if any(k in line for k in ["backend", "loaded", "encoder", "decoder",
+                                        "GPU", "CUDA", "Metal", "cache", "kv", "transcribed"]):
+                print(f"    diag: {line[:130]}")
 
     # Step 5: Clean up model to free disk for the next backend
     _cleanup_cache(backend)
