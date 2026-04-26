@@ -3,9 +3,11 @@
 Pending roadmap items. Each is self-contained with files, approach, and
 effort estimate. Completed items have been moved to `HISTORY.md`.
 
-**Current state (April 2026, v0.5.0):** 17 ASR backends, unified CLI,
+**Current state (April 2026, v0.5.0):** 19 ASR backends + TTS, unified CLI,
 OpenAI-compatible server, shared `src/core/` library, FireRedPunc
 post-processor, C-ABI + Python/Rust/Dart wrappers, CI on 6 platforms.
+All backends support `-m auto --auto-download`. Three new ggml ops
+(`conv_1d_cf`, `conv_1d_dw_cf`, `conv_1d_group`).
 
 ---
 
@@ -165,7 +167,7 @@ No response. HF model card has no license field.
 | O11 | wav2vec2 CNN → ggml | wav2vec2 family | **10.8x** | **DONE** |
 | O9/#44 | FireRed ggml Q4_K decoder | firered-asr | **6.3x** | **DONE** |
 | O10 | Sliding window attention | voxtral4b | Already implemented | **DONE** |
-| O2 | Fused QKV pre-merge | LLM decoders | ~10-15% attn | API ready, needs per-backend wiring |
+| O2 | Fused QKV pre-merge | LLM decoders | ~10-15% attn (GPU) | API ready in core/attention.h; CPU gain <1%, defer to GPU |
 | O3 | Temperature sampling | glm-asr, kyutai-stt | Feature parity | **DONE** |
 | O5 | Pipelined mel+encode | LLM backends, CPU | ~15-20% | TODO |
 | O4 | Beam search for LLMs | Audio-LLM backends | Quality | TODO |
@@ -202,7 +204,7 @@ No response. HF model card has no license field.
 
 - **OmniASR-LLM beam search** — beam=2+ with N hypothesis KV caches
 - ~~**TTS module** — VibeVoice-Realtime-0.5B text-to-speech~~ **DONE** — perfect ASR round-trip on all test cases. 17 bugs found via stage-by-stage diff. Uses DPM-Solver++, dual KV CFG, voice prompts, EOS classifier, text/speech interleaving.
-- **ggml_conv_1d_dw F16 im2col fix** — CPU depthwise conv without im2col for VibeVoice precision
+- ~~**ggml_conv_1d_dw F16 im2col fix**~~ **DONE** — solved via `ggml_conv_1d_dw_cf` (direct F32, no im2col)
 
 ---
 
