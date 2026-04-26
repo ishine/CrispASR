@@ -338,7 +338,9 @@ extern "C" struct firered_asr_context* firered_asr_init_from_file(const char* pa
     auto get = [&](const char* name) -> ggml_tensor* {
         auto it = ts.find(name);
         if (it == ts.end()) {
-            if (params.verbosity >= 2)
+            // Suppress known-missing tensors (BN running stats not needed at inference)
+            if (params.verbosity >= 2 &&
+                !strstr(name, "running_mean") && !strstr(name, "running_var"))
                 fprintf(stderr, "firered_asr: tensor '%s' not found\n", name);
             return nullptr;
         }
