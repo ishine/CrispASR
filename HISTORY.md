@@ -430,3 +430,9 @@ Moved here once shipped. See git history for code diffs.
 - Fixed runtime: conv_1d_f32 mul_mat argument order for F16 kernels
 - All 12 models tested and uploaded to HuggingFace
 - HF: `cstr/moonshine-{tiny,base}-{ja,ar,ko,zh,vi,uk}-GGUF`
+
+**OmniASR LLM-1B conversion (April 2026):**
+- Converted facebook/omniASR-LLM-1B (8.5 GB .pt) to GGUF (4.55 GB F16, 918 tensors)
+- 48-layer encoder (d=1280) + 12-layer LLaMA decoder (d=4096)
+- Output: "fellow americas ask not what your country can do for you"
+- HF: `cstr/omniasr-llm-1b-GGUF` (F16 + Q4_K)
