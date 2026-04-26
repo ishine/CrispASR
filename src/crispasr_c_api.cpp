@@ -1482,7 +1482,8 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         char* text = nullptr;
         bool need_free = true;
 #ifdef CA_HAVE_GLMASR
-        if ((s->backend == "glm-asr" || s->backend == "glmasr" || s->backend == "glm" || s->backend == "glm_asr") && s->glmasr_ctx)
+        if ((s->backend == "glm-asr" || s->backend == "glmasr" || s->backend == "glm" || s->backend == "glm_asr") &&
+            s->glmasr_ctx)
             text = glm_asr_transcribe((glm_asr_context*)s->glmasr_ctx, pcm, n_samples);
 #endif
 #ifdef CA_HAVE_KYUTAI

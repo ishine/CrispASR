@@ -2648,28 +2648,28 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         // See realtime VAE-decoder call site for why this is forced to CPU
         // on Metal — Apple's GPU watchdog kills the single-buffer compute.
         {
-        // Default: route VAE decoder to CPU on Metal only — that's the
-        // backend where we've reproduced Apple's interactivity watchdog.
-        // CUDA/Vulkan on systems where the GPU also drives the display
-        // can hit a similar driver TDR (NVIDIA Windows TDR ~2s by default,
-        // Wayland on Linux varies). Override with VIBEVOICE_VAE_BACKEND:
-        //   auto (default) → CPU on Metal, GPU elsewhere
-        //   cpu            → always CPU (safe choice for desktop NVIDIA)
-        //   gpu            → always GPU (servers, datacenter NVIDIA, etc)
-        const char* vae_be = getenv("VIBEVOICE_VAE_BACKEND");
-        bool force_cpu;
-        if (vae_be && std::strcmp(vae_be, "cpu") == 0)
-            force_cpu = true;
-        else if (vae_be && std::strcmp(vae_be, "gpu") == 0)
-            force_cpu = false;
-        else
-            force_cpu = backend_is_metal(ctx->backend);
-        if (force_cpu && ctx->backend_cpu) {
-            for (int i = 0; i < ggml_graph_n_nodes(dec_gf); i++) {
-                ggml_backend_sched_set_tensor_backend(ctx->sched, ggml_graph_node(dec_gf, i), ctx->backend_cpu);
+            // Default: route VAE decoder to CPU on Metal only — that's the
+            // backend where we've reproduced Apple's interactivity watchdog.
+            // CUDA/Vulkan on systems where the GPU also drives the display
+            // can hit a similar driver TDR (NVIDIA Windows TDR ~2s by default,
+            // Wayland on Linux varies). Override with VIBEVOICE_VAE_BACKEND:
+            //   auto (default) → CPU on Metal, GPU elsewhere
+            //   cpu            → always CPU (safe choice for desktop NVIDIA)
+            //   gpu            → always GPU (servers, datacenter NVIDIA, etc)
+            const char* vae_be = getenv("VIBEVOICE_VAE_BACKEND");
+            bool force_cpu;
+            if (vae_be && std::strcmp(vae_be, "cpu") == 0)
+                force_cpu = true;
+            else if (vae_be && std::strcmp(vae_be, "gpu") == 0)
+                force_cpu = false;
+            else
+                force_cpu = backend_is_metal(ctx->backend);
+            if (force_cpu && ctx->backend_cpu) {
+                for (int i = 0; i < ggml_graph_n_nodes(dec_gf); i++) {
+                    ggml_backend_sched_set_tensor_backend(ctx->sched, ggml_graph_node(dec_gf, i), ctx->backend_cpu);
+                }
             }
         }
-    }
         if (!ggml_backend_sched_alloc_graph(ctx->sched, dec_gf))
             return nullptr;
         ggml_backend_tensor_set(ggml_graph_get_tensor(dec_gf, "dec_latent"), scaled.data(), 0,
