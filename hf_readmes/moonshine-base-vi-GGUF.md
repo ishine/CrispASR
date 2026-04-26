@@ -1,5 +1,6 @@
 ---
-license: mit
+license: other
+license_name: moonshine-ai-community
 language:
 - vi
 pipeline_tag: automatic-speech-recognition
@@ -30,7 +31,7 @@ GGUF conversions and quantisations of [`UsefulSensors/moonshine-base-vi`](https:
 - **Architecture:** Conv1d stem + 8L transformer encoder + 8L transformer decoder (416d, 8 heads, partial RoPE, SiLU/GELU)
 - **Parameters:** 61M
 - **Languages:** Vietnamese (fine-tuned from English moonshine-base)
-- **License:** MIT
+- **License:** [Moonshine AI Community License](https://huggingface.co/UsefulSensors/moonshine-tiny-ja/blob/main/LICENSE.txt) (free for <$1M revenue, attribution required)
 - **Source:** [`UsefulSensors/moonshine-base-vi`](https://huggingface.co/UsefulSensors/moonshine-base-vi)
 
 ## Usage with CrispASR
