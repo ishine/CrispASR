@@ -2166,6 +2166,29 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     const char* dump_dir = getenv("VIBEVOICE_TTS_DUMP");
     const auto tts_t0 = std::chrono::high_resolution_clock::now();
 
+    // VibeVoice TTS hits Apple's GPU watchdog
+    // (kIOGPUCommandBufferCallbackErrorImpactingInteractivity) on Metal
+    // for both model paths, just at different stages:
+    //   - 1.5B/7B base   → LM forward (Q4_K matmul) at frame ~10
+    //   - Realtime 0.5B  → VAE decoder for the full latent sequence
+    // Both stages submit a single Metal command buffer that holds the
+    // GPU long enough for the system to abort the process. ASR works
+    // fine on Metal because its hot-path graph is one big prefill, not
+    // hundreds of small back-to-back submits, and the VAE decoder is
+    // not used for ASR.
+    //
+    // Real fix needs ggml-metal: faster low-batch Q4_K matmul, or
+    // command-buffer splitting in the scheduler. Until then bail with
+    // an actionable message; CPU TTS works end-to-end (-ng).
+    if (backend_is_metal(ctx->backend)) {
+        fprintf(stderr,
+                "vibevoice TTS: Metal backend hits Apple's GPU watchdog "
+                "(kIOGPUCommandBufferCallbackErrorImpactingInteractivity).\n"
+                "  Re-run with -ng (no GPU) — CPU TTS works end-to-end.\n"
+                "  ASR on this model still uses Metal correctly.\n");
+        return nullptr;
+    }
+
     // Detect model type: Realtime (has TTS LM) vs Base (single LM)
     bool is_base_model = (hp.tts_n_layers == 0);
 
@@ -2185,28 +2208,6 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     // Single-LM autoregressive generation: the LM produces text + speech control tokens.
     // When it emits speech_diffusion_id, we run diffusion → audio.
     if (is_base_model) {
-        // The 1.5B / 7B base TTS path runs ~21 heavy graph computes per
-        // generated frame (1 LM forward + 20 diffusion sub-steps). On
-        // Metal at Q4_K, the LM forward submits a single command buffer
-        // that holds the GPU long enough for Apple's interactivity
-        // watchdog (kIOGPUCommandBufferCallbackErrorImpactingInteractivity)
-        // to kill the process around frame 10. ggml's Metal Q4_K kernel
-        // also runs slower than the equivalent CPU path here.
-        //
-        // Verified end-to-end TTS works on CPU (vv7b-q4_k → 1.6 sec WAV),
-        // and partial TTS works on Metal (12 frames before watchdog).
-        // Until ggml-metal gains either a faster Q4_K matmul or
-        // command-buffer splitting, refuse the Metal path with a clear
-        // message instead of letting the user hit the watchdog.
-        if (backend_is_metal(ctx->backend)) {
-            fprintf(stderr,
-                    "vibevoice TTS (base): Metal backend hits Apple's GPU "
-                    "watchdog after ~10 frames on the 1.5B/7B base model.\n"
-                    "  Re-run with -ng (no GPU) — CPU TTS works end-to-end.\n"
-                    "  ASR on this model still uses Metal correctly.\n");
-            return nullptr;
-        }
-
         // VibeVoice reuses Qwen2 vision tokens for speech:
         const int SPEECH_START = 151652;     // <|vision_start|>
         const int SPEECH_DIFFUSION = 151654; // <|vision_pad|> — triggers diffusion
