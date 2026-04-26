@@ -112,10 +112,10 @@ else:
 
 # Detect GPU — try CUDA first, fall back to CPU if cmake fails
 has_gpu = os.path.exists("/usr/local/cuda/bin/nvcc")
-# Clean build dir to force full rebuild with latest source
-if os.path.isdir(BUILD_DIR):
-    shutil.rmtree(BUILD_DIR, ignore_errors=True)
+# Incremental build: keep build dir if cmake config matches, only rebuild changed source.
+# Force reconfigure only if cmake flags would change (e.g. GPU detection differs).
 os.makedirs(BUILD_DIR, exist_ok=True)
+need_reconfigure = not os.path.isfile(f"{BUILD_DIR}/CMakeCache.txt")
 
 # Install ninja for faster builds (2-3x faster than make)
 subprocess.run("apt-get install -y ninja-build 2>/dev/null || pip install -q ninja",
@@ -129,8 +129,8 @@ common_flags = [
     "-DWHISPER_BUILD_TESTS=OFF",  # skip test binaries — saves ~30% build time
 ]
 
-cmake_ok = False
-if has_gpu:
+cmake_ok = not need_reconfigure  # skip configure if cache exists
+if has_gpu and need_reconfigure:
     # CUDA build — use LIBRARY_PATH for stubs (same as Docker) + NO_VMM fallback
     cuda_stubs = "/usr/local/cuda/lib64/stubs"
     if os.path.isdir(cuda_stubs):
@@ -153,7 +153,7 @@ if has_gpu:
         os.makedirs(BUILD_DIR, exist_ok=True)
         has_gpu = False
 
-if not cmake_ok:
+if not cmake_ok and need_reconfigure:
     print("GPU: CPU-only build")
     subprocess.run(
         ["cmake", "-S", CRISPASR_DIR, "-B", BUILD_DIR] + generator + common_flags + [
@@ -161,6 +161,8 @@ if not cmake_ok:
         ],
         check=True
     )
+elif cmake_ok and not need_reconfigure:
+    print(f"✓ Using cached cmake config ({'GPU' if has_gpu else 'CPU'})")
 
 # Build only the main binary (not quantize, test tools, etc.)
 subprocess.run(f"cmake --build {BUILD_DIR} --target crispasr -j$(nproc)",
@@ -255,8 +257,8 @@ def benchmark_backend(backend, display_name, timeout, notes):
     # Run transcription — stderr contains crispasr's own timing line:
     #   "crispasr: transcribed X.Xs audio in Y.Ys (Z.Zx realtime)"
     # This is pure inference time (excludes model download/load).
-    # Enable verbose logging for all backends that support it.
-    env_prefix = "WAV2VEC2_VERBOSE=1 VIBEVOICE_BENCH=1 FIRERED_BENCH=1 OMNIASR_DUMP_DIR= "
+    # CRISPASR_VERBOSE=1 enables all backend-specific verbose/bench flags
+    env_prefix = "CRISPASR_VERBOSE=1 WAV2VEC2_VERBOSE=1 VIBEVOICE_BENCH=1 FIRERED_BENCH=1 "
     cmd = (f"{env_prefix}{CRISPASR} --backend {backend} -m auto --auto-download "
            f"-f {JFK_WAV} --no-prints")
     t0 = time.time()
