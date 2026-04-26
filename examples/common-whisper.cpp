@@ -31,6 +31,7 @@
 #include <io.h>
 #endif
 
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 
@@ -38,6 +39,37 @@
 // as implemented in ffmpeg_trancode.cpp only embedded in common lib if whisper built with ffmpeg support
 extern bool ffmpeg_decode_audio(const std::string & ifname, std::vector<uint8_t> & wav_data);
 #endif
+
+// Decode any audio container that miniaudio can't handle (m4a/mp4/webm/aac/opus)
+// by piping through an ffmpeg subprocess, producing raw 16kHz mono s16le PCM.
+static bool ffmpeg_subprocess_decode(const std::string& fname, std::vector<float>& pcmf32) {
+    // Quote the path for the shell command — basic protection for spaces, no full shell escaping
+    std::string cmd = "ffmpeg -loglevel error -i \"" + fname + "\" -f s16le -ar 16000 -ac 1 -";
+#ifdef _WIN32
+    FILE* pipe = _popen(cmd.c_str(), "rb");
+#else
+    FILE* pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe) return false;
+
+    std::vector<int16_t> buf;
+    int16_t tmp[4096];
+    size_t n;
+    while ((n = fread(tmp, sizeof(int16_t), 4096, pipe)) > 0) {
+        buf.insert(buf.end(), tmp, tmp + n);
+    }
+#ifdef _WIN32
+    int ret = _pclose(pipe);
+#else
+    int ret = pclose(pipe);
+#endif
+    if (ret != 0 || buf.empty()) return false;
+
+    pcmf32.resize(buf.size());
+    for (size_t i = 0; i < buf.size(); i++)
+        pcmf32[i] = (float)buf[i] / 32768.0f;
+    return true;
+}
 
 bool read_audio_data(const std::string & fname, std::vector<float>& pcmf32, std::vector<std::vector<float>>& pcmf32s, bool stereo) {
     std::vector<uint8_t> audio_data; // used for pipe input from stdin or ffmpeg decoding output
@@ -86,11 +118,20 @@ bool read_audio_data(const std::string & fname, std::vector<float>& pcmf32, std:
 			return false;
 		}
 #else
-		if ((result = ma_decoder_init_memory(fname.c_str(), fname.size(), &decoder_config, &decoder)) != MA_SUCCESS) {
-			fprintf(stderr, "error: failed to read audio data as wav (%s)\n", ma_result_description(result));
-
-			return false;
+		// Fallback: try ffmpeg subprocess (handles m4a, mp4, webm, aac, opus, etc.)
+		if (ffmpeg_subprocess_decode(fname, pcmf32)) {
+			// ffmpeg already produced mono 16kHz float PCM; skip the miniaudio path
+			if (stereo) {
+				// duplicate mono channel into both stereo channels
+				pcmf32s.resize(2, std::vector<float>(pcmf32.size()));
+				pcmf32s[0] = pcmf32;
+				pcmf32s[1] = pcmf32;
+			}
+			return true;
 		}
+		fprintf(stderr, "error: failed to read audio '%s': miniaudio and ffmpeg both failed\n"
+		                "       Install ffmpeg or convert to wav/mp3/flac first.\n", fname.c_str());
+		return false;
 #endif
     }
 
