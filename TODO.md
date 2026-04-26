@@ -31,13 +31,11 @@ are in `LEARNINGS.md`. Full roadmap in `PLAN.md`.
   fname.size(), ...)` was a silent no-op that always failed.
 - ~~**Japanese punctuation split (#29)**~~ **FIXED** — CJK clause-break + 42-char fallback
 - ~~**Moonshine multilingual**~~ **FIXED** — converter forces 1D tensors to F32 (line 338). All 14 GGUF variants (tiny/base × en/ja/ar/ko/zh/vi/uk) work on CPU. head_dim=52 (base) works on CPU flash_attn; GPU flash_attn needs aligned head_dim (ggml limitation, moonshine forced to CPU anyway). Verified 2026-04-26: tiny 50.7×, base (head_dim=52) 14.2×, base-zh on English audio 14.8× — all transcripts correct.
-- **Moonshine streaming** — **[next, IN PROGRESS]** different architecture from regular moonshine.
-  Converter DONE (`models/convert-moonshine-streaming-to-gguf.py`, tested tiny+small).
-  Runtime skeleton compiles (`src/moonshine_streaming.{h,cpp}`), loads GGUF, binds 161 tensors.
-  Audio frontend implemented (CPU). Encoder gallocr pattern implemented; likely divergence fixed
-  (changed ggml_gelu→ggml_gelu_erf to match PyTorch default — still needs end-to-end verification with a converted GGUF).
-  Decoder not yet implemented (KV cache + cross-attention + greedy decode). Backend wrapper stub exists.
-  Reference: frontend `[-0.2069,...]`, enc `[0.5546,-0.0089,...]`.
+- ~~**Moonshine streaming**~~ **DONE** — full pipeline working (converter + runtime + backend).
+  Correct jfk.wav transcription matching HF reference. Backend: `--backend moonshine-streaming`.
+  Remaining: upload Q4_K GGUF to HuggingFace, add model registry entry for `-m auto`,
+  debug sliding-window mask (encoder ~99% match without masks, should improve with).
+  Sizes: tiny 34M, small 123M, medium 245M. All MIT.
   Sizes: tiny 34M, small 123M, medium 245M. All MIT.
 - **Gemma-4-E2B** — **[queued]** Google multimodal with 300M USM Conformer audio encoder + 2.3B Gemma4 LLM.
   GGUF exists at ggml-org (text+vision only). llama.cpp PR #21421 adds audio conformer.
