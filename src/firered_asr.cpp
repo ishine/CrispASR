@@ -1690,7 +1690,11 @@ extern "C" char* firered_asr_transcribe(struct firered_asr_context* ctx, const f
     // Step 3: CPU encoder (Conformer with relative PE attention)
     int flat_dim = 608; // 32 * 19
     std::vector<float> enc_output;
+    auto t_enc0 = ggml_time_us();
     hybrid_encoder(subsampled.data(), T_sub, flat_dim, ctx, enc_output);
+    auto t_enc1 = ggml_time_us();
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "firered_asr: encoder %d layers in %.1fms\n", hp.n_layers_enc, (t_enc1 - t_enc0) / 1e3);
     // enc_output: [T_sub, d_model] row-major
 
     if (ctx->params.verbosity >= 1) {
