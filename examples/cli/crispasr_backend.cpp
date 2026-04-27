@@ -22,6 +22,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_kyutai_stt_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_firered_asr_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
 
 #include "ggml.h"
@@ -68,6 +69,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_firered_asr_backend();
     if (name == "moonshine-streaming")
         return crispasr_make_moonshine_streaming_backend();
+    if (name == "gemma4-e2b" || name == "gemma4e2b" || name == "gemma4")
+        return crispasr_make_gemma4_e2b_backend();
     if (name == "moonshine")
         return crispasr_make_moonshine_backend();
     if (name == "omniasr" || name == "omniasr-ctc" || name == "omniasr-llm")
@@ -81,7 +84,7 @@ std::vector<std::string> crispasr_list_backends() {
     return {
         "whisper",    "parakeet",          "canary",    "cohere",  "granite",     "voxtral",   "voxtral4b",
         "qwen3",      "fastconformer-ctc", "wav2vec2",  "hubert",  "data2vec",    "vibevoice", "glm-asr",
-        "kyutai-stt", "firered-asr",       "moonshine", "moonshine-streaming", "omniasr", "omniasr-llm",
+        "kyutai-stt", "firered-asr",       "moonshine", "moonshine-streaming", "gemma4-e2b", "omniasr", "omniasr-llm",
     };
 }
 
@@ -230,6 +233,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
         return "kyutai-stt";
     if (contains_ci("firered") && (contains_ci("asr") || contains_ci("lid")))
         return "firered-asr";
+    if (contains_ci("gemma") && (contains_ci("e2b") || contains_ci("4-e2b")))
+        return "gemma4-e2b";
     if (contains_ci("moonshine") && contains_ci("streaming"))
         return "moonshine-streaming";
     if (contains_ci("moonshine"))
@@ -289,6 +294,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "firered-asr";
             else if (a == "moonshine_streaming")
                 return "moonshine-streaming";
+            else if (a == "gemma4e2b" || a == "gemma4_e2b")
+                return "gemma4-e2b";
             else if (a == "moonshine" || a == "moonshine-tiny" || a == "moonshine-base")
                 result = "moonshine";
             else if (a == "omniasr-ctc" || a == "omniasr_ctc" || a == "omniasr" || a == "omniasr-llm" ||

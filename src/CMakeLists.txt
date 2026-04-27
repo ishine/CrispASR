@@ -441,6 +441,18 @@ if(NOT MSVC)
 endif()
 
 # ---------------------------------------------------------------------------
+# gemma4_e2b — Google Gemma-4-E2B (USM Conformer + Gemma4 LLM)
+# ---------------------------------------------------------------------------
+add_library(gemma4_e2b STATIC gemma4_e2b.h gemma4_e2b.cpp)
+set_target_properties(gemma4_e2b PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(gemma4_e2b PUBLIC .)
+target_compile_features   (gemma4_e2b PUBLIC cxx_std_17)
+target_link_libraries     (gemma4_e2b PUBLIC ggml ggml-base ggml-cpu)
+if(NOT MSVC)
+    target_compile_options(gemma4_e2b PRIVATE -O3)
+endif()
+
+# ---------------------------------------------------------------------------
 # omniasr — Facebook OmniASR-CTC (wav2vec2-style, 1600+ languages)
 # ---------------------------------------------------------------------------
 add_library(omniasr STATIC omniasr.h omniasr.cpp)
@@ -685,6 +697,9 @@ if (TARGET moonshine)
 endif()
 if (TARGET moonshine_streaming)
     target_link_libraries(whisper PUBLIC moonshine_streaming)
+endif()
+if (TARGET gemma4_e2b)
+    target_link_libraries(whisper PUBLIC gemma4_e2b)
 endif()
 if (TARGET fireredpunc)
     target_link_libraries(whisper PUBLIC fireredpunc)
