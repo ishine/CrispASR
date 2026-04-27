@@ -135,6 +135,7 @@ struct qwen3_asr_llm_block {
     ggml_tensor* attn_q_w = nullptr;
     ggml_tensor* attn_k_w = nullptr;
     ggml_tensor* attn_v_w = nullptr;
+    ggml_tensor* attn_qkv_w = nullptr; // fused Q+K+V for single matmul
     ggml_tensor* attn_output_w = nullptr;
     ggml_tensor* attn_q_norm_w = nullptr; // Qwen3 per-head Q RMSNorm
     ggml_tensor* attn_k_norm_w = nullptr;
@@ -187,6 +188,10 @@ struct qwen3_asr_context {
     ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_sched_t sched = nullptr;
+
+    // Fused QKV weights (optional optimization)
+    ggml_context* fused_ctx = nullptr;
+    ggml_backend_buffer_t fused_buf = nullptr;
 
     std::vector<uint8_t> compute_meta;
 
@@ -1170,7 +1175,7 @@ static ggml_cgraph* qwen3_asr_build_graph_llm_kv(qwen3_asr_context* ctx, int n_p
         // shared helper.
         ggml_tensor* attn = core_attn::kv_self_attn(
             ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w, b.attn_q_norm_w, b.attn_k_norm_w,
-            positions, (T == 1) ? nullptr : causal_mask, ctx->kv_k, ctx->kv_v, (int)il, n_past, kvp);
+            positions, (T == 1) ? nullptr : causal_mask, ctx->kv_k, ctx->kv_v, (int)il, n_past, kvp, b.attn_qkv_w);
         cur = ggml_add(ctx0, residual, attn);
 
         // ---- FFN ----
@@ -1380,6 +1385,42 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
         return nullptr;
     }
 
+    // ---- Fuse Q+K+V weights for single-matmul LLM attention ----
+    {
+        auto& hp = ctx->model.hparams;
+        auto& blocks = ctx->model.llm.blocks;
+        if (!blocks.empty() && blocks[0].attn_q_w && blocks[0].attn_k_w && blocks[0].attn_v_w &&
+            (blocks[0].attn_q_w->type == GGML_TYPE_F32 || blocks[0].attn_q_w->type == GGML_TYPE_F16)) {
+            int q_out = (int)blocks[0].attn_q_w->ne[1];
+            int k_out = (int)blocks[0].attn_k_w->ne[1];
+            int hidden = (int)blocks[0].attn_q_w->ne[0];
+            int qkv_out = q_out + 2 * k_out;
+            size_t fused_mem = ggml_tensor_overhead() * blocks.size() + 256;
+            ggml_init_params fgp = {fused_mem, nullptr, true};
+            ctx->fused_ctx = ggml_init(fgp);
+            if (ctx->fused_ctx) {
+                for (auto& b : blocks) {
+                    b.attn_qkv_w = ggml_new_tensor_2d(ctx->fused_ctx, b.attn_q_w->type, hidden, qkv_out);
+                }
+                ctx->fused_buf =
+                    ggml_backend_alloc_ctx_tensors_from_buft(ctx->fused_ctx, ggml_backend_cpu_buffer_type());
+                if (ctx->fused_buf) {
+                    for (auto& b : blocks) {
+                        size_t qb = ggml_nbytes(b.attn_q_w), kb = ggml_nbytes(b.attn_k_w);
+                        std::vector<uint8_t> tmp(qb + 2 * kb);
+                        ggml_backend_tensor_get(b.attn_q_w, tmp.data(), 0, qb);
+                        ggml_backend_tensor_get(b.attn_k_w, tmp.data() + qb, 0, kb);
+                        ggml_backend_tensor_get(b.attn_v_w, tmp.data() + qb + kb, 0, kb);
+                        ggml_backend_tensor_set(b.attn_qkv_w, tmp.data(), 0, tmp.size());
+                    }
+                    if (params.verbosity >= 1)
+                        fprintf(stderr, "qwen3_asr: fused QKV for %zu LLM layers (%d+%d+%d→%d)\n", blocks.size(), q_out,
+                                k_out, k_out, qkv_out);
+                }
+            }
+        }
+    }
+
     // Create the backend scheduler once with the worst-case node budget.
     // All compute functions reuse this scheduler via ggml_backend_sched_reset().
     {
@@ -1405,6 +1446,10 @@ extern "C" void qwen3_asr_free(qwen3_asr_context* ctx) {
         return;
     if (ctx->sched)
         ggml_backend_sched_free(ctx->sched);
+    if (ctx->fused_buf)
+        ggml_backend_buffer_free(ctx->fused_buf);
+    if (ctx->fused_ctx)
+        ggml_free(ctx->fused_ctx);
     if (ctx->kv_buf)
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
