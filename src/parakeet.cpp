@@ -445,8 +445,7 @@ static std::vector<float> parakeet_compute_mel_impl(parakeet_context* ctx, const
         return {};
     }
 
-    // Pull window and filterbank from the GGUF. Both tensors are stored
-    // contiguously by the converter so we can read them straight.
+    // Pull window and filterbank from the GGUF.
     std::vector<float> window_raw((size_t)win);
     ggml_backend_tensor_get(ctx->model.mel_window, window_raw.data(), 0, win * sizeof(float));
 
@@ -521,10 +520,12 @@ static void parakeet_fold_batchnorm(parakeet_model& model) {
             ggml_backend_tensor_set(e.conv_dw_w, w_f16.data(), 0, w_f16.size() * sizeof(ggml_fp16_t));
         }
 
-        // Fold into the synthetic conv_dw_b: b[c] = (0 - mean[c]) * s[c] + bn_b[c]
-        std::vector<float> dw_b(d);
+        // Fold into conv_dw_b: b[c] = (existing_b[c] - mean[c]) * s[c] + bn_b[c]
+        // Read existing bias (may be non-zero for models with explicit dw bias)
+        std::vector<float> dw_b(d, 0.0f);
+        ggml_backend_tensor_get(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
         for (int c = 0; c < d; c++)
-            dw_b[c] = -bn_mean[c] * s[c] + bn_b[c];
+            dw_b[c] = (dw_b[c] - bn_mean[c]) * s[c] + bn_b[c];
         ggml_backend_tensor_set(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
     }
 
@@ -1148,8 +1149,9 @@ extern "C" int parakeet_test_encoder(struct parakeet_context* ctx, int T_mel) {
     auto out = parakeet_encode_mel(ctx, mel.data(), n_mels, T_mel, &T_enc);
     if (out.empty())
         return -1;
-    fprintf(stderr, "parakeet: encoder OK — T_mel=%d → T_enc=%d  d=%d  out[0..3]=%g %g %g %g\n", T_mel, T_enc,
-            (int)ctx->model.hparams.d_model, (double)out[0], (double)out[1], (double)out[2], (double)out[3]);
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: encoder OK — T_mel=%d → T_enc=%d  d=%d  out[0..3]=%g %g %g %g\n", T_mel, T_enc,
+                (int)ctx->model.hparams.d_model, (double)out[0], (double)out[1], (double)out[2], (double)out[3]);
     return T_enc;
 }
 
@@ -1159,9 +1161,10 @@ extern "C" int parakeet_test_audio(struct parakeet_context* ctx, const float* sa
     if (mel.empty())
         return -1;
 
-    fprintf(stderr, "parakeet: mel OK — n_samples=%d (%.2fs)  T_mel=%d  n_mels=%d  mel[0..3]=%g %g %g %g\n", n_samples,
-            (double)n_samples / ctx->model.hparams.sample_rate, T_mel, (int)ctx->model.hparams.n_mels, (double)mel[0],
-            (double)mel[1], (double)mel[2], (double)mel[3]);
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: mel OK — n_samples=%d (%.2fs)  T_mel=%d  n_mels=%d  mel[0..3]=%g %g %g %g\n",
+                n_samples, (double)n_samples / ctx->model.hparams.sample_rate, T_mel, (int)ctx->model.hparams.n_mels,
+                (double)mel[0], (double)mel[1], (double)mel[2], (double)mel[3]);
 
     int T_enc = 0;
     auto enc_out = parakeet_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
@@ -1181,8 +1184,9 @@ extern "C" int parakeet_test_audio(struct parakeet_context* ctx, const float* sa
     }
     double mean = sum / enc_out.size();
     double var = sq / enc_out.size() - mean * mean;
-    fprintf(stderr, "parakeet: encoder OK — T_enc=%d  d=%d  mean=%.4f  std=%.4f  min=%.3f  max=%.3f\n", T_enc,
-            (int)ctx->model.hparams.d_model, mean, sqrt(var), (double)mn, (double)mx);
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: encoder OK — T_enc=%d  d=%d  mean=%.4f  std=%.4f  min=%.3f  max=%.3f\n", T_enc,
+                (int)ctx->model.hparams.d_model, mean, sqrt(var), (double)mn, (double)mx);
     return T_enc;
 }
 
@@ -1248,15 +1252,21 @@ extern "C" struct parakeet_result* parakeet_transcribe_ex(struct parakeet_contex
     auto mel = parakeet_compute_mel_impl(ctx, samples, n_samples, T_mel);
     if (mel.empty())
         return nullptr;
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: mel OK (%d frames)\n", T_mel);
 
     // 2. Encoder
     int T_enc = 0;
     auto enc = parakeet_encode_mel(ctx, mel.data(), (int)ctx->model.hparams.n_mels, T_mel, &T_enc);
     if (enc.empty())
         return nullptr;
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: encoder OK (%d frames)\n", T_enc);
 
     // 3. TDT greedy decode
     auto emitted = parakeet_tdt_decode(ctx, enc.data(), T_enc, (int)ctx->model.hparams.d_model);
+    if (getenv("PARAKEET_DEBUG"))
+        fprintf(stderr, "parakeet: decode OK (%d tokens)\n", (int)emitted.size());
 
     // 4. Build result
     auto* r = (parakeet_result*)calloc(1, sizeof(parakeet_result));

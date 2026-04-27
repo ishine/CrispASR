@@ -255,6 +255,13 @@ def convert(nemo_path: Path, out_path: Path) -> None:
         if isinstance(sd, dict) and "state_dict" in sd:
             sd = sd["state_dict"]
 
+        # Load config
+        cfg = None
+        if "config" in paths:
+            import yaml
+            with open(paths["config"]) as f:
+                cfg = yaml.safe_load(f)
+
         # Load tokenizer
         sp = spm.SentencePieceProcessor(model_file=str(paths["spm"]))
         vocab = [sp.id_to_piece(i) for i in range(sp.get_piece_size())]
@@ -264,12 +271,18 @@ def convert(nemo_path: Path, out_path: Path) -> None:
     print(f"Writing: {out_path}")
     writer = gguf.GGUFWriter(str(out_path), arch="parakeet")
 
-    # Hyper-parameters (hard-coded for parakeet-tdt-0.6b-v3 based on config inspection)
-    writer.add_uint32("parakeet.sample_rate", 16000)
-    writer.add_uint32("parakeet.n_mels", 128)
-    writer.add_uint32("parakeet.n_fft", 512)
-    writer.add_uint32("parakeet.win_length", 400)
-    writer.add_uint32("parakeet.hop_length", 160)
+    # Hyper-parameters — read from config, fall back to parakeet-tdt-0.6b defaults
+    prep = cfg.get("preprocessor", {}) if cfg else {}
+    feat_in = cfg.get("encoder", {}).get("feat_in", prep.get("features", 128)) if cfg else 128
+    sr = prep.get("sample_rate", 16000)
+    n_fft = prep.get("n_fft", 512)
+    ws = prep.get("window_size", 0.025)
+    wst = prep.get("window_stride", 0.01)
+    writer.add_uint32("parakeet.sample_rate", sr)
+    writer.add_uint32("parakeet.n_mels", feat_in)
+    writer.add_uint32("parakeet.n_fft", n_fft)
+    writer.add_uint32("parakeet.win_length", int(ws * sr))
+    writer.add_uint32("parakeet.hop_length", int(wst * sr))
     writer.add_uint32("parakeet.d_model", 1024)
     writer.add_uint32("parakeet.n_layers", 24)
     writer.add_uint32("parakeet.n_heads", 8)
