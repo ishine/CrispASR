@@ -5,7 +5,7 @@ Architecture: 6-layer input_local_transformer (audio token processor) +
 36-layer Qwen2 LLM (4096d, 32 heads, 8 KV heads, SiLU, RoPE).
 Audio input via 8-channel RVQ tokens from MiMo-Audio-Tokenizer (separate model).
 
-Needs ~20 GB RAM (model is ~16 GB in BF16 across 7 safetensors shards).
+Streams tensors one-at-a-time via safe_open (BF16→F16). ~12 GB peak RAM.
 
 Usage:
     python models/convert-mimo-asr-to-gguf.py --input XiaomiMiMo/MiMo-V2.5-ASR --output mimo-asr.gguf
@@ -173,21 +173,24 @@ def main():
             # our C reader rejects. BPE decoder works from vocab alone.
             print(f"  Tokenizer: {len(tokens)} tokens (merges skipped)")
 
-    # Map and write tensors
+    # Map and write tensors — stream one-at-a-time to minimize RAM.
+    # BF16→F16 via torch (numpy can't handle BF16); delete immediately after writing.
     mapped = 0
     for hf_name in sorted(tensor_names.keys()):
         gguf_name = map_tensor_name(hf_name)
-        data = handles[tensor_names[hf_name]].get_tensor(hf_name).to(torch.float32).numpy()
+        t = handles[tensor_names[hf_name]].get_tensor(hf_name)
 
-        if data.ndim == 0:
-            data = np.array([data.item()], dtype=np.float32)
+        if t.ndim == 0:
+            data = np.array([t.item()], dtype=np.float32)
             writer.add_tensor(gguf_name, data, raw_dtype=GGMLQuantizationType.F32)
-        elif data.ndim <= 1:
-            data = np.ascontiguousarray(data.astype(np.float32))
+        elif t.ndim <= 1:
+            data = np.ascontiguousarray(t.to(torch.float32).numpy())
             writer.add_tensor(gguf_name, data, raw_dtype=GGMLQuantizationType.F32)
         else:
-            data = np.ascontiguousarray(data.astype(out_dtype))
+            # Cast BF16→F16 (half the RAM vs F32) then to numpy
+            data = np.ascontiguousarray(t.to(torch.float16 if args.outtype == "f16" else torch.float32).numpy())
             writer.add_tensor(gguf_name, data, raw_dtype=ggml_type)
+        del t, data  # free immediately
         mapped += 1
         if mapped % 50 == 0:
             print(f"  [{mapped}] {gguf_name}")
