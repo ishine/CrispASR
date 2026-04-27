@@ -35,21 +35,21 @@ are in `LEARNINGS.md`. Full roadmap in `PLAN.md`.
   fname.size(), ...)` was a silent no-op that always failed.
 - ~~**Japanese punctuation split (#29)**~~ **FIXED** — CJK clause-break + 42-char fallback
 - ~~**Moonshine multilingual**~~ **FIXED** — converter forces 1D tensors to F32 (line 338). All 14 GGUF variants (tiny/base × en/ja/ar/ko/zh/vi/uk) work on CPU. head_dim=52 (base) works on CPU flash_attn; GPU flash_attn needs aligned head_dim (ggml limitation, moonshine forced to CPU anyway). Verified 2026-04-26: tiny 50.7×, base (head_dim=52) 14.2×, base-zh on English audio 14.8× — all transcripts correct.
-- ~~**Moonshine streaming**~~ **DONE** — full pipeline working (converter + runtime + backend).
-  Correct jfk.wav transcription matching HF reference. Backend: `--backend moonshine-streaming`.
-  Remaining: upload Q4_K GGUF to HuggingFace, add model registry entry for `-m auto`,
-  debug sliding-window mask (encoder ~99% match without masks, should improve with).
-  Sizes: tiny 34M, small 123M, medium 245M. All MIT.
-  Sizes: tiny 34M, small 123M, medium 245M. All MIT.
-- **Gemma-4-E2B** — **[next, IN PROGRESS]** Google USM Conformer (12L, 1024d) + Gemma4 LLM (35L, 1536d).
-  Converter DONE (`models/convert-gemma4-e2b-to-gguf.py`, 2011→~1500 tensors after skipping clips+vision).
-  Runtime skeleton compiles (`src/gemma4_e2b.{h,cpp}`), loads GGUF, binds all audio+LLM tensors.
-  Reuses core/attention.h (kv_self_attn with Q/K norms), core/ffn.h (swiglu), core/mel.h.
-  Backend registered: `--backend gemma4-e2b`. Needs Kaggle to convert (9.5 GB model).
+- ~~**Moonshine streaming**~~ **DONE** — 3 sizes (tiny/small/medium), all MIT, all on HF.
+  Backend `--backend moonshine-streaming`, model registry for auto-download.
+- **Gemma-4-E2B** — **[IN PROGRESS]** Google USM Conformer (12L) + Gemma4 LLM (35L).
+  Converter DONE, F16 GGUF on HF (`cstr/gemma4-e2b-it-GGUF`, 9.5 GB, 872 tensors).
+  Q4_K quantization pending (BPE merges fix applied, re-running on Kaggle).
+  Runtime skeleton compiles, backend registered: `--backend gemma4-e2b`.
   Conformer encoder + LLM decoder forward passes not yet implemented.
   Apache 2.0. 128-bin log-mel, 30s max, 262K BPE vocab.
-- **MiMo-V2.5-ASR** — **[queued, low priority]** Xiaomi 8B Qwen2 + 1.2B RVQ audio tokenizer.
-  Two-stage pipeline, needs A100 for conversion. MIT.
+- **MiMo-V2.5-ASR** — **[IN PROGRESS]** Xiaomi 8B Qwen2 + 1.2B RVQ audio tokenizer.
+  Both converters DONE. F16 GGUFs on HF: `cstr/mimo-asr-GGUF` (15.3 GB),
+  `cstr/mimo-tokenizer-GGUF` (Q4_K 377 MB). Runtime not yet written. MIT.
+- **German wav2vec2 models** — **[DONE]** 5 models on HF, all Apache 2.0 / MIT:
+  `wav2vec2-large-xlsr-53-german` (222 MB Q4_K), `wav2vec2-large-xlsr-53-german-cv13` (212 MB),
+  `wav2vec2-base-german-cv9` (80 MB, MIT), plus 1B models converting on Kaggle.
+  Model registry: `--backend wav2vec2 -m auto -l de` auto-downloads German model.
 - **VibeVoice-ASR 7B** — blocked on ≥16 GB RAM for conversion
 - ~~**VibeVoice TTS**~~ — **DONE**: Realtime-0.5B (17 bugs, perfect round-trip) + 1.5B base model (voice cloning). HF: `cstr/vibevoice-realtime-0.5b-GGUF`, `cstr/vibevoice-1.5b-GGUF`
 - **VibeVoice-7B TTS** — needs 32+ GB RAM for conversion (9.3B params). Same architecture as 1.5B.

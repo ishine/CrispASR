@@ -215,7 +215,7 @@ struct qwen3_asr_context {
     // tests / fallbacks compile; it is no longer the path used by
     // qwen3_asr_compute_mel / qwen3_asr_run_encoder once `audio_ca` is open.
     crisp_audio_context* audio_ca = nullptr;
-    std::string model_path;       // remembered for lazy crisp_audio init
+    std::string model_path; // remembered for lazy crisp_audio init
 };
 
 // ===========================================================================
@@ -545,15 +545,18 @@ static void qwen3_asr_fft_wrapper(const float* in, int N, float* out) {
 // under "qwen3asr.audio." (handled by crisp_audio's prefix fallback), so
 // passing the defaults here is correct.
 static crisp_audio_context* qwen3_asr_get_audio(qwen3_asr_context* ctx) {
-    if (!ctx) return nullptr;
-    if (ctx->audio_ca) return ctx->audio_ca;
-    if (ctx->model_path.empty()) return nullptr;
+    if (!ctx)
+        return nullptr;
+    if (ctx->audio_ca)
+        return ctx->audio_ca;
+    if (ctx->model_path.empty())
+        return nullptr;
     crisp_audio_params p = crisp_audio_params_default();
     p.n_threads = ctx->n_threads;
     p.verbosity = ctx->params.verbosity;
     p.use_gpu = ctx->params.use_gpu;
     p.tensor_prefix = "audio.";
-    p.meta_prefix = "qwen3asr.audio.";  // qwen3-asr's hparam namespace
+    p.meta_prefix = "qwen3asr.audio."; // qwen3-asr's hparam namespace
     ctx->audio_ca = crisp_audio_init_from_file(ctx->model_path.c_str(), &p);
     return ctx->audio_ca;
 }
@@ -1401,7 +1404,8 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
     qwen3_asr_context* ctx = new qwen3_asr_context();
     ctx->params = params;
     ctx->n_threads = params.n_threads > 0 ? params.n_threads : 4;
-    if (path) ctx->model_path = path;
+    if (path)
+        ctx->model_path = path;
 
     // Try GPU backend first (Metal, CUDA, Vulkan...), fall back to CPU.
     // ggml_backend_init_best() picks the highest-priority available backend.
@@ -1591,8 +1595,7 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
         return nullptr;
     crisp_audio_context* ca = qwen3_asr_get_audio(ctx);
     if (ca) {
-        return crisp_audio_encode(ca, mel_features, n_mels, T_mel,
-                                  out_N_total, out_proj_dim);
+        return crisp_audio_encode(ca, mel_features, n_mels, T_mel, out_N_total, out_proj_dim);
     }
     // Fall through to the in-tree implementation below if crisp_audio failed.
     const auto& hp = ctx->model.hparams;
