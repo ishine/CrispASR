@@ -62,6 +62,16 @@ are in `LEARNINGS.md`. Full roadmap in `PLAN.md`.
   HF: `cstr/whisper-vad-encdec-asmr-GGUF`.
 - **4 VAD backends total**: Silero (default), FireRedVAD (recommended), MarbleNet, Whisper-VAD.
   All with auto-download keywords.
+- **Parakeet-JA** — **[IN PROGRESS]** `nvidia/parakeet-tdt_ctc-0.6b-ja` (CC-BY-4.0).
+  Converter fixed: reads n_mels from config (80 vs 128), handles pre-existing dw bias.
+  BN fold fixed: reads existing bias before folding. F16 (1.2 GB) + Q4_K (449 MB) on HF.
+  **Bug**: TDT decoder emits 1 token then all blanks. Encoder + predictor verified correct
+  via Python diff-testing. Needs NeMo ground truth comparison (Kaggle gist ready).
+  Possible causes: encoder output scale, joint network activation, or Q4_K TDT weight sensitivity.
+- **Gemma-4-E2B** — **[IN PROGRESS]** Full forward pass implemented (encoder + LLM decoder).
+  Needs testing with GGUF on Kaggle. Q4_K on HF. See TODO entry above.
+- **MiMo-V2.5-ASR** — **[IN PROGRESS]** Converters done, F16+Q4_K on HF.
+  Runtime not yet written. MIT.
 - **VibeVoice-ASR 7B** — blocked on ≥16 GB RAM for conversion
 - ~~**VibeVoice TTS**~~ — **DONE**: Realtime-0.5B (17 bugs, perfect round-trip) + 1.5B base model (voice cloning). HF: `cstr/vibevoice-realtime-0.5b-GGUF`, `cstr/vibevoice-1.5b-GGUF`
 - **VibeVoice-7B TTS** — needs 32+ GB RAM for conversion (9.3B params). Same architecture as 1.5B.

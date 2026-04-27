@@ -1268,6 +1268,40 @@ MatchboxNet, SEANet encoder in VoiceCodecs, etc.).
 
 ---
 
+### Parakeet-JA: hardcoded mel params + BN fold with existing bias
+
+The parakeet converter had `n_mels=128` hardcoded. The Japanese model
+(`parakeet-tdt_ctc-0.6b-ja`) uses 80 mels. This caused a silent
+tensor-read overflow: the runtime allocated `128 * 257 * 4 = 131 KB`
+for the mel filterbank but the GGUF only stored `80 * 257 * 4 = 82 KB`.
+
+**Fix**: Read `n_mels` (and all mel params) from `model_config.yaml`
+instead of hardcoding.
+
+Second bug: the BN fold assumed depthwise conv bias starts at zero
+(`b_fused = (0 - mean) * scale + bn_bias`). The Japanese model has
+non-zero `depthwise_conv.bias`. Fix: read existing bias first:
+```cpp
+ggml_backend_tensor_get(e.conv_dw_b, dw_b.data(), 0, d * sizeof(float));
+dw_b[c] = (dw_b[c] - bn_mean[c]) * s[c] + bn_b[c];
+```
+
+**TDT decoder issue** (unresolved): After the BN fold fix, the encoder
+runs correctly (verified: mel=581 frames, enc=73 frames, predictor
+init matches Python to 4 decimal places). But the TDT decoder emits
+1 token then all blanks. Joint logits collapse from -20 to -70 after
+the first emission. Needs NeMo reference comparison on the same audio
+(Kaggle gist written). Possible causes:
+- Encoder output scale differs from NeMo reference
+- The 80-mel FastConformer pre_encode (2560→1024) produces different
+  distributions than the 128-mel variant the code was originally tested with
+- Q4_K quantization of TDT joint weights causes decoder loop
+
+**Lesson**: Never hardcode model hyperparameters in converters. Always
+read from the model config, falling back to defaults only as a last resort.
+
+---
+
 ## Windows / MSVC portability (April 2026)
 
 ### `M_PI` is not defined on MSVC by default
