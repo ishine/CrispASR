@@ -13,13 +13,17 @@ are in `LEARNINGS.md`. Full roadmap in `PLAN.md`.
 
 ## Pending optimizations (v0.5.x)
 
-| # | Optimization | Backends | Expected gain | Effort |
-|---|---|---|---|---|
-| O2 | Fused QKV pre-merge (single matmul) | LLM decoders (voxtral, qwen3, granite, glm, omniasr-llm) | ~10-15% attn (GPU mainly) | Medium |
-| O5 | Pipelined mel+encode threading | LLM backends, CPU | ~15-20% | Medium |
-| O4 | Beam search for LLM backends | All Audio-LLM | Quality improvement | High |
-| O6 | Batched encoder (GPU only) | All backends | 3-5x on GPU | High |
-| O7 | Speculative decoding | LLM backends | 2-4x decode | High |
+| # | Optimization | Backends | Expected gain | Effort | Status |
+|---|---|---|---|---|---|
+| O1 | ggml grouped conv1d (im2col+mul_mat) | wav2vec2, data2vec, hubert | **4.9x pos_conv** | Done | **DONE** |
+| O2 | Fused QKV pre-merge (single matmul) | LLM decoders | ~10-15% attn (GPU) | Medium | Infra done (F32/F16 only; Q4_K needs converter-level fuse) |
+| O3 | ggml bump 0.9.8→0.10.0 | All | Bug fixes, FA head_dim=512, BF16 FA | Done | **DONE** |
+| O5 | Pipelined mel+encode threading | LLM backends, CPU | ~15-20% | Medium | TODO |
+| O4 | Beam search for LLM backends | All Audio-LLM | Quality improvement | High | TODO |
+| O6 | Batched encoder (GPU only) | All backends | 3-5x on GPU | High | TODO |
+| O7 | Speculative decoding | LLM backends | 2-4x decode | High | TODO |
+| O8 | FireRed single-graph encoder | firered-asr | ~15s GPU savings | High | TODO (needs rel_pos_attn refactor) |
+| O9 | Grouped conv graph integration | wav2vec2 family | ~300ms saved | Medium | BLOCKED (ggml view bounds) |
 
 ## Pending features (v0.5.x)
 
