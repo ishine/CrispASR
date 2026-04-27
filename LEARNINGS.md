@@ -523,6 +523,25 @@ kernels with small spatial dimensions (k ≤ 5) and few channels (C < 256),
 ship it F32. The 16 MB F32 Silero LID model is smaller than a single
 layer of most ASR encoders — quantization is pointless.
 
+### CUDA im2col grid overflow (MUST RE-APPLY after every ggml bump)
+
+Upstream ggml's CUDA im2col kernel uses `OW` (output width) directly as
+`grid.y` in the kernel launch: `dim3 block_nums(num_blocks, OW, ...)`.
+CUDA grids are limited to 65535 in y and z dimensions. For models that
+process raw audio waveforms (kyutai-stt SEANet, vibevoice), the first
+convolution has T_out = 176000 — far exceeding 65535.
+
+**Symptom:** `CUDA error: invalid configuration argument` in IM2COL.
+
+**Fix (file: `ggml/src/ggml-cuda/im2col.cu`):**
+1. Add `#define MAX_GRIDDIM_Y 65535`
+2. Clamp grid.y: `dim3 block_nums(num_blocks, MIN(OW, MAX_GRIDDIM_Y), ...)`
+3. Loop inside kernel: `for (int64_t iow = blockIdx.y; iow < OW; iow += MAX_GRIDDIM_Y)`
+
+This patch must be re-applied after every ggml version bump. It's marked
+with a `CrispASR patch` comment in the file. First applied in commit
+`1552434`, lost in the 0.9.8→0.10.0 bump, re-applied in the current fix.
+
 ### ggml version bumps: conv_1d_dw shape change (0.9.8 → 0.10.0)
 
 In ggml 0.9.8, `ggml_conv_1d_dw` returned `[OL, 1, channels, 1]` (4D).
