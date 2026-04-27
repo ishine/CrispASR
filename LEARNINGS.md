@@ -535,6 +535,32 @@ Fix: use `ne[1]` instead: `ggml_reshape_2d(ht, ht->ne[0], ht->ne[1])`.
 `ggml_conv_1d_dw` or `ggml_im2col`-based ops — the output tensor
 dimensions may shift.
 
+### Grouped conv1d via ggml: im2col shape pitfalls
+
+Implementing grouped conv1d as G independent `ggml_im2col` + `ggml_mul_mat`
+calls is correct in principle but requires careful tensor shape management:
+
+1. **`ggml_conv_1d` requires F16 kernel** on CPU — can't use Q4_K views directly.
+   Must pre-dequantize to F32 or use manual im2col+mul_mat decomposition.
+
+2. **Q4_K tensor views are unsafe** — Q4_K has 256-byte block structure.
+   `ggml_view_3d` at arbitrary offsets within a Q4_K tensor misaligns blocks.
+   Always dequantize to F32 before taking group-wise views.
+
+3. **im2col output shape**: `OL = (IL + 2*pad - K*dilation) / stride + 1`.
+   With "same" padding where `pad = (K-1)/2`, and stride=1, `OL == IL`.
+   The im2col tensor is `[K*IC, OL, batch]` — verify ne[0] matches
+   the kernel reshape before mul_mat.
+
+4. **Channel-first vs ggml layout**: ggml conv1d expects `[T, C, batch]`
+   where ne[0]=T (time-contiguous). This is the SAME memory layout as
+   channel-first `[C, T]` in C (where each channel's T values are
+   contiguous). No transpose needed.
+
+Status: WIP. Manual `grouped_conv1d_same` with OMP is the active path
+(1.6s on wav2vec2-large). The ggml graph version would use SIMD kernels
+and support GPU but has a tensor bounds assertion bug to fix.
+
 ### Moonshine Streaming: unit-offset LayerNorm and sliding-window attention
 
 Moonshine Streaming (UsefulSensors, MIT) uses a non-standard LayerNorm
