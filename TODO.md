@@ -37,9 +37,13 @@ are in `LEARNINGS.md`. Full roadmap in `PLAN.md`.
   debug sliding-window mask (encoder ~99% match without masks, should improve with).
   Sizes: tiny 34M, small 123M, medium 245M. All MIT.
   Sizes: tiny 34M, small 123M, medium 245M. All MIT.
-- **Gemma-4-E2B** — **[queued]** Google multimodal with 300M USM Conformer audio encoder + 2.3B Gemma4 LLM.
-  GGUF exists at ggml-org (text+vision only). llama.cpp PR #21421 adds audio conformer.
-  Need converter + runtime. Apache 2.0. 128-bin log-mel, 30s max, 262K vocab.
+- **Gemma-4-E2B** — **[next, IN PROGRESS]** Google USM Conformer (12L, 1024d) + Gemma4 LLM (35L, 1536d).
+  Converter DONE (`models/convert-gemma4-e2b-to-gguf.py`, 2011→~1500 tensors after skipping clips+vision).
+  Runtime skeleton compiles (`src/gemma4_e2b.{h,cpp}`), loads GGUF, binds all audio+LLM tensors.
+  Reuses core/attention.h (kv_self_attn with Q/K norms), core/ffn.h (swiglu), core/mel.h.
+  Backend registered: `--backend gemma4-e2b`. Needs Kaggle to convert (9.5 GB model).
+  Conformer encoder + LLM decoder forward passes not yet implemented.
+  Apache 2.0. 128-bin log-mel, 30s max, 262K BPE vocab.
 - **MiMo-V2.5-ASR** — **[queued, low priority]** Xiaomi 8B Qwen2 + 1.2B RVQ audio tokenizer.
   Two-stage pipeline, needs A100 for conversion. MIT.
 - **VibeVoice-ASR 7B** — blocked on ≥16 GB RAM for conversion
