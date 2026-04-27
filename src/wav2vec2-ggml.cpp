@@ -594,8 +594,11 @@ static void ggml_linear_f32(std::vector<uint8_t>& scratch, ggml_tensor* W, const
 // Build ggml graph for grouped conv1d ops inside the transformer graph.
 // Adds pos_conv (G groups × im2col + mul_mat) + GELU + residual to the graph.
 // Input: cur [H, T] channel-first. Returns: cur + gelu(grouped_conv(cur)).
-static ggml_tensor* build_pos_conv_graph(ggml_context* ctx0, ggml_cgraph* gf, ggml_tensor* cur, ggml_tensor* w_tensor,
-                                         ggml_tensor* b_tensor, int H, int T, int K, int G) {
+// Build grouped conv1d into a ggml graph. Uses fresh input tensors for weight/bias
+// (not views of model tensors) to avoid ggml view-of-view bounds issues.
+static ggml_tensor* build_pos_conv_graph(ggml_context* ctx0, ggml_cgraph* gf, ggml_tensor* cur,
+                                         ggml_tensor* /*w_tensor_unused*/, ggml_tensor* /*b_tensor_unused*/, int H,
+                                         int T, int K, int G) {
     int cpg = H / G;
     int pad_l = (K - 1) / 2;
     int pad_r = K - 1 - pad_l;
@@ -604,40 +607,41 @@ static ggml_tensor* build_pos_conv_graph(ggml_context* ctx0, ggml_cgraph* gf, gg
     ggml_tensor* padded = ggml_pad_ext(ctx0, cur, pad_l, pad_r, 0, 0, 0, 0, 0, 0);
     int T_pad = T + pad_l + pad_r;
 
-    // Build G independent conv branches, accumulate into one output
-    // Each group: slice input [cpg, T_pad], slice weight [K, cpg, cpg], im2col+mul_mat → [cpg, T]
+    // Per-group weight and bias tensors as graph inputs (avoids all view issues)
     std::vector<ggml_tensor*> group_outs(G);
     for (int g = 0; g < G; g++) {
         ggml_tensor* x_g = ggml_view_2d(ctx0, padded, T_pad, cpg, padded->nb[1], (size_t)g * cpg * padded->nb[1]);
         x_g = ggml_cont(ctx0, x_g);
         x_g = ggml_reshape_3d(ctx0, x_g, T_pad, cpg, 1);
 
-        ggml_tensor* w_g = ggml_view_3d(ctx0, w_tensor, K, cpg, cpg, w_tensor->nb[1], w_tensor->nb[2],
-                                        (size_t)g * cpg * w_tensor->nb[2]);
+        // Per-group weight: [K, cpg, cpg] — separate input tensor per group
+        char wname[32], bname[32];
+        snprintf(wname, sizeof(wname), "pcw_%d", g);
+        snprintf(bname, sizeof(bname), "pcb_%d", g);
+        ggml_tensor* w_g = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, K, cpg, cpg);
+        ggml_set_name(w_g, wname);
+        ggml_set_input(w_g);
 
         ggml_tensor* im2col = ggml_im2col(ctx0, w_g, x_g, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F32);
         ggml_tensor* w_2d = ggml_reshape_2d(ctx0, w_g, K * cpg, cpg);
         ggml_tensor* im_2d = ggml_reshape_2d(ctx0, im2col, K * cpg, T);
-        ggml_tensor* conv = ggml_mul_mat(ctx0, w_2d, im_2d); // [cpg, T]
+        ggml_tensor* conv = ggml_mul_mat(ctx0, w_2d, im_2d);
 
-        if (b_tensor) {
-            ggml_tensor* b_g = ggml_view_1d(ctx0, b_tensor, cpg, (size_t)g * cpg * sizeof(float));
-            conv = ggml_add(ctx0, conv, b_g);
-        }
+        ggml_tensor* b_g = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, cpg);
+        ggml_set_name(b_g, bname);
+        ggml_set_input(b_g);
+        conv = ggml_add(ctx0, conv, b_g);
         group_outs[g] = conv;
     }
 
-    // Assemble groups into output [H, T]: copy each group's [cpg, T] into the
-    // correct channel slice of a pre-allocated output tensor.
-    ggml_tensor* conv_out = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, H, T);
-    ggml_set_name(conv_out, "pos_conv_out");
-    // Initialize to zero (will be overwritten by copies)
-    for (int g = 0; g < G; g++) {
-        // group_outs[g] is [cpg, T] from mul_mat
-        // Target slice: conv_out[g*cpg .. (g+1)*cpg, :] = [cpg, T]
-        ggml_tensor* dst_slice = ggml_view_2d(ctx0, conv_out, cpg, T, conv_out->nb[1], (size_t)g * cpg * sizeof(float));
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, group_outs[g], dst_slice));
+    // Assemble groups: transpose each [cpg, T] → [T, cpg], concat on dim 1 → [T, H],
+    // then transpose back → [H, T]. Avoids non-contiguous view/cpy issues.
+    ggml_tensor* conv_out = ggml_cont(ctx0, ggml_transpose(ctx0, group_outs[0]));
+    for (int g = 1; g < G; g++) {
+        ggml_tensor* g_t = ggml_cont(ctx0, ggml_transpose(ctx0, group_outs[g]));
+        conv_out = ggml_concat(ctx0, conv_out, g_t, 1);
     }
+    conv_out = ggml_cont(ctx0, ggml_transpose(ctx0, conv_out));
 
     // GELU + residual
     conv_out = ggml_gelu(ctx0, conv_out);
@@ -1411,8 +1415,8 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                        ggml_tensor_overhead() * 200 + ggml_graph_overhead_custom(512, false) + 32 * 1024 * 1024;
 
     // Try full-graph path with ggml_backend_sched (GPU-ready)
-    // TODO: include_pos_conv=true integrates grouped conv into the graph but
-    // has view/reshape contiguity issues in ggml_concat/ggml_cpy. Disabled for now.
+    // Integrated pos_conv graph disabled — per-group tensor approach still triggers
+    // ggml view bounds assert. Using standalone ggml_grouped_conv1d_same (4.9x speedup).
     {
         std::vector<uint8_t> compute_meta;
         ggml_cgraph* gf = wav2vec2_build_transformer_graph(m, T, compute_meta, /*include_pos_conv=*/false);
@@ -1471,6 +1475,26 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
                 ggml_tensor* inp = ggml_graph_get_tensor(gf, "hidden_in");
                 if (inp) {
                     ggml_backend_tensor_set(inp, hidden_ht.data(), 0, H * T * sizeof(float));
+                    // Set per-group pos_conv weight/bias inputs (F32 dequantized)
+                    {
+                        const float* pw = tensor_data_f32(m.pos_conv_w);
+                        const float* pb = m.pos_conv_b ? tensor_data_f32(m.pos_conv_b) : nullptr;
+                        int K_pos = (int)hp.num_conv_pos_embeddings;
+                        int G_pos = (int)hp.num_conv_pos_embedding_groups;
+                        int cpg = H / G_pos;
+                        for (int g = 0; g < G_pos; g++) {
+                            char wn[32], bn[32];
+                            snprintf(wn, sizeof(wn), "pcw_%d", g);
+                            snprintf(bn, sizeof(bn), "pcb_%d", g);
+                            ggml_tensor* wt = ggml_graph_get_tensor(gf, wn);
+                            ggml_tensor* bt = ggml_graph_get_tensor(gf, bn);
+                            if (wt)
+                                ggml_backend_tensor_set(wt, pw + (size_t)g * cpg * cpg * K_pos, 0,
+                                                        (size_t)cpg * cpg * K_pos * sizeof(float));
+                            if (bt && pb)
+                                ggml_backend_tensor_set(bt, pb + g * cpg, 0, cpg * sizeof(float));
+                        }
+                    }
                     if (ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS) {
                         // Dump after_global_ln if available
                         {
