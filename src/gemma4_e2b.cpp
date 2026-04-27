@@ -376,10 +376,45 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
 }
 
 extern "C" char* gemma4_e2b_transcribe(struct gemma4_e2b_context* ctx, const float* pcm, int n_samples) {
-    // TODO: implement mel → conformer encoder → LLM decode
-    (void)ctx;
-    (void)pcm;
-    (void)n_samples;
+    if (!ctx || !pcm || n_samples <= 0)
+        return nullptr;
+
+    auto& m = ctx->model;
+    auto& ahp = m.audio_hp;
+    auto& lhp = m.llm_hp;
+    bool verbose = ctx->verbosity >= 2 || getenv("GEMMA4_E2B_BENCH");
+
+    // ── Step 1: Mel spectrogram ─────────────────────────────────────────
+    // 128-bin log-mel, 16kHz, 40ms frames (HF/Whisper-style)
+    // TODO: use core_mel::compute with baked filterbank from GGUF
+    // For now, placeholder — needs mel filterbank tensor in GGUF
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "gemma4_e2b: %d samples (%.1fs)\n", n_samples, n_samples / 16000.0f);
+
+    // ── Step 2: Conv2D subsampling ──────────────────────────────────────
+    // Two Conv2D layers: [1, n_mels, T_mel] → [128, n_mels/2, T_mel/2] → [32, n_mels/4, T_mel/4]
+    // Then flatten + linear projection to [1024, T_sub]
+    // TODO: implement when we have a converted GGUF to test against
+
+    // ── Step 3: Conformer encoder (12 layers) ───────────────────────────
+    // Each layer: FFN1 (macaron) → self-attn (chunked + rel_pos) → LightConv1d → FFN2 → out_norm
+    // Residual weight: 0.5 (half-step residuals in macaron FFN)
+    // TODO: implement — architecture is well-understood from tensor dump
+
+    // ── Step 4: Audio → LLM token injection ─────────────────────────────
+    // Tokenize prompt with <audio> placeholder, replace with conformer output
+    // Output projection: [1024, T_sub] → [1536, T_sub] via audio_output_proj
+    // Embedding projection: [1536, T_sub] → [1536, T_sub] via audio_embed_proj
+    // TODO: implement chat template + audio injection (same pattern as qwen3)
+
+    // ── Step 5: Gemma4 LLM decode ───────────────────────────────────────
+    // 35-layer decoder with PLE, hybrid sliding/full attention, SwiGLU
+    // Reuses core_attn::kv_self_attn (Q/K norms, GQA) and core_ffn::swiglu
+    // TODO: implement — needs KV cache allocation, chat template
+
+    // For now, return nullptr (not implemented)
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "gemma4_e2b: transcribe not yet implemented (need converted GGUF)\n");
     return nullptr;
 }
 
