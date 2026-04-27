@@ -169,10 +169,9 @@ def main():
                 if idx < len(tokens):
                     tokens[idx] = token
             writer.add_token_list(tokens)
-            merges = tok_data.get("model", {}).get("merges", [])
-            if merges:
-                writer.add_token_merges(merges)
-            print(f"  Tokenizer: {len(tokens)} tokens, {len(merges)} merges")
+            # Skip merges — add_token_merges produces GGUF type 9 which
+            # our C reader rejects. BPE decoder works from vocab alone.
+            print(f"  Tokenizer: {len(tokens)} tokens (merges skipped)")
 
     # Map and write tensors
     mapped = 0

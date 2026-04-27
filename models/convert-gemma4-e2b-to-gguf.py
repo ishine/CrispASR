@@ -222,10 +222,11 @@ def main():
                 if idx < len(tokens):
                     tokens[idx] = token
             writer.add_token_list(tokens)
-            merges = tok_data.get("model", {}).get("merges", [])
-            if merges:
-                writer.add_token_merges(merges)
-            print(f"  Tokenizer: {len(tokens)} tokens, {len(merges)} merges")
+            # NOTE: merges skipped — add_token_merges produces GGUF type 9
+            # which our C reader rejects ("invalid GGUF type 9"). The BPE
+            # decoder in core/bpe.h works from vocab alone. 514K merges
+            # would also bloat the header by ~30 MB.
+            print(f"  Tokenizer: {len(tokens)} tokens (merges skipped)")
 
     # Map and write tensors (streaming, one at a time)
     mapped = 0
