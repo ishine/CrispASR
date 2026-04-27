@@ -123,8 +123,13 @@ static void mbn_fft(float* in, int N, float* out) {
 static std::vector<float> mbn_compute_mel(const float* pcm, int n_samples, const float* hann, int win_len,
                                           const float* fb, int n_mels, int n_fft, int hop, int* out_T) {
     const int n_freqs = n_fft / 2 + 1;
-    // NeMo: no center padding, pad_to=2 (pad T to multiple of 2)
-    int n_frames = (n_samples - win_len) / hop + 1;
+    // NeMo uses center=True: pad n_fft/2 zeros on each side
+    int pad = n_fft / 2;
+    int padded_len = n_samples + 2 * pad;
+    std::vector<float> padded(padded_len, 0);
+    memcpy(padded.data() + pad, pcm, n_samples * sizeof(float));
+
+    int n_frames = (padded_len - n_fft) / hop + 1;
     if (n_frames <= 0) {
         *out_T = 0;
         return {};
@@ -134,11 +139,12 @@ static std::vector<float> mbn_compute_mel(const float* pcm, int n_samples, const
     std::vector<float> si(4 * n_fft, 0), so(8 * n_fft, 0);
 
     for (int t = 0; t < n_frames; t++) {
-        // Window + zero-pad to n_fft
+        // Window (win_len) centered in n_fft-sized frame, zero-padded
         for (int i = 0; i < n_fft; i++)
             si[i] = 0;
-        for (int i = 0; i < win_len && (t * hop + i) < n_samples; i++)
-            si[i] = pcm[t * hop + i] * hann[i];
+        int frame_start = t * hop;
+        for (int i = 0; i < win_len && (frame_start + i) < padded_len; i++)
+            si[i] = padded[frame_start + i] * hann[i];
         mbn_fft(si.data(), n_fft, so.data());
         // Power spectrum
         for (int f = 0; f < n_freqs; f++) {
