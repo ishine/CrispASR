@@ -131,12 +131,18 @@ public:
         // Silero-only VAD loader (#34). When FireRed is detected, disable
         // whisper-internal VAD — the CLI dispatch layer will handle it via
         // crispasr_compute_audio_slices() before calling transcribe().
+        // External VAD models (FireRedVAD, whisper-vad-encdec) are NOT compatible
+        // with whisper's internal Silero-only VAD loader. Detect and disable.
         const bool firered = crispasr_vad_is_firered(p);
-        const std::string vad_path = firered ? "" : crispasr_resolve_vad_model(p);
-        wp.vad = firered ? false : p.vad;
+        const std::string resolved_vad = crispasr_resolve_vad_model(p);
+        const bool external_vad = firered || (resolved_vad.find("whisper") != std::string::npos &&
+                                              resolved_vad.find("vad") != std::string::npos &&
+                                              resolved_vad.find(".gguf") != std::string::npos);
+        const std::string vad_path = external_vad ? "" : resolved_vad;
+        wp.vad = external_vad ? false : p.vad;
         wp.vad_model_path = vad_path.c_str();
-        if (firered && !p.no_prints)
-            fprintf(stderr, "crispasr[whisper]: FireRedVAD detected — using external VAD dispatch\n");
+        if (external_vad && !p.no_prints)
+            fprintf(stderr, "crispasr[whisper]: external VAD detected — using crispasr VAD dispatch\n");
         wp.vad_params.threshold = p.vad_threshold;
         wp.vad_params.min_speech_duration_ms = p.vad_min_speech_duration_ms;
         wp.vad_params.min_silence_duration_ms = p.vad_min_silence_duration_ms;

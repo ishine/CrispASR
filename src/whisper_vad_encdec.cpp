@@ -389,28 +389,20 @@ static std::vector<float> wvad_forward(whisper_vad_encdec_context* ctx, const fl
     ggml_set_input(mel_in);
 
     // Conv1d front-end
-    fprintf(stderr, "wvad: conv1_w=[%lld,%lld,%lld] mel=[%lld,%lld]\n",
-            (long long)m.conv1_w->ne[0], (long long)m.conv1_w->ne[1], (long long)m.conv1_w->ne[2],
-            (long long)mel_in->ne[0], (long long)mel_in->ne[1]);
-    ggml_tensor* h = ggml_conv_1d_ph(ctx0, m.conv1_w, mel_in, 1, 1);
-    fprintf(stderr, "wvad: after conv1 h=[%lld,%lld]\n", (long long)h->ne[0], (long long)h->ne[1]);
+    // ggml conv_1d_ph requires F16 kernel on CPU (im2col_f16 assert)
+    ggml_tensor* conv1_w_f16 = ggml_cast(ctx0, m.conv1_w, GGML_TYPE_F16);
+    ggml_tensor* h = ggml_conv_1d_ph(ctx0, conv1_w_f16, mel_in, 1, 1);
     if (m.conv1_b) {
         h = ggml_cont(ctx0, ggml_transpose(ctx0, h)); // [C, T]
-        fprintf(stderr, "wvad: after trans h=[%lld,%lld] bias=[%lld]\n",
-                (long long)h->ne[0], (long long)h->ne[1], (long long)m.conv1_b->ne[0]);
         h = ggml_add(ctx0, h, m.conv1_b);
-        fprintf(stderr, "wvad: bias add ok\n");
         h = ggml_cont(ctx0, ggml_transpose(ctx0, h));
     }
     h = ggml_gelu(ctx0, h);
-    h = ggml_conv_1d_ph(ctx0, m.conv2_w, h, 2, 1); // stride=2: 3000->1500
-    fprintf(stderr, "wvad: after conv2 h=[%lld,%lld]\n", (long long)h->ne[0], (long long)h->ne[1]);
+    ggml_tensor* conv2_w_f16 = ggml_cast(ctx0, m.conv2_w, GGML_TYPE_F16);
+    h = ggml_conv_1d_ph(ctx0, conv2_w_f16, h, 2, 1); // stride=2: 3000->1500
     if (m.conv2_b) {
         h = ggml_cont(ctx0, ggml_transpose(ctx0, h));
-        fprintf(stderr, "wvad: conv2 trans h=[%lld,%lld] bias=[%lld]\n",
-                (long long)h->ne[0], (long long)h->ne[1], (long long)m.conv2_b->ne[0]);
         h = ggml_add(ctx0, h, m.conv2_b);
-        fprintf(stderr, "wvad: conv2 bias ok\n");
         h = ggml_cont(ctx0, ggml_transpose(ctx0, h));
     }
     h = ggml_gelu(ctx0, h);
@@ -420,10 +412,6 @@ static std::vector<float> wvad_forward(whisper_vad_encdec_context* ctx, const fl
     // Actually after conv2 bias: we did trans→add→trans, so h is back to [T, C]=[1500, 512].
     // Need to transpose to [d, T] = [512, 1500].
     h = ggml_cont(ctx0, ggml_transpose(ctx0, h)); // [d, T]
-    fprintf(stderr, "wvad: before pos h=[%lld,%lld] pos=[%lld,%lld]\n",
-            (long long)h->ne[0], (long long)h->ne[1],
-            (long long)(m.pos_emb ? m.pos_emb->ne[0] : -1),
-            (long long)(m.pos_emb ? m.pos_emb->ne[1] : -1));
     // pos_emb is [d, 1500]. If T != 1500 (e.g. from shorter audio), slice pos_emb.
     if (m.pos_emb) {
         int T_actual = (int)h->ne[1];
@@ -435,7 +423,6 @@ static std::vector<float> wvad_forward(whisper_vad_encdec_context* ctx, const fl
         }
     }
 
-    fprintf(stderr, "wvad: after conv+pos h=[%lld, %lld]\n", (long long)h->ne[0], (long long)h->ne[1]);
 
     // ── Encoder (6 layers) ──
     for (int il = 0; il < m.n_enc_layers; il++) {
@@ -444,10 +431,6 @@ static std::vector<float> wvad_forward(whisper_vad_encdec_context* ctx, const fl
 
         // Pre-attention LayerNorm
         h = ggml_norm(ctx0, h, eps);
-        fprintf(stderr, "wvad: enc.%d norm h=[%lld,%lld] ln_w=[%lld] ln_b=[%lld]\n",
-                il, (long long)h->ne[0], (long long)h->ne[1],
-                (long long)(L.attn_ln_w ? L.attn_ln_w->ne[0] : -1),
-                (long long)(L.attn_ln_b ? L.attn_ln_b->ne[0] : -1));
         h = ggml_add(ctx0, ggml_mul(ctx0, h, L.attn_ln_w), L.attn_ln_b);
 
         // Q (with bias), K (no bias), V (with bias)
@@ -464,7 +447,8 @@ static std::vector<float> wvad_forward(whisper_vad_encdec_context* ctx, const fl
         K = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, K, hd, nh, T), 0, 2, 1, 3));
         V = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, V, hd, nh, T), 0, 2, 1, 3));
 
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, scale, 0.0f, 0.0f);
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, ggml_cast(ctx0, K, GGML_TYPE_F16),
+                                                ggml_cast(ctx0, V, GGML_TYPE_F16), nullptr, scale, 0.0f, 0.0f);
         attn = ggml_reshape_2d(ctx0, attn, d, T);
 
         // Output projection + residual
@@ -499,18 +483,12 @@ static std::vector<float> wvad_forward(whisper_vad_encdec_context* ctx, const fl
     ggml_tensor* tgt = m.dec_pos_queries;
     if (ggml_n_dims(tgt) > 2)
         tgt = ggml_cont(ctx0, ggml_reshape_2d(ctx0, tgt, d, T));
-    fprintf(stderr, "wvad: dec tgt=[%lld,%lld] ndims=%d\n",
-            (long long)tgt->ne[0], (long long)tgt->ne[1], ggml_n_dims(tgt));
 
     for (int il = 0; il < m.n_dec_layers; il++) {
         auto& L = m.dec[il];
 
         // ── Self-attention on target (position queries) ──
         ggml_tensor* residual = tgt;
-        fprintf(stderr, "wvad: dec.%d sa: tgt=[%lld,%lld,%lld,%lld] w=[%lld,%lld,%lld,%lld]\n", il,
-                (long long)tgt->ne[0], (long long)tgt->ne[1], (long long)tgt->ne[2], (long long)tgt->ne[3],
-                (long long)L.sa_in_proj_w->ne[0], (long long)L.sa_in_proj_w->ne[1],
-                (long long)L.sa_in_proj_w->ne[2], (long long)L.sa_in_proj_w->ne[3]);
         ggml_tensor* qkv = ggml_mul_mat(ctx0, L.sa_in_proj_w, tgt);
         if (L.sa_in_proj_b)
             qkv = ggml_add(ctx0, qkv, L.sa_in_proj_b);
@@ -523,7 +501,8 @@ static std::vector<float> wvad_forward(whisper_vad_encdec_context* ctx, const fl
         sa_K = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, sa_K, hd, nh, T), 0, 2, 1, 3));
         sa_V = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, sa_V, hd, nh, T), 0, 2, 1, 3));
 
-        ggml_tensor* sa = ggml_flash_attn_ext(ctx0, sa_Q, sa_K, sa_V, nullptr, scale, 0.0f, 0.0f);
+        ggml_tensor* sa = ggml_flash_attn_ext(ctx0, sa_Q, ggml_cast(ctx0, sa_K, GGML_TYPE_F16),
+                                              ggml_cast(ctx0, sa_V, GGML_TYPE_F16), nullptr, scale, 0.0f, 0.0f);
         sa = ggml_reshape_2d(ctx0, sa, d, T);
         sa = ggml_mul_mat(ctx0, L.sa_o_w, sa);
         if (L.sa_o_b)
@@ -536,58 +515,28 @@ static std::vector<float> wvad_forward(whisper_vad_encdec_context* ctx, const fl
         else if (L.norm1_b)
             tgt = ggml_add(ctx0, ggml_norm(ctx0, tgt, eps), L.norm1_b);
 
-        fprintf(stderr, "wvad: dec.%d after sa, before ca\n", il);
-        // ── Cross-attention to encoder output ──
-        // Q from target, K and V from encoder output.
+        // Cross-attention: Q from target, K/V from encoder.
+        // Fused in_proj_w [ne0=d, ne1=3d]. Do full mul_mat then split output.
         residual = tgt;
-        // The in_proj_weight is [3*d, d] — but for cross-attn in PyTorch's
-        // TransformerDecoderLayer, it's applied to the source (enc_out) for K/V
-        // and to the target for Q. With a fused in_proj, all three come from
-        // the same input... Actually, PyTorch's multihead_attn.in_proj computes
-        // Q from target and K,V from source when used as cross-attention.
-        // But in the ONNX export, the in_proj_weight for multihead_attn
-        // is applied to a single input. Let me check...
-        // In nn.MultiheadAttention with separate q/k/v: in_proj_weight is fused.
-        // When called as cross_attn(query=tgt, key=enc, value=enc), it uses:
-        //   Q = tgt @ Wq, K = enc @ Wk, V = enc @ Wv
-        // But if in_proj_weight is fused [3d, d], the call does:
-        //   q = F.linear(query, w_q), k = F.linear(key, w_k), v = F.linear(value, w_v)
-        // where w_q, w_k, w_v are sliced from in_proj_weight.
-        // So Q uses target, K/V use encoder output.
-        // in_proj_w after transpose: ggml ne[0]=d, ne[1]=3*d. Slice along ne[1].
-        size_t nb1 = L.ca_in_proj_w->nb[1]; // = d * sizeof(float)
-        ggml_tensor* ca_Q_proj = ggml_view_2d(ctx0, L.ca_in_proj_w, d, d, nb1, 0);
-        ggml_tensor* ca_K_proj = ggml_view_2d(ctx0, L.ca_in_proj_w, d, d, nb1, (size_t)d * nb1);
-        ggml_tensor* ca_V_proj = ggml_view_2d(ctx0, L.ca_in_proj_w, d, d, nb1, (size_t)2 * d * nb1);
-
-        ggml_tensor* ca_Q_bias = nullptr;
-        ggml_tensor* ca_K_bias = nullptr;
-        ggml_tensor* ca_V_bias = nullptr;
+        ggml_tensor* ca_q_all = ggml_mul_mat(ctx0, L.ca_in_proj_w, tgt);      // [3d, T]
+        ggml_tensor* ca_kv_all = ggml_mul_mat(ctx0, L.ca_in_proj_w, enc_out); // [3d, T]
         if (L.ca_in_proj_b) {
-            size_t esz = ggml_type_size(L.ca_in_proj_b->type);
-            ca_Q_bias = ggml_view_1d(ctx0, L.ca_in_proj_b, d, 0);
-            ca_K_bias = ggml_view_1d(ctx0, L.ca_in_proj_b, d, (size_t)d * esz);
-            ca_V_bias = ggml_view_1d(ctx0, L.ca_in_proj_b, d, (size_t)2 * d * esz);
+            ca_q_all = ggml_add(ctx0, ca_q_all, L.ca_in_proj_b);
+            ca_kv_all = ggml_add(ctx0, ca_kv_all, L.ca_in_proj_b);
         }
-
-        fprintf(stderr, "wvad: ca_Q_proj=[%lld,%lld] tgt=[%lld,%lld]\n",
-                (long long)ca_Q_proj->ne[0], (long long)ca_Q_proj->ne[1],
-                (long long)tgt->ne[0], (long long)tgt->ne[1]);
-        ggml_tensor* ca_Q = ggml_mul_mat(ctx0, ca_Q_proj, tgt); // Q from target
-        if (ca_Q_bias)
-            ca_Q = ggml_add(ctx0, ca_Q, ca_Q_bias);
-        ggml_tensor* ca_K = ggml_mul_mat(ctx0, ca_K_proj, enc_out); // K from encoder
-        if (ca_K_bias)
-            ca_K = ggml_add(ctx0, ca_K, ca_K_bias);
-        ggml_tensor* ca_V = ggml_mul_mat(ctx0, ca_V_proj, enc_out); // V from encoder
-        if (ca_V_bias)
-            ca_V = ggml_add(ctx0, ca_V, ca_V_bias);
+        // Q from tgt result [0..d), K from enc result [d..2d), V from enc result [2d..3d)
+        ggml_tensor* ca_Q = ggml_cont(ctx0, ggml_view_2d(ctx0, ca_q_all, d, T, ca_q_all->nb[1], 0));
+        ggml_tensor* ca_K =
+            ggml_cont(ctx0, ggml_view_2d(ctx0, ca_kv_all, d, T, ca_kv_all->nb[1], (size_t)d * sizeof(float)));
+        ggml_tensor* ca_V =
+            ggml_cont(ctx0, ggml_view_2d(ctx0, ca_kv_all, d, T, ca_kv_all->nb[1], (size_t)2 * d * sizeof(float)));
 
         ca_Q = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, ca_Q, hd, nh, T), 0, 2, 1, 3));
         ca_K = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, ca_K, hd, nh, T), 0, 2, 1, 3));
         ca_V = ggml_cont(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, ca_V, hd, nh, T), 0, 2, 1, 3));
 
-        ggml_tensor* ca = ggml_flash_attn_ext(ctx0, ca_Q, ca_K, ca_V, nullptr, scale, 0.0f, 0.0f);
+        ggml_tensor* ca = ggml_flash_attn_ext(ctx0, ca_Q, ggml_cast(ctx0, ca_K, GGML_TYPE_F16),
+                                              ggml_cast(ctx0, ca_V, GGML_TYPE_F16), nullptr, scale, 0.0f, 0.0f);
         ca = ggml_reshape_2d(ctx0, ca, d, T);
         ca = ggml_mul_mat(ctx0, L.ca_o_w, ca);
         if (L.ca_o_b)

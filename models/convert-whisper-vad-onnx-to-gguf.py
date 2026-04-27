@@ -182,7 +182,9 @@ def main():
         # needs ne[0]=in, ne[1]=out. Since numpy [in, out] → ggml ne[0]=out, ne[1]=in,
         # we must transpose 2D weight matrices so ggml sees ne[0]=in correctly.
         # Exception: embeddings (embed_positions, position_queries) are lookups, not matmuls.
-        if data.ndim == 2 and "weight" in gguf_name and "embed" not in gguf_name and "position" not in gguf_name:
+        # Only transpose anonymous val_* weights (ONNX MatMul convention [in, out]).
+        # Named ONNX tensors are already in PyTorch convention [out, in] → ggml ne[0]=in.
+        if name in val_to_name and data.ndim == 2 and "weight" in gguf_name and "embed" not in gguf_name and "position" not in gguf_name:
             data = data.T
         data = np.ascontiguousarray(data)
         writer.add_tensor(gguf_name, data, raw_dtype=GGMLQuantizationType.F32)
