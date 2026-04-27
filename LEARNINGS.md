@@ -1231,6 +1231,41 @@ assertion failure in `ggml_backend_sched_alloc_graph`.
 `ggml_backend_sched_set_tensor_backend` for KV tensors before graph
 allocation.
 
+### MarbleNet VAD: NeMo center=True STFT padding
+
+NeMo's `AudioToMelSpectrogramPreprocessor` uses `torch.stft(center=True)`,
+which pads the input with `n_fft/2` zeros on each side before the STFT.
+Without this padding, the mel frame count is wrong (1098 vs 1101 for
+jfk.wav) and all downstream conv outputs are garbage — the model produces
+zero probabilities for all frames.
+
+**Fix:** Pad input with `n_fft/2` zeros on each side:
+```cpp
+int pad = n_fft / 2;
+std::vector<float> padded(n_samples + 2 * pad, 0);
+memcpy(padded.data() + pad, pcm, n_samples * sizeof(float));
+```
+
+Also: NeMo uses `log(mel + 1e-5)` (natural log with dither), NOT
+`log10` (whisper) or `ln + z-score` (NeMo conformer). Each NeMo model
+has its own mel convention — always check `model_config.yaml`.
+
+**Lesson:** When porting NeMo models, compare mel output against the
+PyTorch reference FIRST. A 3-frame mel discrepancy silently corrupts
+all downstream activations. The diff-testing protocol saved hours here.
+
+### BatchNorm fusion for conv-only models
+
+MarbleNet is pure convolutions with BatchNorm after each. BN can be
+algebraically fused into the preceding conv weights at convert time:
+```
+W_fused = W * gamma / sqrt(var + eps)
+b_fused = -mean * gamma / sqrt(var + eps) + beta
+```
+This eliminates all BN tensors from the GGUF (84 → 36 tensors, same
+accuracy). The pattern applies to any conv+BN model (QuartzNet,
+MatchboxNet, SEANet encoder in VoiceCodecs, etc.).
+
 ---
 
 ## Windows / MSVC portability (April 2026)
