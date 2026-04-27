@@ -557,9 +557,11 @@ calls is correct in principle but requires careful tensor shape management:
    channel-first `[C, T]` in C (where each channel's T values are
    contiguous). No transpose needed.
 
-Status: WIP. Manual `grouped_conv1d_same` with OMP is the active path
-(1.6s on wav2vec2-large). The ggml graph version would use SIMD kernels
-and support GPU but has a tensor bounds assertion bug to fix.
+**Status: DONE.** The ggml graph version works after two fixes:
+(a) Use `ggml_pad_ext` for asymmetric "same" padding before im2col
+(b) Transpose mul_mat output from `[ne[0]=cpg, ne[1]=T]` (time-major)
+to channel-first `[cpg, T]` (channel-contiguous).
+Result: pos_conv 1588ms → 324ms (4.9x faster) on wav2vec2-large.
 
 ### Moonshine Streaming: unit-offset LayerNorm and sliding-window attention
 
