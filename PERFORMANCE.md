@@ -140,14 +140,26 @@ Encoder graph on GPU is only 57-128ms.
 3. **Large LLMs (3-4.5B) are 1-2x realtime** on T4. Usable but not fast.
 4. **Most WER=0% on jfk.wav.** The 4.5% models have minor formatting differences,
    not actual transcription errors. Moonshine Tiny (9.1%) has a real word error.
-5. **wav2vec2 pos_conv is the bottleneck** (1.6s = 80% of runtime). Grouped
-   conv on CPU; encoder on GPU is only 128ms.
+5. **wav2vec2 pos_conv was the bottleneck** — now 4.9x faster with ggml grouped
+   conv (im2col + mul_mat SIMD). Was 1.6s (80% of runtime), now 324ms (~3.5%).
 6. **FireRed encoder is slow** because CPU weights auto-copy to GPU per-layer.
    Pre-loading encoder weights to GPU would save ~15s.
 
 ---
 
 ## Optimization history
+
+### wav2vec2 grouped conv — 2026-04-27
+
+| Path | pos_conv | Notes |
+|---|---|---|
+| Manual C++ (OMP) | 1588ms | 4-thread OMP, plain float loops |
+| **ggml im2col + mul_mat** | **324ms** | **4.9x faster**, SIMD kernels |
+
+The grouped positional conv (C=1024, K=128, G=16) is decomposed into G=16
+independent `ggml_pad_ext` + `ggml_im2col` + `ggml_mul_mat` calls. The
+mul_mat output `[cpg, T]` is transposed to channel-first before reassembly.
+Applies to wav2vec2, data2vec, and hubert.
 
 ### FireRed decoder — 2026-04-26
 
