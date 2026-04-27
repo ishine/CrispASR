@@ -365,12 +365,13 @@ static void conv1d(const float* x, const float* w, const float* b, float* y, int
 // Grouped Conv1d with symmetric padding so output_len == input_len.
 // Used for the positional conv embedding (K=128, groups=16 by default).
 // Weight: w[Cout][Cin/groups][K]
+// Manual grouped conv1d with "same" padding (fallback for non-ggml path)
 static void grouped_conv1d_same(const float* x, const float* w, const float* b, float* y, int C_in, int C_out, int K,
                                 int groups, int L) {
     assert(C_in % groups == 0 && C_out % groups == 0);
     int cin_pg = C_in / groups;
     int cout_pg = C_out / groups;
-    int pad_total = K - 1; // "same" padding
+    int pad_total = K - 1;
     int pad_l = pad_total / 2;
     int pad_r = pad_total - pad_l;
     int L_pad = L + pad_l + pad_r;
@@ -379,7 +380,6 @@ static void grouped_conv1d_same(const float* x, const float* w, const float* b, 
     for (int c = 0; c < C_in; c++)
         std::memcpy(padded.data() + c * L_pad + pad_l, x + c * L, L * sizeof(float));
 
-// Parallelize over output channels (groups × cout_pg = C_out)
 #pragma omp parallel for schedule(static) collapse(2)
     for (int g = 0; g < groups; g++) {
         for (int oc = 0; oc < cout_pg; oc++) {
@@ -398,6 +398,110 @@ static void grouped_conv1d_same(const float* x, const float* w, const float* b, 
             }
         }
     }
+}
+
+// ggml-graph grouped conv1d with "same" padding.
+// Decomposes into G independent im2col+mul_mat calls (not ggml_conv_1d, which
+// requires F16 kernel). Uses ggml's SIMD mul_mat kernels for any weight type.
+// Input/output: channel-first [C, T] F32 on CPU.
+// w_f32: pre-dequantized F32 weight [K, C_in/G, C_out], layout [K*cpg, C_out] row-major
+// b_f32: F32 bias [C_out] or nullptr.
+static bool ggml_grouped_conv1d_same(const float* x_cf, float* y_cf, int C, int K, int G, int T, const float* w_f32,
+                                     const float* b_f32, ggml_backend_t backend) {
+    int cpg = C / G;
+    int pad = (K - 1) / 2;
+
+    // Build one graph with G parallel im2col+mul_mat branches
+    size_t n_tensors = G * 15 + 20;
+    size_t mem = ggml_tensor_overhead() * n_tensors + ggml_graph_overhead_custom(4096, false);
+    ggml_init_params gp = {mem, nullptr, true};
+    ggml_context* ctx0 = ggml_init(gp);
+    if (!ctx0)
+        return false;
+
+    // Full input [T, C, 1] and weight [K*cpg, C_out] as F32 input tensors
+    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, T, C);
+    ggml_set_name(inp, "gc_in");
+    ggml_set_input(inp);
+
+    // Full weight as F32 tensor [K, cpg, C] — can take views per group
+    ggml_tensor* w_full = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, K, cpg, C);
+    ggml_set_name(w_full, "gc_w");
+    ggml_set_input(w_full);
+
+    ggml_tensor* b_full = nullptr;
+    if (b_f32) {
+        b_full = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, C);
+        ggml_set_name(b_full, "gc_b");
+        ggml_set_input(b_full);
+    }
+
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+    std::vector<ggml_tensor*> group_outs(G);
+
+    for (int g = 0; g < G; g++) {
+        // Input slice: [T, cpg] at channel offset g*cpg
+        ggml_tensor* x_g = ggml_view_2d(ctx0, inp, T, cpg, inp->nb[1], (size_t)g * cpg * inp->nb[1]);
+        x_g = ggml_reshape_3d(ctx0, x_g, T, cpg, 1);
+
+        // Weight slice: [K, cpg, cpg] at output channel offset g*cpg
+        ggml_tensor* w_g =
+            ggml_view_3d(ctx0, w_full, K, cpg, cpg, w_full->nb[1], w_full->nb[2], (size_t)g * cpg * w_full->nb[2]);
+
+        // im2col + mul_mat (manual decomposition of conv1d, supports F32 weights)
+        ggml_tensor* im2col = ggml_im2col(ctx0, w_g, x_g, 1, 0, pad, 0, 1, 0, false, GGML_TYPE_F32);
+        ggml_tensor* w_2d = ggml_reshape_2d(ctx0, w_g, K * cpg, cpg);
+        ggml_tensor* im2col_2d = ggml_reshape_2d(ctx0, im2col, im2col->ne[0], im2col->ne[1] * im2col->ne[2]);
+        ggml_tensor* conv = ggml_mul_mat(ctx0, w_2d, im2col_2d);
+        // conv is [cpg, T] (after mul_mat: w^T @ im2col)
+
+        if (b_full) {
+            ggml_tensor* b_g = ggml_view_1d(ctx0, b_full, cpg, (size_t)g * cpg * sizeof(float));
+            conv = ggml_add(ctx0, conv, b_g);
+        }
+
+        char name[32];
+        snprintf(name, sizeof(name), "gc_%d", g);
+        ggml_set_name(conv, name);
+        ggml_set_output(conv);
+        group_outs[g] = conv;
+        ggml_build_forward_expand(gf, conv);
+    }
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Set inputs
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "gc_in"), x_cf, 0, (size_t)C * T * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "gc_w"), w_f32, 0, (size_t)K * cpg * C * sizeof(float));
+    if (b_full)
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "gc_b"), b_f32, 0, (size_t)C * sizeof(float));
+
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx0);
+        return false;
+    }
+
+    // Read outputs: each is [cpg, T] → copy to y_cf channel-first
+    for (int g = 0; g < G; g++) {
+        char name[32];
+        snprintf(name, sizeof(name), "gc_%d", g);
+        ggml_tensor* out = ggml_graph_get_tensor(gf, name);
+        if (!out)
+            continue;
+        size_t out_bytes = (size_t)cpg * T * sizeof(float);
+        // out is [cpg, T] in ggml = data[c*T + t] = channel-first! Perfect for y_cf.
+        ggml_backend_tensor_get(out, y_cf + (size_t)g * cpg * T, 0, out_bytes);
+    }
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx0);
+    return true;
 }
 
 // ggml-based quantised linear: y[T, n_out] = W[n_out, n_in] * x[T, n_in] + b
@@ -1170,7 +1274,7 @@ static std::vector<float> wav2vec2_compute_logits_graph(const wav2vec2_model& m,
             int K_this = (int)w_tensor->ne[0];
 
             // Grouped positional conv: manual CPU with GPU-safe weight access.
-            // Uses tensor_data_f32() which reads GPU weights to CPU cache.
+            // TODO: ggml_grouped_conv1d_same (im2col+mul_mat) crashes on tensor bounds — needs fixing
             const float* pw = tensor_data_f32(w_tensor);
             const float* pb = b_tensor ? tensor_data_f32(b_tensor) : nullptr;
             std::vector<float> pos_out(H * T, 0.0f);
@@ -1598,23 +1702,10 @@ std::vector<float> wav2vec2_compute_logits(const wav2vec2_model& m, const float*
         int K_pos = (int)hp.num_conv_pos_embeddings;
         int G_pos = (int)hp.num_conv_pos_embedding_groups;
 
-        std::vector<float> pw_buf;
-        const float* pw;
-        size_t pos_w_n = (size_t)H * (H / G_pos) * K_pos;
-        if (m.pos_conv_w->type == GGML_TYPE_F16) {
-            pw_buf.resize(pos_w_n);
-            const ggml_fp16_t* p16 = (const ggml_fp16_t*)m.pos_conv_w->data;
-            for (size_t i = 0; i < pos_w_n; i++)
-                pw_buf[i] = ggml_fp16_to_fp32(p16[i]);
-            pw = pw_buf.data();
-        } else if (m.pos_conv_w->type == GGML_TYPE_F32) {
-            pw = tensor_data_f32(m.pos_conv_w);
-        } else {
-            fprintf(stderr, "[wav2vec2] pos_conv.weight has unsupported type %d\n", (int)m.pos_conv_w->type);
-            return {};
-        }
+        // Grouped positional conv: manual CPU
+        // TODO: ggml graph version crashes on tensor bounds — needs im2col shape debugging
+        const float* pw = tensor_data_f32(m.pos_conv_w);
         const float* pb = tensor_data_f32(m.pos_conv_b);
-
         grouped_conv1d_same(hcf.data(), pw, pb, pos_out.data(), H, H, K_pos, G_pos, T);
 
         for (int t = 0; t < T; t++)
