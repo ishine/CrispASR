@@ -765,6 +765,60 @@ int argmax(const float* logits, int n) {
     return best;
 }
 
+// Top-k + temperature sampler. Required for the code_predictor —
+// `subtalker_dosample=True` is the official default and greedy
+// argmax for codebooks 1..15 produces a degenerate / silent output
+// (verified empirically against the qwen-tts reference).
+//
+// The PyTorch defaults are top_k=50, top_p=1.0, temperature=0.9.
+// We implement top_k + temperature; top_p=1.0 is a no-op so omit it.
+int top_k_sample(const float* logits, int n, int top_k, float temperature, uint64_t* rng_state) {
+    if (top_k <= 0 || top_k >= n)
+        top_k = n;
+    // Find top-k indices via partial sort. For n=2048, top_k=50,
+    // O(n log k) is fine (~50 µs).
+    std::vector<int> idx(n);
+    for (int i = 0; i < n; i++)
+        idx[i] = i;
+    std::partial_sort(idx.begin(), idx.begin() + top_k, idx.end(),
+                      [&](int a, int b) { return logits[a] > logits[b]; });
+
+    // Softmax over the top-k logits with temperature.
+    const float t = temperature > 0 ? temperature : 1.0f;
+    float max_l = logits[idx[0]];
+    for (int i = 1; i < top_k; i++)
+        if (logits[idx[i]] > max_l)
+            max_l = logits[idx[i]];
+    std::vector<float> probs(top_k);
+    double sum = 0.0;
+    for (int i = 0; i < top_k; i++) {
+        double p = std::exp((logits[idx[i]] - max_l) / t);
+        probs[i] = (float)p;
+        sum += p;
+    }
+    if (sum <= 0)
+        return idx[0];
+    for (int i = 0; i < top_k; i++)
+        probs[i] = (float)(probs[i] / sum);
+
+    // xorshift64* — fast deterministic PRNG, seeded by caller. Given a
+    // fixed seed the synthesis is reproducible.
+    uint64_t x = *rng_state ? *rng_state : 0xdeadbeefcafebabeULL;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    *rng_state = x;
+    double r = (double)((x * 0x2545f4914f6cdd1dULL) >> 11) / (double)(1ULL << 53);
+
+    double cum = 0.0;
+    for (int i = 0; i < top_k; i++) {
+        cum += probs[i];
+        if (r < cum)
+            return idx[i];
+    }
+    return idx[top_k - 1];
+}
+
 // Forward-declared: defined in the prefill section below.
 float* lookup_rows(qwen3_tts_context* c, ggml_tensor* weight, const int32_t* ids, int n_ids);
 
@@ -823,16 +877,18 @@ float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens,
 // (talker.codec_embedding(codebook-0 sample), (d,)). Writes the 15
 // codebook ids (codebooks 1..15) into out_codes. Returns true on
 // success.
+//
+// Always uses sampling (subtalker_dosample=True equivalent) — greedy
+// argmax produces a degenerate silent codec output, verified against
+// the official qwen-tts reference. Defaults: top_k=50, temperature=0.9.
 bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, const float* last_id_hidden_d,
-                           int32_t* out_codes15) {
+                           int32_t* out_codes15, uint64_t* rng_state) {
     auto& cp = c->code_pred;
     const auto& hp = c->hp;
     const int d = (int)hp.cp_d_model;
     const int n_groups = (int)hp.cp_n_code_groups; // 16
-
-    // Reset cache for this frame: the next call starts at n_past=0.
-    // (Cache slots get overwritten on each write; we don't need an
-    // explicit clear, just keep n_past=0 on the first step.)
+    const int top_k = 50;
+    const float temperature = 0.9f;
 
     // ---- step 0: inputs_embeds = (past_hidden, last_id_hidden), n_past=0 ----
     std::vector<float> step0((size_t)2 * d);
@@ -846,7 +902,7 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
     float* logits0 = run_code_pred_kv(c, step0.data(), 2, /*n_past=*/0, cp.lm_head[0]);
     if (!logits0)
         return false;
-    out_codes15[0] = argmax(logits0, (int)hp.cp_vocab_size);
+    out_codes15[0] = top_k_sample(logits0, (int)hp.cp_vocab_size, top_k, temperature, rng_state);
     free(logits0);
 
     int n_past = 2;
@@ -857,7 +913,6 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
             fprintf(stderr, "qwen3_tts: code_pred missing codec_embd[%d] or lm_head[%d]\n", i - 1, i);
             return false;
         }
-        // Embed prev code via codec_embedding[i-1]
         int32_t prev = out_codes15[i - 1];
         float* emb = lookup_rows(c, cp.codec_embd[i - 1], &prev, 1);
         if (!emb)
@@ -866,7 +921,7 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
         free(emb);
         if (!logits)
             return false;
-        out_codes15[i] = argmax(logits, (int)hp.cp_vocab_size);
+        out_codes15[i] = top_k_sample(logits, (int)hp.cp_vocab_size, top_k, temperature, rng_state);
         free(logits);
         n_past += 1;
     }
@@ -1582,6 +1637,12 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
     const int max_frames = ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps : 1500;
     const int eos = (int)hp.codec_eos_id;
 
+    // PRNG seed — env-overridable for reproducibility. Default seed
+    // matches PyTorch's behaviour with `torch.manual_seed(42)`.
+    uint64_t rng = 42;
+    if (const char* s = env_str("QWEN3_TTS_SEED"))
+        rng = (uint64_t)std::strtoull(s, nullptr, 10);
+
     // ---- ref_text comes from the active voice pack ----
     const std::string& ref_text = ctx->vp_ref_texts[ctx->vp_active];
     if (ref_text.empty()) {
@@ -1647,9 +1708,9 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
             free(past_hidden);
             return nullptr;
         }
-        // 3. Code predictor AR loop → 15 more codebook ids.
+        // 3. Code predictor AR loop → 15 more codebook ids (sampled).
         int32_t cb1_15[15];
-        if (!code_pred_generate_15(ctx, past_hidden, last_id_hidden, cb1_15)) {
+        if (!code_pred_generate_15(ctx, past_hidden, last_id_hidden, cb1_15, &rng)) {
             free(past_hidden);
             free(last_id_hidden);
             return nullptr;
