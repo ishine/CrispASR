@@ -486,6 +486,85 @@ ggml_cgraph* build_graph_embed_audio(qwen3_tts_context* c, int n_tokens) {
     return gf;
 }
 
+// Code-predictor forward with persistent KV cache.
+//
+// Same Qwen3 backbone as the talker (Q/K-norm + SwiGLU + flash-attn +
+// NEOX RoPE + GQA), just narrower (5 layers, hidden 1024, 16Q/8KV, ff
+// 3072 — same dims as the 0.6B talker). The lm_head is **per-step** —
+// at AR step i in [0..14], we apply `code_pred.lm_head[i]` to project
+// the last hidden state to the 2048-codebook vocab. The graph builder
+// takes the lm_head tensor as a parameter so we can rebuild a fresh
+// graph per step without conditionals inside.
+ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_tokens, ggml_tensor* lm_head) {
+    const auto& hp = c->hp;
+    const int d = (int)hp.cp_d_model;
+    const int n_q = (int)hp.cp_n_heads;
+    const int n_kv = (int)hp.cp_n_kv_heads;
+    const int hd = (int)hp.head_dim;
+    const int n_kv_grp = n_q / n_kv;
+    const float eps = hp.rms_norm_eps;
+    const float theta = hp.rope_theta;
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int T = n_tokens;
+    const int Lk = n_past + T;
+
+    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
+
+    ggml_tensor* embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
+    ggml_set_name(embeds, "inputs_embeds");
+    ggml_set_input(embeds);
+
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_name(positions, "positions");
+    ggml_set_input(positions);
+
+    ggml_tensor* causal_mask = nullptr;
+    if (T > 1) {
+        causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
+        ggml_set_name(causal_mask, "causal_mask");
+        ggml_set_input(causal_mask);
+    }
+
+    const core_attn::KvSelfAttnParams kvp = {
+        n_q, n_kv, hd, n_kv_grp, (int)hp.max_pos, theta, 32.0f, 1.0f, attn_scale, eps, core_attn::GQA_MANUAL_CONT,
+    };
+
+    ggml_tensor* cur = embeds;
+    for (uint32_t il = 0; il < hp.cp_n_layers; il++) {
+        const auto& b = c->code_pred.blocks[il];
+        ggml_tensor* residual = cur;
+
+        ggml_tensor* x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, b.attn_norm_w);
+
+        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
+                                                    b.attn_q_norm_w, b.attn_k_norm_w, positions,
+                                                    (T == 1) ? nullptr : causal_mask, c->cp_kv_k, c->cp_kv_v, (int)il,
+                                                    n_past, kvp);
+        cur = ggml_add(ctx0, residual, attn);
+
+        residual = cur;
+        x = ggml_rms_norm(ctx0, cur, eps);
+        x = ggml_mul(ctx0, x, b.ffn_norm_w);
+        ggml_tensor* mlp = core_ffn::swiglu(ctx0, x, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
+        cur = ggml_add(ctx0, residual, mlp);
+    }
+
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, c->code_pred.output_norm_w);
+
+    if (T > 1) {
+        cur = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
+    }
+    ggml_tensor* logits = ggml_mul_mat(ctx0, lm_head, cur);
+    ggml_set_name(logits, "logits");
+    ggml_build_forward_expand(gf, logits);
+    ggml_free(ctx0);
+    return gf;
+}
+
 // Talker forward with persistent KV cache.
 ggml_cgraph* build_graph_talker_kv(qwen3_tts_context* c, int n_past, int n_tokens) {
     const auto& hp = c->hp;
@@ -565,6 +644,15 @@ ggml_cgraph* build_graph_talker_kv(qwen3_tts_context* c, int n_past, int n_token
     if (T > 1) {
         cur = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
     }
+    // Expose the last-position hidden state separately — the code
+    // predictor's first input is `cat(past_hidden, last_id_hidden)`,
+    // and `past_hidden` is exactly this tensor. ggml_cont() so the
+    // backend persists it (otherwise it gets folded into the codec_head
+    // matmul).
+    ggml_tensor* hidden_last = ggml_cont(ctx0, cur);
+    ggml_set_name(hidden_last, "hidden_last");
+    ggml_build_forward_expand(gf, hidden_last);
+
     ggml_tensor* logits = ggml_mul_mat(ctx0, c->talker.codec_head_w, cur);
     ggml_set_name(logits, "logits");
     ggml_build_forward_expand(gf, logits);
@@ -608,7 +696,13 @@ float* run_embed_audio(qwen3_tts_context* c, const int32_t* ids, int n) {
     return r;
 }
 
-float* run_talker_kv(qwen3_tts_context* c, const float* embeds, int n_tokens, int n_past) {
+// Run the talker prefill / decode step, returning logits at position[-1]
+// and (optionally) the corresponding last hidden state. Pass `out_hidden_d`
+// non-null to receive a malloc'd float buffer of length `hp.d_model`
+// — caller frees with free().
+float* run_talker_kv(qwen3_tts_context* c, const float* embeds, int n_tokens, int n_past, float** out_hidden_d) {
+    if (out_hidden_d)
+        *out_hidden_d = nullptr;
     if (n_past + n_tokens > c->kv_max_ctx) {
         fprintf(stderr, "qwen3_tts: kv overflow (%d+%d > %d)\n", n_past, n_tokens, c->kv_max_ctx);
         return nullptr;
@@ -649,6 +743,14 @@ float* run_talker_kv(qwen3_tts_context* c, const float* embeds, int n_tokens, in
     ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
     float* r = (float*)malloc((size_t)vocab * sizeof(float));
     ggml_backend_tensor_get(out, r, 0, (size_t)vocab * sizeof(float));
+    if (out_hidden_d) {
+        ggml_tensor* hid = ggml_graph_get_tensor(gf, "hidden_last");
+        if (hid) {
+            float* h = (float*)malloc((size_t)d * sizeof(float));
+            ggml_backend_tensor_get(hid, h, 0, (size_t)d * sizeof(float));
+            *out_hidden_d = h;
+        }
+    }
     return r;
 }
 
@@ -661,6 +763,142 @@ int argmax(const float* logits, int n) {
             best = i;
         }
     return best;
+}
+
+// Forward-declared: defined in the prefill section below.
+float* lookup_rows(qwen3_tts_context* c, ggml_tensor* weight, const int32_t* ids, int n_ids);
+
+// One step of the code-predictor AR loop. Builds + runs the graph
+// against a caller-supplied (T, d) embedding tensor and the lm_head
+// for the current generation step. Returns logits (cp_vocab,).
+float* run_code_pred_kv(qwen3_tts_context* c, const float* embeds, int n_tokens, int n_past,
+                        ggml_tensor* lm_head) {
+    if (!lm_head)
+        return nullptr;
+    if (n_past + n_tokens > c->cp_kv_max_ctx) {
+        fprintf(stderr, "qwen3_tts: cp_kv overflow (%d+%d > %d)\n", n_past, n_tokens, c->cp_kv_max_ctx);
+        return nullptr;
+    }
+    const auto& hp = c->hp;
+    const int d = (int)hp.cp_d_model;
+    const int vocab = (int)hp.cp_vocab_size;
+    const int Lk = n_past + n_tokens;
+
+    std::vector<int32_t> positions(n_tokens);
+    for (int i = 0; i < n_tokens; i++)
+        positions[i] = n_past + i;
+
+    std::vector<ggml_fp16_t> mask;
+    if (n_tokens > 1) {
+        const ggml_fp16_t zero_h = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neginf_h = ggml_fp32_to_fp16(-INFINITY);
+        mask.assign((size_t)Lk * n_tokens, zero_h);
+        for (int q = 0; q < n_tokens; q++)
+            for (int k = n_past + q + 1; k < Lk; k++)
+                mask[(size_t)q * Lk + k] = neginf_h;
+    }
+
+    ggml_cgraph* gf = build_graph_code_pred_kv(c, n_past, n_tokens, lm_head);
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf))
+        return nullptr;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "inputs_embeds"), embeds, 0, (size_t)d * n_tokens * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "positions"), positions.data(), 0,
+                            positions.size() * sizeof(int32_t));
+    if (n_tokens > 1)
+        ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "causal_mask"), mask.data(), 0,
+                                mask.size() * sizeof(ggml_fp16_t));
+    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "qwen3_tts: code_pred compute failed\n");
+        return nullptr;
+    }
+    ggml_tensor* out = ggml_graph_get_tensor(gf, "logits");
+    float* r = (float*)malloc((size_t)vocab * sizeof(float));
+    ggml_backend_tensor_get(out, r, 0, (size_t)vocab * sizeof(float));
+    return r;
+}
+
+// Run the 15-step code-predictor AR loop given the talker's
+// past_hidden (the talker's last hidden state, (d,)) and last_id_hidden
+// (talker.codec_embedding(codebook-0 sample), (d,)). Writes the 15
+// codebook ids (codebooks 1..15) into out_codes. Returns true on
+// success.
+bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, const float* last_id_hidden_d,
+                           int32_t* out_codes15) {
+    auto& cp = c->code_pred;
+    const auto& hp = c->hp;
+    const int d = (int)hp.cp_d_model;
+    const int n_groups = (int)hp.cp_n_code_groups; // 16
+
+    // Reset cache for this frame: the next call starts at n_past=0.
+    // (Cache slots get overwritten on each write; we don't need an
+    // explicit clear, just keep n_past=0 on the first step.)
+
+    // ---- step 0: inputs_embeds = (past_hidden, last_id_hidden), n_past=0 ----
+    std::vector<float> step0((size_t)2 * d);
+    std::memcpy(step0.data(), past_hidden_d, (size_t)d * sizeof(float));
+    std::memcpy(step0.data() + d, last_id_hidden_d, (size_t)d * sizeof(float));
+
+    if (!cp.lm_head[0]) {
+        fprintf(stderr, "qwen3_tts: code_pred.lm_head[0] missing\n");
+        return false;
+    }
+    float* logits0 = run_code_pred_kv(c, step0.data(), 2, /*n_past=*/0, cp.lm_head[0]);
+    if (!logits0)
+        return false;
+    out_codes15[0] = argmax(logits0, (int)hp.cp_vocab_size);
+    free(logits0);
+
+    int n_past = 2;
+
+    // ---- steps 1..14: input = codec_embedding[i-1](codes[i-1]), apply lm_head[i] ----
+    for (int i = 1; i < n_groups - 1; i++) {
+        if (!cp.codec_embd[i - 1] || !cp.lm_head[i]) {
+            fprintf(stderr, "qwen3_tts: code_pred missing codec_embd[%d] or lm_head[%d]\n", i - 1, i);
+            return false;
+        }
+        // Embed prev code via codec_embedding[i-1]
+        int32_t prev = out_codes15[i - 1];
+        float* emb = lookup_rows(c, cp.codec_embd[i - 1], &prev, 1);
+        if (!emb)
+            return false;
+        float* logits = run_code_pred_kv(c, emb, 1, n_past, cp.lm_head[i]);
+        free(emb);
+        if (!logits)
+            return false;
+        out_codes15[i] = argmax(logits, (int)hp.cp_vocab_size);
+        free(logits);
+        n_past += 1;
+    }
+    return true;
+}
+
+// Allocate the code_predictor KV cache: (head_dim, max_ctx, n_kv, cp_n_layers).
+// max_ctx is small — at most 2 + 14 = 16 positions per frame.
+bool cp_kv_alloc(qwen3_tts_context* c) {
+    if (c->cp_kv_k)
+        return true;
+    const auto& hp = c->hp;
+    const int hd = (int)hp.head_dim;
+    const int n_kv = (int)hp.cp_n_kv_heads;
+    const int n_lay = (int)hp.cp_n_layers;
+    const int max_ctx = 32;
+
+    ggml_init_params kp = {ggml_tensor_overhead() * 4 + 1024, nullptr, true};
+    c->cp_kv_ctx = ggml_init(kp);
+    c->cp_kv_k = ggml_new_tensor_4d(c->cp_kv_ctx, GGML_TYPE_F16, hd, max_ctx, n_kv, n_lay);
+    c->cp_kv_v = ggml_new_tensor_4d(c->cp_kv_ctx, GGML_TYPE_F16, hd, max_ctx, n_kv, n_lay);
+    ggml_set_name(c->cp_kv_k, "cp_kv_k");
+    ggml_set_name(c->cp_kv_v, "cp_kv_v");
+    const size_t kb = ggml_nbytes(c->cp_kv_k), vb = ggml_nbytes(c->cp_kv_v);
+    c->cp_kv_buf = ggml_backend_alloc_buffer(c->backend, kb + vb);
+    if (!c->cp_kv_buf)
+        return false;
+    char* base = (char*)ggml_backend_buffer_get_base(c->cp_kv_buf);
+    ggml_backend_tensor_alloc(c->cp_kv_buf, c->cp_kv_k, base);
+    ggml_backend_tensor_alloc(c->cp_kv_buf, c->cp_kv_v, base + kb);
+    c->cp_kv_max_ctx = max_ctx;
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,7 +1551,7 @@ extern "C" float* qwen3_tts_run_talker_with_embeds(struct qwen3_tts_context* ctx
         return nullptr;
     // Guarantee a clean cache: this is a one-shot diff entry point, so
     // n_past=0 always.
-    float* logits = run_talker_kv(ctx, embeds, n_tokens, /*n_past=*/0);
+    float* logits = run_talker_kv(ctx, embeds, n_tokens, /*n_past=*/0, /*out_hidden_d=*/nullptr);
     if (!logits)
         return nullptr;
     if (out_vocab)
@@ -1330,96 +1568,150 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         fprintf(stderr, "qwen3_tts: vocab empty — re-convert with the updated converter\n");
         return nullptr;
     }
+    if (ctx->vp_active < 0) {
+        fprintf(stderr, "qwen3_tts: no voice loaded — call qwen3_tts_load_voice_pack + select_voice first\n");
+        return nullptr;
+    }
 
     const bool bench = env_bool("QWEN3_TTS_BENCH");
     const bool dbg = env_bool("QWEN3_TTS_DEBUG");
     const char* dump_dir = env_str("QWEN3_TTS_DUMP_DIR");
+    const auto& hp = ctx->hp;
+    const int d = (int)hp.d_model;
+    const int n_groups = (int)hp.n_code_groups; // 16
+    const int max_frames = ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps : 1500;
+    const int eos = (int)hp.codec_eos_id;
 
-    auto prompt_ids = tokenise_assistant_text(ctx, text);
-    if (ctx->params.verbosity >= 1 || dbg) {
-        fprintf(stderr, "qwen3_tts: prompt %zu tokens\n", prompt_ids.size());
-        if (ctx->params.verbosity >= 2 || dbg) {
-            fprintf(stderr, "  ids:");
-            for (auto id : prompt_ids)
-                fprintf(stderr, " %d", id);
-            fprintf(stderr, "\n");
-        }
+    // ---- ref_text comes from the active voice pack ----
+    const std::string& ref_text = ctx->vp_ref_texts[ctx->vp_active];
+    if (ref_text.empty()) {
+        fprintf(stderr, "qwen3_tts: voice '%s' has no ref_text\n", ctx->vp_names[ctx->vp_active].c_str());
+        return nullptr;
     }
-    if (dump_dir)
-        dump_i32(dump_dir, "prompt_ids", prompt_ids.data(), prompt_ids.size());
 
-    // Prefill: embed text via text_embedding + text_proj (the prompt is
-    // text-only; the prompt builder ends with <|tts_bos|> which is also
-    // a text-vocab token), then run the talker over the whole prefix.
+    // ---- ICL prefill builder (matches PyTorch's generate_icl_prompt) ----
     double t0 = bench ? now_ms() : 0.0;
-    float* embeds = run_embed_text(ctx, prompt_ids.data(), (int)prompt_ids.size());
-    if (!embeds)
+    std::vector<float> prefill, trailing;
+    int T_pre = 0, M_trail = 0;
+    if (!build_icl_prefill_embeds(ctx, text, ref_text, prefill, T_pre, trailing, M_trail))
         return nullptr;
     if (bench)
-        fprintf(stderr, "qwen3_tts: text_proj  %7.1f ms (T=%zu)\n", now_ms() - t0, prompt_ids.size());
+        fprintf(stderr, "qwen3_tts: icl_prefill %7.1f ms (T=%d)\n", now_ms() - t0, T_pre);
     if (dump_dir)
-        dump_f32(dump_dir, "text_proj_out", embeds, (size_t)ctx->hp.d_model * prompt_ids.size());
+        dump_f32(dump_dir, "icl_prefill", prefill.data(), prefill.size());
+
+    // ---- talker prefill: get logits + hidden_last ----
     double t1 = bench ? now_ms() : 0.0;
-    float* logits = run_talker_kv(ctx, embeds, (int)prompt_ids.size(), /*n_past=*/0);
-    free(embeds);
-    if (!logits)
+    float* past_hidden = nullptr;
+    float* logits = run_talker_kv(ctx, prefill.data(), T_pre, /*n_past=*/0, &past_hidden);
+    if (!logits || !past_hidden) {
+        free(logits);
+        free(past_hidden);
         return nullptr;
+    }
     if (bench)
-        fprintf(stderr, "qwen3_tts: prefill    %7.1f ms\n", now_ms() - t1);
+        fprintf(stderr, "qwen3_tts: talker_pre %7.1f ms\n", now_ms() - t1);
     if (dump_dir)
-        dump_f32(dump_dir, "talker_prefill_logits", logits, ctx->hp.vocab_size);
-    int n_past = (int)prompt_ids.size();
+        dump_f32(dump_dir, "talker_prefill_logits", logits, hp.vocab_size);
 
-    const int max_steps = ctx->params.max_codec_steps > 0 ? ctx->params.max_codec_steps : 1500;
-    const int eos = (int)ctx->hp.codec_eos_id;
+    int n_past = T_pre;
 
-    std::vector<int32_t> codes;
-    codes.reserve(max_steps);
+    // ---- AR loop: 1 talker step + 15 code_predictor steps per frame ----
+    if (!cp_kv_alloc(ctx)) {
+        fprintf(stderr, "qwen3_tts: cp_kv allocation failed\n");
+        free(logits);
+        free(past_hidden);
+        return nullptr;
+    }
 
-    for (int step = 0; step < max_steps; step++) {
-        // Greedy sample codebook-0 from the talker's logits (vocab=3072).
-        int code = argmax(logits, (int)ctx->hp.vocab_size);
+    std::vector<int32_t> all_codes; // flattened (T_frames, 16)
+    all_codes.reserve((size_t)max_frames * n_groups);
+
+    double t_loop = bench ? now_ms() : 0.0;
+    int frame = 0;
+    for (frame = 0; frame < max_frames; frame++) {
+        // 1. Sample codebook-0 from talker logits.
+        int cb0 = argmax(logits, (int)hp.vocab_size);
         free(logits);
         logits = nullptr;
-        if (code == eos)
-            break;
-        codes.push_back(code);
-
-        // Decode step: embed via codec_embedding + run one talker step.
-        float* e = run_embed_audio(ctx, &codes.back(), 1);
-        if (!e) {
-            fprintf(stderr, "qwen3_tts: decode embed failed at step %d\n", step);
+        if (cb0 == eos) {
+            if (dbg)
+                fprintf(stderr, "qwen3_tts: codec_eos at frame %d\n", frame);
+            free(past_hidden);
+            past_hidden = nullptr;
             break;
         }
-        logits = run_talker_kv(ctx, e, 1, n_past);
-        free(e);
-        if (!logits) {
-            fprintf(stderr, "qwen3_tts: decode talker failed at step %d\n", step);
+        // 2. Embed cb0 via talker.codec_embedding → last_id_hidden (d,)
+        float* last_id_hidden = lookup_rows(ctx, ctx->talker.token_embd_w, &cb0, 1);
+        if (!last_id_hidden) {
+            free(past_hidden);
+            return nullptr;
+        }
+        // 3. Code predictor AR loop → 15 more codebook ids.
+        int32_t cb1_15[15];
+        if (!code_pred_generate_15(ctx, past_hidden, last_id_hidden, cb1_15)) {
+            free(past_hidden);
+            free(last_id_hidden);
+            return nullptr;
+        }
+        free(past_hidden);
+        past_hidden = nullptr;
+
+        // 4. Append the full 16-codebook frame.
+        all_codes.push_back(cb0);
+        for (int i = 0; i < 15; i++)
+            all_codes.push_back(cb1_15[i]);
+
+        // 5. Build next talker input:
+        //    sum_{cb=0..15}(codec_embd_for_cb(frame[cb])) + trailing[step]
+        //    where trailing[step] = trailing_text_hidden[gen_step] if gen_step
+        //    < M else tts_pad_embed (only the latter when codec_lens > text_lens).
+        std::vector<float> next_emb(d, 0.0f);
+        for (int cb = 0; cb < n_groups; cb++) {
+            int32_t code = (cb == 0) ? cb0 : cb1_15[cb - 1];
+            ggml_tensor* w = (cb == 0) ? ctx->talker.token_embd_w : ctx->code_pred.codec_embd[cb - 1];
+            float* row = lookup_rows(ctx, w, &code, 1);
+            if (!row) {
+                free(last_id_hidden);
+                return nullptr;
+            }
+            for (int j = 0; j < d; j++)
+                next_emb[j] += row[j];
+            free(row);
+        }
+        free(last_id_hidden);
+
+        // Add trailing_text_hidden[gen_step] (or last row if past M).
+        const int trail_idx = std::min(frame, M_trail - 1);
+        const float* trail = trailing.data() + (size_t)trail_idx * d;
+        for (int j = 0; j < d; j++)
+            next_emb[j] += trail[j];
+
+        // 6. Talker forward on the (1, d) input → next logits + hidden_last.
+        if (n_past >= ctx->kv_max_ctx - 1) {
+            fprintf(stderr, "qwen3_tts: talker kv cache full at frame %d (n_past=%d)\n", frame, n_past);
             break;
+        }
+        logits = run_talker_kv(ctx, next_emb.data(), 1, n_past, &past_hidden);
+        if (!logits || !past_hidden) {
+            free(logits);
+            free(past_hidden);
+            return nullptr;
         }
         n_past += 1;
-        if (n_past >= ctx->kv_max_ctx - 1) {
-            fprintf(stderr, "qwen3_tts: kv cache full at %d\n", n_past);
-            break;
-        }
     }
-    if (logits)
-        free(logits);
+    free(logits);
+    free(past_hidden);
 
-    // The KV cache holds layer-by-layer keys/values for `n_past`
-    // tokens; the next call would attend to those stale entries
-    // unless we explicitly say "n_past=0 again". Our API today is
-    // single-shot, so the call sites always start at n_past=0 — no
-    // explicit reset needed because each synthesise call rewrites
-    // every cache slot it uses. (If we add a partial-decode API
-    // later, expose a kv_reset.)
+    if (bench)
+        fprintf(stderr, "qwen3_tts: ar_loop    %7.1f ms (%d frames, %.1f ms/frame)\n", now_ms() - t_loop, frame,
+                frame > 0 ? (now_ms() - t_loop) / frame : 0.0);
     if (ctx->params.verbosity >= 1)
-        fprintf(stderr, "qwen3_tts: produced %zu codes (steps used %d / max %d)\n", codes.size(),
-                (int)codes.size(), max_steps);
+        fprintf(stderr, "qwen3_tts: produced %d frames × 16 codebooks = %zu codes\n", frame, all_codes.size());
 
-    *out_n_codes = (int)codes.size();
-    int32_t* out = (int32_t*)malloc(codes.size() * sizeof(int32_t));
-    memcpy(out, codes.data(), codes.size() * sizeof(int32_t));
+    *out_n_codes = (int)all_codes.size();
+    int32_t* out = (int32_t*)malloc(all_codes.size() * sizeof(int32_t));
+    std::memcpy(out, all_codes.data(), all_codes.size() * sizeof(int32_t));
     return out;
 }
 
@@ -1449,6 +1741,10 @@ extern "C" void qwen3_tts_free(struct qwen3_tts_context* ctx) {
         ggml_backend_buffer_free(ctx->kv_buf);
     if (ctx->kv_ctx)
         ggml_free(ctx->kv_ctx);
+    if (ctx->cp_kv_buf)
+        ggml_backend_buffer_free(ctx->cp_kv_buf);
+    if (ctx->cp_kv_ctx)
+        ggml_free(ctx->cp_kv_ctx);
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)
