@@ -1415,7 +1415,7 @@ extern "C" char* gemma4_e2b_transcribe(struct gemma4_e2b_context* ctx, const flo
     mp.n_mels = n_mels;
     mp.log_base = core_mel::LogBase::Log10;
     mp.log_guard = core_mel::LogGuard::MaxClip;
-    mp.norm = core_mel::Normalization::GlobalClipMax;
+    mp.norm = core_mel::Normalization::None;
     mp.layout = core_mel::Layout::MelsTime;
     mp.fb_layout = core_mel::FbLayout::FreqsMels;
     mp.matmul = core_mel::MatmulPrecision::Double;
@@ -1798,7 +1798,7 @@ extern "C" float* gemma4_e2b_compute_mel(struct gemma4_e2b_context* ctx, const f
     mp.n_mels = n_mels;
     mp.log_base = core_mel::LogBase::Log10;
     mp.log_guard = core_mel::LogGuard::MaxClip;
-    mp.norm = core_mel::Normalization::GlobalClipMax;
+    mp.norm = core_mel::Normalization::None;
     mp.layout = core_mel::Layout::MelsTime;
     mp.fb_layout = core_mel::FbLayout::FreqsMels;
     mp.matmul = core_mel::MatmulPrecision::Double;

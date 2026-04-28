@@ -50,6 +50,11 @@ enum class Normalization {
     // normalization rather than computed): y = (max(x, fixed_max-8) + 4) / 4.
     // Used by voxtral4b with fixed_max = 1.5.
     GlobalClipFixed,
+
+    // No post-log normalization — raw log10(max(mel, mel_floor)) is the
+    // final feature. Used by Gemma4AudioFeatureExtractor (no per_bin_mean
+    // or per_bin_stddev, no whisper-style clip-and-scale).
+    None,
 };
 
 enum class Layout {

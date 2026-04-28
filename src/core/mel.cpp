@@ -202,6 +202,9 @@ std::vector<float> compute(const float* samples, int n_samples, const float* win
         }
         break;
     }
+    case Normalization::None:
+        // Raw log-mel — no post-log normalization. Gemma4 uses this.
+        break;
     }
 
     // -----------------------------------------------------------------
