@@ -1335,8 +1335,11 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
     ctx->model_path = path_model;
 
     // Generate mel resources at runtime (Gemma4 GGUF doesn't include them)
-    g4e_gen_hann_window(400, ctx->mel_window);
-    g4e_gen_mel_filterbank(128, 400, 16000, ctx->mel_filterbank);
+    // Gemma4 mel: fft_length=512, frame_length=320, hop=160. Hann window
+    // is 320 samples long (gets center-padded to 512 inside core_mel).
+    // Filterbank is sized to n_fft=512 (n_freqs=257) over 0..8000 Hz.
+    g4e_gen_hann_window(320, ctx->mel_window);
+    g4e_gen_mel_filterbank(128, 512, 16000, ctx->mel_filterbank);
 
     // Look up special token IDs from vocab. Gemma4 uses `<|turn>` /
     // `<turn|>` for turn markers (not `<start_of_turn>` / `<end_of_turn>`
@@ -1385,29 +1388,30 @@ extern "C" char* gemma4_e2b_transcribe(struct gemma4_e2b_context* ctx, const flo
 
     int64_t t0 = ggml_time_us();
 
-    // ── Step 1: Mel spectrogram (128-bin, 16kHz, Whisper-style) ─────────
-    const int n_fft = 400, hop = 160, n_mels = 128;
+    // ── Step 1: Mel spectrogram ──
+    // Gemma4AudioFeatureExtractor params (processor_config.json):
+    //   feature_size: 128       n_mels
+    //   fft_length: 512         FFT size (zero-padded)
+    //   frame_length: 320       Hann window length (<= n_fft)
+    //   hop_length: 160         frame stride
+    //   sampling_rate: 16000
+    //   mel_floor: 0.001        clamp before log
+    //   max_frequency: 8000
+    const int n_fft = 512, hop = 160, n_mels = 128;
+    const int win_length = 320;
     const int n_freqs = n_fft / 2 + 1;
 
-    // Prefer GGUF-stored mel resources; fall back to runtime-generated ones
-    std::vector<float> hann_buf, filt_buf;
+    // Use runtime-generated mel resources (the GGUF-stored ones from older
+    // converters were sized for n_fft=400 which is wrong — Gemma4 uses
+    // fft_length=512 with frame_length=320). The runtime-generated ones
+    // already match the new params (regen happens in init).
     const float* hann_ptr = ctx->mel_window.data();
     const float* filt_ptr = ctx->mel_filterbank.data();
-    if (m.mel_window && m.mel_filters) {
-        hann_buf.resize(n_fft);
-        ggml_backend_tensor_get(m.mel_window, hann_buf.data(), 0, n_fft * sizeof(float));
-        filt_buf.resize((size_t)n_freqs * n_mels);
-        ggml_backend_tensor_get(m.mel_filters, filt_buf.data(), 0, filt_buf.size() * sizeof(float));
-        hann_ptr = hann_buf.data();
-        filt_ptr = filt_buf.data();
-        if (verbose)
-            fprintf(stderr, "gemma4_e2b: using GGUF-stored mel filterbank\n");
-    }
 
     core_mel::Params mp;
     mp.n_fft = n_fft;
     mp.hop_length = hop;
-    mp.win_length = n_fft;
+    mp.win_length = win_length;        // 320 (Hann window length); core_mel pads to n_fft internally
     mp.n_mels = n_mels;
     mp.log_base = core_mel::LogBase::Log10;
     mp.log_guard = core_mel::LogGuard::MaxClip;
@@ -1420,7 +1424,7 @@ extern "C" char* gemma4_e2b_transcribe(struct gemma4_e2b_context* ctx, const flo
     mp.drop_last_frame = true;
 
     int T_mel = 0;
-    auto mel = core_mel::compute(pcm, n_samples, hann_ptr, n_fft, filt_ptr, n_freqs, g4e_fft_wrapper, mp, T_mel);
+    auto mel = core_mel::compute(pcm, n_samples, hann_ptr, win_length, filt_ptr, n_freqs, g4e_fft_wrapper, mp, T_mel);
     if (mel.empty()) {
         fprintf(stderr, "gemma4_e2b: mel computation failed\n");
         return nullptr;
@@ -1777,27 +1781,20 @@ extern "C" float* gemma4_e2b_compute_mel(struct gemma4_e2b_context* ctx, const f
     if (!ctx || !pcm || n_samples <= 0 || !out_n_mels || !out_T_mel)
         return nullptr;
 
-    const int n_fft = 400, hop = 160, n_mels = 128;
+    // Match Gemma4AudioFeatureExtractor: fft_length=512, frame_length=320,
+    // hop_length=160, feature_size=128, sampling_rate=16000.
+    const int n_fft = 512, hop = 160, n_mels = 128, win_length = 320;
     const int n_freqs = n_fft / 2 + 1;
-    auto& m = ctx->model;
 
-    // Prefer GGUF-stored mel resources; fall back to runtime-generated.
-    std::vector<float> hann_buf, filt_buf;
+    // Use runtime-generated resources (init regenerates them with the
+    // correct sizes; older GGUF-stored tables would be wrong-sized).
     const float* hann_ptr = ctx->mel_window.data();
     const float* filt_ptr = ctx->mel_filterbank.data();
-    if (m.mel_window && m.mel_filters) {
-        hann_buf.resize(n_fft);
-        ggml_backend_tensor_get(m.mel_window, hann_buf.data(), 0, n_fft * sizeof(float));
-        filt_buf.resize((size_t)n_freqs * n_mels);
-        ggml_backend_tensor_get(m.mel_filters, filt_buf.data(), 0, filt_buf.size() * sizeof(float));
-        hann_ptr = hann_buf.data();
-        filt_ptr = filt_buf.data();
-    }
 
     core_mel::Params mp;
     mp.n_fft = n_fft;
     mp.hop_length = hop;
-    mp.win_length = n_fft;
+    mp.win_length = win_length;
     mp.n_mels = n_mels;
     mp.log_base = core_mel::LogBase::Log10;
     mp.log_guard = core_mel::LogGuard::MaxClip;
@@ -1810,7 +1807,7 @@ extern "C" float* gemma4_e2b_compute_mel(struct gemma4_e2b_context* ctx, const f
     mp.drop_last_frame = true;
 
     int T_mel = 0;
-    auto mel = core_mel::compute(pcm, n_samples, hann_ptr, n_fft, filt_ptr, n_freqs, g4e_fft_wrapper, mp, T_mel);
+    auto mel = core_mel::compute(pcm, n_samples, hann_ptr, win_length, filt_ptr, n_freqs, g4e_fft_wrapper, mp, T_mel);
     if (mel.empty())
         return nullptr;
     if (T_mel > 3000)
