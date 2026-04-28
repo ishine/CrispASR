@@ -78,29 +78,22 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         out["raw_audio"] = audio.astype(np.float32)
 
     # ---- Forward hooks: capture per-layer encoder activations ----
+    # Shared helper handles registration + (T, D) normalisation. Each
+    # backend just declares its (stage_name, nn.Module) list.
+    from . import _hooks
     captured: Dict[str, torch.Tensor] = {}
-    handles = []
-
-    def _save(name: str):
-        def hook(_mod, _inp, output):
-            # NeMo conformer modules return either a Tensor or a tuple
-            # whose first element is the (B, T, D) hidden state. Some
-            # versions return (B, D, T); we normalise both to (B, T, D)
-            # by sniffing the dim that matches the encoder d_model.
-            t = output[0] if isinstance(output, (tuple, list)) else output
-            captured[name] = t.detach().cpu().float()
-        return hook
 
     enc = model.encoder
+    stage_modules = []
     if "pre_encode_output" in stages and hasattr(enc, "pre_encode"):
-        handles.append(enc.pre_encode.register_forward_hook(_save("pre_encode_output")))
-
+        stage_modules.append(("pre_encode_output", enc.pre_encode))
     layers = getattr(enc, "layers", None)
     if layers is not None:
         for i in range(len(layers)):
             stage = f"encoder_layer_{i}"
             if stage in stages:
-                handles.append(layers[i].register_forward_hook(_save(stage)))
+                stage_modules.append((stage, layers[i]))
+    handles = _hooks.capture_modules(captured, stage_modules)
 
     with torch.no_grad():
         feats, feat_len = model.preprocessor(input_signal=sig, length=sig_len)
@@ -120,22 +113,6 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             e = encf[0, :, :T_enc].transpose(0, 1).contiguous()
             out["encoder_output"] = e.detach().cpu().float().numpy()
 
-    for h in handles:
-        h.remove()
-
-    # ---- Normalise per-layer captures to (T, d_model) ----
-    # NeMo's ConvSubsampling (pre_encode) returns (B, T, D) directly;
-    # ConformerLayer also returns (B, T, D). The final encoder transposes
-    # to (B, D, T) at the end, but per-layer outputs are time-major.
-    T_enc = int(enc_len.item()) if "encoder_output" in stages else None
-    for name, t in captured.items():
-        if t.ndim == 3:
-            # (B, T, D)
-            arr = t[0]  # (T, D)
-            if T_enc is not None and arr.shape[0] >= T_enc:
-                arr = arr[:T_enc]
-            out[name] = arr.contiguous().numpy()
-        elif t.ndim == 2:
-            out[name] = t[0].contiguous().numpy()
-
+    _hooks.drop_hooks(handles)
+    out.update(_hooks.finalize(captured, T_max=int(enc_len.item())))
     return out

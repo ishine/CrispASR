@@ -83,6 +83,11 @@ import numpy as np
 #       listed in `stages`, and return {name: ndarray}. Raise KeyError or
 #       NotImplementedError for stages this backend doesn't support."""
 #
+# For per-layer encoder/LLM captures, use `reference_backends/_hooks.py`
+# (capture_modules / drop_hooks / finalize) — it handles forward-hook
+# bookkeeping and normalises (B, T, D) → (T, D) row-major to match
+# crispasr's flat layout. See parakeet.py for a worked example.
+#
 # Adding a new backend is:
 #   1. tools/reference_backends/<name>.py  with dump() + DEFAULT_STAGES
 #   2. one line here.
@@ -103,6 +108,9 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # (16 kHz mono); synth text + ref text come from env vars. See
     # reference_backends/qwen3_tts.py for the full prompt contract.
     "qwen3-tts":  "reference_backends.qwen3_tts",
+    # Qwen3-TTS-Tokenizer-12Hz codec decoder only (codes → PCM).
+    # model_dir = the Tokenizer-12Hz HF snapshot; audio arg is unused.
+    "qwen3-tts-codec": "reference_backends.qwen3_tts_codec",
     # VibeVoice-ASR 7B: two σ-VAE encoders + connectors + Qwen2 decoder.
     # NOTE: audio must be 16 kHz on entry (shared loader); the backend
     # resamples to 24 kHz internally.

@@ -231,33 +231,90 @@ were already loaded via `require()` because they exist in every
 variant. Add `try_` for the rest, never `require()`, so v3-style
 checkpoints still load.
 
-### How to find this class of bug methodically
+**Rule of thumb:** when adding a new model whose conditional builder
+takes `(weight, bias)` pairs, audit the loader for every `weight`
+that has a sibling `bias` in the GGUF. If the model's reference code
+has `use_bias` as a config flag, ALL biases should load via `try_get`
+— never `require()`.
 
-`crispasr-diff` with per-layer captures is the only reliable detector.
-Steps that worked for issue #37:
+### Per-layer diff is the only reliable encoder-bug detector
 
-1. Add `pre_encode_output` and `encoder_layer_K` for K=0..N-1 to the
-   reference dump via `register_forward_hook` on `model.encoder.pre_encode`
-   and `model.encoder.layers[K]`. NeMo returns layers in time-major
-   `(B, T, D)`, which matches crispasr's flat layout — no transpose
-   gymnastics.
-2. Add a per-layer dump path to the C++ runtime that builds the
-   encoder graph with each layer's output marked as a graph output
-   (`ggml_set_name` + `ggml_set_output`), runs once, and reads each
-   intermediate back via `ggml_backend_tensor_get`.
-3. Add stages to the diff harness so each `encoder_layer_K` is
-   compared head-to-head with the reference.
-4. The first layer where `cos_mean` drops is where the bug lives.
-   For issue #37 the drop appeared at `encoder_layer_0` itself,
-   immediately after a bit-exact `pre_encode_output` — pinpointing
-   the bug to *inside* the conformer block, not the subsampling.
-   Reading the loader against the GGUF tensor list found the
-   missing biases in <30 seconds.
+When an encoder produces fluent-but-wrong output and the final
+`encoder_output` cos < 0.999, scattered numerical guessing wastes days.
+The recipe that cracked issue #37 in <30 minutes:
 
-The "feed reference mel into our encoder" stage
-(`encoder_output_ref_mel`) is also worth keeping in the harness —
-when its cos matches `encoder_output`'s, you know mel propagation
-isn't the issue and the bug is encoder-internal.
+**1. Capture per-layer reference activations.** In the backend's
+`tools/reference_backends/<name>.py`, register PyTorch forward hooks
+on every encoder submodule of interest. Use the shared helper:
+
+```python
+from . import _hooks
+captured = {}
+handles = _hooks.capture_modules(captured, [
+    ("pre_encode_output", model.encoder.pre_encode),
+    *[(f"encoder_layer_{i}", L) for i, L in enumerate(model.encoder.layers)],
+])
+# ... run the model ...
+_hooks.drop_hooks(handles)
+out.update(_hooks.finalize(captured, T_max=int(enc_len.item())))
+```
+
+Add the stage names to `DEFAULT_STAGES` so they're captured by
+default. NeMo conformer modules emit `(B, T, D)` directly — `_hooks`
+strips the batch dim and slices to `T_max`.
+
+**2. Dump per-layer C++ activations.** Add a dump entry point to the
+runtime (parallel to the production encoder builder) that tags each
+layer's output:
+
+```cpp
+for (uint32_t il = 0; il < n_layers; il++) {
+    cur = build_block(ctx0, cur, ...);
+    char nm[64]; snprintf(nm, sizeof(nm), "dump_layer_%u", il);
+    ggml_tensor* tag = ggml_cont(ctx0, cur);
+    ggml_set_name(tag, nm); ggml_set_output(tag);
+    ggml_build_forward_expand(gf, tag);
+    cur = tag;  // chain — see below
+}
+```
+
+Run the graph once, read each tagged tensor with
+`ggml_backend_tensor_get`. See `parakeet_run_encoder_dump()` for a
+worked example.
+
+**Chain through the tag** (`cur = tag`). Without it, the production
+buffer can be reused before the read-back happens — you'll see the
+final layer's value flip between runs while upstream layers stay
+stable. With it, every dumped tensor stays live through compute.
+
+**3. Wire stages into `crispasr-diff`.** Call
+`ref.compare("encoder_layer_K", our_buf, n_elem)` for each layer.
+The first K where `cos_mean` drops below ~0.999 is where the bug
+lives. Reading the runtime's loader / `build_block` code against
+that layer's GGUF tensors usually finds the bug in minutes.
+
+**4. Distinguish mel propagation from encoder-internal bugs.** Add
+an `encoder_output_ref_mel` stage that feeds the REFERENCE mel into
+the C++ encoder (skipping our `compute_mel`). If its cos matches the
+production `encoder_output` cos, mel error isn't the issue — the
+bug is encoder-internal. See `parakeet_encoder_with_ref_mel_r()` in
+`crispasr_diff_main.cpp`.
+
+For issue #37 the drop appeared at `encoder_layer_0` itself,
+immediately after a bit-exact `pre_encode_output`. Reading the
+loader against the GGUF tensor list found the missing biases in
+<30 seconds. The same recipe applies to LLM hidden states, audio
+projector outputs, and RVQ codec stages — any sequential pipeline
+that can drift from a Python reference.
+
+**Where the reusable infrastructure lives:**
+
+| Piece | Path | Reusable? |
+|---|---|---|
+| Forward-hook helper | `tools/reference_backends/_hooks.py` | yes — every backend |
+| Per-layer dump pattern | `parakeet_run_encoder_dump()` in `src/parakeet.cpp` | template — copy per backend |
+| Reference-mel-input stage | `parakeet_encoder_with_ref_mel_r()` | template — copy per backend |
+| Recipe documentation | `examples/cli/crispasr_diff.h` header comment | always-up-to-date |
 
 ### Cohere's cblas_sgemm note (kept for the historical record)
 

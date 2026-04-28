@@ -22,6 +22,47 @@
 // top1_match_rate fields and an `is_pass(cos_threshold)` helper. Test
 // drivers stop caring about NPY format, shape checking, or cosine loop
 // writing — they just name the stage and compare.
+//
+// ---------------------------------------------------------------------------
+// Per-layer diff recipe (what cracked issue #37 — see LEARNINGS.md)
+// ---------------------------------------------------------------------------
+// When an encoder runtime produces fluent-but-wrong output and the
+// final encoder cos < 0.999, follow this protocol to localise the bug:
+//
+//   1. PYTHON SIDE — dump per-layer reference activations.
+//      In the backend's reference_backends/<name>.py, register forward
+//      hooks on every encoder submodule of interest (subsampling,
+//      each conformer/transformer layer, attention, conv, ffn).
+//      Use `tools/reference_backends/_hooks.py` (capture_modules /
+//      drop_hooks / finalize) — it normalises (B, T, D) -> (T, D)
+//      and matches crispasr's flat row-major layout.
+//
+//      Add the stage names to DEFAULT_STAGES so they get captured
+//      automatically: pre_encode_output, encoder_layer_0..N-1, etc.
+//
+//   2. C++ SIDE — add a per-layer dump entry point to the runtime.
+//      Mirror the production encoder graph but tag every layer's
+//      output with `ggml_set_name("dump_layer_K")` + `ggml_set_output()`.
+//      Run the graph once, then read each tagged tensor back via
+//      `ggml_backend_tensor_get`. Allocate one (T_enc * d_model) F32
+//      buffer per dumped stage. See parakeet_run_encoder_dump() in
+//      src/parakeet.cpp for a worked example (~50 LOC).
+//
+//   3. DIFF HARNESS — wire stages into crispasr_diff_main.cpp.
+//      Call ref.compare("encoder_layer_K", our_K_buf, n_elem) for each
+//      stage. The first K where cos_mean drops below ~0.999 is where
+//      the bug lives. Reading the runtime's loader / build_block code
+//      against that layer's GGUF tensors usually finds it in minutes.
+//
+//   4. ISOLATE MEL VS ENCODER — add an "encoder_output_ref_mel" stage
+//      that feeds the REFERENCE mel into the C++ encoder (not our
+//      C++ mel). If cos matches the production encoder_output cos,
+//      mel propagation isn't the issue and the bug is encoder-internal.
+//      See parakeet_encoder_with_ref_mel_r() in crispasr_diff_main.cpp.
+//
+// The same recipe applies to LLM stages (per-layer hidden states),
+// audio projector outputs, RVQ codec stages — anywhere a sequential
+// pipeline can drift from a Python reference.
 
 #pragma once
 
