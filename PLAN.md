@@ -15,7 +15,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 
 | Priority | Item | Effort | Status |
 |---|---|---|---|
-| **MEDIUM** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | |
+| **MEDIUM** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet/cohere DONE; canary remaining |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
 | **LOW** | ~~#40b Moonshine streaming~~ | ~~High~~ | **DONE** (3 sizes) |
 | **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | |
@@ -64,6 +64,10 @@ Write `tools/reference_backends/{parakeet,canary,cohere}.py` for
 `crispasr-diff` reference activation comparison.
 
 **Effort:** ~100-150 LOC per backend.
+
+**Status (April 2026):** `parakeet` reference backend done — used to
+diagnose the JA xscaling bug. Cohere already has one
+(`reference_backends/cohere.py`). Canary is the only one still missing.
 
 ---
 

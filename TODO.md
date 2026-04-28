@@ -62,21 +62,12 @@ are in `LEARNINGS.md`. Full roadmap in `PLAN.md`.
   HF: `cstr/whisper-vad-encdec-asmr-GGUF`.
 - **4 VAD backends total**: Silero (default), FireRedVAD (recommended), MarbleNet, Whisper-VAD.
   All with auto-download keywords.
-- **Parakeet-JA** — **[F16 BIT-EXACT, Q4_K STILL DEGENERATES]**
-  `nvidia/parakeet-tdt_ctc-0.6b-ja` (CC-BY-4.0). Converter fixed: reads
-  n_mels (80 vs 128) AND every other architecture hparam from
-  model_config.yaml, handles pre-existing dw bias, persists
-  `parakeet.xscaling` to GGUF metadata. Runtime fixed: applies
-  `*sqrt(d_model)` between pre_encode and the first conformer block
-  when xscaling=true (the JA model's setting; v3 has xscaling=false
-  which is why v3 worked without this fix). On a JSUT sample at F16,
-  crispasr now matches NeMo bit-exact:
-  `'水をマレーシアから買わなくてはならないのです。'`. The current Q4_K
-  GGUFs on HF were built with the old converter (no xscaling key) and
-  with quantization aggressive enough to degenerate after ~8 tokens
-  on JA. Need to re-convert and re-upload F16+Q4_K (use Q5_K or pin
-  joint.pred / decoder.embed to F16 since their dims fall back to
-  q4_0 in q4_k mode).
+- ~~**Parakeet-JA**~~ — **DONE** (xscaling fix → F16 bit-exact match
+  with NeMo). Q4_K of the JA model is still quantisation-sensitive
+  (degrades after ~8 tokens because `joint.pred` / `decoder.embed`
+  fall back to q4_0); follow-up to ship a Q5_K build, or pin those
+  two tensors to F16 inside Q4_K, lives below under "open polish".
+  See HISTORY.md.
 - **Gemma-4-E2B** — **[IN PROGRESS]** Full forward pass implemented (encoder + LLM decoder).
   Needs testing with GGUF on Kaggle. Q4_K on HF. See TODO entry above.
 - **MiMo-V2.5-ASR** — **[IN PROGRESS]** Converters done, F16+Q4_K on HF.
@@ -86,6 +77,19 @@ are in `LEARNINGS.md`. Full roadmap in `PLAN.md`.
 - **VibeVoice-7B TTS** — needs 32+ GB RAM for conversion (9.3B params). Same architecture as 1.5B.
 - **VibeVoice multi-speaker** — 1.5B/7B support up to 4 speakers; need prompt template for multi-speaker scripts
 - **VibeVoice negative conditioning** — base model uses zero negative; proper dual-LM CFG would improve quality
+- **Qwen3 TTS** — user-requested follow-on after VibeVoice TTS landed.
+  Add converter + runtime + auto-download. Same backend slot as the
+  ASR Qwen3 (text → speech direction), needs new registry entry and
+  whatever speech-side decoder Qwen3-TTS ships with.
+
+### Open polish
+
+- **parakeet-ja Q4_K** — F16 is bit-exact, Q4_K still loops after
+  ~8 tokens because `joint.pred.weight` and `decoder.embed.weight`
+  fall back to q4_0 (dims don't tile for q4_k blocks) and the
+  80-mel encoder amplifies the error. Two ways to fix: ship a Q5_K
+  build, or extend the converter / quantiser to pin those two
+  tensors to F16 inside a q4_k file.
 
 ---
 

@@ -436,3 +436,34 @@ Moved here once shipped. See git history for code diffs.
 - 48-layer encoder (d=1280) + 12-layer LLaMA decoder (d=4096)
 - Output: "fellow americas ask not what your country can do for you"
 - HF: `cstr/omniasr-llm-1b-GGUF` (F16 + Q4_K)
+
+**Parakeet TDT-CTC Japanese — xscaling fix (April 2026):**
+- `nvidia/parakeet-tdt_ctc-0.6b-ja` was emitting "1 token then loop"
+  because NeMo's `RelPositionalEncoding` multiplies the encoder
+  input by `sqrt(d_model)=32` when `encoder.xscaling=true`. The C++
+  runtime never applied this scale; v3 has `xscaling=false` so the
+  multilingual sibling worked by accident.
+- Diagnostic path: stood up `tools/reference_backends/parakeet.py`
+  + `tools/dump_parakeet_reference.py` so `crispasr-diff parakeet
+  <model.gguf> <ref.gguf> <audio.wav>` produces a stage-by-stage
+  comparison against the NeMo reference. mel matched at cos≈0.99,
+  encoder at cos=0.149 → grep'd `model_config.yaml`, found
+  `xscaling: true`, applied `ggml_scale(*, sqrt(d_model))` between
+  pre_encode and the first conformer block. Encoder cos jumped to
+  0.81, F16 transcript bit-exact.
+- Verified on a JSUT-basic5000 sample at F16:
+  NeMo:     `'水をマレーシアから買わなくてはならないのです。'`
+  crispasr: `'水をマレーシアから買わなくてはならないのです。'`
+- Converter rewrite: every architecture hparam read from
+  `model_config.yaml` (no more hardcoded `d_model=1024` /
+  `pred_hidden=640`), cross-checked against actual tensor shapes,
+  unmapped tensors warn loudly. New `parakeet.xscaling` GGUF key
+  (default true on read) so old-converter v3 GGUFs continue to work
+  unchanged once re-converted with `xscaling=false`.
+- Q4_K JA still degenerates after ~8 tokens — the smaller 80-mel JA
+  encoder is more quantisation-sensitive than v3's 128-mel one and
+  `joint.pred` / `decoder.embed` fall back to q4_0. F16 is the
+  recommended JA file; Q5_K or pinning those two tensors to F16 is
+  the path forward.
+- HF: `cstr/parakeet-tdt-0.6b-ja-GGUF` (F16 1.24 GB,
+  Q4_K 470 MB) re-uploaded with the new converter + README.
