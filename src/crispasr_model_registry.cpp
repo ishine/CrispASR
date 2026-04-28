@@ -72,9 +72,24 @@ constexpr Entry k_registry[] = {
     {"gemma4-e2b", "gemma4-e2b-it-q4_k.gguf",
      "https://huggingface.co/cstr/gemma4-e2b-it-GGUF/resolve/main/gemma4-e2b-it-q4_k.gguf",
      "~2.5 GB", nullptr, nullptr},
-    {"parakeet-ja", "parakeet-tdt-0.6b-ja-q4_k.gguf",
-     "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja-q4_k.gguf",
-     "~449 MB", nullptr, nullptr},
+    // parakeet-ja: F16 is the auto-download default — Q4_K of this
+    // model is quantisation-sensitive (joint.pred / decoder.embed
+    // dimensions fall back to q4_0 inside q4_k mode) and the talker
+    // enters a fixed-point loop after ~8 tokens. The Q4_K file is
+    // available at the same repo for users who pin disk space, but
+    // we'd rather have correct output by default.
+    {"parakeet-ja", "parakeet-tdt-0.6b-ja.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja.gguf",
+     "~1.24 GB", nullptr, nullptr},
+    // Qwen3-TTS: the talker LM and the codec live in two separate HF
+    // repos. The runtime is still being written (PLAN #52); these
+    // entries are ready for `crispasr --backend qwen3-tts -m auto
+    // --auto-download` once the runtime lands.
+    {"qwen3-tts", "qwen3-tts-12hz-0.6b-base.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF/resolve/main/qwen3-tts-12hz-0.6b-base.gguf",
+     "~1.7 GB",
+     "qwen3-tts-tokenizer-12hz.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
 };
 // clang-format on
 
