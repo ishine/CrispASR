@@ -130,6 +130,122 @@ No response. HF model card has no license field.
 
 ---
 
+## 50. Gemma-4-E2B runtime refactor
+
+The Gemma4 GGUF (cstr/gemma4-e2b-it-GGUF) currently makes
+`crispasr --backend gemma4-e2b` SIGABRT/SIGSEGV. The PLE direction
+fix is in (commit `48ee13e`); the remaining gaps are structural and
+genuinely Gemma4-specific:
+
+1. **Per-layer head_dim** — sliding-attention layers use 256, full-
+   attention layers use `global_head_dim=512`. Single-head_dim graph
+   trips `ggml_can_mul_mat` at the first full layer.
+2. **Double-wide MLP** (`use_double_wide_mlp=true`): two MLP halves
+   per layer with `pre_feedforward_layernorm_2`,
+   `post_feedforward_layernorm_1/2` norms. Converter now maps these;
+   runtime needs the second half wired in.
+3. **KV-cache sharing** — first 20 layers reuse K/V from a later
+   layer (`num_kv_shared_layers=20`); some lower-layer K/V projection
+   weights may be absent in the checkpoint.
+4. **layer_types** — alternating sliding (window 512) / full attention.
+   New per-layer mask `parakeet.layer_full_mask` is in metadata.
+5. **Per-layer-type RoPE** — sliding uses theta 10000, full uses
+   `rope_theta_full=1e6` with `partial_rotary_factor=0.25`.
+
+The converter (`models/convert-gemma4-e2b-to-gguf.py`) already
+persists `layer_full_mask`, `global_head_dim`,
+`num_kv_shared_layers`, `use_double_wide_mlp`, `attention_k_eq_v`,
+and the partial-rotary RoPE params. Once the runtime honours all of
+these, `tools/reference_backends/gemma4.py` is in place for the
+stage-by-stage diff (same flow that cracked parakeet-ja).
+
+**Effort:** Medium-large. ~400-600 LOC in `src/gemma4_e2b.cpp`.
+
+---
+
+## 51. MiMo-V2.5-ASR runtime
+
+Converter done (`models/convert-mimo-asr-to-gguf.py` plus the
+audio-tokenizer side `models/convert-mimo-tokenizer-to-gguf.py`).
+Runtime not yet written.
+
+- **Architecture:** 6-layer input_local_transformer + 36-layer Qwen2
+  LLM (4096d, 32Q/8KV, SiLU, RoPE).
+- **Audio path:** 8-channel RVQ tokens from `cstr/mimo-tokenizer-GGUF`
+  (separate model) get fed into the input_local_transformer, which
+  produces embeddings the Qwen2 LLM consumes.
+- **Reuse:** Qwen2 LLM core can lean on `core_attn::kv_self_attn` +
+  `core_ffn::swiglu` — both already in production via qwen3-asr.
+
+**Effort:** Large (~1000 LOC), but most of it is the audio-tokenizer
+runtime (RVQ encoder/decoder over conv stacks). The Qwen2 part
+mostly slots into the existing core helpers.
+
+---
+
+## 52. Qwen3-TTS
+
+User-requested follow-on to the VibeVoice TTS work. Apache-2.0
+collection: [Qwen/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS),
+[HF collection](https://huggingface.co/collections/Qwen/qwen3-tts).
+
+- **Six repos in the collection** (all BF16 safetensors, Apache 2.0):
+  - `Qwen/Qwen3-TTS-Tokenizer-12Hz` — RVQ codec, 16 codebooks × 2048,
+    12.5 FPS at 24 kHz. Non-DiT lightweight architecture (8L
+    encoder + 8L decoder).
+  - `Qwen/Qwen3-TTS-12Hz-{0.6B,1.7B}-Base` — base talker LM with
+    voice clone (3s reference audio).
+  - `Qwen/Qwen3-TTS-12Hz-{0.6B,1.7B}-CustomVoice` — fine-tuned,
+    fixed speakers.
+  - `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign` — instruction-tuned
+    (voice description → speech).
+- **Architecture:** "Discrete Multi-Codebook LM" — Qwen3 backbone
+  with a 16-codebook output head. No DiT; direct AR generation of
+  RVQ codes. ~97ms end-to-end latency, 10 languages incl.
+  en/de/zh/ja/ko/it.
+- **Status (April 2026):** both converters scaffolded
+  (`models/convert-qwen3-tts-to-gguf.py`,
+  `models/convert-qwen3-tts-tokenizer-to-gguf.py`) — they read every
+  hparam from the HF config.json and warn loudly on unmapped tensors.
+  Runtime, model registry entries, CLI hooks, and a reference dump
+  for diff-testing are all pending.
+- **Reuse:** the talker is essentially Qwen3-0.6B/1.7B with a
+  multi-codebook output head — `core_attn::kv_self_attn` +
+  `core_ffn::swiglu` again. The codec needs new code for RVQ
+  decoding; that work is shared with MiMo (#51) and overlaps in
+  shape with the VibeVoice σ-VAE decoder, so a `core_audio_decoder`
+  helper is worth landing alongside the runtime (see #53).
+
+**Effort:** Large. ~1500 LOC across runtime + codec + reference
+backend. The two TTS targets (Qwen3-TTS and any future expansion)
+share enough that landing one substantially de-risks the other.
+
+---
+
+## 53. `core/audio_decoder.h` — DRY across TTS / codec backends
+
+VibeVoice TTS (σ-VAE), Qwen3-TTS (RVQ codec) and MiMo
+(MiMo-Audio-Tokenizer) all share the "discrete codes → 24 kHz
+waveform" shape: a stack of 1D conv up-sampling blocks driven by a
+small transformer or directly by quantised codes. Pull the recurring
+patterns into `src/core/audio_decoder.h`:
+
+- RVQ codebook lookup (multi-stage residual) — same in MiMo and
+  Qwen3-TTS, plus their semantic-quantiser variant.
+- 1D-conv up-sampling stack (`ggml_conv_1d_cf` already there from
+  vibevoice work — reuse).
+- Optional small transformer on the latent stream (Qwen3-TTS has 8L
+  decoder transformer).
+
+Same layering pattern as `core_conformer` / `core_attn` /
+`core_ffn`. ~200-300 LOC in headers; payoff is two new TTS backends
+plus future ones (e.g. Mimi/Encodec) sharing the same decode path.
+
+**Effort:** Medium. Easier *after* one TTS runtime exists — extract
+upward rather than design forward.
+
+---
+
 
 ## Ecosystem expansion (lower priority)
 

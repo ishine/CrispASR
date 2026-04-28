@@ -3261,3 +3261,40 @@ detect via `uname -s` (Darwin/Linux/MINGW*/MSYS*/CYGWIN*) and apply
 only the flags that platform's toolchain accepts. None of these flags
 go into CMakeLists.txt itself, so CI/Docker/release builds are
 unaffected.
+
+
+## Per-layer architecture variations are easy to miss (April 2026)
+
+Two cases bit us this session:
+
+### Architectural booleans flipping per model variant
+
+`encoder.xscaling` is `false` for `parakeet-tdt-0.6b-v3` and `true`
+for `parakeet-tdt_ctc-0.6b-ja`. The C++ runtime that worked for v3
+silently produced near-random encoder activations on the JA model
+because we never multiplied by `sqrt(d_model)`. Lesson: **whenever a
+config flag is a bool, surface it to GGUF metadata** so old models
+that lack the key default to the *correct* behaviour for that family
+and the runtime can branch on it. Don't rely on "every model in this
+family does X" — sister models flip flags.
+
+### Per-LAYER hparam variations
+
+`google/gemma-4-E2B-it` alternates `sliding_attention` /
+`full_attention` layers (5 of 35 are full). The two layer types use
+DIFFERENT `head_dim`: 256 for sliding, 512 for full
+(`global_head_dim`). A single-`head_dim` graph trips
+`ggml_can_mul_mat` at the first full layer. Same model also has
+`num_kv_shared_layers=20` (first 20 layers reuse K/V from later
+layers — some lower-layer K/V projections may be absent in the
+checkpoint), and `use_double_wide_mlp=true` (TWO MLP halves per
+layer with their own pre/post norms).
+
+Lesson: **runtime hparams aren't always per-model; some are
+per-layer.** When a `layer_types` array, `num_kv_shared_layers`-style
+counter, or a `global_*` paired with a regular `*` shows up in the
+config, plan a per-layer mask in the runtime, not a single value.
+The converter should persist the mask (we now do for Gemma4 via
+`gemma4e2b.llm.layer_full_mask`) so the runtime can branch without
+re-parsing the YAML.
+
