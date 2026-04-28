@@ -38,9 +38,60 @@ add_executable(${TARGET}
     crispasr_diarize_cli.cpp
     crispasr_output.cpp
     crispasr_model_mgr_cli.cpp
+    crispasr_diagnostics.cpp
     crispasr_run.cpp
     crispasr_server.cpp
 )
+
+# ---------------------------------------------------------------------------
+# Build-info macros surfaced to crispasr_diagnostics.cpp. Together they
+# answer "what exact bits am I running?" — important for bug reports
+# from prebuilt Docker tags where the user has no source tree handy.
+#
+# `git-vars.cmake` populates GIT_SHA1 / GIT_DATE / GIT_COMMIT_SUBJECT.
+# Re-include defensively in case a downstream consumer of this file
+# imports it without the top-level CMakeLists having run yet.
+# ---------------------------------------------------------------------------
+if (NOT DEFINED GIT_SHA1)
+    include(${CMAKE_SOURCE_DIR}/cmake/git-vars.cmake)
+endif()
+string(TIMESTAMP CRISPASR_BUILD_DATE_STR "%Y-%m-%dT%H:%M:%SZ" UTC)
+target_compile_definitions(${TARGET} PRIVATE
+    CRISPASR_VERSION_STR="${PROJECT_VERSION}"
+    CRISPASR_GIT_SHA1="${GIT_SHA1}"
+    CRISPASR_GIT_DATE="${GIT_DATE}"
+    CRISPASR_GIT_SUBJECT="${GIT_COMMIT_SUBJECT}"
+    CRISPASR_BUILD_DATE="${CRISPASR_BUILD_DATE_STR}"
+    CRISPASR_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+)
+if (GGML_CUDA)
+    target_compile_definitions(${TARGET} PRIVATE
+        CRISPASR_HAVE_CUDA=1
+        CRISPASR_CUDA_VERSION="${CUDAToolkit_VERSION}"
+        CRISPASR_CUDA_ARCHS="${CMAKE_CUDA_ARCHITECTURES}"
+    )
+endif()
+if (GGML_METAL)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_METAL=1)
+endif()
+if (GGML_VULKAN)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_VULKAN=1)
+endif()
+if (GGML_HIP)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_HIP=1)
+endif()
+if (GGML_SYCL)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_SYCL=1)
+endif()
+if (GGML_OPENCL)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_OPENCL=1)
+endif()
+if (GGML_BLAS)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_BLAS=1)
+endif()
+if (GGML_MUSA)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_MUSA=1)
+endif()
 
 # ---------------------------------------------------------------------------
 # crispasr-diff-lib — shared ground-truth diff harness (companion to

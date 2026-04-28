@@ -31,6 +31,12 @@ else()
     set(WHISPER_STANDALONE OFF)
 endif()
 
+# Always populate GIT_SHA1 / GIT_DATE / GIT_COMMIT_SUBJECT — the CLI
+# build-info banner uses them whether or not we're the top-level build.
+if (NOT DEFINED GIT_SHA1)
+    include(git-vars)
+endif()
+
 if (EMSCRIPTEN)
     set(BUILD_SHARED_LIBS_DEFAULT OFF)
 

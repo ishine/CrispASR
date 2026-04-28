@@ -45,11 +45,28 @@ FROM ${BASE_CUDA_RUN_CONTAINER} AS runtime
 WORKDIR /app
 
 RUN apt-get update && \
-  apt-get install -y curl ffmpeg wget cmake git \
+  apt-get install -y curl ffmpeg wget cmake git pciutils \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
+# Strip the cuda-compat ld.so.conf entry — same rationale as in
+# main-cuda.Dockerfile (see that file for the full #31 incident notes).
+# Compat libs stay on disk; opt back in via CRISPASR_USE_CUDA_COMPAT=1.
+RUN rm -f /etc/ld.so.conf.d/000_cuda_compat.conf /etc/ld.so.conf.d/cuda-compat.conf && ldconfig
+
+ARG GIT_SHA=unknown
+ARG GIT_REF=unknown
+ARG BUILD_DATE=unknown
+LABEL org.opencontainers.image.title="crispasr"
+LABEL org.opencontainers.image.source="https://github.com/CrispStrobe/CrispASR"
+LABEL org.opencontainers.image.revision="${GIT_SHA}"
+LABEL org.opencontainers.image.ref.name="${GIT_REF}"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.description="crispasr unified ASR — CUDA 12.4 build (driver R510+; sm_75-90)"
+
 COPY --from=build /app /app
+RUN printf 'image=main-cuda-12\ncuda_version=12.4\ngit_sha=%s\ngit_ref=%s\nbuild_date=%s\n' \
+        "${GIT_SHA}" "${GIT_REF}" "${BUILD_DATE}" > /app/build-info.txt
 RUN (id -u crispasr 2>/dev/null || \
      useradd -m -u 1000 crispasr 2>/dev/null || \
      useradd -m crispasr) && \

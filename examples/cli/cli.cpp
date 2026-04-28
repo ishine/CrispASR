@@ -4,10 +4,11 @@
 #include "whisper.h"
 #include "grammar-parser.h"
 #include "whisper_params.h"   // struct whisper_params (shared with crispasr_*)
-#include "crispasr_backend.h" // crispasr_run_backend() dispatch entry point
-#include "crispasr_output.h"  // crispasr_make_disp_segments — split-on-punct (#29)
-#include "crispasr_server.h"  // crispasr_run_server()
-#include "crispasr_vad_cli.h" // crispasr_resolve_vad_model — auto-DL silero (#33)
+#include "crispasr_backend.h"     // crispasr_run_backend() dispatch entry point
+#include "crispasr_diagnostics.h" // --version / --diagnostics + verbose banner (#31)
+#include "crispasr_output.h"      // crispasr_make_disp_segments — split-on-punct (#29)
+#include "crispasr_server.h"      // crispasr_run_server()
+#include "crispasr_vad_cli.h"     // crispasr_resolve_vad_model — auto-DL silero (#33)
 
 #include <cmath>
 #include <algorithm>
@@ -159,6 +160,23 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
 
         if (arg == "-h" || arg == "--help") {
             whisper_print_usage(argc, argv, params);
+            exit(0);
+        }
+
+        // --version: just the build info, machine-grep-friendly. Used in
+        // bug reports — the very first thing to ask for in #31-style
+        // tickets is `crispasr --version`.
+        if (arg == "--version") {
+            crispasr_print_build_info(stdout);
+            exit(0);
+        }
+
+        // --diagnostics: full dump (build info + runtime env + ggml device
+        // enumeration). Triggers ggml_backend_load_all() so any CUDA
+        // bring-up failure is logged through GGML_LOG_ERROR before we
+        // exit, which gives users a complete capture for issue reports.
+        if (arg == "--diagnostics" || arg == "--diag") {
+            crispasr_print_full_diagnostics(stderr);
             exit(0);
         }
 #define ARGV_NEXT (((i + 1) < argc) ? argv[++i] : requires_value_error(arg))
@@ -430,6 +448,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
     fprintf(stderr, "\n");
     fprintf(stderr, "options:\n");
     fprintf(stderr, "  -h,        --help                 [default] show this help message and exit\n");
+    fprintf(stderr, "             --version              print build info (version, git SHA, backends) and exit\n");
+    fprintf(stderr, "             --diagnostics          full diagnostics (build + env + GPU enumeration) and exit\n");
     fprintf(stderr, "  -t N,      --threads N            [%-7d] number of threads to use during computation\n",
             params.n_threads);
     fprintf(stderr, "  -p N,      --processors N         [%-7d] number of processors to use during computation\n",
@@ -1347,6 +1367,21 @@ int main(int argc, char** argv) {
     if (whisper_params_parse(argc, argv, params) == false) {
         whisper_print_usage(argc, argv, params);
         return 1;
+    }
+
+    // Always emit a one-line banner unless --no-prints. Cheap insurance:
+    // any user log starts with the exact build identifier, so triage
+    // doesn't have to ask "which tag did you pull?" (#31).
+    if (!params.no_prints) {
+        crispasr_print_short_banner(stderr);
+    }
+
+    // --verbose: dump the full build info + env + device list before we
+    // touch the model. The CUDA enumeration in crispasr_print_devices()
+    // logs through GGML_LOG_ERROR on driver/runtime mismatch, so users
+    // hitting #31 get a complete capture in the same log block.
+    if (params.verbose) {
+        crispasr_print_full_diagnostics(stderr);
     }
 
     if (params.use_gpu && params.gpu_backend != "cpu") {

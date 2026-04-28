@@ -94,3 +94,10 @@ jobs:
           platforms: ${{ matrix.config.platform }}
           tags: ${{ steps.tags.outputs.tags }}
           file: ${{ matrix.config.dockerfile }}
+          # Surface SHA + ref + build date to the image so users hitting
+          # GPU-init failures can answer "which build am I on?" via
+          # `docker run --rm <image> crispasr --version` (#31).
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            GIT_REF=${{ github.ref_name }}
+            BUILD_DATE=${{ github.event.repository.updated_at }}
