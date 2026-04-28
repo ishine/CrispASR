@@ -221,7 +221,7 @@ collection: [Qwen/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS),
   with a 16-codebook output head. No DiT; direct AR generation of
   RVQ codes. ~97ms end-to-end latency, 10 languages incl.
   en/de/zh/ja/ko/it.
-- **Status (April 2026):** **talker forward live + diff harness wired**.
+- **Status (April 2026):** **talker + ICL prefill + code_predictor live; intelligible synthesis verified (codec via Python)**.
   - Converter (`models/convert-qwen3-tts-to-gguf.py`) maps the
     actual HF tensor namespace (`talker.model.codec_embedding` →
     `talker.token_embd`, `talker.codec_head` → `talker.output`,
@@ -243,25 +243,78 @@ collection: [Qwen/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS),
     text_embedding + resize-MLP path on the "Hello world." prompt.
   - Debug knobs: `QWEN3_TTS_{BENCH,DEBUG,DUMP_DIR}` env vars in the
     style of `GEMMA4_E2B_BENCH` / `OMNIASR_DUMP_DIR`.
+  - **Verified milestones (in landed order):**
+    1. ✓ Talker forward (28L Qwen3 + Q/K-norm + flash-attn + F16 KV
+       cache). `talker_logits` PASS at cos_min=1.000000 against
+       PyTorch when fed the same prefill (commit `2b85b78`).
+    2. ✓ ICL prefill builder. Independent C++ implementation of
+       `Qwen3TTSForConditionalGeneration.generate_icl_prompt` —
+       chat-template prompt + codec sentinels + speaker_embed (from
+       voice pack) + per-frame summed 16-codebook ref_code embeddings
+       + tts_pad/bos/eos splice. `talker_logits_via_icl` PASS at
+       cos_min=1.000000 (commit `b939d4f`).
+    3. ✓ Code predictor (5L Qwen3, 15 separate codec_embedding +
+       lm_head pairs, top-k=50 + temperature=0.9 sampling). Greedy
+       was a silent-output trap; sampling matches the reference
+       `subtalker_dosample=True` default (commit `9608202`,
+       `69c135c`).
+    4. ✓ Roundtrip: TTS-out → ASR-in. Our pipeline synthesises
+       "The quick brown fox jumps over the lazy dog." → 55 frames
+       × 16 codebooks → Python codec decode → 4.4s audio →
+       parakeet ASR transcribes back verbatim.
   - **Open** (in priority order):
-    1. **ICL prefill splice.** Base model fundamentally requires a
-       voice prompt: `<|im_start|>assistant\n<ref_text><|im_end|>\n
-       <|im_start|>assistant\n<text><|im_end|>\n<|im_start|>assistant\n`,
-       interleaved with codec sentinels (codec_think/nothink/language,
-       codec_pad, codec_bos) and the speaker embedding. The current
-       `build_prompt_ids` tokenises text-only and never hits codec_eos
-       for this reason — see `ref/Qwen3-TTS/qwen_tts/core/models/
-       modeling_qwen3_tts.py::generate_icl_prompt`.
-    2. **Speaker encoder forward.** ECAPA-style TDNN + Res2Net + ASP
-       chain, weights loaded but no graph. Needed for (1).
-    3. **Code-predictor AR loop.** 5-layer Qwen3, 15 separate
-       codec_embedding + lm_head pairs to fill codebooks 1..15 each
-       step. Same `core_attn::kv_self_attn` infrastructure.
-    4. **Codec decoder.** 8L sliding-window transformer + 1D-conv
-       up-sample stack to 24 kHz waveform (separate
-       `Qwen3-TTS-Tokenizer-12Hz` repo). RVQ multi-codebook lookup.
-       Shared with MiMo (#51) — pull into `core/audio_decoder.h`
-       (#53) on the way through.
+    1. **Codec decoder** (Tokenizer-12Hz). The remaining "codes →
+       24 kHz waveform" step. Architecture:
+       - `quantizer`: SplitResidualVectorQuantizer
+         - rvq_first (1 semantic codebook): codes[:, 0] →
+           input_proj(1024→512) → codebook_lookup (2048×256) →
+           output_proj(256→512) projection.
+         - rvq_rest (15 acoustic codebooks): codes[:, 1..15] →
+           same shape per layer, summed (residual VQ).
+         - Combined: hidden = rvq_first.decode + rvq_rest.decode →
+           (B, 1024, T_codec).
+       - `pre_conv`: CausalConvNet(1024 → 1024, k=3).
+       - `pre_transformer`: 8L sliding-window (window=72) transformer
+         with hidden 1024, 16 heads, head_dim 64, ff 3072, RMS-norm,
+         RoPE theta 10000, LayerScale.
+         - `input_proj`: Linear(1024 → 1024).
+         - `output_proj`: Linear(1024 → 1024).
+       - `upsample` (×2 of `upsampling_ratios=(2, 2)`):
+         - CausalTransConvNet(1024, 1024, k=2, stride=2) — 2×
+           temporal upsample.
+         - ConvNeXtBlock(1024): dwconv(k=7,groups=1024) + LN +
+           pwconv1(1024→4096) + GELU + pwconv2(4096→1024) + LayerScale.
+       - `decoder` (final stack):
+         - CausalConvNet(1024 → 1536, k=7).
+         - 4 DecoderBlocks for `upsample_rates=(8, 5, 4, 3)` —
+           each: SnakeBeta(in_dim) → CausalTransConvNet(in_dim,
+           out_dim, 2*r, r) → 3 ResidualUnits with dilations (1,3,9),
+           each ResidualUnit = SnakeBeta+conv1(k=7,d) +
+           SnakeBeta+conv2(k=1) + residual.
+         - Final SnakeBeta(96) + CausalConvNet(96 → 1, k=7).
+       - Total upsample = 2*2 * 8*5*4*3 = 1920 → matches
+         24000 / 12.5 = 1920 (12.5 fps codec → 24 kHz audio).
+       - Activations: SnakeBeta(x) = x + (1/exp(beta)) * sin²(x*exp(alpha)).
+       - All convs are causal (left-pad to absorb stride/dilation).
+       - Estimated effort: ~500 LOC C++ (mostly conv1d / conv1d_transpose
+         + helpers for ConvNeXt blocks + SnakeBeta), plus diff-harness
+         instrumentation per stage.
+    2. **Runtime ECAPA speaker_encoder forward.** Removes the
+       `bake-qwen3-tts-voice-pack.py` dependency for new voices —
+       end users pass any ref WAV and we compute spk_embedding in
+       C++. ~250 LOC: mel(24kHz) → TDNN → 3 SE-Res2Net → MFA →
+       ASP → Conv1×1 → 1024-d. Reference: `Qwen3TTSSpeakerEncoder`
+       in `ref/Qwen3-TTS/qwen_tts/core/models/modeling_qwen3_tts.py`.
+    3. **Runtime codec encoder forward.** Mimi-based encoder (used
+       in voice cloning to extract `ref_code` from the reference
+       WAV). Closes the loop on the bake script — pure C++ pipeline.
+       Larger effort (Mimi is its own architecture).
+    4. **Performance pass.** Current AR step is ~137 ms/frame on
+       M1 Metal — 1.7× slower than real-time at 12.5 fps. Bottleneck
+       is the 15 sequential code_predictor graph builds per frame.
+       Fuse them into a single graph with all 15 lm_heads and KV
+       writes baked in. Also: fused QKV in talker (qwen3_asr has
+       this; qwen3_tts could too), Q4_K weights (1.83 GB → 480 MB).
 - **Reuse:** the talker is essentially Qwen3-0.6B/1.7B with a
   multi-codebook output head — `core_attn::kv_self_attn` +
   `core_ffn::swiglu` again. The codec needs new code for RVQ
