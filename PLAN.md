@@ -221,20 +221,47 @@ collection: [Qwen/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS),
   with a 16-codebook output head. No DiT; direct AR generation of
   RVQ codes. ~97ms end-to-end latency, 10 languages incl.
   en/de/zh/ja/ko/it.
-- **Status (April 2026):** **scaffold only**.
-  - Both converters scaffolded
-    (`models/convert-qwen3-tts-to-gguf.py`,
-    `models/convert-qwen3-tts-tokenizer-to-gguf.py`) — they read every
-    hparam from the HF config.json and warn loudly on unmapped tensors.
-  - Runtime: `src/qwen3_tts.{h,cpp}` (284 LOC) — loads the GGUF, but
-    `qwen3_tts_synthesise` returns nullptr with `"qwen3_tts: synthesise
-    called but talker/codec forward not implemented"`. No actual
-    inference yet.
-  - Open: talker forward (Qwen3 LM with 16-codebook output head),
-    codec forward (RVQ encoder/decoder), model registry entry, CLI
-    hook, reference dump for diff-testing. None done.
-  - Recommend after #51 (MiMo) since both share RVQ codec runtime
-    work — see #53 for the proposed `core/audio_decoder.h` extraction.
+- **Status (April 2026):** **talker forward live + diff harness wired**.
+  - Converter (`models/convert-qwen3-tts-to-gguf.py`) maps the
+    actual HF tensor namespace (`talker.model.codec_embedding` →
+    `talker.token_embd`, `talker.codec_head` → `talker.output`,
+    `talker.text_projection.linear_fc{1,2}` → `talker.text_proj.fc{1,2}`,
+    speaker_encoder + 15-CB code-predictor likewise). Writes BPE
+    merges so subword tokenisation works. **Verified** end-to-end:
+    478 tensors, 0 unmapped, `qwen3-tts-0.6b-base.gguf` loads.
+  - Runtime: 28L Qwen3 talker forward via `core_attn::kv_self_attn`
+    + `core_ffn::swiglu` (single-axis NEOX RoPE — text-only collapse,
+    swap to `ggml_rope_multi` once codec splice lands). F16 KV cache.
+    `qwen3_tts_synthesize_codes(text)` AR-decodes codebook-0 from
+    `codec_head`. Empirically produces 923 codes for "Hello, this
+    is a test." on Metal.
+  - Diff harness wired: `tools/reference_backends/qwen3_tts.py`
+    drives the qwen-tts pip package on CPU and dumps stage tensors
+    to a GGUF archive. `crispasr-diff qwen3-tts` reads `text_input_ids`
+    from the archive and runs `qwen3_tts_run_text_proj` against
+    `text_proj_out` → **PASS at cos_min=1.000000** for the
+    text_embedding + resize-MLP path on the "Hello world." prompt.
+  - Debug knobs: `QWEN3_TTS_{BENCH,DEBUG,DUMP_DIR}` env vars in the
+    style of `GEMMA4_E2B_BENCH` / `OMNIASR_DUMP_DIR`.
+  - **Open** (in priority order):
+    1. **ICL prefill splice.** Base model fundamentally requires a
+       voice prompt: `<|im_start|>assistant\n<ref_text><|im_end|>\n
+       <|im_start|>assistant\n<text><|im_end|>\n<|im_start|>assistant\n`,
+       interleaved with codec sentinels (codec_think/nothink/language,
+       codec_pad, codec_bos) and the speaker embedding. The current
+       `build_prompt_ids` tokenises text-only and never hits codec_eos
+       for this reason — see `ref/Qwen3-TTS/qwen_tts/core/models/
+       modeling_qwen3_tts.py::generate_icl_prompt`.
+    2. **Speaker encoder forward.** ECAPA-style TDNN + Res2Net + ASP
+       chain, weights loaded but no graph. Needed for (1).
+    3. **Code-predictor AR loop.** 5-layer Qwen3, 15 separate
+       codec_embedding + lm_head pairs to fill codebooks 1..15 each
+       step. Same `core_attn::kv_self_attn` infrastructure.
+    4. **Codec decoder.** 8L sliding-window transformer + 1D-conv
+       up-sample stack to 24 kHz waveform (separate
+       `Qwen3-TTS-Tokenizer-12Hz` repo). RVQ multi-codebook lookup.
+       Shared with MiMo (#51) — pull into `core/audio_decoder.h`
+       (#53) on the way through.
 - **Reuse:** the talker is essentially Qwen3-0.6B/1.7B with a
   multi-codebook output head — `core_attn::kv_self_attn` +
   `core_ffn::swiglu` again. The codec needs new code for RVQ
