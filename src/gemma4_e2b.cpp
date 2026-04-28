@@ -49,14 +49,22 @@ struct g4e_llm_hp {
     uint32_t num_layers = 35;
     uint32_t num_heads = 8;
     uint32_t num_kv_heads = 1;
-    uint32_t head_dim = 256;
-    uint32_t intermediate_size = 6144; // layers 0-14; layers 15+ use 12288
+    uint32_t head_dim = 256;          // sliding-attention layers
+    uint32_t global_head_dim = 512;   // full-attention layers
+    uint32_t intermediate_size = 6144;
     uint32_t vocab_size = 262144;
     uint32_t max_position_embeddings = 131072;
     uint32_t sliding_window = 512;
-    float rope_theta = 10000.0f;
+    uint32_t num_kv_shared_layers = 0; // first N layers reuse later K/V
+    float rope_theta = 10000.0f;       // sliding layers
+    float rope_theta_full = 1000000.0f; // full layers (partial-rotary)
+    float partial_rotary_factor = 0.25f;
     float final_logit_softcapping = 30.0f;
     float rms_norm_eps = 1e-6f;
+    bool use_double_wide_mlp = false;
+    bool attention_k_eq_v = false;
+    // 1 = full attention, 0 = sliding. Indexed by layer; size = num_layers.
+    std::vector<int32_t> layer_full_mask;
 };
 
 // ── Model tensors ───────────────────────────────────────────────────────────
@@ -173,10 +181,21 @@ struct gemma4_e2b_context {
     std::string model_path;
     std::vector<uint8_t> compute_meta; // scratch for graph building
 
-    // KV cache for LLM decode
+    // KV cache for LLM decode.
+    //
+    // Gemma4 alternates sliding-window (head_dim=256) and full-attention
+    // (head_dim=global_head_dim, e.g. 512) layers, so they need separate
+    // KV cache buffers — one ggml tensor can't hold rows of two different
+    // widths along its inner axis. `kv_k` / `kv_v` are the LOCAL (sliding)
+    // cache; `kv_k_full` / `kv_v_full` are the GLOBAL (full-attention)
+    // cache. Both store all `num_layers` slots so layer-index lookups
+    // stay simple — only the slots whose `layer_full_mask` matches that
+    // cache are written/read.
     ggml_context* kv_ctx = nullptr;
-    ggml_tensor* kv_k = nullptr;
+    ggml_tensor* kv_k = nullptr;       // local (sliding) layers
     ggml_tensor* kv_v = nullptr;
+    ggml_tensor* kv_k_full = nullptr;  // full-attention layers
+    ggml_tensor* kv_v_full = nullptr;
     ggml_backend_buffer_t kv_buf = nullptr;
     int kv_max_ctx = 0;
 
@@ -363,19 +382,35 @@ static bool g4e_kv_init(gemma4_e2b_context* ctx, int max_ctx) {
 
     const auto& lhp = ctx->model.llm_hp;
     const int hd = (int)lhp.head_dim;
+    const int hd_full = (int)lhp.global_head_dim;
     const int n_kv = (int)lhp.num_kv_heads;
     const int n_lay = (int)lhp.num_layers;
 
-    ggml_init_params kp = {ggml_tensor_overhead() * 4 + 1024, nullptr, true};
+    // Are there any full-attention layers in this model? If layer_full_mask
+    // is all-zeros (older GGUF, or a model without the alternation) we skip
+    // the second buffer entirely.
+    bool has_full = false;
+    for (int v : lhp.layer_full_mask)
+        if (v) { has_full = true; break; }
+
+    ggml_init_params kp = {ggml_tensor_overhead() * 8 + 1024, nullptr, true};
     ctx->kv_ctx = ggml_init(kp);
     ctx->kv_k = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd, max_ctx, n_kv, n_lay);
     ctx->kv_v = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd, max_ctx, n_kv, n_lay);
     ggml_set_name(ctx->kv_k, "kv_k");
     ggml_set_name(ctx->kv_v, "kv_v");
+    if (has_full && hd_full != hd) {
+        ctx->kv_k_full = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd_full, max_ctx, n_kv, n_lay);
+        ctx->kv_v_full = ggml_new_tensor_4d(ctx->kv_ctx, GGML_TYPE_F16, hd_full, max_ctx, n_kv, n_lay);
+        ggml_set_name(ctx->kv_k_full, "kv_k_full");
+        ggml_set_name(ctx->kv_v_full, "kv_v_full");
+    }
 
-    const size_t kbytes = ggml_nbytes(ctx->kv_k);
-    const size_t vbytes = ggml_nbytes(ctx->kv_v);
-    ctx->kv_buf = ggml_backend_alloc_buffer(ctx->backend, kbytes + vbytes);
+    size_t kbytes = ggml_nbytes(ctx->kv_k);
+    size_t vbytes = ggml_nbytes(ctx->kv_v);
+    size_t kfbytes = ctx->kv_k_full ? ggml_nbytes(ctx->kv_k_full) : 0;
+    size_t vfbytes = ctx->kv_v_full ? ggml_nbytes(ctx->kv_v_full) : 0;
+    ctx->kv_buf = ggml_backend_alloc_buffer(ctx->backend, kbytes + vbytes + kfbytes + vfbytes);
     if (!ctx->kv_buf) {
         fprintf(stderr, "gemma4_e2b: failed to alloc kv buffer\n");
         return false;
@@ -383,6 +418,10 @@ static bool g4e_kv_init(gemma4_e2b_context* ctx, int max_ctx) {
     char* base = (char*)ggml_backend_buffer_get_base(ctx->kv_buf);
     ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k, base);
     ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v, base + kbytes);
+    if (ctx->kv_k_full)
+        ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_k_full, base + kbytes + vbytes);
+    if (ctx->kv_v_full)
+        ggml_backend_tensor_alloc(ctx->kv_buf, ctx->kv_v_full, base + kbytes + vbytes + kfbytes);
     ctx->kv_max_ctx = max_ctx;
 
     if (ctx->verbosity >= 1)
@@ -497,7 +536,22 @@ static ggml_cgraph* g4e_build_graph_llm_kv(gemma4_e2b_context* ctx, int n_past, 
         ple_all = ggml_get_rows(ctx0, m.llm_ple_w, ple_ids);
     }
 
-    const core_attn::KvSelfAttnParams kvp = {
+    // Build attention params for both layer types up front. Sliding
+    // (local) layers use head_dim with the regular RoPE theta. Full
+    // (global) layers use global_head_dim with rope_theta_full and
+    // partial-rotary RoPE — only the first `partial_rotary_factor`
+    // fraction of the head dimension is rotated.
+    const int hd_full = (int)lhp.global_head_dim;
+    const float attn_scale_full = 1.0f / std::sqrt((float)hd_full);
+    // TODO(PLAN #50): full-attention layers should rotate only the first
+    // `lhp.partial_rotary_factor * hd_full` dims (25%), but the shared
+    // core_attn::kv_self_attn helper rotates the whole head_dim. Adding
+    // a `n_rot` field to KvSelfAttnParams is a follow-up; for now full
+    // layers run with full-dim RoPE which is mathematically wrong but
+    // matches what the tensors line up with at the mul_mat level.
+    (void)lhp.partial_rotary_factor;
+
+    const core_attn::KvSelfAttnParams kvp_local = {
         /*n_heads*/ n_q,
         /*n_kv_heads*/ n_kv,
         /*head_dim*/ hd,
@@ -510,9 +564,30 @@ static ggml_cgraph* g4e_build_graph_llm_kv(gemma4_e2b_context* ctx, int n_past, 
         /*qk_norm_eps*/ eps,
         /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
     };
+    const core_attn::KvSelfAttnParams kvp_full = {
+        /*n_heads*/ n_q,
+        /*n_kv_heads*/ n_kv,
+        /*head_dim*/ hd_full,
+        /*n_kv_grp*/ n_kv_grp,
+        /*n_ctx_orig*/ (int)lhp.max_position_embeddings,
+        /*rope_theta*/ lhp.rope_theta_full,
+        /*rope_beta_fast*/ 32.0f,
+        /*rope_beta_slow*/ 1.0f,
+        /*attn_scale*/ attn_scale_full,
+        /*qk_norm_eps*/ eps,
+        /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
+    };
+
+    auto is_full_layer = [&](uint32_t il) -> bool {
+        return il < lhp.layer_full_mask.size() && lhp.layer_full_mask[il];
+    };
 
     for (uint32_t il = 0; il < lhp.num_layers; il++) {
         const auto& b = m.llm_layers[il];
+        const bool full = is_full_layer(il);
+        const auto& kvp = full ? kvp_full : kvp_local;
+        ggml_tensor* kv_k_for_layer = (full && ctx->kv_k_full) ? ctx->kv_k_full : ctx->kv_k;
+        ggml_tensor* kv_v_for_layer = (full && ctx->kv_v_full) ? ctx->kv_v_full : ctx->kv_v;
 
         // ── PLE (per-layer embedding adjustment) ──
         // Gemma4 flow (per transformers/models/gemma4/modeling_gemma4.py):
@@ -523,13 +598,6 @@ static ggml_cgraph* g4e_build_graph_llm_kv(gemma4_e2b_context* ctx, int n_past, 
         //
         // ple_gate.weight  PyTorch (256, 1536)  → ggml ne[0]=1536, ne[1]=256.  Linear(1536→256).
         // ple_proj.weight  PyTorch (1536, 256)  → ggml ne[0]=256, ne[1]=1536.  Linear(256→1536).
-        //
-        // PLAN #50 — the attention block below still trips
-        // ggml_can_mul_mat on full-attention layers (head_dim=512)
-        // because `kvp` is built once with the local head_dim=256.
-        // Fix is to read `layer_full_mask` from the GGUF and rebuild
-        // kvp per layer (sliding=256, full=global_head_dim=512), with
-        // matching RoPE theta + partial_rotary_factor.
         if (ple_all && b.ple_gate && b.ple_proj) {
             // Slice this layer's PLE: [ple_dim, T] from [n_layers*ple_dim, T]
             ggml_tensor* ple_slice = ggml_view_2d(ctx0, ple_all, ple_dim, T, ple_all->nb[1],
@@ -555,7 +623,8 @@ static ggml_cgraph* g4e_build_graph_llm_kv(gemma4_e2b_context* ctx, int n_past, 
 
         ggml_tensor* attn =
             core_attn::kv_self_attn(ctx0, gf, x, b.q_proj, b.k_proj, b.v_proj, b.o_proj, b.q_norm, b.k_norm, positions,
-                                    (T == 1) ? nullptr : causal_mask, ctx->kv_k, ctx->kv_v, (int)il, n_past, kvp);
+                                    (T == 1) ? nullptr : causal_mask, kv_k_for_layer, kv_v_for_layer,
+                                    (int)il, n_past, kvp);
 
         // Post-attention norm
         if (b.post_attn_norm) {
@@ -743,6 +812,10 @@ static float g4e_gguf_f32(gguf_context* ctx, const char* key, float def = 0.0f) 
     int64_t id = gguf_find_key(ctx, key);
     return id >= 0 ? gguf_get_val_f32(ctx, id) : def;
 }
+static bool g4e_gguf_bool(gguf_context* ctx, const char* key, bool def = false) {
+    int64_t id = gguf_find_key(ctx, key);
+    return id >= 0 ? gguf_get_val_bool(ctx, id) : def;
+}
 
 extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path_model,
                                                                 struct gemma4_e2b_context_params params) {
@@ -779,13 +852,36 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
     lhp.num_heads = g4e_gguf_u32(gctx, "gemma4e2b.llm.num_heads", 8);
     lhp.num_kv_heads = g4e_gguf_u32(gctx, "gemma4e2b.llm.num_kv_heads", 1);
     lhp.head_dim = g4e_gguf_u32(gctx, "gemma4e2b.llm.head_dim", 256);
+    lhp.global_head_dim = g4e_gguf_u32(gctx, "gemma4e2b.llm.global_head_dim", lhp.head_dim);
     lhp.intermediate_size = g4e_gguf_u32(gctx, "gemma4e2b.llm.intermediate_size", 6144);
     lhp.vocab_size = g4e_gguf_u32(gctx, "gemma4e2b.llm.vocab_size", 262144);
     lhp.max_position_embeddings = g4e_gguf_u32(gctx, "gemma4e2b.llm.max_position_embeddings", 131072);
     lhp.sliding_window = g4e_gguf_u32(gctx, "gemma4e2b.llm.sliding_window", 512);
+    lhp.num_kv_shared_layers = g4e_gguf_u32(gctx, "gemma4e2b.llm.num_kv_shared_layers", 0);
     lhp.rope_theta = g4e_gguf_f32(gctx, "gemma4e2b.llm.rope_theta", 10000.0f);
+    lhp.rope_theta_full = g4e_gguf_f32(gctx, "gemma4e2b.llm.rope_theta_full", 1000000.0f);
+    lhp.partial_rotary_factor = g4e_gguf_f32(gctx, "gemma4e2b.llm.partial_rotary_factor", 0.25f);
     lhp.final_logit_softcapping = g4e_gguf_f32(gctx, "gemma4e2b.llm.final_logit_softcapping", 30.0f);
     lhp.rms_norm_eps = g4e_gguf_f32(gctx, "gemma4e2b.llm.rms_norm_eps", 1e-6f);
+    lhp.use_double_wide_mlp = g4e_gguf_bool(gctx, "gemma4e2b.llm.use_double_wide_mlp", false);
+    lhp.attention_k_eq_v = g4e_gguf_bool(gctx, "gemma4e2b.llm.attention_k_eq_v", false);
+
+    // Per-layer attention type mask: 1 = full, 0 = sliding. New
+    // converter persists this directly. Older GGUFs (pre-2026-04-28
+    // converter) didn't, in which case we infer it from tensor shapes
+    // after the weights load.
+    {
+        const int mask_key = gguf_find_key(gctx, "gemma4e2b.llm.layer_full_mask");
+        const int n_layers = (int)lhp.num_layers;
+        lhp.layer_full_mask.assign(n_layers, 0);
+        if (mask_key >= 0) {
+            const int n_arr = gguf_get_arr_n(gctx, mask_key);
+            const auto* arr_data = (const int32_t*)gguf_get_arr_data(gctx, mask_key);
+            const int n_take = std::min(n_arr, n_layers);
+            for (int i = 0; i < n_take; i++)
+                lhp.layer_full_mask[i] = arr_data[i] ? 1 : 0;
+        }
+    }
 
     // Read tokenizer from GGUF
     int tok_key = gguf_find_key(gctx, "tokenizer.ggml.tokens");
@@ -906,10 +1002,13 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
             return get(buf);
         };
         L.attn_norm = g("attn_norm.weight");
-        L.q_proj = g("attn.q_proj.weight");
-        L.k_proj = g("attn.k_proj.weight");
-        L.v_proj = g("attn.v_proj.weight");
-        L.o_proj = g("attn.o_proj.weight");
+        // Converter renames: q_proj/k_proj/v_proj → q/k/v; o_proj is
+        // kept as o_proj. Try the short names first; fall back to the
+        // long *_proj names if a future converter reverses the rename.
+        L.q_proj = g("attn.q.weight"); if (!L.q_proj) L.q_proj = g("attn.q_proj.weight");
+        L.k_proj = g("attn.k.weight"); if (!L.k_proj) L.k_proj = g("attn.k_proj.weight");
+        L.v_proj = g("attn.v.weight"); if (!L.v_proj) L.v_proj = g("attn.v_proj.weight");
+        L.o_proj = g("attn.o_proj.weight"); if (!L.o_proj) L.o_proj = g("attn.o.weight");
         L.q_norm = g("attn.q_norm.weight");
         L.k_norm = g("attn.k_norm.weight");
         L.post_attn_norm = g("post_attn_norm.weight");
@@ -922,6 +1021,50 @@ extern "C" struct gemma4_e2b_context* gemma4_e2b_init_from_file(const char* path
         L.ple_proj = g("ple_proj.weight");
         L.post_ple_norm = g("post_ple_norm.weight");
         L.layer_scalar = g("layer_scalar");
+    }
+
+    // Infer layer_full_mask + global_head_dim from tensor shapes when
+    // the GGUF didn't persist them. Older converters wrote neither;
+    // the runtime can recover both from q.weight->ne[1] (which equals
+    // n_heads * head_dim_for_this_layer). Uniform shape across layers
+    // means the model only has one attention type → leave mask all-0.
+    {
+        int from_metadata = 0;
+        for (int v : lhp.layer_full_mask) from_metadata += v;
+        if (from_metadata == 0) {
+            // Discover per-layer q.ne[1] values.
+            int min_cols = INT32_MAX, max_cols = 0;
+            for (uint32_t il = 0; il < lhp.num_layers; il++) {
+                ggml_tensor* q = m.llm_layers[il].q_proj;
+                if (!q) continue;
+                int cols = (int)q->ne[1];
+                if (cols < min_cols) min_cols = cols;
+                if (cols > max_cols) max_cols = cols;
+            }
+            if (min_cols != INT32_MAX && max_cols > min_cols) {
+                // Two distinct sizes — the bigger one is full attention.
+                const uint32_t inferred_local_hd  = (uint32_t)(min_cols / lhp.num_heads);
+                const uint32_t inferred_global_hd = (uint32_t)(max_cols / lhp.num_heads);
+                if (lhp.global_head_dim == lhp.head_dim) {
+                    // Metadata only had a single head_dim; trust shapes.
+                    lhp.head_dim = inferred_local_hd;
+                    lhp.global_head_dim = inferred_global_hd;
+                }
+                int n_full = 0;
+                for (uint32_t il = 0; il < lhp.num_layers; il++) {
+                    ggml_tensor* q = m.llm_layers[il].q_proj;
+                    if (!q) continue;
+                    if ((int)q->ne[1] == max_cols) {
+                        lhp.layer_full_mask[il] = 1;
+                        n_full++;
+                    }
+                }
+                fprintf(stderr,
+                        "gemma4_e2b: inferred layer_full_mask: %d full / %u total "
+                        "(local head_dim=%u, full head_dim=%u)\n",
+                        n_full, lhp.num_layers, lhp.head_dim, lhp.global_head_dim);
+            }
+        }
     }
 
     // Setup scheduler for GPU-accelerated encoder/LLM
