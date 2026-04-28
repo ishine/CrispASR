@@ -2098,7 +2098,7 @@ extern "C" char* gemma4_e2b_transcribe(struct gemma4_e2b_context* ctx, const flo
     // ── Step 7: Greedy decode ───────────────────────────────────────────
     core_greedy_decode::Config cfg;
     cfg.max_new_tokens = 256;
-    cfg.eos_id = ctx->eos_id;
+    cfg.eos_id = ctx->end_of_turn_id >= 0 ? ctx->end_of_turn_id : ctx->eos_id;
     cfg.vocab_size = vocab;
     cfg.temperature = ctx->temperature;
 
