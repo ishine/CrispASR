@@ -15,7 +15,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 
 | Priority | Item | Effort | Status |
 |---|---|---|---|
-| **MEDIUM** | [#54 NeMo-cluster encoder cos](#54-nemo-cluster-encoder-cosine-divergence-parakeet-post-mel-fix) | Medium-Large | mel fix landed; encoder still cos~0.8 |
+| **DONE** | [#54 NeMo-cluster encoder cos](#54-nemo-cluster-encoder-cosine-divergence-parakeet-post-mel-fix) | Medium-Large | bias-load fix: cos_mean 0.79 → 0.996 |
 | **MEDIUM** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet/cohere DONE; canary remaining |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
 | **LOW** | ~~#40b Moonshine streaming~~ | ~~High~~ | **DONE** (3 sizes) |
@@ -264,42 +264,14 @@ collection: [Qwen/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS),
        × 16 codebooks → Python codec decode → 4.4s audio →
        parakeet ASR transcribes back verbatim.
   - **Open** (in priority order):
-    1. **Codec decoder** (Tokenizer-12Hz). The remaining "codes →
-       24 kHz waveform" step. Architecture:
-       - `quantizer`: SplitResidualVectorQuantizer
-         - rvq_first (1 semantic codebook): codes[:, 0] →
-           input_proj(1024→512) → codebook_lookup (2048×256) →
-           output_proj(256→512) projection.
-         - rvq_rest (15 acoustic codebooks): codes[:, 1..15] →
-           same shape per layer, summed (residual VQ).
-         - Combined: hidden = rvq_first.decode + rvq_rest.decode →
-           (B, 1024, T_codec).
-       - `pre_conv`: CausalConvNet(1024 → 1024, k=3).
-       - `pre_transformer`: 8L sliding-window (window=72) transformer
-         with hidden 1024, 16 heads, head_dim 64, ff 3072, RMS-norm,
-         RoPE theta 10000, LayerScale.
-         - `input_proj`: Linear(1024 → 1024).
-         - `output_proj`: Linear(1024 → 1024).
-       - `upsample` (×2 of `upsampling_ratios=(2, 2)`):
-         - CausalTransConvNet(1024, 1024, k=2, stride=2) — 2×
-           temporal upsample.
-         - ConvNeXtBlock(1024): dwconv(k=7,groups=1024) + LN +
-           pwconv1(1024→4096) + GELU + pwconv2(4096→1024) + LayerScale.
-       - `decoder` (final stack):
-         - CausalConvNet(1024 → 1536, k=7).
-         - 4 DecoderBlocks for `upsample_rates=(8, 5, 4, 3)` —
-           each: SnakeBeta(in_dim) → CausalTransConvNet(in_dim,
-           out_dim, 2*r, r) → 3 ResidualUnits with dilations (1,3,9),
-           each ResidualUnit = SnakeBeta+conv1(k=7,d) +
-           SnakeBeta+conv2(k=1) + residual.
-         - Final SnakeBeta(96) + CausalConvNet(96 → 1, k=7).
-       - Total upsample = 2*2 * 8*5*4*3 = 1920 → matches
-         24000 / 12.5 = 1920 (12.5 fps codec → 24 kHz audio).
-       - Activations: SnakeBeta(x) = x + (1/exp(beta)) * sin²(x*exp(alpha)).
-       - All convs are causal (left-pad to absorb stride/dilation).
-       - Estimated effort: ~500 LOC C++ (mostly conv1d / conv1d_transpose
-         + helpers for ConvNeXt blocks + SnakeBeta), plus diff-harness
-         instrumentation per stage.
+    1. ✓ **Codec decoder** (Tokenizer-12Hz, commit `d1f47b1`).
+       Converter rewritten (0 unmapped, 253 tensors, 0.25 GB F16 GGUF).
+       C++ decoder: SplitRVQ → pre_conv → 8L XFMR(512d, sliding-window=72)
+       → 2× ConvNeXt upsample → 4× SnakeBeta+tconv DecoderBlock → PCM.
+       CPU: T=5 frames → 9600 samples, all finite, range [-0.165,0.141].
+       Metal: GPU scheduler conflict with ggml_conv_1d_dw + SnakeBeta on
+       M1 (kIOGPUCommandBufferCallbackErrorImpactingInteractivity) — fix
+       separately; `use_gpu=false` for codec decode in the interim.
     2. **Runtime ECAPA speaker_encoder forward.** Removes the
        `bake-qwen3-tts-voice-pack.py` dependency for new voices —
        end users pass any ref WAV and we compute spk_embedding in
@@ -329,7 +301,47 @@ share enough that landing one substantially de-risks the other.
 
 ---
 
-## 54. NeMo-cluster encoder cosine divergence (parakeet, post-mel-fix)
+## 54. NeMo-cluster encoder cosine divergence — **DONE** (April 2026)
+
+Resolved by loading the per-layer bias tensors that the parakeet
+loader was previously skipping. After the fix:
+
+| sample | mel cos | enc cos before | enc cos after |
+|---|---|---|---|
+| reazon_meal_11s | 0.999 | 0.792 | **0.996** |
+| jsut 3.19s | 0.998 | 0.806 | (similar) |
+
+Per-layer diff confirmed the divergence started at `encoder_layer_0`
+(immediately after a bit-exact `pre_encode_output`), localising the
+bug inside the conformer block. The GGUF stored `attn.{q,k,v,out}.bias`
++ `{ff1,ff2}.linear{1,2}.bias` + `conv.{pw1,pw2}.bias` (10 biases per
+layer × 24 layers = 240 tensors), but `parakeet_load_weights` only
+loaded the weights — the bias slots stayed nullptr, and `mm_bias`
+silently skipped the bias add. The fix was 10 lines:
+`e.X_b = try_("…bias")` for each missing slot in `parakeet_load_weights`.
+
+`try_get()` rather than `require()` keeps the loader compatible with
+v3 (which has `use_bias=False` and stores no biases at all). v3 EN
+on JFK still passes regression. Documented in LEARNINGS.md.
+
+Residual issue (open follow-up, lower priority): on layers 17-22 the
+cos_mean stays high (~0.99) but cos_min crashes to negative values on
+specific frames — `encoder_layer_22` cos_min = -0.67. Indicates a
+small number of frames are catastrophically wrong while the bulk
+match. Suspects: rel_shift edge cases, specific position-encoding
+positions where numerical instability surfaces, or a buffer-aliasing
+issue in the dump path that masks an analogous issue in production.
+Not blocking the bug-report fix.
+
+The diagnostic infrastructure landed (per-layer captures in
+`reference_backends/parakeet.py`, `parakeet_run_encoder_dump` C-API,
+`encoder_output_ref_mel` + `encoder_layer_K` stages in the diff
+harness) is reusable for canary, canary_ctc, and any future
+NeMo-cluster runtime debug.
+
+---
+
+## 54-historical. NeMo-cluster encoder cosine divergence (original analysis)
 
 After the preemph + Bessel-corrected PerFeatureZ fix
 (`mel_spectrogram cos_mean = 0.999451` on reazon_meal_11s, up from
