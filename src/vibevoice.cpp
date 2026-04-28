@@ -1252,15 +1252,21 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         return best;
     };
 
+    // Qwen2.5 chat template's natural assistant-turn stop is <|im_end|> (IM_END).
+    // <|endoftext|> (EOS_TOKEN) is end-of-document, not end-of-turn — the model
+    // emits IM_END at the end of its response. Stopping only on EOS_TOKEN runs
+    // decode to max_gen for every call (cf. gemma4 same-bug LEARNINGS #9).
+    auto is_stop = [&](int tok) { return tok == IM_END || tok == EOS_TOKEN; };
+
     std::vector<int> output_tokens;
     int cur_token = argmax(logits);
-    if (cur_token != EOS_TOKEN)
+    if (!is_stop(cur_token))
         output_tokens.push_back(cur_token);
 
     if (ctx->params.verbosity >= 2)
         fprintf(stderr, "  prefill → token=%d\n", cur_token);
 
-    for (int step = 0; step < max_gen && cur_token != EOS_TOKEN; step++) {
+    for (int step = 0; step < max_gen && !is_stop(cur_token); step++) {
         const int32_t tid = cur_token;
         std::vector<float> tok_emb = run_token_embedding_lookup(ctx, &tid, 1);
         if (tok_emb.size() != (size_t)hp.d_lm)
@@ -1276,7 +1282,7 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
         }
 
         cur_token = argmax(logits);
-        if (cur_token == EOS_TOKEN)
+        if (is_stop(cur_token))
             break;
         output_tokens.push_back(cur_token);
 
