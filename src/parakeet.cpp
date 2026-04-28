@@ -93,6 +93,7 @@ struct parakeet_hparams {
     uint32_t subsampling_factor = 8;
     uint32_t subsampling_channels = 256;
     uint32_t conv_kernel = 9;
+    bool xscaling = true; // RelPositionalEncoding scales encoder input by sqrt(d_model)
     uint32_t pred_hidden = 640;
     uint32_t pred_layers = 2;
     uint32_t joint_hidden = 640;
@@ -240,6 +241,7 @@ static bool parakeet_load_model(parakeet_model& model, parakeet_vocab& vocab, co
         hp.subsampling_factor = core_gguf::kv_u32(gctx, "parakeet.subsampling_factor", hp.subsampling_factor);
         hp.subsampling_channels = core_gguf::kv_u32(gctx, "parakeet.subsampling_channels", hp.subsampling_channels);
         hp.conv_kernel = core_gguf::kv_u32(gctx, "parakeet.conv_kernel", hp.conv_kernel);
+        hp.xscaling = core_gguf::kv_bool(gctx, "parakeet.xscaling", hp.xscaling);
         hp.pred_hidden = core_gguf::kv_u32(gctx, "parakeet.pred_hidden", hp.pred_hidden);
         hp.pred_layers = core_gguf::kv_u32(gctx, "parakeet.pred_layers", hp.pred_layers);
         hp.joint_hidden = core_gguf::kv_u32(gctx, "parakeet.joint_hidden", hp.joint_hidden);
@@ -466,8 +468,9 @@ static std::vector<float> parakeet_compute_mel_impl(parakeet_context* ctx, const
     p.log_eps = (float)(1.0 / (1 << 24));
     p.center_pad = true;
 
-    return core_mel::compute(samples, n_samples, window_raw.data(), win, mel_fb.data(), n_freqs, parakeet_fft_r2c, p,
-                             T_out);
+    auto mel = core_mel::compute(samples, n_samples, window_raw.data(), win, mel_fb.data(), n_freqs, parakeet_fft_r2c, p,
+                                 T_out);
+    return mel;
 }
 
 // ===========================================================================
@@ -563,6 +566,17 @@ static ggml_cgraph* parakeet_build_graph_encoder(parakeet_context* ctx, int T_me
     // ----- Pre-encode (dw_striding subsampling 8×) -----
     int T = 0;
     ggml_tensor* cur = core_conformer::build_pre_encode(ctx0, mel, m.pre_encode, (int)hp.subsampling_channels, &T);
+
+    // ----- xscaling: NeMo's RelPositionalEncoding multiplies the encoder
+    // input by sqrt(d_model) before the conformer layers when the model's
+    // `encoder.xscaling: true` (default for parakeet-tdt-0.6b-v3 and -ja).
+    // Without it, every layer's input is 32× too small, the rel-pos
+    // sinusoid is the same scale, and the model produces near-random
+    // activations downstream.
+    if (hp.xscaling) {
+        const float xscale = sqrtf((float)hp.d_model);
+        cur = ggml_scale(ctx0, cur, xscale);
+    }
 
     // ----- Sinusoidal rel-pos table [d, 2T-1] -----
     ggml_tensor* pos_enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, (int)hp.d_model, 2 * T - 1);
@@ -820,6 +834,7 @@ static void parakeet_init_pred_weights(parakeet_context* ctx) {
     auto& p = ctx->model.predictor;
     auto& W = ctx->pred_w;
     const int H = (int)ctx->model.hparams.pred_hidden;
+    const int blank_id = (int)ctx->model.hparams.blank_id;
 
     W.embed = tensor_to_f32(p.embed_w);
     W.w_ih_0 = tensor_to_f32(p.lstm0_w_ih);
@@ -833,6 +848,49 @@ static void parakeet_init_pred_weights(parakeet_context* ctx) {
 
     W.H = H;
     W.initialised = true;
+
+    // Sanity checks against the actual tensor shapes. ggml stores
+    // PyTorch (rows, cols) as ne[0]=cols, ne[1]=rows.
+    const int64_t embed_cols = p.embed_w->ne[0]; // == hidden
+    const int64_t embed_rows = p.embed_w->ne[1]; // == vocab+1
+    const int64_t lstm0_ih_cols = p.lstm0_w_ih->ne[0]; // == in_dim
+    const int64_t lstm0_ih_rows = p.lstm0_w_ih->ne[1]; // == 4*H
+    if (embed_cols != H) {
+        fprintf(stderr,
+                "parakeet: WARN embed.weight cols=%lld but pred_hidden=%d "
+                "(GGUF hparam may be wrong)\n",
+                (long long)embed_cols, H);
+    }
+    if (lstm0_ih_cols != H || lstm0_ih_rows != 4 * H) {
+        fprintf(stderr,
+                "parakeet: WARN lstm.0.w_ih shape=%lldx%lld but expected "
+                "%dx%d (4*H, H)\n",
+                (long long)lstm0_ih_rows, (long long)lstm0_ih_cols, 4 * H, H);
+    }
+    if (embed_rows < blank_id + 1) {
+        fprintf(stderr,
+                "parakeet: WARN embed.weight rows=%lld but blank_id+1=%d\n",
+                (long long)embed_rows, blank_id + 1);
+    }
+
+    // NeMo's RNNT decoder uses Embedding(..., padding_idx=blank_id), so
+    // the blank row should be all-zeros after training. If non-zero,
+    // either the converter dropped padding_idx semantics or the
+    // checkpoint was built with a different convention — the SOS step
+    // (predictor at blank input) would produce wrong output.
+    if (getenv("PARAKEET_DEBUG") && blank_id < (int)embed_rows) {
+        const float* row = W.embed.data() + (size_t)blank_id * H;
+        double s = 0;
+        float maxv = 0;
+        for (int k = 0; k < H; k++) {
+            s += row[k] * row[k];
+            if (fabsf(row[k]) > maxv) maxv = fabsf(row[k]);
+        }
+        fprintf(stderr,
+                "parakeet: embed[blank=%d]  L2=%.4f  max|.|=%.4f  "
+                "(NeMo padding_idx → expect ~0)\n",
+                blank_id, sqrt(s), (double)maxv);
+    }
 }
 
 static void parakeet_init_joint_weights(parakeet_context* ctx) {
@@ -1040,6 +1098,27 @@ static std::vector<parakeet_emitted_token> parakeet_tdt_decode(parakeet_context*
             int t_end = std::min(T_enc, t + std::max(0, dur_skip));
             emitted.push_back({tok, t, t_end, tok_p});
             predictor_step(W, tok, state, pred_out);
+
+            // Diagnostic: dump predictor stats for the first few emissions
+            // so we can compare with NeMo step-by-step (not just SOS).
+            if (getenv("PARAKEET_DEBUG") && (int)emitted.size() <= 5) {
+                double s = 0, m = 0;
+                float minv = pred_out[0], maxv = pred_out[0];
+                for (auto v : pred_out) {
+                    m += v;
+                    s += v * v;
+                    if (v < minv) minv = v;
+                    if (v > maxv) maxv = v;
+                }
+                m /= pred_out.size();
+                double std_ = sqrt(s / pred_out.size() - m * m);
+                fprintf(stderr,
+                        "parakeet: emit#%zu tok=%d dur=%d  pred_out: mean=%.4f std=%.4f "
+                        "min=%.3f max=%.3f [0..3]=%.3f %.3f %.3f %.3f\n",
+                        emitted.size(), tok, dur_skip, m, std_, (double)minv, (double)maxv,
+                        (double)pred_out[0], (double)pred_out[1], (double)pred_out[2],
+                        (double)pred_out[3]);
+            }
 
             // Advance encoder frame by the predicted duration (≥ 0). If 0,
             // we stay on this frame for another inner step.

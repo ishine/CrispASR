@@ -96,6 +96,7 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # autoregresses with a KV cache that doesn't have a clean "per-step
     # logits" entry point the way the speech-LLMs do.
     "cohere":     "reference_backends.cohere",
+    "parakeet":   "reference_backends.parakeet",
     # VibeVoice-ASR 7B: two σ-VAE encoders + connectors + Qwen2 decoder.
     # NOTE: audio must be 16 kHz on entry (shared loader); the backend
     # resamples to 24 kHz internally.

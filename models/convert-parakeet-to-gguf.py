@@ -210,7 +210,10 @@ def remap_name(nemo_name: str) -> str | None:
     if n == "joint.joint_net.2.bias":
         return "joint.out.bias"
 
-    print(f"  [warn] unmapped tensor: {n}", file=sys.stderr)
+    # Unmapped: print a clear warning so any extra structure (e.g. a
+    # t_norm or extra joint Linear that the runtime doesn't know about)
+    # cannot be silently dropped during conversion.
+    print(f"  [WARN unmapped] {n}", file=sys.stderr)
     return None
 
 
@@ -271,46 +274,118 @@ def convert(nemo_path: Path, out_path: Path) -> None:
     print(f"Writing: {out_path}")
     writer = gguf.GGUFWriter(str(out_path), arch="parakeet")
 
-    # Hyper-parameters — read from config, fall back to parakeet-tdt-0.6b defaults
+    # Hyper-parameters — read every value from model_config.yaml when
+    # available, falling back to parakeet-tdt-0.6b-v3 defaults only as a
+    # last resort. The first round of JA debugging caught a hardcoded
+    # n_mels=128 silently reading 80-mel data; never repeat that pattern.
     prep = cfg.get("preprocessor", {}) if cfg else {}
-    feat_in = cfg.get("encoder", {}).get("feat_in", prep.get("features", 128)) if cfg else 128
+    enc_cfg = cfg.get("encoder", {}) if cfg else {}
+    dec_cfg = cfg.get("decoder", {}) if cfg else {}
+    pred_cfg = dec_cfg.get("prednet", {}) if cfg else {}
+    joint_cfg = cfg.get("joint", {}) if cfg else {}
+    joint_net = joint_cfg.get("jointnet", {}) if cfg else {}
+
+    feat_in = enc_cfg.get("feat_in", prep.get("features", 128))
     sr = prep.get("sample_rate", 16000)
     n_fft = prep.get("n_fft", 512)
     ws = prep.get("window_size", 0.025)
     wst = prep.get("window_stride", 0.01)
+    d_model = enc_cfg.get("d_model", 1024)
+    n_layers = enc_cfg.get("n_layers", 24)
+    n_heads = enc_cfg.get("n_heads", 8)
+    head_dim = d_model // n_heads
+    ff_dim = enc_cfg.get("ff_expansion_factor", 4) * d_model
+    subsampling_factor = enc_cfg.get("subsampling_factor", 8)
+    subsampling_channels = enc_cfg.get("subsampling_conv_channels", 256)
+    conv_kernel = enc_cfg.get("conv_kernel_size", 9)
+    xscaling = bool(enc_cfg.get("xscaling", True))
+    pred_hidden = pred_cfg.get("pred_hidden", 640)
+    pred_layers = pred_cfg.get("pred_rnn_layers", 2)
+    joint_hidden = joint_net.get("encoder_hidden", joint_net.get("pred_hidden", 640))
+    n_tdt_durations = len(dec_cfg.get("durations", [0, 1, 2, 3, 4]))
+    tdt_durations = list(dec_cfg.get("durations", [0, 1, 2, 3, 4]))
+
+    # Cross-check the reported pred_hidden against the actual LSTM weight
+    # shape — the surest defence against another silent hparam mismatch.
+    lstm0_w_ih = sd.get("decoder.prediction.dec_rnn.lstm.weight_ih_l0")
+    if lstm0_w_ih is not None:
+        actual = int(lstm0_w_ih.shape[1])
+        if actual != pred_hidden:
+            print(
+                f"  [warn] config pred_hidden={pred_hidden} disagrees "
+                f"with lstm.weight_ih_l0 in_dim={actual}; using {actual}",
+                file=sys.stderr,
+            )
+            pred_hidden = actual
+    joint_pred_w = sd.get("joint.pred.weight")
+    if joint_pred_w is not None:
+        actual = int(joint_pred_w.shape[0])
+        if actual != joint_hidden:
+            print(
+                f"  [warn] config joint_hidden={joint_hidden} disagrees "
+                f"with joint.pred.weight rows={actual}; using {actual}",
+                file=sys.stderr,
+            )
+            joint_hidden = actual
+
+    print(
+        f"  hparams: d_model={d_model} layers={n_layers} heads={n_heads} "
+        f"ff={ff_dim} pred_hidden={pred_hidden} joint_hidden={joint_hidden} "
+        f"n_mels={feat_in}"
+    )
+
     writer.add_uint32("parakeet.sample_rate", sr)
     writer.add_uint32("parakeet.n_mels", feat_in)
     writer.add_uint32("parakeet.n_fft", n_fft)
     writer.add_uint32("parakeet.win_length", int(ws * sr))
     writer.add_uint32("parakeet.hop_length", int(wst * sr))
-    writer.add_uint32("parakeet.d_model", 1024)
-    writer.add_uint32("parakeet.n_layers", 24)
-    writer.add_uint32("parakeet.n_heads", 8)
-    writer.add_uint32("parakeet.head_dim", 128)
-    writer.add_uint32("parakeet.ff_dim", 4096)
-    writer.add_uint32("parakeet.subsampling_factor", 8)
-    writer.add_uint32("parakeet.subsampling_channels", 256)
-    writer.add_uint32("parakeet.conv_kernel", 9)
-    writer.add_uint32("parakeet.pred_hidden", 640)
-    writer.add_uint32("parakeet.pred_layers", 2)
-    writer.add_uint32("parakeet.joint_hidden", 640)
+    writer.add_uint32("parakeet.d_model", d_model)
+    writer.add_uint32("parakeet.n_layers", n_layers)
+    writer.add_uint32("parakeet.n_heads", n_heads)
+    writer.add_uint32("parakeet.head_dim", head_dim)
+    writer.add_uint32("parakeet.ff_dim", ff_dim)
+    writer.add_uint32("parakeet.subsampling_factor", subsampling_factor)
+    writer.add_uint32("parakeet.subsampling_channels", subsampling_channels)
+    writer.add_uint32("parakeet.conv_kernel", conv_kernel)
+    writer.add_bool("parakeet.xscaling", xscaling)
+    writer.add_uint32("parakeet.pred_hidden", pred_hidden)
+    writer.add_uint32("parakeet.pred_layers", pred_layers)
+    writer.add_uint32("parakeet.joint_hidden", joint_hidden)
     writer.add_uint32("parakeet.vocab_size", len(vocab))
     writer.add_uint32("parakeet.blank_id", len(vocab))  # blank is vocab_size
-    writer.add_uint32("parakeet.n_tdt_durations", 5)
-    writer.add_array("parakeet.tdt_durations", [0, 1, 2, 3, 4])
-    writer.add_uint32("parakeet.frame_dur_cs", 8)  # 80 ms = 8 cs
+    writer.add_uint32("parakeet.n_tdt_durations", n_tdt_durations)
+    writer.add_array("parakeet.tdt_durations", tdt_durations)
+    # frame_dur_cs is in centiseconds: 0.01 s stride × 8× subsampling = 8 cs (80 ms)
+    writer.add_uint32("parakeet.frame_dur_cs", int(round(wst * subsampling_factor * 100)))
 
     writer.add_array("tokenizer.ggml.tokens", vocab)
+
+    # ----- inventory: highlight any decoder/joint structure we don't
+    # know about so a JA-specific extra Linear/LayerNorm/Dropout-with-
+    # weights can't slip past unnoticed (the converter has been bitten
+    # by silent skips before, see HISTORY/parakeet-ja).
+    decoder_keys = sorted(k for k in sd.keys() if k.startswith("decoder.prediction."))
+    joint_keys = sorted(k for k in sd.keys() if k.startswith("joint."))
+    print("  decoder.prediction.* tensors:")
+    for k in decoder_keys:
+        print(f"    {k}  shape={tuple(sd[k].shape)}")
+    print("  joint.* tensors:")
+    for k in joint_keys:
+        print(f"    {k}  shape={tuple(sd[k].shape)}")
 
     # ----- tensors -----
     n_written = 0
     n_f16 = 0
     n_f32 = 0
+    n_unmapped = 0
     layers_seen = set()
     layers_with_dw_bias = set()
     for name in sorted(sd.keys()):
         gguf_name = remap_name(name)
         if gguf_name is None:
+            # remap_name already printed a warning; track for the summary.
+            if not name.endswith("num_batches_tracked"):
+                n_unmapped += 1
             continue
         t = sd[name].cpu().numpy()
         if t.dtype == np.float64:
@@ -353,6 +428,13 @@ def convert(nemo_path: Path, out_path: Path) -> None:
         f"\n  total tensors: {n_written}  (F16: {n_f16}, F32: {n_f32})  "
         f"(+{len(layers_seen) - len(layers_with_dw_bias)} synthetic conv.dw.bias)"
     )
+    if n_unmapped:
+        print(
+            f"\n  WARNING: {n_unmapped} tensor(s) were unmapped — see "
+            f"[WARN unmapped] lines above. Re-check remap_name() before "
+            f"trusting this GGUF for inference.",
+            file=sys.stderr,
+        )
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
