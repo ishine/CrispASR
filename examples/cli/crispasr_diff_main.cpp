@@ -45,6 +45,7 @@
 
 #include "common-whisper.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

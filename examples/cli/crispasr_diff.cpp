@@ -49,6 +49,21 @@ Ref::~Ref() {
     }
 }
 
+Ref::Ref(Ref&& other) noexcept : impl_(other.impl_) {
+    other.impl_ = nullptr;
+}
+
+Ref& Ref::operator=(Ref&& other) noexcept {
+    if (this != &other) {
+        if (impl_) {
+            delete impl_;
+        }
+        impl_ = other.impl_;
+        other.impl_ = nullptr;
+    }
+    return *this;
+}
+
 // ---------------------------------------------------------------------------
 // Load
 // ---------------------------------------------------------------------------

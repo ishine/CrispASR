@@ -492,6 +492,15 @@ Notes:
 - When `qwen3-tts --voice` points to a `.wav`, `--ref-text` is required.
 - When `qwen3-tts --voice` points to a `.gguf`, it is treated as a baked voice
   pack and `--ref-text` is ignored.
+- `qwen3-tts` quantization is not quality-equivalent across variants. Treat
+  `f16` talker + `f16` codec as the reference baseline.
+- Recommended quantized deployment today: `q8_0` talker with the `f16` codec.
+- Lower-bit talker quants such as `q6_k`, `q5_k`, and `q4_k` can still produce
+  usable audio, but they drift noticeably in intermediate tensor checks. Voice
+  similarity, prompt adherence, prosody, and multilingual robustness may
+  change. Use them only when memory matters more than strict fidelity.
+- Quantizing the tokenizer / codec hurts `qwen3-tts` earlier than talker-only
+  quantization. Prefer keeping `qwen3-tts-tokenizer-12hz.gguf` at `f16`.
 
 GGUF downloads: [`cstr/vibevoice-realtime-0.5b-GGUF`](https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF), [`cstr/vibevoice-1.5b-GGUF`](https://huggingface.co/cstr/vibevoice-1.5b-GGUF), [`cstr/qwen3-tts-0.6b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF), [`cstr/qwen3-tts-tokenizer-12hz-GGUF`](https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF)
 

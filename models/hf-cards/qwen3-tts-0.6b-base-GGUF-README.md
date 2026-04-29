@@ -42,7 +42,7 @@ This repo contains the **talker / code-predictor / speaker-encoder** model. It m
 File | Size | Notes
 --- | --- | ---
 `qwen3-tts-12hz-0.6b-base.gguf` | 1.7 GB | F16
-`qwen3-tts-12hz-0.6b-base-q8_0.gguf` | 940 MB | Q8_0, near-lossless talker quant
+`qwen3-tts-12hz-0.6b-base-q8_0.gguf` | 940 MB | Q8_0, recommended quantised talker
 
 ## Quick Start
 
@@ -97,12 +97,26 @@ When `--voice` points to a `.wav`, `--ref-text` is required. When `--voice` poin
 Current CrispASR validation status:
 
 - `qwen3-tts-12hz-0.6b-base.gguf`
-  - reference export
+  - reference baseline
 - `qwen3-tts-12hz-0.6b-base-q8_0.gguf`
-  - good deployment candidate
-  - end-to-end synthesis stays close to F16 in current CrispASR cosine-similarity checks
+  - recommended quantised deployment
+  - end-to-end synthesis is audibly good in current CrispASR testing
+  - intermediate activations still drift measurably from F16 in strict tensor diffs
 
-More aggressive talker quantisations load and run, but drift noticeably more in strict tensor diffs and are not the recommended default.
+Lower-bit talker quants such as `q6_k`, `q5_k`, and `q4_k` can still load and
+produce usable speech, but they are not numerically faithful to the F16
+reference. They should be treated as experimental builds, not as quality-
+equivalent replacements.
+
+If fidelity matters more than memory:
+
+- use `qwen3-tts-12hz-0.6b-base.gguf`
+- keep the companion tokenizer / codec at F16
+
+If you want the best currently-tested size / quality trade-off:
+
+- use `qwen3-tts-12hz-0.6b-base-q8_0.gguf`
+- still keep `qwen3-tts-tokenizer-12hz.gguf` at F16
 
 ## How this was made
 

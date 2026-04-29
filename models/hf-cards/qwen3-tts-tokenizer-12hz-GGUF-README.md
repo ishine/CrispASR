@@ -69,11 +69,20 @@ The tokenizer GGUF is used for:
 Current CrispASR validation status:
 
 - `qwen3-tts-tokenizer-12hz.gguf`
-  - reference export
+  - reference baseline
 - `qwen3-tts-tokenizer-12hz-q8_0.gguf`
   - usable, but numerically less faithful than the F16 codec in strict diff tests
 
 For best fidelity, keep the tokenizer / codec at F16 even when quantising the talker. In current CrispASR testing, codec quantisation drifts earlier in the codec-encoder path than talker-only quantisation.
+
+This repo may also publish lower-bit talker variants in the companion talker
+repo. If you use them, the safest pairing is still:
+
+- quantised talker
+- `qwen3-tts-tokenizer-12hz.gguf` kept at F16
+
+In other words: if you must choose where to keep precision, keep it in the
+tokenizer / codec first.
 
 ## How this was made
 

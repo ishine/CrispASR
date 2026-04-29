@@ -807,6 +807,21 @@ If the network stages pass but `cenc_codes` fails, the bug is almost
 certainly in the RVQ encode layout / residual logic, not the prompt
 builder.
 
+### Qwen3-TTS quantization guidance
+
+`qwen3-tts` quantization quality does not track audible output as closely as
+many ASR models do. Current CrispASR testing found:
+
+- `f16` talker + `f16` codec is the reference baseline
+- `q8_0` talker + `f16` codec is the best tested quantized deployment
+- lower-bit talker quants (`q6_k`, `q5_k`, `q4_k`) can still sound usable, but
+  drift noticeably in strict tensor diffs
+- quantizing the tokenizer / codec hurts earlier than talker-only quantization,
+  especially around `runtime_ref_codes`
+
+Practical rule: if you must save memory, quantize the talker first and keep the
+tokenizer / codec at `f16`.
+
 ### CUDA im2col grid overflow (MUST RE-APPLY after every ggml bump)
 
 Upstream ggml's CUDA im2col kernel uses `OW` (output width) directly as
