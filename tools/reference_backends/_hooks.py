@@ -36,22 +36,36 @@ from __future__ import annotations
 from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 
-def _hook_factory(captured: Dict, name: str) -> Callable:
+def _hook_factory(captured: Dict, name: str, *, first_call_only: bool = False) -> Callable:
     """Return a forward_hook that stores `output` under `captured[name]`.
 
     NeMo conformer modules return a Tensor or a tuple whose first element
     is the (B, T, D) hidden state. Both shapes are accepted; downstream
     `finalize()` does the (B, T, D) → (T, D) reshape.
+
+    `first_call_only=True` skips overwrites on subsequent calls. Useful
+    when a module is invoked many times inside `generate()` — e.g. the
+    Qwen3-TTS talker decoder fires once for the full prefill and then
+    again for every AR step with shape (1, 1, *), and we want to keep
+    the prefill capture. This option does NOT replace `_iter_capture`,
+    which collects ONE tensor PER call instead of skipping later calls.
     """
     def hook(_module, _inp, output):
         import torch
+        if first_call_only and name in captured:
+            return
         t = output[0] if isinstance(output, (tuple, list)) else output
         if isinstance(t, torch.Tensor):
             captured[name] = t.detach().cpu().float()
     return hook
 
 
-def capture_modules(captured: Dict, stages: Iterable[Tuple[str, object]]) -> List:
+def capture_modules(
+    captured: Dict,
+    stages: Iterable[Tuple[str, object]],
+    *,
+    first_call_only: bool = False,
+) -> List:
     """Register forward hooks on each (name, module) pair in `stages`.
 
     Skips entries whose module is None (so callers can pass
@@ -59,12 +73,18 @@ def capture_modules(captured: Dict, stages: Iterable[Tuple[str, object]]) -> Lis
     of handles for `drop_hooks()`. Stage names that match the diff
     harness must be lowercase ASCII (no spaces) — they end up as GGUF
     tensor names.
+
+    `first_call_only=True` is the qwen3-tts pattern: the hooked module
+    fires repeatedly inside `generate()` and only the prefill call's
+    output is meaningful. Set this when the module is invoked more than
+    once per `dump()` and you want to keep the first.
     """
     handles = []
     for name, module in stages:
         if module is None:
             continue
-        handles.append(module.register_forward_hook(_hook_factory(captured, name)))
+        handles.append(module.register_forward_hook(
+            _hook_factory(captured, name, first_call_only=first_call_only)))
     return handles
 
 

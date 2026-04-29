@@ -38,6 +38,8 @@ from typing import Any, Dict, Set
 
 import numpy as np
 
+from . import _hooks
+
 DEFAULT_STAGES = [
     "text_input_ids",
     "ref_input_ids",
@@ -144,39 +146,39 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     # `codec_head` output at position [-1] is what greedy decode would
     # then sample from.
 
-    captures: Dict[str, np.ndarray] = {}
-
-    def cap(name: str):
-        # Capture the FIRST forward call (the prefill). Decode steps fire
-        # the hook again with shape (1, 1, *) and would overwrite the
-        # full-prefill capture — explicitly skip those.
-        def hook(_mod, _inp, output):
-            if name in captures:
-                return
-            t = output[0] if isinstance(output, tuple) else output
-            captures[name] = t.detach().cpu().float().numpy()
-        return hook
-
+    # Capture the FIRST call to each module — every layer fires once for the
+    # full prefill and again per AR step with shape (1, 1, *); the first call
+    # is the only meaningful one for our diff. `first_call_only=True` is the
+    # _hooks.py knob for that pattern (see also `_iter_capture` if/when we
+    # add a per-step talker diff).
+    captures: Dict[str, "torch.Tensor | np.ndarray"] = {}
     handles = []
-    layer_hook_map = {
-        "talker_layer_0_out":  talker.model.layers[0],
-        "talker_layer_27_out": talker.model.layers[-1],
-        "talker_output_norm":  talker.model.norm,
-        "talker_logits":       talker.codec_head,
-    }
-    for stage_name, mod in layer_hook_map.items():
-        if stage_name in stages:
-            handles.append(mod.register_forward_hook(cap(stage_name)))
 
-    # Pre-hook on talker.model captures the kwargs (specifically
-    # inputs_embeds) so we can write the exact prefill back out.
+    layer_hook_map = [
+        ("talker_layer_0_out",  talker.model.layers[0]),
+        ("talker_layer_27_out", talker.model.layers[-1]),
+        ("talker_output_norm",  talker.model.norm),
+        ("talker_logits",       talker.codec_head),
+    ]
+    handles.extend(_hooks.capture_modules(
+        captures,
+        [(name, mod) for name, mod in layer_hook_map if name in stages],
+        first_call_only=True,
+    ))
+
+    # Pre-hook on talker.model captures the kwargs (specifically inputs_embeds)
+    # so we can write the exact prefill back out. _hooks doesn't have a
+    # pre-hook helper yet (only post-hooks), so we register inline; the
+    # first-call-only logic mirrors the post-hook helper.
     if "talker_inputs_embeds" in stages:
         def cap_embeds(_mod, args, kwargs):
+            if "talker_inputs_embeds" in captures:
+                return
             embeds = kwargs.get("inputs_embeds", None)
             if embeds is None and len(args) >= 5:
                 embeds = args[4]  # signature: (input_ids, attention_mask, position_ids, past_key_values, inputs_embeds)
-            if embeds is not None and "talker_inputs_embeds" not in captures:
-                captures["talker_inputs_embeds"] = embeds[0].detach().cpu().float().numpy()
+            if embeds is not None:
+                captures["talker_inputs_embeds"] = embeds[0].detach().cpu().float()
         handles.append(talker.model.register_forward_pre_hook(cap_embeds, with_kwargs=True))
 
     # ---- Run generate (greedy) for deterministic codes + activations ----
@@ -199,8 +201,17 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
                 top_k=1,
             )
 
-    for h in handles:
-        h.remove()
-    out.update(captures)
+    _hooks.drop_hooks(handles)
+
+    # Convert captures (torch.Tensor) -> numpy via _hooks.finalize, but ours
+    # are already (B?, T, D) per-stage and the consumers expect raw arrays
+    # without the (T, D) dim-sniff that finalize does for NeMo encoders.
+    # So we just .numpy() each tensor here.
+    import torch
+    for name, t in captures.items():
+        if isinstance(t, torch.Tensor):
+            out[name] = t.numpy()
+        else:
+            out[name] = t
 
     return out

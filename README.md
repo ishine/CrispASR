@@ -1184,6 +1184,8 @@ If your model has a canonical Q4_K HuggingFace release, add it to `crispasr_mode
 
 ### Regression-test your backend
 
+For ASR backends, the transcript is the regression target:
+
 ```bash
 ./build/bin/crispasr --backend yourmodel -m model.gguf -f samples/jfk.wav -np > before.txt
 # ... make changes ...
@@ -1191,6 +1193,42 @@ cmake --build build --target crispasr
 ./build/bin/crispasr --backend yourmodel -m model.gguf -f samples/jfk.wav -np > after.txt
 diff before.txt after.txt && echo BIT-IDENTICAL
 ```
+
+For TTS backends the output is audio (not text), and diffusion samplers
+are stochastic, so a `diff` of two runs won't compare. The regression
+target is "audio cosine similarity vs the official model's output, with
+the same Gaussian noise pinned in both runs":
+
+```bash
+# 1. Run the official PyTorch model with hooks that capture the
+#    per-frame init noise plus the conditions / latents per frame
+HF_HOME=/path/to/hf-cache python tools/run_official_vibevoice.py \
+    --text "Hello, how are you today?" \
+    --voice voices_pt/en-Emma_woman.pt \
+    --output-wav /tmp/ref.wav \
+    --output-dir /tmp/ref_dump
+
+# 2. Run crispasr with the same noise pinned and per-frame dumps
+VIBEVOICE_TTS_NOISE=/tmp/ref_dump/noise.bin \
+VIBEVOICE_TTS_DUMP=/tmp/cpp_dump VIBEVOICE_TTS_DUMP_PERFRAME=1 \
+./build/bin/crispasr --tts "Hello, how are you today?" \
+    -m vibevoice-realtime-0.5b-tts-f16.gguf \
+    --voice vibevoice-voice-emma.gguf \
+    --tts-output /tmp/cpp.wav -ng
+
+# 3. Audio cos at xcorr peak (accounts for any leading-silence trim)
+python -c "import sys; sys.path.insert(0, 'tools'); \
+    from _audio_diff import cos_report; \
+    print(cos_report('/tmp/ref.wav', '/tmp/cpp.wav'))"
+# OFFICIAL: 182400 samples = 7.60s  rms=0.0653
+# AFTER_FIX: 171459 samples = 7.14s  rms=0.0672
+# cos at zero shift  = 0.0027
+# cos at xcorr peak  = 0.9991  lag=7741 samples = 322.5 ms
+```
+
+`cos at xcorr peak ≥ 0.999` is "essentially bit-exact modulo F16
+quantization". A drop indicates a real divergence — pair the audio
+diff with the per-frame stage diff (next section) to localise.
 
 ### Debug a new backend against PyTorch ground truth
 
@@ -1227,10 +1265,40 @@ compares them with **cosine similarity per row**, **max-abs error**,
 
 Adding a new backend to the dumper is a ~60-line file in
 `tools/reference_backends/<name>.py` that registers PyTorch forward
-hooks and returns a dict `{stage_name: ndarray}`. See
-`tools/reference_backends/qwen3.py` and `voxtral.py` for worked
-examples; `voxtral4b.py` and `granite.py` are stubs with inline notes
-on what to port from the legacy `models/*-dump-*.py` scripts.
+hooks and returns a dict `{stage_name: ndarray}`. Worked examples:
+
+- `tools/reference_backends/qwen3.py`, `voxtral.py`, `cohere.py`,
+  `parakeet.py`, `gemma4.py`, `omniasr_llm.py`, `granite.py` —
+  encoder-decoder / Audio-LLM ASR backends. Use the `_hooks.py`
+  forward_hook helpers (`capture_modules`, `drop_hooks`, `finalize`).
+- `tools/reference_backends/qwen3_tts.py`,
+  `qwen3_tts_codec.py`, `qwen3_tts_spk.py`, `qwen3_tts_cenc.py` —
+  TTS prefill / encoder backends. Use `capture_modules(..., first_call_only=True)`
+  for hooks that fire once per stage (e.g. talker prefill called from
+  inside `generate()`).
+- `tools/reference_backends/vibevoice.py`, `vibevoice_tts.py` —
+  VibeVoice σ-VAE encoder + TTS pipeline.
+
+For **autoregressive / diffusion-sampler diffs** the per-stage capture
+above isn't enough — bugs that appear only after several AR steps don't
+show up in a frame-0 cos diff. Two extra helpers:
+
+- `tools/reference_backends/_iter_capture.py` — companion to `_hooks.py`
+  for "monkey-patch a sampler entry point and append one tensor per
+  iteration to a `{stage: [...]}` dict". Used to capture
+  `pos_cond / neg_cond / noise / v_cfg_step0 / latent` per frame inside
+  `sample_speech_tokens` for vibevoice.
+- `tools/_audio_diff.py` — sample-wise audio cos at zero shift, cos at
+  the cross-correlation peak (so leading-silence trims and causal-padding
+  offsets don't tank the score), spectral band-power table, and a
+  one-call `cos_report(a_path, b_path)` for CLI use.
+
+`tools/run_official_vibevoice.py` is the worked example combining all
+three: it loads the upstream model, monkey-patches `sample_speech_tokens`
+via `_iter_capture.patch_method`, captures `acoustic_embed` via a
+standard forward_hook, and writes both `perframe_<stage>_f<NNN>.bin`
+files (matching the C++ runtime's `VIBEVOICE_TTS_DUMP_PERFRAME=1`
+output) and a `noise.bin` for the C++ side to replay.
 
 ---
 
@@ -1356,9 +1424,11 @@ reference (see [Debug a new backend against PyTorch ground truth](#debug-a-new-b
 | `PARAKEET_DEBUG=1` | Parakeet TDT per-step diagnostics (joint network, blank-id sanity). |
 | `VIBEVOICE_BENCH=1` / `VIBEVOICE_DEBUG=1` / `VIBEVOICE_DUMP_DIR=` | VibeVoice ASR per-stage timings, diagnostics, and stage dumps. |
 | `VIBEVOICE_REF_FEATURES=path` | Replace the live encoder with a saved feature tensor (regression harness). |
-| `VIBEVOICE_TTS_DUMP=path/` | Per-step VibeVoice TTS diffusion dumps. |
+| `VIBEVOICE_TTS_DUMP=path/` | VibeVoice TTS per-stage dumps (token IDs, base/TTS hidden, neg condition, frame-0 noise/v_cfg/latent/acoustic_embed) for the diff harness. |
+| `VIBEVOICE_TTS_DUMP_PERFRAME=1` | Per-frame VibeVoice TTS dumps written as `perframe_<stage>_f<NNN>.bin`. Pair with `VIBEVOICE_TTS_DUMP=path/` and `VIBEVOICE_TTS_NOISE=path` for stage-by-stage AR diff against `tools/run_official_vibevoice.py`. |
+| `VIBEVOICE_TTS_TRACE=1` | Extra one-line traces (negative-condition prefill rms, scaling/bias factors loaded). Same effect as `-vv`. |
 | `VIBEVOICE_VOICE_AUDIO=path.wav` | Reference voice WAV for 1.5B-base TTS without a `.gguf` voice cache. |
-| `VIBEVOICE_TTS_NOISE=path` | Override the diffusion noise sample (deterministic generation). |
+| `VIBEVOICE_TTS_NOISE=path` | Override the per-frame Gaussian init noise. Flat little-endian float32 `[N_frames, vae_dim]` — typically the `noise.bin` written by `tools/run_official_vibevoice.py`. |
 | `VIBEVOICE_VAE_BACKEND=cpu\|metal\|cuda\|vulkan` | Pin the VAE decoder onto a specific backend. |
 | `WAV2VEC2_BENCH=1` / `WAV2VEC2_VERBOSE=1` / `WAV2VEC2_DUMP_DIR=` | wav2vec2 per-stage timings, verbose graph traces, and stage dumps. |
 | `GRANITE_ENCODER_GRAPH=1` | Switch the granite_speech encoder from per-layer CPU loops to a single ggml graph. |
