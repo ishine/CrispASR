@@ -54,7 +54,19 @@ def _hook_factory(captured: Dict, name: str, *, first_call_only: bool = False) -
         import torch
         if first_call_only and name in captured:
             return
-        t = output[0] if isinstance(output, (tuple, list)) else output
+        # Three output shapes seen in practice:
+        #   - bare torch.Tensor (most modules);
+        #   - (tuple|list) — first element is the hidden state (NeMo conformer);
+        #   - HF ModelOutput / BaseModelOutputWithPast / dict-like — has
+        #     `.last_hidden_state` (transformer modules in HF). We pick that
+        #     attribute when present without forcing the caller to write a
+        #     custom hook just to peel one layer.
+        if hasattr(output, "last_hidden_state"):
+            t = output.last_hidden_state
+        elif isinstance(output, (tuple, list)):
+            t = output[0]
+        else:
+            t = output
         if isinstance(t, torch.Tensor):
             captured[name] = t.detach().cpu().float()
     return hook

@@ -25,6 +25,8 @@ from typing import Dict, Set
 
 import numpy as np
 
+from . import _hooks
+
 DEFAULT_STAGES = [
     "cenc_input_audio",
     "cenc_se_init",
@@ -104,75 +106,55 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     if "cenc_input_audio" in stages:
         out["cenc_input_audio"] = audio_np
 
-    captures: Dict[str, np.ndarray] = {}
+    captures: Dict[str, "torch.Tensor"] = {}
 
-    # Hook 1: SEANet output (after self.encoder)
-    if "cenc_seanet_out" in stages:
-        def cap_seanet(_mod, _inp, output):
-            if "cenc_seanet_out" not in captures:
-                t = output[0] if isinstance(output, tuple) else output
-                # output is [B, 512, T_enc] — store as (T_enc, 512)
-                captures["cenc_seanet_out"] = t.detach().cpu().float().squeeze(0).T.numpy()
-        encoder.encoder.register_forward_hook(cap_seanet)
-
-    # Intra-SEANet checkpoints. The encoder.encoder is a ModuleList where
-    # layer indices map to: 0=init conv, {3,6,9,12}=stride convs (s0..s3).
-    # Hooks on those four MimiConv1d modules give us per-stride outputs.
-    seanet_intra = {
-        "cenc_se_init": 0,
-        "cenc_se_s0":   3,
-        "cenc_se_s1":   6,
-        "cenc_se_s2":   9,
-        "cenc_se_s3":   12,
+    # Modules whose outputs need a (B, C, T) → (T, C) transpose after squeeze.
+    # SEANet (encoder.encoder) returns [B, 512, T_enc]; intra-SEANet layers
+    # return [B, C, T]; downsample returns [B, 512, T_frames]. We collect them
+    # all into one capture set, transpose at the end.
+    needs_transpose = {
+        "cenc_seanet_out": encoder.encoder,
+        "cenc_se_init":    encoder.encoder.layers[0],
+        "cenc_se_s0":      encoder.encoder.layers[3],
+        "cenc_se_s1":      encoder.encoder.layers[6],
+        "cenc_se_s2":      encoder.encoder.layers[9],
+        "cenc_se_s3":      encoder.encoder.layers[12],
+        "cenc_ds_out":     encoder.downsample,
     }
-    for name, idx in seanet_intra.items():
-        if name in stages:
-            def make_cap(nm):
-                def cap(_mod, _inp, out):
-                    if nm not in captures:
-                        t = out[0] if isinstance(out, tuple) else out
-                        # MimiConv1d returns [B, C, T] — store as (T, C)
-                        captures[nm] = t.detach().cpu().float().squeeze(0).T.numpy()
-                return cap
-            encoder.encoder.layers[idx].register_forward_hook(make_cap(name))
+    handles = _hooks.capture_modules(captures, [
+        (name, mod) for name, mod in needs_transpose.items() if name in stages
+    ], first_call_only=True)
 
-    # Hook 2: encoder_transformer output (post-hook on the transformer)
-    # The transformer returns (last_hidden_state, ...) tuple where last_hidden_state
-    # is [B, T_enc, 512]. Store as (T_enc, 512).
+    # encoder_transformer returns BaseModelOutputWithPast — _hooks._hook_factory
+    # picks `output.last_hidden_state` automatically. Shape stays (B, T, 512),
+    # NO transpose needed (already time-first).
     if "cenc_xfmr_out" in stages:
-        def cap_xfmr(_mod, _inp, output):
-            if "cenc_xfmr_out" not in captures:
-                # Output is BaseModelOutputWithPast(last_hidden_state=..., past_key_values=...)
-                if hasattr(output, "last_hidden_state"):
-                    t = output.last_hidden_state
-                elif isinstance(output, tuple):
-                    t = output[0]
-                else:
-                    t = output
-                # (B, T_enc, 512) — squeeze B
-                captures["cenc_xfmr_out"] = t.detach().cpu().float().squeeze(0).numpy()
-        encoder.encoder_transformer.register_forward_hook(cap_xfmr)
-
-    # Hook 3: downsample output (after the stride-2 conv)
-    if "cenc_ds_out" in stages:
-        def cap_ds(_mod, _inp, output):
-            if "cenc_ds_out" not in captures:
-                t = output[0] if isinstance(output, tuple) else output
-                # output is [B, 512, T_frames] — store as (T_frames, 512)
-                captures["cenc_ds_out"] = t.detach().cpu().float().squeeze(0).T.numpy()
-        encoder.downsample.register_forward_hook(cap_ds)
+        handles.extend(_hooks.capture_modules(
+            captures, [("cenc_xfmr_out", encoder.encoder_transformer)],
+            first_call_only=True,
+        ))
 
     # Run the encoder
     audio_pt = torch.from_numpy(audio_np).unsqueeze(0).unsqueeze(0)  # [1, 1, T]
     with torch.no_grad():
         result = encoder.encode(audio_pt)
+
+    _hooks.drop_hooks(handles)
+
     # result is MimiEncoderOutput with audio_codes [B, n_q, T_codec]
     codes = result.audio_codes if hasattr(result, "audio_codes") else result[0]
-    # Take first 16 quantizers (encoder_valid_num_quantizers)
-    codes_16 = codes[:, :16, :]  # [B, 16, T_codec]
+    codes_16 = codes[:, :16, :]  # take first 16 quantizers
     if "cenc_codes" in stages:
-        # Store as (T_codec, 16) time-first
         out["cenc_codes"] = codes_16[0].T.detach().cpu().numpy().astype(np.float32)
 
-    out.update(captures)
+    # Squeeze batch + transpose channels-first stages to time-first.
+    for name, t in captures.items():
+        if name not in stages:
+            continue
+        arr = t.squeeze(0).numpy()
+        if name in needs_transpose:
+            # (C, T) → (T, C)
+            arr = arr.T if arr.ndim == 2 else arr
+        out[name] = arr
+
     return out

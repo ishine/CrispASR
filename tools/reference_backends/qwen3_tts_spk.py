@@ -22,6 +22,8 @@ from typing import Dict, Set
 
 import numpy as np
 
+from . import _hooks
+
 DEFAULT_STAGES = [
     "spk_mel",
     "spk_blk0_out",
@@ -78,16 +80,7 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     spk.eval()
 
     out: Dict[str, np.ndarray] = {}
-    captures = {}
-
-    def make_hook(name):
-        def hook(_m, _inp, o):
-            if name not in captures:
-                t = o[0] if isinstance(o, tuple) else o
-                captures[name] = t.detach().cpu().float().squeeze(0).numpy()
-        return hook
-
-    handles = []
+    captures: Dict[str, "torch.Tensor"] = {}
 
     # Mel spectrogram (24kHz, n_fft=1024, hop=256, fmin=0, fmax=12000)
     with torch.no_grad():
@@ -100,29 +93,28 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
         # Store as (T, 128) time-first matching ggml convention
         out["spk_mel"] = mel_t[0].numpy().astype(np.float32)  # [T, 128]
 
-    # Hook blocks[0] for blk0 output (channels-first after internal transpose)
-    if "spk_blk0_out" in stages:
-        def cap_blk0(_m, _inp, o):
-            if "spk_blk0_out" not in captures:
-                captures["spk_blk0_out"] = o.detach().cpu().float().squeeze(0).numpy()
-        handles.append(spk.blocks[0].register_forward_hook(cap_blk0))
-
-    # Hook mfa output
-    if "spk_mfa_out" in stages:
-        handles.append(spk.mfa.register_forward_hook(make_hook("spk_mfa_out")))
+    # Each module fires once per forward, but we use first_call_only=True for
+    # consistency with sibling backends and to be safe if the encoder is ever
+    # called more than once per dump in the future.
+    handles = _hooks.capture_modules(captures, [
+        ("spk_blk0_out", spk.blocks[0]),
+        ("spk_mfa_out",  spk.mfa),
+    ], first_call_only=True)
 
     with torch.no_grad():
         emb = spk(mel_t)  # [1, 1024]
 
-    for h in handles:
-        h.remove()
+    _hooks.drop_hooks(handles)
 
     if "spk_emb" in stages:
         out["spk_emb"] = emb[0].detach().cpu().float().numpy()  # [1024]
 
-    # Transfer intermediate captures — 2D tensors in (C, T) → transpose to (T, C)
-    for name, arr in captures.items():
-        if name in stages:
-            out[name] = arr.T if arr.ndim == 2 else arr
+    # Captures are torch tensors with batch dim. Squeeze batch and transpose
+    # 2D (C, T) -> (T, C) for the time-first ggml convention.
+    for name, t in captures.items():
+        if name not in stages:
+            continue
+        arr = t.squeeze(0).numpy()
+        out[name] = arr.T if arr.ndim == 2 else arr
 
     return out
