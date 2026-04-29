@@ -3436,7 +3436,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     const int SPEECH_WINDOW = 6;
     int text_cursor = 0; // how many text tokens processed so far
     int n_past = voice_offset;
-    int neg_n_past = has_voice ? ctx->voice.neg_tts_seq_len : 0;
+    // Negative KV cache always has the IMAGE_PAD prefill at pos 0 (see prefill block above),
+    // regardless of voice mode. Speech frames are appended starting at pos 1.
+    int neg_n_past = has_tts_lm ? 1 : 0;
     std::vector<float> hidden;
 
     // Initial negative condition for CFG. Per the official
@@ -3453,8 +3455,9 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
     if (has_tts_lm) {
         const int32_t IMAGE_PAD = 151655;
         int32_t pad_id = IMAGE_PAD;
-        // Run the negative base LM prefill (1 IMAGE_PAD token, no past KV, no final norm).
-        // Realtime base LM has no final norm — pass false.
+        // 1. Run the negative base LM prefill (1 IMAGE_PAD token, no past KV, no final norm).
+        //    Realtime base LM has no final norm — pass has_final_norm=false. We do not need
+        //    to persist the base LM negative KV (it is never re-attended to in the inner loop).
         auto pad_emb = run_token_embedding_lookup(ctx, &pad_id, 1);
         std::vector<float> neg_base_pad_hidden =
             run_qwen2_prefill_no_kv(ctx, pad_emb.data(), 1, "lm", hp.n_lm_layers, /*has_final_norm=*/false,
@@ -3463,17 +3466,19 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             fprintf(stderr, "vibevoice TTS: neg base prefill failed\n");
             return nullptr;
         }
-        // Build TTS LM prefill input: neg_base_pad_hidden + type_text. The official
-        // forward_tts_lm replaces the entire input embedding tail with lm_last_hidden_state,
-        // then adds tts_input_types(tts_text_masks=1). For a 1-token input, the entire
-        // embedding is replaced; tts_emb(IMAGE_PAD) is unused.
+        // 2. Build TTS LM prefill input. The official forward_tts_lm replaces the input
+        //    embedding tail with lm_last_hidden_state, then adds tts_input_types[1] for text.
+        //    For a 1-token input the entire embedding is replaced; tts_emb(IMAGE_PAD) is unused.
         std::vector<float> neg_prefill_input(d_lm);
         for (int j = 0; j < d_lm; j++)
             neg_prefill_input[j] = neg_base_pad_hidden[j] + text_type_emb[j];
-        // TTS LM has final norm.
-        neg_condition = run_qwen2_prefill_no_kv(ctx, neg_prefill_input.data(), 1, "tts_lm", hp.tts_n_layers,
-                                                /*has_final_norm=*/true, /*all_positions=*/false);
-        if ((int)neg_condition.size() != d_lm) {
+        // 3. Run TTS LM prefill via run_lm_step at pos 0 with kv_sel=1 — this both returns
+        //    the last hidden (= initial neg_condition) AND writes the K, V at pos 0 of the
+        //    negative KV cache. In with-voice mode this overwrites the value loaded from
+        //    voice.neg_tts_lm.{k,v} with a recomputed-from-weights equivalent (same input
+        //    → same output modulo F16 rounding); in no-voice mode this initialises the
+        //    cache that subsequent speech frames need to attend to.
+        if (!run_lm_step(neg_prefill_input.data(), 1, 0, neg_condition, /*kv_sel=*/1)) {
             fprintf(stderr, "vibevoice TTS: neg TTS LM prefill failed\n");
             return nullptr;
         }
@@ -3509,8 +3514,12 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
         return true;
     };
 
-    // Process first text window
-    {
+    // Initial TTS-LM prefill / first text window.
+    if (has_voice) {
+        // With voice: voice.tts_lm KV is already loaded into the cache (positions 0..vsl_tts-1).
+        // We feed the first TEXT_WINDOW tokens of the user text through the TTS LM at the
+        // tail (positions vsl_tts..vsl_tts+win-1). all_base_hidden was populated above by the
+        // base LM run with voice.lm KV.
         int first_win = std::min((int)text_ids.size(), TEXT_WINDOW);
         if (verbosity >= 1)
             fprintf(stderr, "vibevoice TTS: text window 1: %d tokens, pos %d\n", first_win, n_past);
@@ -3519,9 +3528,24 @@ extern "C" float* vibevoice_synthesize(struct vibevoice_context* ctx, const char
             return nullptr;
         }
         text_cursor = first_win;
-        vibevoice_dump_f32(dump_dir, "tts_prefill_hidden", hidden.data(), hidden.size());
-        vibevoice_dump_f32(dump_dir, "tts_neg_condition_frame0", neg_condition.data(), neg_condition.size());
+    } else {
+        // No voice loaded: prefix_embeds holds the full chat-template prompt (system + user
+        // with the entire text + assistant header) with type embeddings already added and
+        // base-LM hidden states spliced at the text positions. Prefill the whole thing
+        // through the TTS LM at pos 0..prefix_len-1; subsequent iterations only generate
+        // speech frames (no more text windows — all text is in this prefix).
+        if (verbosity >= 1)
+            fprintf(stderr, "vibevoice TTS (no-voice): prefilling chat template (%d tokens) through TTS LM\n",
+                    prefix_len);
+        if (!run_lm_step(prefix_embeds.data(), prefix_len, 0, hidden, /*kv_sel=*/0)) {
+            fprintf(stderr, "vibevoice TTS: no-voice TTS LM prefill failed\n");
+            return nullptr;
+        }
+        n_past = prefix_len;
+        text_cursor = (int)text_ids.size();   // skip subsequent text windows
     }
+    vibevoice_dump_f32(dump_dir, "tts_prefill_hidden", hidden.data(), hidden.size());
+    vibevoice_dump_f32(dump_dir, "tts_neg_condition_frame0", neg_condition.data(), neg_condition.size());
 
     const auto t_prefill_done = std::chrono::high_resolution_clock::now();
     if (verbosity >= 1)
