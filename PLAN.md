@@ -270,8 +270,8 @@ flight.
 | Variant | Decoder | Encoder change | Outputs | Status |
 |---|---|---|---|---|
 | `granite-speech-4.1-2b` (base) | Granite-1B AR | none | text | DONE — 4 GGUFs on HF, encoder cos 0.999908, transcribes JFK at 2.1× realtime on M1 Q4K |
-| `granite-speech-4.1-2b-plus` | Granite-1B AR | `cat_hidden_layers: [3]` | text + speaker labels + word-level timestamps | converter DONE; runtime LOADS but transcript empty — needs cat_layer index verification (off-by-one suspected: HF's `output_hidden_states[3]` includes input embedding at index 0) |
-| `granite-speech-4.1-2b-nar` | non-autoregressive (`NLENARDecoder`) | self-conditioning at L8 + BPE aux head + 4-layer hidden capture | text | converter DONE; runtime scaffold loads tensors but `run_encoder` / `run_projector` / `run_llm_editing` are stubs |
+| `granite-speech-4.1-2b-plus` | Granite-1B AR | `cat_hidden_layers: [3]` | text + speaker labels + word-level timestamps | DONE — f16 GGUF on HF, transcribes JFK with punctuation/capitalisation by default; speaker labels + word timestamps in template work pending |
+| `granite-speech-4.1-2b-nar` | non-autoregressive (`NLENARDecoder`) | self-conditioning at L8 + BPE aux head + 4-layer hidden capture | text | converter + scaffold DONE (5.36 GiB GGUF loads cleanly with tokenizer + mel_filters); encoder/projector/LLM editing forward pending |
 
 ### Base 4.1-2b (DONE)
 
@@ -285,16 +285,25 @@ flight.
   `proj.encoder_hidden_size`, `proj.cat_layers`. Old values default
   in for legacy GGUFs.
 
-### Plus variant — pending
+### Plus variant — DONE for ASR transcription
 
-1. Verify cat_layer index against a Python reference dump
-   (`tools/dump_reference.py`). Most likely fix: capture after
-   `il == 2` instead of `il == 3` to match
-   `output_hidden_states[3]` which includes the input embedding at
-   index 0. ~10 LOC plus a diff-harness validation.
-2. Decode the structured-output tokens upstream emits — speaker
-   labels and word-level timing markers. Template-only change in
-   `examples/cli/crispasr_backend_granite.cpp`.
+The PLUS GGUF (5.6 GB f16) is converted and the runtime concatenates
+encoder layer 3 with the final layer output (`il + 1 == cat_index`,
+matching HF's `output_hidden_states` convention). End-to-end JFK
+transcription with the new `--backend granite-4.1-plus` alias produces:
+
+```
+And so my fellow Americans, ask not what your country can do for you,
+ask what you can do for your country.
+```
+
+Punctuation and capitalisation come for free — the PLUS variant's
+training default is structured output. Speaker labels and word-level
+timestamps are not yet in the output; investigating the upstream
+`chat_template.jinja` is the next step (~50 LOC, template-only).
+
+Commits: `f298818` (cat_layer + tokenizer fix), `ed0e5ac` (backend
+alias + registry), `a3147b6` (HF README).
 
 ### NAR variant — pending
 

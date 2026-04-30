@@ -471,39 +471,52 @@ each backend. High-value gaps to close:
 - **[done]** ~~`GRANITE_BENCH=1` per-stage timer.~~ RAII wrapper that
   prints elapsed wall-clock for compute_mel / run_encoder /
   run_projector. Useful for A/B-ing the encoder paths.
-- **[next] PLUS variant — verify cat_layer index against upstream.**
-  `granite-speech-4.1-2b-plus-f16.gguf` is converted (5.6 GB) and the
-  runtime parses `granite_speech.proj.cat_layers`, captures the
-  intermediate hidden state, concatenates with the final encoder output
-  and feeds the wider 2048-dim into the projector — but the LLM
-  produces empty transcripts on JFK. Most likely cause: HF's
-  `cat_hidden_layers: [3]` indexes into `output_hidden_states` (which
-  starts with the input embedding at index 0), so we should be
-  capturing **after layer 2** in our 0-indexed loop, not after layer 3.
-  Need a Python reference dump (`tools/dump_reference.py` for the
-  plus model) to verify the layer-3 hidden state numerically and
-  flip the index off-by-one if needed. Files:
-  `src/granite_speech.cpp` (capture in encoder loop, lines around
-  `proj_cat_layers_parsed`); `tools/reference_backends/granite.py`
-  (would need a `granite_speech_plus` variant). Commit `eb78a59`.
-- **[next] PLUS variant — speaker labels + word timestamps.** Once
-  the cat_layer index is verified the LLM should emit the structured
-  output upstream advertises (per the IBM model card). The decoder
-  template / output parsing for those structured tokens lives in
-  `examples/cli/crispasr_backend_granite.cpp` — most of the work is
-  template-only.
-- **[next] NAR variant — encoder forward.** Converter (`models/convert-granite-nle-to-gguf.py`)
-  done; produces `granite-speech-4.1-2b-nar-f16.gguf` (5.36 GB, 930
-  tensors). Runtime (`src/granite_nle.{h,cpp}`) loads the model and
-  wires the CTC + LLM tokenizers but `run_encoder` returns nullptr.
-  Encoder is the **same 16-layer Conformer as the base** plus:
-  (a) self-conditioning at layer 8 — the running CTC logits feed
-  back via `out_mid` into the hidden state; (b) BPE auxiliary head
-  (`out_bpe`, 100353 vocab) computed only on posterior-weighted-pooled
-  hidden states (window=4); (c) capture hidden states at indices
-  `[4, 8, 12, -1]` for the projector's 4-encoder-layer concat.
-  Most of (a) and (c) can be lifted from `granite_speech.cpp`'s
-  encoder forward; (b) is a fresh ~80 LOC. Commit `d6ddad0`.
+- **[done]** ~~PLUS variant — cat_layer index + tokenizer fixes.~~ Two
+  bugs blocked PLUS from producing transcripts even though encoder +
+  projector + LLM all ran. (1) PLUS HF snapshot ships only the unified
+  `tokenizer.json` (no separate `vocab.json` / `merges.txt`); the
+  converter silently skipped the tokenizer write. Fix: parse
+  `model.vocab` + `model.merges` from `tokenizer.json` when legacy
+  files are absent. (2) `cat_hidden_layers: [3]` indexes into HF's
+  `output_hidden_states` tuple where index 0 is the input embedding,
+  so we needed to capture after `il == N - 1` instead of `il == N`.
+  Both fixed in commit `f298818`. PLUS now transcribes JFK at 0.9×
+  realtime CPU-only with punctuation + capitalisation by default:
+  "And so my fellow Americans, ask not what your country can do for
+  you, ask what you can do for your country."
+- **[done]** ~~PLUS variant — `granite-4.1-plus` backend alias + HF
+  upload.~~ Backend alias of `granite` registered, registry entry
+  with `~5.6 GB` size, HF repo `cstr/granite-speech-4.1-2b-plus-GGUF`
+  populated with f16 GGUF + README. Commit `ed0e5ac`.
+- **[next] PLUS variant — speaker labels + word timestamps.** PLUS's
+  default output already includes punctuation; the upstream model
+  card also advertises speaker labels and word-level timestamps. We
+  haven't yet seen those in the LLM output — likely because the
+  granite chat template currently used isn't the one that primes for
+  structured output. Investigate `chat_template.jinja` in the PLUS
+  HF snapshot; the structured tokens may need a different prompt
+  prefix in `examples/cli/crispasr_backend_granite.cpp`. Most of the
+  work is template-only (~50 LOC).
+- **[done]** ~~NAR variant — converter + runtime scaffold.~~ Converter
+  (`models/convert-granite-nle-to-gguf.py`) writes all 930 tensors,
+  the LLM tokenizer (BPE), the CTC tokenizer (348 chars) and the
+  mel filterbank. Runtime (`src/granite_nle.{h,cpp}`) loads the
+  model, parses both tokenizers and reports config correctly:
+  `granite_nle: loaded ... (enc 16 layers, proj 2 layers, llm 40
+  layers, vocab 100352)`. Forward-pass functions are stubs. Commits
+  `d6ddad0`, `ffdd19f`, `108a6ae`.
+- **[next] NAR variant — encoder forward + diff harness.** The
+  encoder is the **same 16-layer Conformer as the base** plus three
+  additions: (a) self-conditioning at layer 8 — at the layer-8 boundary
+  the running CTC logits (via `out` → softmax) feed back into the
+  hidden state via `out_mid` (348 → 1024 projection); (b) BPE auxiliary
+  head (`out_bpe`, 100353 vocab) computed only on posterior-weighted-
+  pooled hidden states (window=4); (c) capture hidden states at indices
+  `[4, 8, 12, -1]` for the projector's 4-encoder-layer concat. Most of
+  (a) and (c) can be lifted from `granite_speech.cpp`'s encoder forward
+  (the cat_layers infrastructure already exists). (b) is a fresh ~80
+  LOC. Validate by extending `tools/dump_reference.py` with an `nle`
+  backend and running the CTC-out diff against PyTorch BF16.
 - **[next] NAR variant — windowed Q-Former projector.** Different
   tensor naming and structure from base 4.1's BLIP-2 Q-Former: 4
   per-encoder-layer LayerNorms, a `layer_proj` (4096 → 2048), 32-head

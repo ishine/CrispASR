@@ -4464,25 +4464,58 @@ exclusion. Match the converter's `is_f32_tensor` policy when you
 write a quantizer's downcast path — they encode the same domain
 knowledge.
 
-### `cat_hidden_layers` indexing: `output_hidden_states` includes the input embedding
+### `cat_hidden_layers` indexing: `output_hidden_states` includes the input embedding (CONFIRMED)
 
-When implementing the granite-speech-4.1-2b-plus runtime support,
-the encoder loads cleanly, the projector accepts the wider 2048-dim
-input, and the LLM runs to completion — but the transcript is empty.
-Most likely cause: the upstream `cat_hidden_layers: [3]` in the
-config indexes into HuggingFace's `output_hidden_states` tuple, and
-that tuple's index 0 is the *input embedding*, not the first layer's
-output. So `[3]` means "after layer 2" in our 0-indexed encoder
-loop, not "after layer 3".
+Implementing granite-speech-4.1-2b-plus's encoder concat exposed two
+bugs in sequence. The first was a *silent decode failure* — encoder
+loads cleanly, projector accepts the wider 2048-dim input, LLM runs
+26 high-confidence tokens to completion … and the transcript is
+empty. Two compounding causes:
 
-This is the kind of off-by-one that is impossible to detect from
-the encoder cosine alone (the captured tensor still has the right
-shape and reasonable magnitudes — it's just one layer off, which
-slightly degrades the projector's K/V quality, which is enough to
-push the LLM into degenerate decode).
+1. **The PLUS HF snapshot ships only the unified `tokenizer.json`**
+   format. No separate `vocab.json` / `merges.txt`. The converter's
+   tokenizer-write path conditionally fired only on the legacy
+   files, silently writing zero tokens for PLUS. Every decoded LLM
+   token id mapped to "" → empty transcript. Fix: parse
+   `model.vocab` + `model.merges` out of `tokenizer.json` when the
+   legacy files are missing. Handles both
+   `[[left, right], ...]` (newer) and `["left right"]` (older)
+   merges layouts.
 
-**Lesson.** Whenever a model config's "layer index" refers into HF's
-`output_hidden_states` API, expect the +1 offset for the embedding
-slot. Confirm with a per-layer dump
-(`tools/dump_reference.py` extended with the variant) before
-trusting the runtime output.
+2. **Off-by-one on cat_layer indexing.** The upstream
+   `cat_hidden_layers: [3]` in the config indexes into
+   HuggingFace's `output_hidden_states` tuple, where index 0 is the
+   *input embedding* (after `input_linear`, before any encoder
+   block) and index N is the output of encoder block N-1. So `[3]`
+   means "after layer 2" in our 0-indexed encoder loop, not "after
+   layer 3". Capturing one layer too late slightly degraded the
+   projector's K/V quality, which on JFK was enough to push the
+   LLM into a degenerate decode that happened to land on tokens
+   the detokeniser had already mapped to "" — so the
+   off-by-one bug was *masked* by the tokenizer bug. Fixing only one
+   of the two would not have produced a working transcript.
+
+**Lesson 1.** Whenever a model config's "layer index" refers into
+HF's `output_hidden_states` API, expect the +1 offset for the
+embedding slot. Capture after `il == N - 1` for HF's `[N]`. Add a
+special case for `[0]` if you want to be able to feed the projector
+the input embedding directly.
+
+**Lesson 2.** When the tokenizer is silently dropping tokens, every
+downstream signal (cosines, magnitudes, logit confidences) looks
+fine — the decode loop generates real-looking ids and the per-token
+probability is ~0.99. The bug only surfaces in the printed transcript
+because every id maps to the empty string. Add a debug print of
+`granite_speech_decode_tokens(...)` output right after the call when
+diagnosing "no transcript" issues — that catches the mismatch in one
+shot.
+
+**Lesson 3.** Tokenizer files are split across three layouts in the
+HF ecosystem, and any new model release can choose any of them:
+- `vocab.json` + `merges.txt` (legacy GPT-2 style)
+- `tokenizer.json` with `model.vocab` (dict) + `model.merges`
+  (`[[left, right], ...]` or `["left right"]` strings)
+- `tokenizer.model` (sentencepiece proto, not used by granite)
+A converter that silently skips a layout it doesn't recognise will
+ship a useless GGUF. Always make missing tokenizer data a *warning*
+in the converter output, not silence.
