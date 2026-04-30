@@ -336,8 +336,7 @@ static bool granite_speech_load_model(granite_speech_model& model, const char* p
         hp.proj_ff_dim = core_gguf::kv_u32(g, "granite_speech.proj.ff_dim", hp.proj_ff_dim);
         // Default proj_encoder_hidden_size to proj_d_model so non-plus
         // GGUFs keep the old single-layer-output behaviour.
-        hp.proj_encoder_hidden_size =
-            core_gguf::kv_u32(g, "granite_speech.proj.encoder_hidden_size", hp.proj_d_model);
+        hp.proj_encoder_hidden_size = core_gguf::kv_u32(g, "granite_speech.proj.encoder_hidden_size", hp.proj_d_model);
         hp.proj_cat_layers = core_gguf::kv_str(g, "granite_speech.proj.cat_layers", hp.proj_cat_layers.c_str());
 
         hp.llm_n_layers = core_gguf::kv_u32(g, "granite_speech.llm.n_layers", hp.llm_n_layers);
@@ -682,8 +681,7 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
             fprintf(stderr, "granite_speech: PLUS variant — concatenating encoder layers [");
             for (size_t k = 0; k < ctx->proj_cat_layers_parsed.size(); k++)
                 fprintf(stderr, "%s%d", k > 0 ? "," : "", ctx->proj_cat_layers_parsed[k]);
-            fprintf(stderr, "] + final → projector input width = %u\n",
-                    ctx->model.hparams.proj_encoder_hidden_size);
+            fprintf(stderr, "] + final → projector input width = %u\n", ctx->model.hparams.proj_encoder_hidden_size);
         }
     }
 
@@ -1512,8 +1510,8 @@ static bool run_matmul_pair(granite_speech_context* ctx, float* out_a, ggml_tens
 // in front of each block's QKV projection — one fewer CPU round-trip
 // per encoder layer plus better fusion on Metal.
 static bool run_norm_matmul_pair(granite_speech_context* ctx, float* out_a, ggml_tensor* W_a, int d_out_a, float* out_b,
-                                 ggml_tensor* W_b, int d_out_b, const float* x, int d_in, int T,
-                                 ggml_tensor* norm_w, ggml_tensor* norm_b, float eps) {
+                                 ggml_tensor* W_b, int d_out_b, const float* x, int d_in, int T, ggml_tensor* norm_w,
+                                 ggml_tensor* norm_b, float eps) {
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
     ggml_context* ctx0 = ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
@@ -1958,7 +1956,8 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
             for (int k = 0; k < n_cat; k++) {
                 if (cat_layer_outputs[k].empty())
                     continue;
-                std::memcpy(dst + (size_t)k * d, cat_layer_outputs[k].data() + (size_t)t * d, (size_t)d * sizeof(float));
+                std::memcpy(dst + (size_t)k * d, cat_layer_outputs[k].data() + (size_t)t * d,
+                            (size_t)d * sizeof(float));
             }
             std::memcpy(dst + (size_t)n_cat * d, hidden.data() + (size_t)t * d, (size_t)d * sizeof(float));
         }
@@ -2005,10 +2004,10 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
 static ggml_cgraph* granite_build_projector(granite_speech_context* ctx, int enc_len) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
-    const int d = (int)hp.proj_d_model;                  // 1024 (queries / K-V output dim)
-    const int enc_d = (int)hp.proj_encoder_hidden_size;  // 1024 (base) / 2048 (plus, cat-layers)
-    const int n_heads = (int)hp.proj_n_heads;            // 16
-    const int hd = d / n_heads;                          // 64
+    const int d = (int)hp.proj_d_model;                 // 1024 (queries / K-V output dim)
+    const int enc_d = (int)hp.proj_encoder_hidden_size; // 1024 (base) / 2048 (plus, cat-layers)
+    const int n_heads = (int)hp.proj_n_heads;           // 16
+    const int hd = d / n_heads;                         // 64
     const int n_layers = (int)hp.proj_n_layers;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
 

@@ -1002,10 +1002,10 @@ ggml_cgraph* build_graph_code_pred_kv(qwen3_tts_context* c, int n_past, int n_to
         // Lk = n_past + T.
         const int fixed_kv = (o15 && T == 1) ? c->cp_kv_max_ctx : 0;
         ggml_tensor* eff_mask = (T == 1 && !o15) ? nullptr : causal_mask;
-        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w,
-                                                    b.attn_q_norm_w, b.attn_k_norm_w, positions, eff_mask,
-                                                    c->cp_kv_k, c->cp_kv_v, (int)il, n_past, kvp,
-                                                    /*qkv_w=*/nullptr, /*fixed_kv_len=*/fixed_kv);
+        ggml_tensor* attn =
+            core_attn::kv_self_attn(ctx0, gf, x, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_output_w, b.attn_q_norm_w,
+                                    b.attn_k_norm_w, positions, eff_mask, c->cp_kv_k, c->cp_kv_v, (int)il, n_past, kvp,
+                                    /*qkv_w=*/nullptr, /*fixed_kv_len=*/fixed_kv);
         cur = ggml_add(ctx0, residual, attn);
 
         residual = cur;
