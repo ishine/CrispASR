@@ -95,6 +95,14 @@ struct granite_speech_hparams {
     uint32_t proj_d_model = 1024;
     uint32_t proj_n_heads = 16;
     uint32_t proj_ff_dim = 4096;
+    // For granite-speech-4.1-2b-plus: encoder feeds the projector a
+    // concatenation of (cat_layers + final_layer). Default = same as
+    // proj_d_model (no concat). Plus sets it to 2 * proj_d_model = 2048.
+    uint32_t proj_encoder_hidden_size = 1024;
+    // Comma-separated 0-indexed encoder layer indices to concatenate
+    // with the final layer output before the projector. Empty = no
+    // concat (base / 4.0 / 4.1 base behaviour). Plus = "3".
+    std::string proj_cat_layers = "";
 
     // LLM
     uint32_t llm_n_layers = 40;
@@ -263,6 +271,13 @@ struct granite_speech_context {
     // rpe_lookup[c][r][d] = rel_pos_emb(attention_dists[c][r])[d]
     std::vector<float> rpe_lookup;
 
+    // For granite-speech-4.1-2b-plus: 0-indexed encoder layer indices whose
+    // hidden states are concatenated (along the feature dim) with the final
+    // encoder output before the projector. Empty for base / 4.0 / 4.1 base.
+    // Plus = {3}. Convention: index N means "the output of encoder block N"
+    // (after `il == N` in the per-layer loop).
+    std::vector<int> proj_cat_layers_parsed;
+
     // Tokenizer (GPT-2-style byte-level BPE).
     //
     // id_to_token holds the byte-encoded unicode form of each vocab
@@ -319,6 +334,11 @@ static bool granite_speech_load_model(granite_speech_model& model, const char* p
         hp.proj_d_model = core_gguf::kv_u32(g, "granite_speech.proj.d_model", hp.proj_d_model);
         hp.proj_n_heads = core_gguf::kv_u32(g, "granite_speech.proj.n_heads", hp.proj_n_heads);
         hp.proj_ff_dim = core_gguf::kv_u32(g, "granite_speech.proj.ff_dim", hp.proj_ff_dim);
+        // Default proj_encoder_hidden_size to proj_d_model so non-plus
+        // GGUFs keep the old single-layer-output behaviour.
+        hp.proj_encoder_hidden_size =
+            core_gguf::kv_u32(g, "granite_speech.proj.encoder_hidden_size", hp.proj_d_model);
+        hp.proj_cat_layers = core_gguf::kv_str(g, "granite_speech.proj.cat_layers", hp.proj_cat_layers.c_str());
 
         hp.llm_n_layers = core_gguf::kv_u32(g, "granite_speech.llm.n_layers", hp.llm_n_layers);
         hp.llm_d_model = core_gguf::kv_u32(g, "granite_speech.llm.d_model", hp.llm_d_model);
@@ -631,6 +651,39 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
                     fprintf(stderr, "granite_speech: loaded %d BPE merges\n", n);
             }
             gguf_free(g);
+        }
+    }
+
+    // Parse cat_layers ("3,7,11" or empty) into vector<int> for the
+    // PLUS variant's encoder layer concatenation feature.
+    {
+        const std::string& s = ctx->model.hparams.proj_cat_layers;
+        size_t i = 0;
+        while (i < s.size()) {
+            size_t j = s.find(',', i);
+            if (j == std::string::npos)
+                j = s.size();
+            std::string tok = s.substr(i, j - i);
+            // strip whitespace
+            while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t'))
+                tok.pop_back();
+            while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t'))
+                tok.erase(0, 1);
+            if (!tok.empty()) {
+                try {
+                    ctx->proj_cat_layers_parsed.push_back(std::stoi(tok));
+                } catch (...) {
+                    fprintf(stderr, "granite_speech: ignoring unparseable cat_layers entry '%s'\n", tok.c_str());
+                }
+            }
+            i = j + 1;
+        }
+        if (!ctx->proj_cat_layers_parsed.empty() && params.verbosity >= 1) {
+            fprintf(stderr, "granite_speech: PLUS variant — concatenating encoder layers [");
+            for (size_t k = 0; k < ctx->proj_cat_layers_parsed.size(); k++)
+                fprintf(stderr, "%s%d", k > 0 ? "," : "", ctx->proj_cat_layers_parsed[k]);
+            fprintf(stderr, "] + final → projector input width = %u\n",
+                    ctx->model.hparams.proj_encoder_hidden_size);
         }
     }
 
@@ -1672,6 +1725,14 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
     if (ctx->params.verbosity >= 1)
         fprintf(stderr, "  encoder: per-layer processing T=%d d=%d layers=%d ctx=%d\n", T, d, n_layers, ctx_size);
 
+    // For the PLUS variant, capture intermediate hidden states at the
+    // configured cat_layers indices. After the last layer we concatenate
+    // them along the feature dim with the final encoder output.
+    const bool do_cat_concat = !ctx->proj_cat_layers_parsed.empty();
+    std::vector<std::vector<float>> cat_layer_outputs;
+    if (do_cat_concat)
+        cat_layer_outputs.resize(ctx->proj_cat_layers_parsed.size());
+
     // Input linear: mel (160, T) → hidden (d, T)
     std::vector<float> hidden((size_t)d * T);
     run_matmul(ctx, hidden.data(), mel, n_mels, T, ctx->model.encoder.input_w, ctx->model.encoder.input_b, d);
@@ -1806,6 +1867,17 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
                           b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
         }
 
+        // PLUS: snapshot the post-norm hidden state at any cat_layer index.
+        // Done before mid-CTC residual so we capture the same tensor the
+        // upstream HF model puts in its `output_hidden_states[il+1]`.
+        if (do_cat_concat) {
+            for (size_t k = 0; k < ctx->proj_cat_layers_parsed.size(); k++) {
+                if (ctx->proj_cat_layers_parsed[k] == il) {
+                    cat_layer_outputs[k].assign(hidden.begin(), hidden.end());
+                }
+            }
+        }
+
         // --- Mid-CTC residual at layer 8 ---
         if (il == n_layers / 2 - 1 && ctx->model.encoder.ctc_out_w && ctx->model.encoder.ctc_mid_w) {
             const int ctc_dim = (int)ctx->model.encoder.ctc_out_w->ne[1]; // output_dim from tensor shape
@@ -1849,6 +1921,42 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
         }
     }
 
+    // PLUS variant: concat captured cat_layers + final into a wider tensor.
+    // Layout per frame: [cat_layer_0[d], cat_layer_1[d], ..., final[d]] →
+    // total feature dim = (n_cat + 1) * d. Frame-major so the projector's
+    // existing per-frame input stride works unchanged.
+    if (do_cat_concat) {
+        const int n_cat = (int)cat_layer_outputs.size();
+        const int wide_d = (n_cat + 1) * d;
+        const int expect_d = (int)ctx->model.hparams.proj_encoder_hidden_size;
+        if (wide_d != expect_d) {
+            fprintf(stderr,
+                    "granite_speech: cat_layers width mismatch — cat=%d * d=%d + final=%d → %d, but "
+                    "proj.encoder_hidden_size = %d\n",
+                    n_cat, d, d, wide_d, expect_d);
+        }
+        std::vector<float> wide((size_t)wide_d * T);
+        for (int t = 0; t < T; t++) {
+            float* dst = wide.data() + (size_t)t * wide_d;
+            for (int k = 0; k < n_cat; k++) {
+                if (cat_layer_outputs[k].empty())
+                    continue;
+                std::memcpy(dst + (size_t)k * d, cat_layer_outputs[k].data() + (size_t)t * d, (size_t)d * sizeof(float));
+            }
+            std::memcpy(dst + (size_t)n_cat * d, hidden.data() + (size_t)t * d, (size_t)d * sizeof(float));
+        }
+        size_t wide_total = (size_t)T * wide_d;
+        float* result = (float*)malloc(wide_total * sizeof(float));
+        std::memcpy(result, wide.data(), wide_total * sizeof(float));
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "  encoder: PLUS concat output (%d, %d)\n", T_mel, wide_d);
+        if (out_N)
+            *out_N = T_mel;
+        if (out_dim)
+            *out_dim = wide_d;
+        return result;
+    }
+
     size_t total = (size_t)T * d;
     float* result = (float*)malloc(total * sizeof(float));
     std::memcpy(result, hidden.data(), total * sizeof(float));
@@ -1880,9 +1988,10 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
 static ggml_cgraph* granite_build_projector(granite_speech_context* ctx, int enc_len) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
-    const int d = (int)hp.proj_d_model;       // 1024
-    const int n_heads = (int)hp.proj_n_heads; // 16
-    const int hd = d / n_heads;               // 64
+    const int d = (int)hp.proj_d_model;                  // 1024 (queries / K-V output dim)
+    const int enc_d = (int)hp.proj_encoder_hidden_size;  // 1024 (base) / 2048 (plus, cat-layers)
+    const int n_heads = (int)hp.proj_n_heads;            // 16
+    const int hd = d / n_heads;                          // 64
     const int n_layers = (int)hp.proj_n_layers;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
 
@@ -1894,7 +2003,7 @@ static ggml_cgraph* granite_build_projector(granite_speech_context* ctx, int enc
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 4096, false);
 
     // Encoder output as input
-    ggml_tensor* enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, enc_len);
+    ggml_tensor* enc = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, enc_d, enc_len);
     ggml_set_name(enc, "proj_enc_input");
     ggml_set_input(enc);
 
@@ -2016,10 +2125,17 @@ static ggml_cgraph* granite_build_projector(granite_speech_context* ctx, int enc
 
 extern "C" float* granite_speech_run_projector(struct granite_speech_context* ctx, const float* enc_out, int enc_len,
                                                int enc_dim, int* out_N, int* out_dim) {
-    if (!ctx || !enc_out || enc_dim != (int)ctx->model.hparams.proj_d_model)
+    // Plus variant supplies a wider (concat) encoder output. Accept either
+    // proj_d_model (base / 4.1) or proj_encoder_hidden_size (plus = 2048).
+    if (!ctx || !enc_out)
         return nullptr;
+    const int expect_d = (int)ctx->model.hparams.proj_encoder_hidden_size;
+    if (enc_dim != expect_d) {
+        fprintf(stderr, "granite_speech: projector expected enc_dim=%d, got %d\n", expect_d, enc_dim);
+        return nullptr;
+    }
     granite_bench_stage _b("run_projector");
-    const int d = enc_dim;                                          // 1024
+    const int d = enc_dim;                                          // 1024 (base) or 2048 (plus)
     const int llm_d = (int)ctx->model.hparams.llm_d_model;          // 2048
     const int window_size = (int)ctx->model.hparams.window_size;    // 15
     const int downsample = (int)ctx->model.hparams.downsample_rate; // 5
