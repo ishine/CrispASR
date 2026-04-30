@@ -1,7 +1,7 @@
 // crispasr_model_registry.h — known-model registry lookup.
 //
 // Tiny table mapping a backend name (whisper, parakeet, canary, voxtral,
-// voxtral4b, granite, qwen3, cohere, wav2vec2) to the canonical GGUF
+// voxtral4b, granite, granite-4.1, qwen3, cohere, wav2vec2) to the canonical GGUF
 // filename + HuggingFace download URL + approximate size. Used by:
 //
 //   * the CLI's `-m auto` / `-m default` resolver
@@ -34,7 +34,7 @@ bool crispasr_registry_lookup_by_filename(const std::string& filename, CrispasrR
 /// Scan the cache directory for any already-downloaded model from the
 /// registry and return the first hit, preferring backends in this order:
 /// whisper > parakeet > canary > cohere > voxtral > voxtral4b > granite
-/// > qwen3 > wav2vec2. Populates `out` on success. Returns true if a
+/// > granite-4.1 > qwen3 > wav2vec2. Populates `out` on success. Returns true if a
 /// cached model was found, false if the cache is empty. Intended for the
 /// `-m auto` path so a user who already has *any* model doesn't trigger
 /// a fresh download of whisper-base.

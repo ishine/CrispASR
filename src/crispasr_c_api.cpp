@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "whisper.h"
+#include "crispasr.h"
 #include "crispasr_vad.h"            // VAD slicing + stitching (shared with CLI)
 #include "crispasr_diarize.h"        // Speaker diarization (shared with CLI)
 #include "crispasr_lid.h"            // Language identification (shared with CLI)
@@ -187,7 +187,7 @@ CA_EXPORT void crispasr_params_set_initial_prompt(whisper_full_params* p, const 
         p->initial_prompt = prompt; // caller owns the string
 }
 
-// VAD (whisper.cpp built-in Silero pipeline). When enabled, whisper_full
+// VAD (crispasr built-in Silero pipeline). When enabled, whisper_full
 // detects speech spans internally and only decodes those regions —
 // timestamps are adjusted for the caller. Skips costly decode on silence.
 CA_EXPORT void crispasr_params_set_vad(whisper_full_params* p, int v) {
@@ -369,7 +369,7 @@ CA_EXPORT void crispasr_vad_free(float* spans) {
 //
 // This is the same "sliding-window" trick the CLI uses. It is not true
 // token-level streaming — it is chunked batch with context carry, which
-// is what whisper.cpp itself supports.
+// is what crispasr itself supports.
 
 struct crispasr_stream {
     whisper_context* ctx = nullptr; // not owned
@@ -442,7 +442,7 @@ static int crispasr_stream_run_decode(crispasr_stream* s) {
     }
     pcm.insert(pcm.end(), s->accum.begin(), s->accum.end());
 
-    whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    whisper_full_params wparams = whisper_full_default_params(CRISPASR_SAMPLING_GREEDY);
     wparams.print_progress = false;
     wparams.print_realtime = false;
     wparams.print_timestamps = false;
@@ -874,7 +874,7 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
     }
 #endif
 #ifdef CA_HAVE_GRANITE
-    if (s->backend == "granite") {
+    if (s->backend == "granite" || s->backend == "granite-4.1") {
         granite_speech_context_params p = granite_speech_context_default_params();
         p.n_threads = s->n_threads;
         p.verbosity = 0;
@@ -1101,7 +1101,7 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
     list += ",cohere";
 #endif
 #ifdef CA_HAVE_GRANITE
-    list += ",granite";
+    list += ",granite,granite-4.1";
 #endif
 #ifdef CA_HAVE_CTC
     list += ",fastconformer-ctc,canary-ctc";
@@ -1338,7 +1338,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
     r->backend = s->backend;
 
     if (s->backend == "whisper" && s->whisper_ctx) {
-        whisper_full_params wparams = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+        whisper_full_params wparams = whisper_full_default_params(CRISPASR_SAMPLING_GREEDY);
         wparams.print_progress = false;
         wparams.print_realtime = false;
         wparams.print_timestamps = false;
@@ -1433,7 +1433,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
     }
 #endif
 #ifdef CA_HAVE_GRANITE
-    if (s->backend == "granite" && s->granite_ctx) {
+    if ((s->backend == "granite" || s->backend == "granite-4.1") && s->granite_ctx) {
         return run_char_transcribe(granite_speech_transcribe(s->granite_ctx, pcm, n_samples));
     }
 #endif
@@ -1610,7 +1610,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe(crispasr_session*
 //
 // Runs Silero VAD on the PCM buffer, merges short / overlong slices into
 // usable chunks, stitches them into a single contiguous buffer with 0.1s
-// silence gaps (whisper.cpp-style), calls crispasr_session_transcribe on
+// silence gaps (crispasr-style), calls crispasr_session_transcribe on
 // the stitched buffer, and remaps segment + word timestamps from
 // stitched-buffer space back to original-audio positions.
 //

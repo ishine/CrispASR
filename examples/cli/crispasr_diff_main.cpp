@@ -43,7 +43,7 @@
 #include "cohere.h"
 #include "gemma4_e2b.h"
 
-#include "common-whisper.h"
+#include "common-crispasr.h"
 
 #include <algorithm>
 #include <cmath>
@@ -423,7 +423,8 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
                 "\n"
-                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, granite, parakeet, "
+                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, granite, granite-4.1, "
+                "parakeet, "
                 "canary, cohere, gemma4\n"
                 "  model.gguf    crispasr-compatible model weights\n"
                 "  reference.gguf  archive produced by tools/dump_reference.py\n"
@@ -1089,7 +1090,7 @@ int main(int argc, char** argv) {
         }
         qwen3_tts_free(ctx);
 
-    } else if (backend_name == "granite") {
+    } else if (backend_name == "granite" || backend_name == "granite-4.1") {
         auto cp = granite_speech_context_default_params();
         cp.n_threads = 4;
         cp.verbosity = 0;
@@ -1103,6 +1104,25 @@ int main(int argc, char** argv) {
             auto rep = ref.compare("mel_spectrogram", mel_r.data.data(), mel_r.data.size());
             print_row("mel_spectrogram", rep, COS_THRESHOLD);
             record(rep);
+
+            int enc_N = 0, enc_dim = 0;
+            float* enc_out =
+                granite_speech_run_encoder(ctx, mel_r.data.data(), mel_r.shape[0], mel_r.shape[1], &enc_N, &enc_dim);
+            if (enc_out) {
+                auto rep2 = ref.compare("encoder_out", enc_out, (size_t)enc_N * enc_dim);
+                print_row("encoder_out", rep2, COS_THRESHOLD);
+                record(rep2);
+
+                int proj_N = 0, proj_dim = 0;
+                float* proj_out = granite_speech_run_projector(ctx, enc_out, enc_N, enc_dim, &proj_N, &proj_dim);
+                free(enc_out);
+                if (proj_out) {
+                    auto rep3 = ref.compare("projector_out", proj_out, (size_t)proj_N * proj_dim);
+                    print_row("projector_out", rep3, COS_THRESHOLD);
+                    record(rep3);
+                    free(proj_out);
+                }
+            }
         } else {
             printf("[ERR ] mel_spectrogram         %s\n", mel_r.note.c_str());
             n_fail++;
@@ -1283,7 +1303,7 @@ int main(int argc, char** argv) {
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
-                "Supported: voxtral, voxtral4b, qwen3, granite, parakeet, canary, cohere, gemma4.\n",
+                "Supported: voxtral, voxtral4b, qwen3, granite, granite-4.1, parakeet, canary, cohere, gemma4.\n",
                 backend_name.c_str());
         return 5;
     }

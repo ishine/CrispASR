@@ -89,6 +89,7 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
     }
     const bool is_firered = (arch.find("firered") != std::string::npos);
     const bool is_ecapa = (arch.find("ecapa") != std::string::npos);
+    const bool is_granite_speech = (arch.find("granite_speech") != std::string::npos);
 
     const int n_tensors = gguf_get_n_tensors(ctx_in);
     for (int i = 0; i < n_tensors; i++) {
@@ -146,6 +147,10 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                         is_weight && (sname.find("norm") == std::string::npos) &&
                         // Skip projector tensors (Granite Speech: precision-sensitive)
                         (sname.find("proj.") != 0) &&
+                        // Skip encoder tensors for Granite Speech: 16-layer Conformer
+                        // encoder is precision-sensitive (cos drops to ~0.93 at Q4_K
+                        // when encoder is quantized; ~0.999 when kept F32).
+                        !(is_granite_speech && sname.find("enc.") == 0) &&
                         // Skip small classifier heads (ECAPA cosine: 45x192, precision-critical)
                         !(sname.find("cls.") == 0 && ggml_nelements(t) < 65536) &&
                         // Skip OmniASR-LLM bridging tensors (enc_proj, lm_head, tok_emb, lang_emb)

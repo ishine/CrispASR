@@ -497,6 +497,12 @@ def convert(input_dir: Path, out_path: Path) -> None:
         "granite_speech.enc.ff_dim",
         enc_cfg.get("hidden_dim", 1024) * enc_cfg.get("feedforward_mult", 4),
     )
+    writer.add_uint32(
+        "granite_speech.enc.context_size", enc_cfg.get("context_size", 200)
+    )
+    writer.add_uint32(
+        "granite_speech.enc.max_pos_emb", enc_cfg.get("max_pos_emb", 512)
+    )
 
     writer.add_uint32(
         "granite_speech.proj.n_layers", proj_cfg.get("num_hidden_layers", 2)

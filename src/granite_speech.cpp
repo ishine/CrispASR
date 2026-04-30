@@ -54,6 +54,8 @@ struct granite_speech_hparams {
     uint32_t enc_input_dim = 160;
     uint32_t enc_conv_kernel = 15;
     uint32_t enc_ff_dim = 4096;
+    uint32_t enc_context_size = 200; // block-local attention window
+    uint32_t enc_max_pos_emb = 512;  // Shaw RPE table half-width
 
     // Projector (Q-Former)
     uint32_t proj_n_layers = 2;
@@ -277,6 +279,8 @@ static bool granite_speech_load_model(granite_speech_model& model, const char* p
         hp.enc_input_dim = core_gguf::kv_u32(g, "granite_speech.enc.input_dim", hp.enc_input_dim);
         hp.enc_conv_kernel = core_gguf::kv_u32(g, "granite_speech.enc.conv_kernel", hp.enc_conv_kernel);
         hp.enc_ff_dim = core_gguf::kv_u32(g, "granite_speech.enc.ff_dim", hp.enc_ff_dim);
+        hp.enc_context_size = core_gguf::kv_u32(g, "granite_speech.enc.context_size", hp.enc_context_size);
+        hp.enc_max_pos_emb = core_gguf::kv_u32(g, "granite_speech.enc.max_pos_emb", hp.enc_max_pos_emb);
 
         hp.proj_n_layers = core_gguf::kv_u32(g, "granite_speech.proj.n_layers", hp.proj_n_layers);
         hp.proj_d_model = core_gguf::kv_u32(g, "granite_speech.proj.d_model", hp.proj_d_model);
@@ -603,7 +607,7 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
     // where scale = gamma/sqrt(var+eps), shift = beta - mean*scale
     {
         const float eps = 1e-5f;
-        const int inner = 2048; // conv expansion = 2 * d_model
+        const int inner = 2 * (int)ctx->model.hparams.enc_d_model; // conv expansion = 2 * d_model
         int folded = 0;
         for (uint32_t il = 0; il < ctx->model.hparams.enc_n_layers; il++) {
             auto& b = ctx->model.encoder.blocks[il];
@@ -635,8 +639,8 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
     // attention_dists[c][r] = clamp(c - r, -ctx_size, ctx_size) + max_pos_emb
     // RPE lookup: (ctx_size, ctx_size, head_dim) F32
     {
-        const int C = 200;                                   // context_size
-        const int max_pos = 512;                             // max_pos_emb
+        const int C = (int)ctx->model.hparams.enc_context_size;
+        const int max_pos = (int)ctx->model.hparams.enc_max_pos_emb;
         const int hd = (int)ctx->model.hparams.enc_head_dim; // 128
         const int emb_size = 2 * max_pos + 1;                // 1025
 
@@ -661,19 +665,16 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
             if (rpe_w->type == GGML_TYPE_F32) {
                 ggml_backend_tensor_get(rpe_w, emb_table.data(), 0, emb_table.size() * sizeof(float));
             } else {
-                // Dequantize: build a tiny graph that casts to F32
-                ggml_init_params tip = {2 * ggml_tensor_overhead(), nullptr, true};
-                ggml_context* tctx = ggml_init(tip);
-                ggml_tensor* f32 = ggml_cast(tctx, rpe_w, GGML_TYPE_F32);
-                ggml_set_name(f32, "rpe_f32");
-                ggml_set_output(f32);
-                ggml_cgraph* tgf = ggml_new_graph(tctx);
-                ggml_build_forward_expand(tgf, f32);
-                ggml_backend_sched_reset(ctx->sched);
-                ggml_backend_sched_alloc_graph(ctx->sched, tgf);
-                ggml_backend_sched_graph_compute(ctx->sched, tgf);
-                ggml_backend_tensor_get(f32, emb_table.data(), 0, emb_table.size() * sizeof(float));
-                ggml_free(tctx);
+                // Quantized RPE weight — dequantize via CPU type traits (no sched needed).
+                std::vector<uint8_t> raw(ggml_nbytes(rpe_w));
+                ggml_backend_tensor_get(rpe_w, raw.data(), 0, raw.size());
+                const struct ggml_type_traits* tt = ggml_get_type_traits(rpe_w->type);
+                if (tt && tt->to_float) {
+                    tt->to_float(raw.data(), emb_table.data(), (int64_t)emb_table.size());
+                } else {
+                    fprintf(stderr, "granite_speech: unsupported RPE type %s — skipping RPE\n",
+                            ggml_type_name(rpe_w->type));
+                }
             }
 
             // Build lookup: rpe_lookup[c * C * hd + r * hd + d] = emb_table[dists[c,r] * hd + d]
@@ -1074,7 +1075,7 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T) {
         cur = ggml_add(ctx0, cur, m.encoder.input_b);
 
     // Block-local attention with Shaw relative position embeddings
-    const int ctx_size = 200; // context_size
+    const int ctx_size = (int)hp.enc_context_size;
     const int n_blocks_attn = (T + ctx_size - 1) / ctx_size;
     const int T_padded = n_blocks_attn * ctx_size;
     (void)T_padded; // reserved — the block path would clip-pad here
@@ -1303,7 +1304,7 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T) {
 static float* granite_run_encoder_graph(granite_speech_context* ctx, const float* mel, int n_mels, int T, int d) {
     const auto& hp = ctx->model.hparams;
     const int hd = (int)hp.enc_head_dim; // 128
-    const int ctx_size = 200;
+    const int ctx_size = (int)hp.enc_context_size;
 
     ggml_cgraph* gf = granite_build_encoder(ctx, T);
     ggml_backend_sched_reset(ctx->sched);
@@ -1544,7 +1545,7 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
     const int n_heads = (int)hp.enc_n_heads;   // 8
     const int hd = (int)hp.enc_head_dim;       // 128
     const int n_layers = (int)hp.enc_n_layers; // 16
-    const int ctx_size = 200;
+    const int ctx_size = (int)hp.enc_context_size;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
     const int T = T_mel;
     const int remainder = T % ctx_size;
@@ -1578,7 +1579,7 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
     // Precompute per-layer RPE lookups
     std::vector<std::vector<float>> rpe_per_layer(n_layers);
     {
-        const int max_pos = 512;
+        const int max_pos = (int)hp.enc_max_pos_emb;
         std::vector<int> dists(ctx_size * ctx_size);
         for (int c = 0; c < ctx_size; c++)
             for (int r = 0; r < ctx_size; r++) {
@@ -1590,7 +1591,21 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
             if (!rpe_w)
                 continue;
             std::vector<float> emb((size_t)(2 * max_pos + 1) * hd);
-            ggml_backend_tensor_get(rpe_w, emb.data(), 0, emb.size() * sizeof(float));
+            if (rpe_w->type == GGML_TYPE_F32) {
+                ggml_backend_tensor_get(rpe_w, emb.data(), 0, emb.size() * sizeof(float));
+            } else {
+                // Quantized RPE — read raw bytes and dequantize via type traits.
+                std::vector<uint8_t> raw(ggml_nbytes(rpe_w));
+                ggml_backend_tensor_get(rpe_w, raw.data(), 0, raw.size());
+                const struct ggml_type_traits* tt = ggml_get_type_traits(rpe_w->type);
+                if (tt && tt->to_float) {
+                    tt->to_float(raw.data(), emb.data(), (int64_t)emb.size());
+                } else {
+                    fprintf(stderr, "granite_speech: unsupported RPE type %s at layer %d\n",
+                            ggml_type_name(rpe_w->type), il);
+                    continue;
+                }
+            }
             rpe_per_layer[il].resize((size_t)ctx_size * ctx_size * hd);
             for (int c = 0; c < ctx_size; c++)
                 for (int r = 0; r < ctx_size; r++) {

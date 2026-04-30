@@ -34,6 +34,8 @@ constexpr Entry k_registry[] = {
      "~3.3 GB", nullptr, nullptr},
     {"granite", "granite-speech-4.0-1b-q4_k.gguf",
      "https://huggingface.co/cstr/granite-speech-4.0-1b-GGUF/resolve/main/granite-speech-4.0-1b-q4_k.gguf", "~2.94 GB", nullptr, nullptr},
+    {"granite-4.1", "granite-speech-4.1-2b-q4_k.gguf",
+     "https://huggingface.co/cstr/granite-speech-4.1-2b-GGUF/resolve/main/granite-speech-4.1-2b-q4_k.gguf", "~2.94 GB", nullptr, nullptr},
     {"qwen3", "qwen3-asr-0.6b-q4_k.gguf",
      "https://huggingface.co/cstr/qwen3-asr-0.6b-GGUF/resolve/main/qwen3-asr-0.6b-q4_k.gguf", "~500 MB", nullptr, nullptr},
     {"cohere", "cohere-transcribe-q4_k.gguf",

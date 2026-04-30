@@ -2,7 +2,7 @@
 
 **One C++ binary, twenty-one ASR backends, zero Python dependencies.**
 
-CrispASR is a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) that extends it into a **unified speech recognition tool** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file.
+CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech recognition tool** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file.
 
 ```console
 $ crispasr -m ggml-base.en.bin          -f samples/jfk.wav        # OpenAI Whisper
@@ -58,6 +58,7 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 | **canary** | [`nvidia/canary-1b-v2`](https://huggingface.co/nvidia/canary-1b-v2) | FastConformer + Transformer decoder | 25 EU (explicit `-sl/-tl`) | CC-BY-4.0 |
 | **cohere** | [`CohereLabs/cohere-transcribe-03-2026`](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026) | Conformer + Transformer | 13 | Apache-2.0 |
 | **granite** | [`ibm-granite/granite-speech-{3.2-8b,3.3-2b,3.3-8b,4.0-1b}`](https://huggingface.co/ibm-granite/granite-speech-3.3-2b) | Conformer + BLIP-2 Q-Former + Granite LLM (μP) | en fr de es pt ja | Apache-2.0 |
+| **granite-4.1** | [`ibm-granite/granite-speech-4.1-2b`](https://huggingface.co/ibm-granite/granite-speech-4.1-2b) | Same architecture as 4.0 (16-layer Conformer + Q-Former + Granite LLM); "2B" = full system | en fr de es pt ja | Apache-2.0 |
 | **fastconformer-ctc** | [`nvidia/stt_en_fastconformer_ctc_large`](https://huggingface.co/nvidia/stt_en_fastconformer_ctc_large) | FastConformer + CTC (NeMo family, all sizes) | en | CC-BY-4.0 |
 | **voxtral** | [`mistralai/Voxtral-Mini-3B-2507`](https://huggingface.co/mistralai/Voxtral-Mini-3B-2507) | Whisper encoder + Mistral 3B LLM, audio-token injection | 8 | Apache-2.0 |
 | **voxtral4b** | [`mistralai/Voxtral-Mini-4B-Realtime-2602`](https://huggingface.co/mistralai/Voxtral-Mini-4B-Realtime-2602) | Causal RoPE+SwiGLU encoder + 3.4B LLM with adaptive RMSNorm + sliding window | 13, realtime streaming | Apache-2.0 |
@@ -216,7 +217,7 @@ crispasr --backend cohere -m $TC/cohere-transcribe-q5_0.gguf \
 
 These LID providers are available:
 
-- `--lid-backend whisper` (default) — uses a small multilingual ggml-*.bin model via the whisper.cpp C API. Auto-downloads ~75 MB on first use. 99 languages.
+- `--lid-backend whisper` (default) — uses a small multilingual ggml-*.bin model via the crispasr C API. Auto-downloads ~75 MB on first use. 99 languages.
 - `--lid-backend silero` — native GGUF port of Silero's 95-language classifier. 16 MB F32, pure C++. Faster and smaller than whisper-tiny but slightly less accurate on long audio (>20s).
 - `--lid-backend ecapa` — **recommended**: ECAPA-TDNN (Apache-2.0). Purpose-built for language ID. Very high accuracy on TTS benchmark. Two variants via `--lid-model`:
   - [`cstr/ecapa-lid-107-GGUF`](https://huggingface.co/cstr/ecapa-lid-107-GGUF) — VoxLingua107, 43 MB F16, 107 languages, ISO codes (en, de, ...). **Default.**
@@ -240,7 +241,7 @@ Pass `--lid-backend off` to skip LID entirely.
 
 - C++17 compiler (GCC 10+, Clang 12+, MSVC 19.30+)
 - CMake 3.14+
-- Optional: `libavformat`/`libavcodec`/`libavutil`/`libswresample` for Opus/M4A ingestion (`WHISPER_FFMPEG=ON`)
+- Optional: `libavformat`/`libavcodec`/`libavutil`/`libswresample` for Opus/M4A ingestion (`CRISPASR_FFMPEG=ON`)
 - Optional: `libopenblas`/MKL/Accelerate — speeds up CPU-side matmuls for the Conformer-based encoders (parakeet, canary, cohere, granite, fastconformer-ctc). The ggml CPU backend picks up BLAS automatically when it's present at build time; no CrispASR configure flag needed.
 - Optional: CUDA/Metal/Vulkan GPU backend — enabled via ggml's standard flags (`GGML_CUDA=ON`, `GGML_METAL=ON`, etc.). On CUDA you can set `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` to allow swapping to system RAM when VRAM is exhausted.
 - `curl` or `wget` on `$PATH` if you want to use `-m auto` auto-download
@@ -258,7 +259,14 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc) --target crispasr
 ```
 
-The produced binary is `build/bin/crispasr` with a `build/bin/whisper-cli` backward-compatibility alias.
+The produced binary is `build/bin/crispasr`.
+
+For the repo's default local preset, which already disables tests and ccache-related friction:
+
+```bash
+cmake --preset default
+cmake --build build -j$(nproc) --target crispasr
+```
 
 ### Windows (convenience scripts)
 
@@ -273,7 +281,7 @@ build-windows.bat
 Produces `build\bin\crispasr.exe`. Extra CMake flags can be appended:
 
 ```cmd
-build-windows.bat -DWHISPER_CURL=ON          :: enable libcurl fallback
+build-windows.bat -DCRISPASR_CURL=ON          :: enable libcurl fallback
 build-windows.bat -DGGML_CUDA=ON             :: NVIDIA GPU (CUDA must be installed)
 ```
 
@@ -282,7 +290,7 @@ What it does:
 2. Finds the latest VS 2022 installation that includes the VC++ toolchain
 3. Calls `vcvars64.bat` to initialize the 64-bit MSVC environment
 4. Runs `cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release [extra flags]`
-5. Builds the `whisper-cli` target → `build\bin\crispasr.exe`
+5. Builds the `crispasr` target → `build\bin\crispasr.exe`
 
 #### `build-vulkan.bat` — Vulkan GPU build
 
@@ -328,21 +336,21 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON    # Apple Silicon
 # Install ffmpeg dev libs first:
 #   apt install libavformat-dev libavcodec-dev libavutil-dev libswresample-dev
 
-cmake -B build-ffmpeg -DCMAKE_BUILD_TYPE=Release -DWHISPER_FFMPEG=ON
+cmake -B build-ffmpeg -DCMAKE_BUILD_TYPE=Release -DCRISPASR_FFMPEG=ON
 cmake --build build-ffmpeg -j$(nproc) --target crispasr
 ```
 
-> **Upstream bug warning.** `.m4a` / `.mp4` / `.webm` containers currently crash `whisper.cpp`'s ffmpeg integration. For those formats, pre-convert to WAV:
+> **Upstream bug warning.** `.m4a` / `.mp4` / `.webm` containers currently crash `crispasr`'s ffmpeg integration. For those formats, pre-convert to WAV:
 > ```bash
 > ffmpeg -i input.opus -ar 16000 -ac 1 -c:a pcm_s16le -y /tmp/audio.wav
 > ```
-> Bare-codec `.opus` files work fine with `WHISPER_FFMPEG=ON`.
+> Bare-codec `.opus` files work fine with `CRISPASR_FFMPEG=ON`.
 
 ---
 
 ## Quick start
 
-### Whisper (historical path, byte-identical to upstream whisper-cli)
+### Whisper (historical path, byte-identical to upstream whisper.cpp)
 
 ```bash
 # Download a whisper model (same as upstream whisper.cpp)
@@ -377,7 +385,7 @@ curl -L -o parakeet.gguf \
 # Translation (German speech → English text)
 ./build/bin/crispasr --backend canary -m canary-1b-v2-q5_0.gguf -f audio.de.wav -sl de -tl en
 
-# ...or use the familiar whisper-cli flag:
+# ...or use the familiar crispasr flag:
 ./build/bin/crispasr --backend canary -m canary-1b-v2-q5_0.gguf -f audio.de.wav -l de --translate
 ```
 
@@ -675,7 +683,7 @@ curl http://localhost:8080/v1/audio/transcriptions \
 
 ## CLI reference
 
-`crispasr` extends upstream `whisper-cli`'s argument set with a handful of backend-dispatch flags. Every historical whisper flag still works — when you don't pass `--backend`, whisper is the default.
+`crispasr` extends upstream `crispasr`'s argument set with a handful of backend-dispatch flags. Every historical whisper flag still works — when you don't pass `--backend`, whisper is the default.
 
 ### Core
 
@@ -763,13 +771,13 @@ curl http://localhost:8080/v1/audio/transcriptions \
 
 These work both with the historical default whisper code path AND with `--backend whisper`. The historical path retains a few extras unique to it (`-owts` karaoke, full-mode JSON DTW tokens, `-di` stereo diarize) — pass a `ggml-*.bin` model without `--backend` to get them.
 
-`--diarize`, `-tdrz`/`--tinydiarize`, `--carry-initial-prompt`, `-dtw`, `-fa`/`-nfa`, `-suppress-regex`, `-suppress-nst`, and the full upstream `whisper-cli --help` list.
+`--diarize`, `-tdrz`/`--tinydiarize`, `--carry-initial-prompt`, `-dtw`, `-fa`/`-nfa`, `-suppress-regex`, `-suppress-nst`, and the full upstream `crispasr --help` list.
 
 ---
 
 ## Voice Activity Detection (VAD)
 
-Every non-whisper backend uses the Silero VAD model to segment long audio into speech regions, **stitch them into a single contiguous buffer** (with 0.1s silence gaps, matching whisper.cpp's internal approach), transcribe in one pass, and remap timestamps back to original-audio positions. This preserves cross-segment context and avoids boundary artifacts. Short VAD segments (< 3s) are auto-merged, and oversized segments are split at `--chunk-seconds` boundaries. Whisper handles VAD internally via `wparams.vad`.
+Every non-whisper backend uses the Silero VAD model to segment long audio into speech regions, **stitch them into a single contiguous buffer** (with 0.1s silence gaps, matching crispasr's internal approach), transcribe in one pass, and remap timestamps back to original-audio positions. This preserves cross-segment context and avoids boundary artifacts. Short VAD segments (< 3s) are auto-merged, and oversized segments are split at `--chunk-seconds` boundaries. Whisper handles VAD internally via `wparams.vad`.
 
 ```bash
 # Just pass --vad — the model is auto-downloaded on first use
@@ -948,6 +956,7 @@ When you pass `-m auto` (or `-m default`), CrispASR downloads the default quanti
 | voxtral | `cstr/voxtral-mini-3b-2507-GGUF` | ~2.5 GB |
 | voxtral4b | `cstr/voxtral-mini-4b-realtime-GGUF` | ~3.3 GB |
 | granite | `cstr/granite-speech-4.0-1b-GGUF` | ~2.94 GB |
+| granite-4.1 | `cstr/granite-speech-4.1-2b-GGUF` | ~2.94 GB |
 | qwen3 | `cstr/qwen3-asr-0.6b-GGUF` | ~500 MB |
 | cohere | `cstr/cohere-transcribe-03-2026-GGUF` | ~550 MB |
 | wav2vec2 | `cstr/wav2vec2-large-xlsr-53-english-GGUF` | ~212 MB |
@@ -969,7 +978,7 @@ Every audio path goes through `read_audio_data()` inherited from upstream whispe
 
 Out of the box, CrispASR accepts **WAV / FLAC / MP3 / OGG Vorbis** at any bit depth and any sample rate (auto-resampled to 16 kHz), mono or stereo (auto-mixed to mono).
 
-| Format | Default build | `WHISPER_FFMPEG=ON` |
+| Format | Default build | `CRISPASR_FFMPEG=ON` |
 |---|:---:|:---:|
 | WAV / FLAC / MP3 / OGG | ✔ | ✔ |
 | `.opus` | ✗ | ✔ |
@@ -982,7 +991,7 @@ For anything in the bottom half, the reliable path is `ffmpeg -i in.X -ar 16000 
 
 ## Architecture
 
-CrispASR is structured around three layers on top of whisper.cpp. The
+CrispASR is structured around three layers on top of crispasr. The
 split between `src/` (library) and `examples/cli/` (presentation) is
 deliberate: **every algorithm** — VAD, diarization, LID, CTC alignment,
 HF download/cache, model registry — lives in `src/` behind a stable
@@ -1003,7 +1012,7 @@ presentation + UX policy.
 │   work to the shared library below.                                │
 ├───────────────────────────────────────────────────────────────────┤
 │ src/crispasr_c_api.cpp — C-ABI (shared with Dart / Python / Rust) │
-│   crispasr_vad.{h,cpp}           Silero VAD + whisper.cpp-style   │
+│   crispasr_vad.{h,cpp}           Silero VAD + crispasr-style   │
 │                                  stitching, timestamp remap       │
 │   crispasr_diarize.{h,cpp}       energy / xcorr / vad-turns /     │
 │                                  native pyannote diarization      │
@@ -1035,7 +1044,7 @@ all consume the same symbols.
 | File | Role |
 |---|---|
 | `crispasr_c_api.cpp` | The C-ABI. Exports session open/close/transcribe, VAD, diarize, LID, alignment, cache, registry — everything a wrapper needs. |
-| `crispasr_vad.{h,cpp}` | Silero VAD slicing + whisper.cpp-style stitching with timestamp remapping. Used by `crispasr_session_transcribe_vad`. |
+| `crispasr_vad.{h,cpp}` | Silero VAD slicing + crispasr-style stitching with timestamp remapping. Used by `crispasr_session_transcribe_vad`. |
 | `crispasr_diarize.{h,cpp}` | Four diarizers: energy (stereo), xcorr (stereo, TDOA), vad-turns (mono, timing), pyannote (mono, GGUF). |
 | `crispasr_lid.{h,cpp}` | whisper-tiny + silero-native language ID with process-wide whisper-context cache. |
 | `crispasr_aligner.{h,cpp}` | canary-CTC + Qwen3-ForcedAligner forced alignment behind one entry point; filename-based dispatch. |
@@ -1077,7 +1086,7 @@ Duplicated scaffolding is bundled in a single static library, `crispasr-core`, l
 
 ### Whisper is the reference implementation
 
-`src/whisper.cpp` is **intentionally not migrated** to `src/core/` (yet) — it's (for the time being) the battle-tested reference and the `crispasr -m ggml-base.en.bin …` code path is byte-identical to upstream `whisper-cli`. This guarantee is a test gate: every CrispASR commit that touches the CLI is checked against it.
+`src/crispasr` is **intentionally not migrated** to `src/core/` (yet) — it's (for the time being) the battle-tested reference and the `crispasr -m ggml-base.en.bin …` code path is byte-identical to upstream `crispasr`. This guarantee is a test gate: every CrispASR commit that touches the CLI is checked against it.
 
 ### Regression discipline
 
@@ -1469,7 +1478,7 @@ reference (see [Debug a new backend against PyTorch ground truth](#debug-a-new-b
 | `CRISPASR_NO_REL_POS=1` | Ablate the relative-position bias in the Gemma-4 audio encoder (development only). |
 | `ECAPA_REF_FBANK=path` | Reference filterbank tensor for the ECAPA-TDNN LID model (regression harness). |
 | `CRISPASR_SHERPA_LID_BIN=path` | Override the auto-detected sherpa-onnx LID binary. |
-| `WHISPER_ARG_DEVICE=N` | Default GPU device index when `-dev` isn't passed. |
+| `CRISPASR_ARG_DEVICE=N` | Default GPU device index when `-dev` isn't passed. |
 | `GGML_CUDA_ENABLE_UNIFIED_MEMORY=1` | Let CUDA swap to RAM when VRAM is exhausted. |
 | `GGML_VK_VISIBLE_DEVICES` / `CUDA_VISIBLE_DEVICES` | Standard ggml/CUDA device-visibility filters. |
 
@@ -1482,7 +1491,7 @@ downloads (in that order).
 
 ## Credits
 
-- **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** — the ggml inference engine and the whisper runtime this fork is built on
+- **[whisper.cpp](https://github.com/ggml-org/whisper.cpp)** — the original ggml inference engine and Whisper runtime this fork is built on
 - **[ggml](https://github.com/ggml-org/ggml)** — the tensor library everything runs on
 - **NVIDIA NeMo** — parakeet-tdt, canary-1b-v2, canary-ctc aligner, and the FastConformer-CTC family (stt_en_fastconformer_ctc_{large,xlarge,xxlarge})
 - **Cohere** — cohere-transcribe-03-2026

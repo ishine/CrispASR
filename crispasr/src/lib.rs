@@ -74,7 +74,7 @@ impl CrispASR {
     ///
     /// Returns a list of segments with text and timing.
     pub fn transcribe_pcm(&self, pcm: &[f32]) -> Result<Vec<Segment>, String> {
-        self.transcribe_pcm_with_strategy(pcm, crispasr_sys::WHISPER_SAMPLING_GREEDY)
+        self.transcribe_pcm_with_strategy(pcm, crispasr_sys::CRISPASR_SAMPLING_GREEDY)
     }
 
     /// Transcribe with a specific sampling strategy.
@@ -100,7 +100,7 @@ impl CrispASR {
         pcm: &[f32],
         opts: &TranscribeOptions,
     ) -> Result<Vec<Segment>, String> {
-        let strategy = opts.strategy.unwrap_or(crispasr_sys::WHISPER_SAMPLING_GREEDY);
+        let strategy = opts.strategy.unwrap_or(crispasr_sys::CRISPASR_SAMPLING_GREEDY);
         let params = unsafe {
             crispasr_sys::whisper_full_default_params_by_ref(strategy)
         };
@@ -413,7 +413,7 @@ impl Session {
         Ok(out)
     }
 
-    /// Transcribe with Silero VAD segmentation + whisper.cpp-style stitching.
+    /// Transcribe with Silero VAD segmentation + crispasr-style stitching.
     ///
     /// Runs VAD on the PCM buffer, merges short / overlong speech slices
     /// into usable chunks, stitches them into a single buffer with 0.1s
@@ -422,7 +422,7 @@ impl Session {
     ///
     /// `vad_model_path` must point to a Silero GGUF on disk. Passing
     /// `None` for `opts` uses the library defaults (mirroring
-    /// whisper.cpp's `whisper_vad_default_params`).
+    /// crispasr's `whisper_vad_default_params`).
     ///
     /// Compared to a fixed-chunk loop, stitching preserves cross-segment
     /// decoder context, which matters for O(T²) backends such as parakeet
@@ -581,7 +581,7 @@ impl Session {
     }
 }
 
-/// Tunables for [`Session::transcribe_vad`]. Defaults mirror whisper.cpp's
+/// Tunables for [`Session::transcribe_vad`]. Defaults mirror crispasr's
 /// `whisper_vad_default_params` plus the max-chunk fallback the shared
 /// library uses to bound encoder cost on long audio.
 #[derive(Clone, Copy, Debug)]
@@ -642,7 +642,7 @@ pub struct RegistryEntry {
 }
 
 /// Look up the canonical GGUF for a backend (whisper, parakeet, canary,
-/// voxtral, voxtral4b, granite, qwen3, cohere, wav2vec2). Returns `None`
+/// voxtral, voxtral4b, granite, granite-4.1, qwen3, cohere, wav2vec2). Returns `None`
 /// on miss.
 pub fn registry_lookup(backend: &str) -> Result<Option<RegistryEntry>, String> {
     registry_call_inner(backend, true)
