@@ -176,12 +176,39 @@ direction; do not interleave.
   TTS under `QWEN3_TTS_O15=1` produces the same 78-frame / 6.24 s
   output as default (was: 20 s of noise, never emitted EOS).
 
-  **[next] Re-validate FUSED_QKV** end-to-end with the same harness.
-  Prefill diff was bit-identical, and at seed=42 we saw byte-identical
-  WAV vs default — strong signal it's correct at T=1 too, but a
-  per-step diff closes the loop. Run the harness under
-  `QWEN3_TTS_FUSED_QKV=1` and `QWEN3_TTS_O15=1 QWEN3_TTS_FUSED_QKV=1`
-  to close the 4-variant matrix.
+  **[next] 4-variant correctness + speed matrix on a quiet machine.**
+  With the cp_step diff harness in place and O15 fixed, the four env
+  combos can finally be A/B'd cleanly. For each variant, run on a
+  cold machine (no parallel jobs starving GPU/CPU) and record both
+  the cp_step diff result and the per-frame timing breakdown:
+
+  | variant                          | env                                          |
+  |----------------------------------|----------------------------------------------|
+  | default                          | (unset)                                      |
+  | O15                              | `QWEN3_TTS_O15=1`                            |
+  | FUSED_QKV                        | `QWEN3_TTS_FUSED_QKV=1` (needs F16 talker)   |
+  | O15 + FUSED_QKV                  | both                                         |
+
+  Per variant:
+  1. `crispasr-diff qwen3-tts <talker.gguf> /tmp/qwen3-tts-ref.gguf
+     /private/tmp/clone-16k.wav` — confirm 15/15 cp_step PASS
+     cos≥0.999. Any drop names which path regressed.
+  2. `QWEN3_TTS_BENCH=1 QWEN3_TTS_MAX_FRAMES=100 crispasr --backend
+     qwen3-tts --tts "..." --voice samples/jfk_24k.wav ...` —
+     capture talker_kv + code_pred_kv per-frame ms.
+  3. `md5(out.wav)` cross-check against default at fixed seed (was
+     bit-identical for FUSED_QKV at seed=42 / "Hello world…").
+
+  Then decide whether to flip `O15` and/or `FUSED_QKV` on by default.
+  FUSED_QKV needs an F16 talker; the auto-download default is Q8_0,
+  so seed the cache with `cstr/qwen3-tts-0.6b-base-GGUF` F16 first
+  (see `.local/bench-qwen3/matrix.sh` — already wired but skips
+  FUSED_QKV when only Q8_0 is in `~/.cache/crispasr/`).
+  Open question to settle: on M1 Metal at low T, three small matmuls
+  may parallelize better than one fused matmul (first noisy run had
+  `f16_nofuse ≈ 237 ms/frame` vs `f16_fused ≈ 273 ms/frame` — possibly
+  contention noise, possibly real). Quiet-machine numbers will
+  resolve it.
 
   **[later] Speed roadmap** (LEARNINGS.md): Lk bucketing for talker,
   Q8_0 KV cache, converter-side Q4_K fused QKV. Each requires the
