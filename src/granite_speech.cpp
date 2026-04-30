@@ -1414,6 +1414,90 @@ static bool run_matmul(granite_speech_context* ctx, float* out, const float* x, 
     return true;
 }
 
+// Run two matmuls with the same input in a single graph dispatch. ggml
+// schedules both branches in parallel, saving one scheduler reset / Metal
+// command-buffer round-trip per encoder layer (~16 dispatches saved per
+// encoder forward at T=550). Used for fusing the encoder attention's
+// Q (d -> d) and KV (d -> 2d) projections, which share the same `normed`
+// input.
+static bool run_matmul_pair(granite_speech_context* ctx, float* out_a, ggml_tensor* W_a, int d_out_a, float* out_b,
+                            ggml_tensor* W_b, int d_out_b, const float* x, int d_in, int T) {
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
+
+    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_in, T);
+    ggml_set_name(inp, "mm_pair_in");
+    ggml_set_input(inp);
+
+    ggml_tensor* r_a = ggml_mul_mat(ctx0, W_a, inp);
+    ggml_set_name(r_a, "mm_pair_out_a");
+    ggml_set_output(r_a);
+
+    ggml_tensor* r_b = ggml_mul_mat(ctx0, W_b, inp);
+    ggml_set_name(r_b, "mm_pair_out_b");
+    ggml_set_output(r_b);
+
+    ggml_build_forward_expand(gf, r_a);
+    ggml_build_forward_expand(gf, r_b);
+    ggml_free(ctx0);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+        return false;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mm_pair_in"), x, 0, (size_t)d_in * T * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+        return false;
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "mm_pair_out_a"), out_a, 0, (size_t)d_out_a * T * sizeof(float));
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "mm_pair_out_b"), out_b, 0, (size_t)d_out_b * T * sizeof(float));
+    return true;
+}
+
+// run_matmul_pair plus a fused LayerNorm in the graph head: the input
+// `x` is normalised (via norm_w / norm_b if non-null) before being fed
+// to both matmuls. Eliminates the CPU layernorm pass that used to sit
+// in front of each block's QKV projection — one fewer CPU round-trip
+// per encoder layer plus better fusion on Metal.
+static bool run_norm_matmul_pair(granite_speech_context* ctx, float* out_a, ggml_tensor* W_a, int d_out_a, float* out_b,
+                                 ggml_tensor* W_b, int d_out_b, const float* x, int d_in, int T,
+                                 ggml_tensor* norm_w, ggml_tensor* norm_b, float eps) {
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
+
+    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_in, T);
+    ggml_set_name(inp, "nmm_pair_in");
+    ggml_set_input(inp);
+
+    ggml_tensor* normed = ggml_norm(ctx0, inp, eps);
+    if (norm_w)
+        normed = ggml_mul(ctx0, normed, norm_w);
+    if (norm_b)
+        normed = ggml_add(ctx0, normed, norm_b);
+
+    ggml_tensor* r_a = ggml_mul_mat(ctx0, W_a, normed);
+    ggml_set_name(r_a, "nmm_pair_out_a");
+    ggml_set_output(r_a);
+
+    ggml_tensor* r_b = ggml_mul_mat(ctx0, W_b, normed);
+    ggml_set_name(r_b, "nmm_pair_out_b");
+    ggml_set_output(r_b);
+
+    ggml_build_forward_expand(gf, r_a);
+    ggml_build_forward_expand(gf, r_b);
+    ggml_free(ctx0);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+        return false;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "nmm_pair_in"), x, 0, (size_t)d_in * T * sizeof(float));
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+        return false;
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "nmm_pair_out_a"), out_a, 0, (size_t)d_out_a * T * sizeof(float));
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "nmm_pair_out_b"), out_b, 0, (size_t)d_out_b * T * sizeof(float));
+    return true;
+}
+
 // Build and run the conv module as a ggml graph
 static bool run_conv_module(granite_speech_context* ctx, float* out, const float* x, int d, int T,
                             const granite_enc_block& b) {
@@ -1663,24 +1747,12 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
         if (ctx->params.verbosity >= 2 && il == 0)
             fprintf(stderr, "  L0 after FFN1: [%.4f,%.4f,%.4f,%.4f]\n", hidden[0], hidden[1], hidden[2], hidden[3]);
 
-        // --- Attention: norm → Q/KV projections → Shaw attention on CPU ---
-        // LayerNorm
-        std::vector<float> normed((size_t)d * T);
-        {
-            std::vector<float> nw(d), nb(d);
-            if (b.attn_norm_w)
-                ggml_backend_tensor_get(b.attn_norm_w, nw.data(), 0, d * sizeof(float));
-            if (b.attn_norm_b)
-                ggml_backend_tensor_get(b.attn_norm_b, nb.data(), 0, d * sizeof(float));
-            cpu_layernorm(normed.data(), hidden.data(), b.attn_norm_w ? nw.data() : nullptr,
-                          b.attn_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
-        }
-
-        // Q projection: (d → d)
-        run_matmul(ctx, Q.data(), normed.data(), d, T, b.attn_q_w, nullptr, d);
-
-        // KV projection: (d → 2d)
-        run_matmul(ctx, KV.data(), normed.data(), d, T, b.attn_kv_w, nullptr, d * 2);
+        // --- Attention: norm + Q/KV projections (fused graph) → Shaw attention on CPU ---
+        // The norm + Q + KV go in a single graph dispatch: the layernorm
+        // runs on the same backend as the matmuls (Metal-accelerated when
+        // available) and we skip the CPU normalisation pass.
+        run_norm_matmul_pair(ctx, Q.data(), b.attn_q_w, d, KV.data(), b.attn_kv_w, d * 2, hidden.data(), d, T,
+                             b.attn_norm_w, b.attn_norm_b, 1e-5f);
 
         // Split KV: KV layout is (2*d, T) — ne[0]=2*d per frame
         // First d values = K, next d values = V
