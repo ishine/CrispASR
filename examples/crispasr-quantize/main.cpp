@@ -250,7 +250,13 @@ static bool crispasr_model_quantize(const std::string& fname_inp, const std::str
                    sname.find("norm") == std::string::npos &&
                    sname.find("running_mean") == std::string::npos &&
                    sname.find("running_var") == std::string::npos &&
-                   sname.find("rel_pos") == std::string::npos) {
+                   sname.find("rel_pos") == std::string::npos &&
+                   sname.find("conv_bn") == std::string::npos &&
+                   ggml_n_dims(t) == 2) {
+            // Only downcast 2D weight matrices. 1D biases stay F32 because
+            // Metal's `ggml_add(matmul_result_f32, bias)` asserts bias is
+            // F32. conv_bn (BatchNorm gamma/beta) also stays F32 because
+            // the runtime does in-place BN folding at load time.
             // Granite Speech encoder weight: keep out of Q4K (precision-
             // sensitive across 16 layers) but downcast F32 → F16. Norms,
             // BN stats and the RPE table stay F32.
