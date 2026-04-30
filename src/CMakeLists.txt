@@ -427,6 +427,36 @@ if(GGML_CUDA)
 endif()
 
 # ---------------------------------------------------------------------------
+# granite_nle — runtime for ibm-granite/granite-speech-4.1-2b-nar
+# (NLENARDecoder: non-autoregressive LLM refiner). Forward-pass functions
+# are scaffolded as stubs returning nullptr; the model loads and the
+# CTC tokenizer is wired up. See src/granite_nle.cpp for the roadmap.
+
+add_library(granite_nle STATIC
+            granite_nle.h
+            granite_nle.cpp
+            )
+target_include_directories(granite_nle PUBLIC . ../include)
+target_compile_features   (granite_nle PUBLIC cxx_std_17)
+set_target_properties(granite_nle PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries (granite_nle PUBLIC ggml ggml-base Threads::Threads OpenMP::OpenMP_CXX crispasr-core)
+else()
+    target_link_libraries (granite_nle PUBLIC ggml ggml-base Threads::Threads crispasr-core)
+endif()
+if(NOT MSVC)
+    target_compile_options(granite_nle PRIVATE -O3)
+endif()
+if(GGML_METAL)
+    target_compile_definitions(granite_nle PRIVATE GGML_USE_METAL)
+    target_link_libraries(granite_nle PUBLIC ggml-metal)
+endif()
+if(GGML_CUDA)
+    target_compile_definitions(granite_nle PRIVATE GGML_USE_CUDA)
+    target_link_libraries(granite_nle PUBLIC ggml-cuda)
+endif()
+
+# ---------------------------------------------------------------------------
 # wav2vec2-ggml — Wav2Vec2ForCTC encoder (GGUF, ggml-based)
 # ---------------------------------------------------------------------------
 # glm-asr — GLM-ASR-Nano (zai-org/GLM-ASR-Nano-2512)

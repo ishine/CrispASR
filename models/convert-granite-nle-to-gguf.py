@@ -218,6 +218,30 @@ def to_numpy(t):
     return np.asarray(t)
 
 
+def is_f32_tensor(name: str, shape) -> bool:
+    """Match the policy of convert-granite-speech-to-gguf.py: keep encoder /
+    projector weights and small / norm tensors at F32; everything else
+    (mainly LLM matmul weights) goes F16. Without this, an all-F32 NAR
+    GGUF is ~10 GB instead of ~5 GB."""
+    if name.endswith(".bias"):
+        return True
+    if "norm" in name:
+        return True
+    if "rel_pos" in name:
+        return True
+    if "running_mean" in name or "running_var" in name:
+        return True
+    if "window_pos" in name or "query" in name:
+        return True
+    if len(shape) <= 1:
+        return True
+    if name.startswith("enc."):
+        return True
+    if name.startswith("proj."):
+        return True
+    return False
+
+
 def convert(input_dir: Path, out_path: Path) -> None:
     print(f"Loading: {input_dir}")
     with open(input_dir / "config.json") as f:
@@ -355,12 +379,14 @@ def convert(input_dir: Path, out_path: Path) -> None:
                     continue
                 t = f.get_tensor(name)
                 arr = to_numpy(t)
-                # Promote bfloat16 → float32, then keep storage dtype mapping
-                # to the GGUFWriter's auto-detection (F32 stays F32, F16 stays
-                # F16). NAR ships in bfloat16, which we promote to float32 here
-                # — the F16 GGUF writer will downcast at write time.
-                if arr.dtype == np.float64:
+                # Promote everything to F32 first, then downcast LLM matmul
+                # weights to F16 to keep the on-disk size near 5 GB rather
+                # than 10 GB. is_f32_tensor mirrors the policy of the base
+                # granite_speech converter.
+                if arr.dtype != np.float32:
                     arr = arr.astype(np.float32)
+                if not is_f32_tensor(new_name, arr.shape):
+                    arr = arr.astype(np.float16)
                 writer.add_tensor(new_name, arr)
                 written += 1
                 if written <= 6 or written % 50 == 0:
