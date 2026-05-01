@@ -140,7 +140,7 @@ constexpr Entry k_registry[] = {
     // tokenizer.
     {"qwen3-tts-1.7b-base", "qwen3-tts-12hz-1.7b-base-q8_0.gguf",
      "https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF/resolve/main/qwen3-tts-12hz-1.7b-base-q8_0.gguf",
-     "~1.9 GB (publish pending)",
+     "~1.9 GB",
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft, llama3.2 — "Built with
