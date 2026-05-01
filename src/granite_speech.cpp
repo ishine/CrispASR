@@ -17,6 +17,7 @@
 #include "core/conformer_ibm.h"
 #include "core/cpu_ops.h"
 #include "core/fft.h"
+#include "core/granite_llm.h"
 #include "core/mel.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -1876,9 +1877,6 @@ static ggml_cgraph* granite_build_llm_kv(granite_speech_context* ctx, int n_past
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.llm_d_model;       // 2048
-    const int n_q = (int)hp.llm_n_heads;     // 16
-    const int n_kv = (int)hp.llm_n_kv_heads; // 4
-    const int hd = (int)hp.llm_head_dim;     // 128
     const int n_layers = (int)hp.llm_n_layers;
 
     ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
@@ -1900,62 +1898,28 @@ static ggml_cgraph* granite_build_llm_kv(granite_speech_context* ctx, int n_past
         ggml_set_input(causal_mask);
     }
 
-    // Apply μP embedding multiplier to ALL inputs (text + audio) uniformly
-    // This matches HF/mlx: h = h * embedding_multiplier after splicing audio features
-    ggml_tensor* cur = ggml_scale(ctx0, embeds, hp.embedding_multiplier);
-    ggml_set_name(cur, "emb_scaled");
+    core_granite_llm::Hparams llm_hp = {};
+    llm_hp.n_layers = n_layers;
+    llm_hp.d_model = d;
+    llm_hp.n_heads = (int)hp.llm_n_heads;
+    llm_hp.n_kv_heads = (int)hp.llm_n_kv_heads;
+    llm_hp.head_dim = (int)hp.llm_head_dim;
+    llm_hp.rms_eps = hp.llm_rms_eps;
+    llm_hp.rope_theta = hp.llm_rope_theta;
+    llm_hp.embedding_multiplier = hp.embedding_multiplier;
+    llm_hp.attention_multiplier = hp.attention_multiplier;
+    llm_hp.residual_multiplier = hp.residual_multiplier;
 
-    const core_attn::KvSelfAttnParams kvp = {
-        /*n_heads*/ n_q,
-        /*n_kv_heads*/ n_kv,
-        /*head_dim*/ hd,
-        /*n_kv_grp*/ n_q / n_kv,
-        /*n_ctx_orig*/ 0,
-        /*rope_theta*/ hp.llm_rope_theta,
-        /*rope_beta_fast*/ 0.0f,
-        /*rope_beta_slow*/ 0.0f,
-        /*attn_scale*/ hp.attention_multiplier, // µP — not 1/sqrt(hd)
-        /*qk_norm_eps*/ 0.0f,                   // no Q/K norm
-        /*gqa_mode*/ core_attn::GQA_NATIVE,     // flash-attn handles GQA
-    };
-
+    std::vector<core_granite_llm::LayerWeights> blocks(n_layers);
     for (int il = 0; il < n_layers; il++) {
         const auto& b = m.llm.blocks[il];
-        ggml_tensor* residual = cur;
-
-        // Pre-RMSNorm
-        cur = ggml_rms_norm(ctx0, cur, hp.llm_rms_eps);
-        cur = ggml_mul(ctx0, cur, b.attn_norm_w);
-
-        // KV-cached self-attention. Granite is the one backend that relies
-        // on flash-attn-ext's native GQA path (no manual K/V repeat) and a
-        // µP attention_multiplier scale instead of the usual 1/sqrt(hd).
-        ggml_tensor* attn = core_attn::kv_self_attn(ctx0, gf, cur, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_out_w,
-                                                    /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, causal_mask,
-                                                    ctx->kv_k, ctx->kv_v, il, n_past, kvp);
-
-        // μP: residual_multiplier scales the residual addition
-        cur = ggml_add(ctx0, residual, ggml_scale(ctx0, attn, hp.residual_multiplier));
-
-        // FFN: Pre-RMSNorm + SwiGLU, with a μP residual_multiplier on the
-        // residual add (granite-4.0 scales every residual by 0.22).
-        residual = cur;
-        cur = ggml_rms_norm(ctx0, cur, hp.llm_rms_eps);
-        cur = ggml_mul(ctx0, cur, b.ffn_norm_w);
-        cur = core_ffn::swiglu(ctx0, cur, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
-        cur = ggml_add(ctx0, residual, ggml_scale(ctx0, cur, hp.residual_multiplier));
-
-        // Debug: name select layer outputs
-        if (il == 0 || il == 1 || il == 19 || il == 38 || il == 39) {
-            char name[32];
-            snprintf(name, sizeof(name), "layer_%d", il);
-            ggml_set_name(cur, name);
-        }
+        blocks[il] = {b.attn_norm_w, b.attn_q_w,    b.attn_k_w, b.attn_v_w,    b.attn_out_w,
+                      b.ffn_norm_w,  b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w};
     }
 
-    // Final RMSNorm
-    cur = ggml_rms_norm(ctx0, cur, hp.llm_rms_eps);
-    cur = ggml_mul(ctx0, cur, m.llm.output_norm_w);
+    ggml_tensor* cur =
+        core_granite_llm::build_decoder(ctx0, gf, embeds, positions, causal_mask, ctx->kv_k, ctx->kv_v, n_past, blocks,
+                                        m.llm.output_norm_w, llm_hp, /*is_causal*/ true);
 
     // LM head (separate, not tied) with μP logits scaling
     if (n_tokens > 1) {
