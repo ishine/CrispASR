@@ -719,8 +719,12 @@ static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggm
 //
 // With s=2, k=3, p=1, op=1 the output collapses to:
 //   y[c, 2t]   = w[c, 1] * x[c, t]
-//   y[c, 2t+1] = w[c, 0] * x[c, t] + w[c, 2] * x[c, t+1]    (x[c, T]=0 boundary)
+//   y[c, 2t+1] = w[c, 2] * x[c, t] + w[c, 0] * x[c, t+1]    (x[c, T]=0 boundary)
 // Plus per-channel bias.
+//
+// Derivation: PyTorch ConvTranspose1d sums input[j] * weight[k] over (j, k)
+// satisfying j*stride + k - padding = output_idx. For i=2t+1: j=t (k=2) and
+// j=t+1 (k=0) contribute, hence the w[2]·x[t] + w[0]·x[t+1] split.
 // ---------------------------------------------------------------------------
 
 static inline ggml_tensor* kokoro_pool_2x_depthwise(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w_kernel,
@@ -747,8 +751,9 @@ static inline ggml_tensor* kokoro_pool_2x_depthwise(ggml_context* ctx, ggml_tens
 
     // y_even (C, T) = w1 ⊙ x  (broadcast w1 over T)
     ggml_tensor* y_even = ggml_mul(ctx, x, w1);
-    // y_odd (C, T) = w0 ⊙ x + w2 ⊙ x_shifted
-    ggml_tensor* y_odd = ggml_add(ctx, ggml_mul(ctx, x, w0), ggml_mul(ctx, x_shifted, w2));
+    // y_odd (C, T) = w2 ⊙ x + w0 ⊙ x_shifted   (PyTorch ConvTranspose1d kernel
+    // indexing — see derivation note above the function)
+    ggml_tensor* y_odd = ggml_add(ctx, ggml_mul(ctx, x, w2), ggml_mul(ctx, x_shifted, w0));
 
     // Interleave: reshape both to (C, 1, T), concat dim=1 → (C, 2, T),
     // reshape to (C, 2*T). Memory layout means consecutive time positions

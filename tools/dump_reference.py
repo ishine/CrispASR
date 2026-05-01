@@ -129,6 +129,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # model_dir = the MiMo-Audio-Tokenizer HF snapshot. 16 kHz mono PCM is
     # resampled to 24 kHz internally.
     "mimo-tokenizer": "reference_backends.mimo_tokenizer",
+    # Kokoro / StyleTTS2 (iSTFTNet). Text-driven; the audio arg is a
+    # placeholder. Phonemes + voice come from KOKORO_PHONEMES / KOKORO_VOICE
+    # env vars (see reference_backends/kokoro.py for the full list).
+    "kokoro":     "reference_backends.kokoro",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
@@ -338,7 +342,8 @@ def main() -> None:
             meta[name] = captures.pop(name)
     # Pass through env-configurable prompt/text/voice metadata so diff
     # harnesses on the C++ side can replay the exact synthesis context.
-    for env_key in ("QWEN3_TTS_SYN_TEXT", "QWEN3_TTS_REF_TEXT", "QWEN3_TTS_LANG", "QWEN3_TTS_VOICE"):
+    for env_key in ("QWEN3_TTS_SYN_TEXT", "QWEN3_TTS_REF_TEXT", "QWEN3_TTS_LANG", "QWEN3_TTS_VOICE",
+                    "KOKORO_PHONEMES", "KOKORO_VOICE", "KOKORO_SEED"):
         val = os.environ.get(env_key)
         if val is not None:
             meta[env_key.lower()] = val
