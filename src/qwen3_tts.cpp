@@ -1659,6 +1659,15 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
     int n_past = 2;
 
     // ---- steps 1..14: input = codec_embedding[i-1](codes[i-1]), apply lm_head[i] ----
+    // For 1.7B variants, codec_embedding rows have dim = talker_hidden_size
+    // (2048), and the upstream Qwen3TTSTalkerCodePredictorModelForConditionalGeneration.forward()
+    // pipes them through `small_to_mtp_projection` (Linear 2048→1024) before
+    // feeding the code_pred decoder — same projection used for step 0's
+    // (past_hidden, last_id_hidden) concat. 0.6B has matched dims and no
+    // projection in the GGUF — fall through to memcpy.
+    const int d_emb_in =
+        (cp.codec_embd[0] ? (int)cp.codec_embd[0]->ne[0] : (cp.small_to_mtp_w ? (int)cp.small_to_mtp_w->ne[0] : d));
+    std::vector<float> emb_in_buf(d_emb_in);
     std::vector<float> emb_buf(d);
     for (int i = 1; i < n_groups - 1; i++) {
         if (!cp.lm_head[i]) {
@@ -1669,7 +1678,7 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
         bool ok = false;
         const bool use_cache = !env_bool("QWEN3_TTS_NO_EMBD_CACHE");
         if (use_cache && i - 1 < (int)c->codec_embd_cache.size() && c->codec_embd_cache[i - 1]) {
-            ok = c->codec_embd_cache[i - 1].get_row_into(prev, emb_buf.data());
+            ok = c->codec_embd_cache[i - 1].get_row_into(prev, emb_in_buf.data());
         } else {
             if (!cp.codec_embd[i - 1]) {
                 fprintf(stderr, "qwen3_tts: code_pred missing codec_embd[%d]\n", i - 1);
@@ -1679,12 +1688,19 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
             if (!emb) {
                 return false;
             }
-            std::memcpy(emb_buf.data(), emb, (size_t)d * sizeof(float));
+            std::memcpy(emb_in_buf.data(), emb, (size_t)d_emb_in * sizeof(float));
             free(emb);
             ok = true;
         }
         if (!ok) {
             return false;
+        }
+        if (cp.small_to_mtp_w) {
+            if (!apply_small_to_mtp(c, emb_in_buf.data(), emb_buf.data())) {
+                return false;
+            }
+        } else {
+            std::memcpy(emb_buf.data(), emb_in_buf.data(), (size_t)d * sizeof(float));
         }
         if (dump_dir && frame_idx >= 0) {
             char name[64];
