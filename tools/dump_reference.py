@@ -125,6 +125,10 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # NOTE: audio must be 16 kHz on entry (shared loader); the backend
     # resamples to 24 kHz internally.
     "vibevoice":  "reference_backends.vibevoice",
+    # MiMo-Audio-Tokenizer encoder (PCM → 8-channel RVQ codes).
+    # model_dir = the MiMo-Audio-Tokenizer HF snapshot. 16 kHz mono PCM is
+    # resampled to 24 kHz internally.
+    "mimo-tokenizer": "reference_backends.mimo_tokenizer",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import
