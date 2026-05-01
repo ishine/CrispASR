@@ -157,21 +157,58 @@ def main():
     for i, v in enumerate(speech_vocab.split("-")):
         writer.add_uint32(f"mimo_asr.audio.speech_vocab.{i}", int(v))
 
-    # Tokenizer: BPE from tokenizer.json
+    # Tokenizer: BPE vocab + merges. Mirror qwen3-asr / granite-speech:
+    # the regular BPE vocab lives in tokenizer.json's `model.vocab` (151643
+    # entries); the 30 special tokens (<|im_start|>, <|empty|>, audio
+    # markers, ...) live in `added_tokens` and need to be patched in at
+    # their proper IDs so the C++ BPE encoder can resolve them. Merges
+    # come from merges.txt and are written as a string array (GGUF
+    # type 9) — `core_gguf::kv_str_array` reads this fine.
     tok_path = model_dir / "tokenizer.json"
     if tok_path.exists():
         with open(tok_path) as f:
             tok_data = json.load(f)
         vocab = tok_data.get("model", {}).get("vocab", {})
-        if vocab:
-            tokens = [""] * len(vocab)
-            for token, idx in vocab.items():
-                if idx < len(tokens):
-                    tokens[idx] = token
-            writer.add_token_list(tokens)
-            # Skip merges — add_token_merges produces GGUF type 9 which
-            # our C reader rejects. BPE decoder works from vocab alone.
-            print(f"  Tokenizer: {len(tokens)} tokens (merges skipped)")
+        added = tok_data.get("added_tokens", [])
+        vocab_size = config["vocab_size"]
+        tokens = [f"[PAD{i}]" for i in range(vocab_size)]
+        for token, idx in vocab.items():
+            if 0 <= idx < vocab_size:
+                tokens[idx] = token
+        for entry in added:
+            tid = entry.get("id")
+            content = entry.get("content")
+            if content and tid is not None and 0 <= tid < vocab_size:
+                tokens[tid] = content
+        writer.add_tokenizer_model("gpt2")
+        writer.add_token_list(tokens)
+        print(f"  Tokenizer: {len(tokens)} tokens "
+              f"({len(vocab)} BPE + {len(added)} added)")
+
+    merges_path = model_dir / "merges.txt"
+    if merges_path.exists():
+        merges = []
+        with open(merges_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if line and not line.startswith("#"):
+                    merges.append(line)
+        if merges:
+            writer.add_token_merges(merges)
+            print(f"  Merges: {len(merges)}")
+    else:
+        # Fall back to merges embedded in tokenizer.json (newer dumps)
+        if tok_path.exists():
+            raw_merges = tok_data.get("model", {}).get("merges", [])
+            merges = []
+            for m in raw_merges:
+                if isinstance(m, list):
+                    merges.append(" ".join(m))
+                else:
+                    merges.append(m)
+            if merges:
+                writer.add_token_merges(merges)
+                print(f"  Merges: {len(merges)} (from tokenizer.json)")
 
     # Map and write tensors — stream one-at-a-time to minimize RAM.
     # BF16→F16 via torch (numpy can't handle BF16); delete immediately after writing.
