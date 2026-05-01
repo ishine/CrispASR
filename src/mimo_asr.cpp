@@ -50,11 +50,11 @@
 #include "mimo_tokenizer.h"
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -1556,9 +1556,8 @@ extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* ctx, const float* 
     // 5. Prefill.
     const bool bench = std::getenv("MIMO_ASR_BENCH") != nullptr;
     auto now_ms = []() {
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+        using namespace std::chrono;
+        return duration_cast<duration<double, std::milli>>(steady_clock::now().time_since_epoch()).count();
     };
     const double t_prefill0 = bench ? now_ms() : 0.0;
     float* logits = mimo_asr_run_lm(ctx, input_ids.data(), T_total, /*n_past*/ 0);
