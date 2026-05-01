@@ -20,6 +20,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | **HIGH** | [#54 granite-speech-4.1 plus / nar](#54-granite-speech-41-plus--nar-variants) | Small | base + plus + nar runtimes all DONE; only NAR quant + HF upload remain |
 | **MEDIUM** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet/cohere DONE; canary remaining |
 | **MEDIUM** | [#53 core/audio_decoder.h](#53-coreaudio_decoderh--dry-across-tts--codec-backends) | Medium | DRY across qwen3-tts/mimo/vibevoice |
+| **MEDIUM** | [#55 granite-family DRY refactor](#55-granite-family-dry-refactor) | Medium | ~1500 LOC duplicated between granite_speech and granite_nle; ~5 lifts gated by diff harness |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
 | **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | |
 | **LOW** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | |
@@ -391,6 +392,165 @@ plus future ones (e.g. Mimi/Encodec) sharing the same decode path.
 
 **Effort:** Medium. Easier *after* one TTS runtime exists — extract
 upward rather than design forward.
+
+---
+
+## 55. granite-family DRY refactor
+
+`src/granite_speech.cpp` (2570 LOC) and `src/granite_nle.cpp` (2096
+LOC) share roughly 1500 LOC of near-identical math. Both ship the
+same 16-layer Macaron Conformer encoder, the same windowed simplified
+Q-Former projector, and the same 40-layer Granite-1B LLM with µP
+multipliers + RoPE — only the *plumbing* (autoregressive generate vs.
+non-autoregressive single-pass; 2-layer hidden-concat in PLUS vs.
+4-layer in NAR; BPE auxiliary head only in NAR) differs. PLUS is also
+shipped via the same `granite_speech.cpp` runtime + a `cat_hidden_layers`
+config knob, so the refactor benefits all three variants at once.
+
+This is a pure refactor — no math changes, no tensor renames, no
+behaviour changes. Each step lands behind the diff harness:
+`crispasr-diff granite-speech` (base + plus, JFK transcribes ✅) and
+`crispasr-diff granite-nle` (transcribe == ref ✅) must both stay
+green after every commit. Reference: the granite-speech-4.1 family
+just landed in this state in commits `a03c529` (LLM editing bit-exact)
+and `d4b892f` (NAR transcribe end-to-end), so the harness gates are
+known-good baselines.
+
+### Duplication map (observed during the NAR transcribe work)
+
+| What | Lives in | LOC | Identical? | Where to lift |
+|---|---|---|---|---|
+| Radix-2 Cooley-Tukey FFT | `granite_speech.cpp` + `granite_nle.cpp:316` (comment notes future cleanup) + `kokoro.cpp` + `mimo_tokenizer.cpp` | ~80 each | Yes (granite/granite_nle); mostly yes (kokoro/mimo) | `core/fft.h` |
+| 80-bin log-mel pipeline (FFT → 512 mel filterbank → 8-frame stack → log-clip) | both granite | ~150 each | Yes | extend existing `core/mel.{h,cpp}` (already used by parakeet/canary) |
+| `nle_cpu_layernorm` / `nle_run_matmul` (CPU fallbacks) | both granite | ~30 each | Yes | `core/cpu_ops.h` |
+| Macaron Conformer block (FFN1 + Shaw-RPE attn + conv module + FFN2 + post-norm) — `nle_run_ffn`, `nle_run_conv_module`, `nle_shaw_block_attention_cpu`, `nle_run_norm_matmul_pair` | both granite | ~600 each | Yes (different from parakeet's FastConformer in `core/fastconformer.h`) | `core/conformer_ibm.h` (sibling of fastconformer.h; do NOT merge — Shaw RPE / fused conv layout / BN folding differ) |
+| Granite-1B LLM forward (40 layers, GQA 16/4, µP multipliers, RoPE θ=10000, optional `is_causal=False`) — `nle_llm_attn_noncausal` + `nle_build_llm` | both granite (causal in granite_speech, non-causal in granite_nle) | ~250 each | Same shape, different `is_causal` | `core/granite_llm.h` taking an `is_causal` flag |
+| Window-based simplified Q-Former projector (layer_proj + N×{cross-attn + MLP} + out_norm + out_linear) — `nle_proj_layer_proj` + `nle_proj_build_block` | both granite | ~300 each | Yes; only the # of input encoder layer concat'd differs | `core/qformer.h` |
+| Posterior-weighted pool (used by NAR's BPE aux head) | granite_nle only today | ~25 | n/a | `core/ctc.h` (next to existing `greedy_decode.h`) — generic CTC trick, useful for any aux-head variant |
+| BN-folding-at-load + Shaw RPE lookup-table builder | both granite | ~80 each | Yes | already-marginal; bundle with `conformer_ibm.h` |
+
+GPT-2 byte-level detokenize (`core_bpe::detokenize` /
+`token_bytes_to_utf8`) was already lifted in commit `d4b892f`; the
+encode side (`core_bpe::tokenize_simple` + `bpe_one`) was lifted
+earlier. That work proves the lift pattern works — all three granite
+variants ship the same byte-decoder now, with no diff regressions.
+
+### Five-step refactor (in landing order)
+
+Each step is independently committable + reverentible. Diff-harness
+green is the gate; do not move to step N+1 until step N's commit
+passes both granite-speech (base/plus) and granite-nle.
+
+**Step 1 — `core/fft.h` + `core/cpu_ops.h`. Risk: very low.**
+
+Lift `granite_nle_fft` + `granite_nle_fft_wrapper` into
+`core/fft.h` as `core_fft::fft_radix2(...)` and a thread-local-scratch
+helper. Lift `nle_cpu_layernorm` + `nle_run_matmul` (and the matching
+`granite_speech` copies) into `core/cpu_ops.h` as
+`core_cpu::layernorm` and `core_cpu::matmul_F32` (or `matmul` taking
+either F32/F16 weights via overload). Update both granite TUs to
+include the new headers and call through; delete the old static
+helpers. **LOC saved:** ~250. **Validation:** the first lift that
+exercises both granite_speech and granite_nle in one PR — both diff
+harnesses must report identical numbers (cos values shouldn't even
+shift in the LSB; this is a pure rename).
+
+**Step 2 — `core/ctc.h` (posterior-weighted pool + greedy decode helpers). Risk: very low.**
+
+Add `core_ctc::posterior_weighted_pool(hidden, importance, window)`
+to a new `core/ctc.h`. Move the BPE-CTC greedy decode from
+`granite_nle_transcribe` (the unique_consecutive → drop-blank →
+shift-by-K loop) into `core_ctc::greedy_decode_with_blank(logits, T,
+V, blank_id, shift)`. parakeet/canary's CTC paths already use
+`core/greedy_decode.h`; co-locate. **LOC saved:** ~60.
+**Validation:** `crispasr-diff granite-nle` transcribe == ref.
+
+**Step 3 — `core/conformer_ibm.h` (Macaron block forward). Risk: medium.**
+
+Lift `nle_run_ffn`, `nle_run_conv_module`,
+`nle_shaw_block_attention_cpu`, `nle_run_norm_matmul_pair`, and the
+per-layer Shaw RPE lookup-table builder into `core/conformer_ibm.h`
+behind a `core_conformer_ibm::block(ctx, hidden, T, d, n_heads, hd,
+ctx_size, ...)` API. The encoder forward in both granite TUs becomes
+a 16-iteration loop calling `core_conformer_ibm::block`. Keep
+`core/fastconformer.h` (NeMo style) untouched — the Shaw RPE +
+fused conv layout + BN folding diverge enough that merging the two
+would obscure both. **LOC saved:** ~600. **Validation:** the encoder
+forward is the most cosine-sensitive lift; expect drift in the LSB
+only. encoder_output cos_min must remain ≥ 0.999852 for granite-nle
+and ≥ 0.99 for granite-speech base/plus.
+
+**Step 4 — `core/granite_llm.h` (40-layer forward, causal toggle). Risk: medium.**
+
+Lift `nle_llm_attn_noncausal` + `nle_build_llm` and the matching
+causal `granite_speech` LLM forward into `core/granite_llm.h` as
+`core_granite_llm::build_graph(ctx, embed_inputs, n_tokens,
+position_ids, params, is_causal)`. Both granite TUs now compose
+projector_out + (audio + text_with_slots OR audio + prompt) into a
+single embedding tensor and hand it to the same builder. The µP
+multipliers (`embedding_multiplier=12`, `attention_multiplier=
+0.0078125`, `residual_multiplier=0.22`, `logits_scaling=8`) live in
+the params struct. The only behavioural difference from the existing
+two paths is the `is_causal` flag and whether `lm_head` divides by
+`logits_scaling` (NAR bypasses it; base/plus uses it for sampling
+correctness). **LOC saved:** ~250. **Validation:** editing_logits
+cos_min must stay at 0.999999 for granite-nle; base/plus must keep
+transcribing JFK identically.
+
+**Step 5 — `core/qformer.h` (windowed simplified Q-Former). Risk: low-medium.**
+
+Lift `nle_proj_layer_proj` + `nle_proj_build_block` into
+`core/qformer.h` as `core_qformer::run_windowed(...)`. Parameters: #
+input encoder-layer concat (2 in PLUS, 4 in NAR, 1 in base),
+block_size, downsample_rate, n_layers, n_heads, mlp_ratio. The
+runtime call sites in both granite TUs collapse to a single function
+call. **LOC saved:** ~300. **Validation:** projector_output cos_min
+must stay at 0.999999.
+
+### Non-goals
+
+- **No graph-mode encoder.** `GRANITE_ENCODER_GRAPH=1` (the
+  experimental Metal-accel encoder graph) is gated by §16 (Shaw RPE
+  in graph path) and stays out of this refactor.
+- **No FastConformer merge.** parakeet/canary use a different
+  Conformer dialect (NeMo's, with conv subsampling and MHA RPE);
+  forcing both into one header would muddy both. Keep
+  `core/fastconformer.h` and `core/conformer_ibm.h` separate.
+- **No tensor renames.** GGUF on-disk names stay identical; existing
+  cstr/* HF GGUFs continue to load.
+- **No new µP knobs.** Multipliers move to a struct, but their
+  values stay hardcoded as defaults from `granite-1b-base` config.
+
+### Acceptance criteria
+
+After all five steps:
+- `crispasr-diff granite-speech` (base) — JFK transcribes identically.
+- `crispasr-diff granite-speech` (plus, F16 + 3× Q4_K) — same.
+- `crispasr-diff granite-nle` — all 6 stages PASS, transcribe matches
+  reference `final_text` exactly.
+- `granite_speech.cpp` + `granite_nle.cpp` total LOC drops by ~1500
+  (from ~4670 to ~3170). New `core/*.h` files add ~600 LOC. Net win:
+  ~900 LOC of duplicated math removed.
+- No regression in encoder/projector/LLM cosine numbers (allow LSB
+  drift only; reject anything that moves cos_min by ≥ 1e-5).
+
+### Effort
+
+Medium. Step 1 is an afternoon. Steps 2–5 are each a session.
+Total: ~5 focused sessions. The diff harness gates make each step
+zero-risk to land independently — the project never goes through a
+"refactor in progress, please don't touch granite" window.
+
+### Why now (this is the optimal moment)
+
+1. All three runtimes (base, plus, nar) just hit bit-exact diff
+   parity (commits `a03c529` + `d4b892f`). Any future feature work
+   would need to be implemented twice if we don't lift first.
+2. The user just asked the DRY question — duplication is recent +
+   visible in the working set, easy to see. Six months from now the
+   same lift would require re-discovery.
+3. `core_bpe` lift in `d4b892f` proved the pattern + the harness
+   gate workflow works on the granite family.
 
 ---
 
