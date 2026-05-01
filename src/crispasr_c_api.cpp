@@ -78,6 +78,10 @@
 #include "kokoro.h"
 #define CA_HAVE_KOKORO 1
 #endif
+#if __has_include("orpheus.h")
+#include "orpheus.h"
+#define CA_HAVE_ORPHEUS 1
+#endif
 #if __has_include("glm_asr.h")
 #include "glm_asr.h"
 #define CA_HAVE_GLMASR 1
@@ -697,6 +701,8 @@ CA_EXPORT int crispasr_detect_backend_from_gguf(const char* path, char* out_name
         backend = "vibevoice";
     else if (strcmp(arch, "qwen3-tts") == 0 || strcmp(arch, "qwen3_tts") == 0)
         backend = "qwen3-tts";
+    else if (strcmp(arch, "orpheus") == 0)
+        backend = "orpheus";
 
     std::strncpy(out_name, backend, out_cap - 1);
     out_name[out_cap - 1] = '\0';
@@ -785,6 +791,10 @@ struct crispasr_session {
 #endif
 #ifdef CA_HAVE_OMNIASR
     void* omniasr_ctx = nullptr;
+#endif
+#ifdef CA_HAVE_ORPHEUS
+    orpheus_context* orpheus_ctx = nullptr;
+    bool orpheus_codec_loaded = false;
 #endif
 };
 
@@ -1053,6 +1063,21 @@ CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_pat
         return s;
     }
 #endif
+#ifdef CA_HAVE_ORPHEUS
+    if (s->backend == "orpheus" || s->backend == "orpheus-tts") {
+        s->backend = "orpheus";
+        orpheus_context_params p = orpheus_context_default_params();
+        s->orpheus_ctx = orpheus_init_from_file(model_path, p);
+        if (!s->orpheus_ctx) {
+            delete s;
+            return nullptr;
+        }
+        orpheus_set_n_threads(s->orpheus_ctx, s->n_threads);
+        // SNAC codec must be loaded before synthesise. Caller does so via
+        // `crispasr_session_set_codec_path` after open.
+        return s;
+    }
+#endif
 
     // Unknown or unsupported-in-this-build backend.
     delete s;
@@ -1139,6 +1164,9 @@ CA_EXPORT int crispasr_session_available_backends(char* out_csv, int out_cap) {
 #endif
 #ifdef CA_HAVE_OMNIASR
     list += ",omniasr";
+#endif
+#ifdef CA_HAVE_ORPHEUS
+    list += ",orpheus";
 #endif
     std::strncpy(out_csv, list.c_str(), out_cap - 1);
     out_csv[out_cap - 1] = '\0';
@@ -2029,6 +2057,14 @@ CA_EXPORT int crispasr_session_set_codec_path(crispasr_session* s, const char* p
     if (s->qwen3_tts_ctx)
         return qwen3_tts_set_codec_path(s->qwen3_tts_ctx, path);
 #endif
+#ifdef CA_HAVE_ORPHEUS
+    if (s->orpheus_ctx) {
+        int rc = orpheus_set_codec_path(s->orpheus_ctx, path);
+        if (rc == 0)
+            s->orpheus_codec_loaded = true;
+        return rc;
+    }
+#endif
     return 0; // not applicable
 }
 
@@ -2065,6 +2101,72 @@ CA_EXPORT int crispasr_session_set_voice(crispasr_session* s, const char* path, 
     }
 #endif
     return -3;
+}
+
+// Select a fixed/preset speaker by NAME for backends that bake speakers
+// into the GGUF (orpheus + qwen3-tts CustomVoice today).
+//
+// For orpheus, canonical names are "tara"/"leo"/"leah" etc. for the
+// canopylabs English finetune; "Anton"/"Sophie" etc. for the
+// SebastianBodza/Kartoffel_Orpheus DE finetunes. For qwen3-tts
+// CustomVoice the names are the 9 baked speakers (vivian, aiden,
+// dylan, eric, ono_anna, ryan, serena, sohee, uncle_fu). Enumerate
+// at runtime via crispasr_session_n_speakers /
+// crispasr_session_get_speaker_name.
+//
+// Returns 0 on success, -1 if the session isn't valid, -2 if the name
+// is unknown for the active backend, -3 if the active backend has no
+// preset-speaker contract.
+CA_EXPORT int crispasr_session_set_speaker_name(crispasr_session* s, const char* name) {
+    if (!s || !name)
+        return -1;
+#ifdef CA_HAVE_ORPHEUS
+    if (s->orpheus_ctx) {
+        return orpheus_set_speaker_by_name(s->orpheus_ctx, name);
+    }
+#endif
+#ifdef CA_HAVE_QWEN3_TTS
+    if (s->qwen3_tts_ctx && qwen3_tts_is_custom_voice(s->qwen3_tts_ctx)) {
+        int rc = qwen3_tts_set_speaker_by_name(s->qwen3_tts_ctx, name);
+        if (rc == 0)
+            s->qwen3_tts_voice_loaded = true;
+        return rc;
+    }
+#endif
+    return -3;
+}
+
+// Number of fixed/preset speakers baked into the active backend's GGUF.
+// Returns 0 if the backend has no preset speakers (or isn't loaded).
+CA_EXPORT int crispasr_session_n_speakers(crispasr_session* s) {
+    if (!s)
+        return 0;
+#ifdef CA_HAVE_ORPHEUS
+    if (s->orpheus_ctx)
+        return orpheus_n_speakers(s->orpheus_ctx);
+#endif
+#ifdef CA_HAVE_QWEN3_TTS
+    if (s->qwen3_tts_ctx && qwen3_tts_is_custom_voice(s->qwen3_tts_ctx))
+        return qwen3_tts_n_speakers(s->qwen3_tts_ctx);
+#endif
+    return 0;
+}
+
+// Returns the i-th preset speaker name (0-indexed). Buffer is owned by
+// the session; do not free. Returns nullptr for out-of-range indices
+// or backends without preset speakers.
+CA_EXPORT const char* crispasr_session_get_speaker_name(crispasr_session* s, int i) {
+    if (!s || i < 0)
+        return nullptr;
+#ifdef CA_HAVE_ORPHEUS
+    if (s->orpheus_ctx)
+        return orpheus_get_speaker_name(s->orpheus_ctx, i);
+#endif
+#ifdef CA_HAVE_QWEN3_TTS
+    if (s->qwen3_tts_ctx && qwen3_tts_is_custom_voice(s->qwen3_tts_ctx))
+        return qwen3_tts_get_speaker_name(s->qwen3_tts_ctx, i);
+#endif
+    return nullptr;
 }
 
 // Set the natural-language voice description for instruct-tuned TTS
@@ -2124,6 +2226,13 @@ CA_EXPORT float* crispasr_session_synthesize(crispasr_session* s, const char* te
 #ifdef CA_HAVE_QWEN3_TTS
     if (s->qwen3_tts_ctx) {
         return qwen3_tts_synthesize(s->qwen3_tts_ctx, text, out_n_samples);
+    }
+#endif
+#ifdef CA_HAVE_ORPHEUS
+    if (s->orpheus_ctx) {
+        if (!s->orpheus_codec_loaded)
+            return nullptr; // SNAC must be loaded via set_codec_path first
+        return orpheus_synthesize(s->orpheus_ctx, text, out_n_samples);
     }
 #endif
     return nullptr;
@@ -2210,6 +2319,10 @@ CA_EXPORT void crispasr_session_close(crispasr_session* s) {
 #ifdef CA_HAVE_OMNIASR
     if (s->omniasr_ctx)
         omniasr_free((omniasr_context*)s->omniasr_ctx);
+#endif
+#ifdef CA_HAVE_ORPHEUS
+    if (s->orpheus_ctx)
+        orpheus_free(s->orpheus_ctx);
 #endif
     delete s;
 }
