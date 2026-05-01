@@ -38,12 +38,15 @@
 #include "ggml.h"
 #include "gguf.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cfenv>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1536,6 +1539,717 @@ static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids,
     return r;
 }
 
+// ---------------------------------------------------------------------------
+// M7c — Generator (iSTFTNet)
+//
+// Reference: kokoro/istftnet.py Generator + AdaINResBlock1 + SineGen +
+// SourceModuleHnNSF + TorchSTFT.
+//
+// Forward at synth time:
+//   x = dec_decode_3_out                 (512, 2*T_frames)   from M7b
+//   F0_curve = pred.F0_proj output        (1, 2*T_frames)    from M5b
+//   s_dec  = voice.pack[:, :128]          (128, 1)
+//
+//   # CPU-side (pre-built before graph), uses random noise + STFT:
+//   f0_up = repeat-300×(F0_curve)        (600*T_frames,)
+//   har_source = m_source(SineGen(f0_up))(600*T_frames,)
+//   har_spec, har_phase = STFT(har_source, n_fft=20, hop=5, hann periodic, center=True)
+//   har = cat(har_spec, har_phase, dim=0) (22, T_har) where T_har = 120*T_frames + 1
+//
+//   for i in 0..1:
+//       x = LeakyReLU(0.1)(x)
+//       x_source = noise_convs[i](har)                    # k=12 s=6 (i=0); k=1 (i=1)
+//       x_source = noise_res[i](x_source, s_dec)           # AdaINResBlock1 with Snake-α
+//       x = ups[i](x)                                       # ConvTranspose1d
+//       if i == 1: x = reflection_pad(x, (1, 0))           # left-pad 1
+//       x = x + x_source
+//       x = mean_j(resblocks[i*3+j](x, s_dec) for j in 0..2)
+//   x = LeakyReLU(0.01)(x)                                  # default slope, NOT 0.1!
+//   x = conv_post(x)                                        # Conv1d 128→22, k=7, p=3
+//   spec  = exp(x[:11, :])                                  # NOT raw mag
+//   phase = sin(x[11:, :])                                  # NOT raw phase
+//
+// All Generator AdaINResBlock1 (note capital B!) use Snake-α activation:
+//   y = x + (1/α) * sin²(α*x)   with per-channel α (1, C, 1) F16, init=1.
+// This is *different* from the predictor / decoder-body's `kokoro_adain_resblk`
+// which uses LeakyReLU(0.2).
+// ---------------------------------------------------------------------------
+
+// Snake-α activation. x: (C, T) F32. alpha: ne=(1, C, 1) F16 — reshape +
+// cast → (C, 1) F32 broadcasts on T. Returns (C, T) F32.
+static inline ggml_tensor* kokoro_snake1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
+    const int C = (int)x->ne[0];
+    ggml_tensor* a = ggml_reshape_2d(ctx, alpha, C, 1);
+    a = ggml_cast(ctx, a, GGML_TYPE_F32);                 // (C, 1) F32
+    ggml_tensor* ax = ggml_mul(ctx, x, a);                // α·x (broadcast α on T)
+    ggml_tensor* sin_sq = ggml_sqr(ctx, ggml_sin(ctx, ax));
+    ggml_tensor* div = ggml_div(ctx, sin_sq, a);          // sin²(α·x) / α
+    return ggml_add(ctx, x, div);
+}
+
+// AdaINResBlock1 (NOTE the capital "B" — this is the Generator's class, not
+// the predictor/decoder-body's `kokoro_adain_resblk`).
+// 3 sub-blocks (j=0..2) looping over `dilations` for the convs1; convs2
+// always uses dilation=1. All convs use kernel_size=K with same-padding.
+struct kokoro_resblock1_w {
+    int K = 0;
+    int dilations[3] = {1, 3, 5};
+    ggml_tensor* a1w[3] = {}; ggml_tensor* a1b[3] = {};
+    ggml_tensor* a2w[3] = {}; ggml_tensor* a2b[3] = {};
+    ggml_tensor* alpha1[3] = {}; ggml_tensor* alpha2[3] = {};
+    ggml_tensor* c1w[3] = {}; ggml_tensor* c1b[3] = {};
+    ggml_tensor* c2w[3] = {}; ggml_tensor* c2b[3] = {};
+};
+
+static void kokoro_load_resblock1(const kokoro_context* c, kokoro_resblock1_w& w,
+                                  const char* prefix, int K, const int dilations[3]) {
+    char buf[128];
+    w.K = K;
+    for (int j = 0; j < 3; j++) w.dilations[j] = dilations[j];
+    for (int j = 0; j < 3; j++) {
+        std::snprintf(buf, sizeof(buf), "%s.adain1.%d.weight", prefix, j); w.a1w[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain1.%d.bias",   prefix, j); w.a1b[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain2.%d.weight", prefix, j); w.a2w[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain2.%d.bias",   prefix, j); w.a2b[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.alpha1.%d", prefix, j);        w.alpha1[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.alpha2.%d", prefix, j);        w.alpha2[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.convs1.%d.weight", prefix, j); w.c1w[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.convs1.%d.bias",   prefix, j); w.c1b[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.convs2.%d.weight", prefix, j); w.c2w[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.convs2.%d.bias",   prefix, j); w.c2b[j] = require(c, buf);
+    }
+}
+
+// Conv1d helper used by AdaINResBlock1: kernel size K, dilation d, same-padding.
+// in: (Cin, T) F32. w: ne=(K, Cin, Cout) F16. b: ne=(Cout,) F32.
+// Returns (Cout, T) F32.
+static inline ggml_tensor* kokoro_conv1d_kd(ggml_context* ctx, ggml_tensor* in,
+                                            ggml_tensor* w, ggml_tensor* b, int K, int d) {
+    const int Tin = (int)in->ne[1];
+    const int Cout = (int)w->ne[2];
+    const int p = d * (K - 1) / 2;       // same-padding for stride=1
+    ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in));    // (T, Cin)
+    y = ggml_conv_1d(ctx, w, y, /*s*/ 1, p, d);                  // (T, Cout, 1)
+    if (b) {
+        ggml_tensor* b3 = ggml_reshape_3d(ctx, b, 1, b->ne[0], 1);
+        y = ggml_add(ctx, y, b3);
+    }
+    y = ggml_reshape_2d(ctx, y, Tin, Cout);                      // (T, Cout)
+    return ggml_cont(ctx, ggml_transpose(ctx, y));               // (Cout, T)
+}
+
+static inline ggml_tensor* kokoro_resblock1_forward(ggml_context* ctx, ggml_tensor* x,
+                                                    ggml_tensor* style, const kokoro_resblock1_w& w) {
+    for (int j = 0; j < 3; j++) {
+        ggml_tensor* xt = kokoro_adain1d(ctx, x, style, w.a1w[j], w.a1b[j]);
+        xt = kokoro_snake1d(ctx, xt, w.alpha1[j]);
+        xt = kokoro_conv1d_kd(ctx, xt, w.c1w[j], w.c1b[j], w.K, w.dilations[j]);
+        xt = kokoro_adain1d(ctx, xt, style, w.a2w[j], w.a2b[j]);
+        xt = kokoro_snake1d(ctx, xt, w.alpha2[j]);
+        xt = kokoro_conv1d_kd(ctx, xt, w.c2w[j], w.c2b[j], w.K, /*d=*/1);
+        x = ggml_add(ctx, xt, x);
+    }
+    return x;
+}
+
+// PyTorch ConvTranspose1d wrapper: ggml_conv_transpose_1d only supports
+// padding=0, so we run with p=0 and crop `pad` samples from each side of the
+// time axis afterwards. PyTorch formula (stride s, kernel k, padding p):
+//   T_out = (T_in - 1) * s - 2*p + k
+// ggml's p=0 output: T_unpad = (T_in - 1) * s + k. Crop p from each side.
+//
+// in: (Cin, T) F32. w: ne=(K, Cout, Cin) F16. b: ne=(Cout,) F32.
+// Returns (Cout, T_out) F32.
+static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in,
+                                              ggml_tensor* w, ggml_tensor* b, int stride, int pad) {
+    const int Cout = (int)w->ne[1];
+    ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, in));              // (T, Cin)
+    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xT, stride, 0, 1);      // (T_unpad, Cout, 1, 1)
+    const int T_unpad = (int)y->ne[0];
+    const int T_out = T_unpad - 2 * pad;
+    y = ggml_reshape_2d(ctx, y, T_unpad, Cout);                              // (T_unpad, Cout)
+    if (pad > 0) {
+        // Slice [pad : pad + T_out] along the time (ne[0]) axis.
+        y = ggml_view_2d(ctx, y, T_out, Cout,
+                         (size_t)T_unpad * sizeof(float),
+                         (size_t)pad * sizeof(float));
+        y = ggml_cont(ctx, y);                                               // (T_out, Cout)
+    }
+    ggml_tensor* yT = ggml_cont(ctx, ggml_transpose(ctx, y));                // (Cout, T_out)
+    if (b)
+        yT = ggml_add(ctx, yT, b);                                           // bias broadcasts on T
+    return yT;
+}
+
+// Conv1d helper for noise_convs[i]. Different from kokoro_conv1d_kd in that K
+// and stride may be non-trivial (k=12,s=6 for noise_convs[0]; k=1,s=1 for
+// noise_convs[1]). Does PyTorch-style same-output handling via explicit
+// padding param.
+static inline ggml_tensor* kokoro_conv1d_ks(ggml_context* ctx, ggml_tensor* in,
+                                            ggml_tensor* w, ggml_tensor* b, int s, int p) {
+    const int Cout = (int)w->ne[2];
+    ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in));    // (T, Cin)
+    y = ggml_conv_1d(ctx, w, y, s, p, /*d*/ 1);                  // (T_out, Cout, 1)
+    if (b) {
+        ggml_tensor* b3 = ggml_reshape_3d(ctx, b, 1, b->ne[0], 1);
+        y = ggml_add(ctx, y, b3);
+    }
+    const int Tout = (int)y->ne[0];
+    y = ggml_reshape_2d(ctx, y, Tout, Cout);
+    return ggml_cont(ctx, ggml_transpose(ctx, y));               // (Cout, T_out)
+}
+
+// ---------------------------------------------------------------------------
+// CPU-side: produce `har` (22, T_har) from f0_curve via SineGen + l_linear +
+// tanh + STFT. Has random noise (rand_ini, randn_like) so MUST be CPU.
+//
+// Reference: istftnet.py SineGen._f02sine + SourceModuleHnNSF.forward +
+// TorchSTFT.transform.
+//
+//   upsample_scale = 300 (= 10 * 6 * 5 from upsample_rates [10, 6] * hop 5)
+//   harmonic_num = 8, dim = 9, sample_rate = 24000
+//   sine_amp = 0.1, noise_std = 0.003, voiced_threshold = 10
+//   n_fft = 20, hop = 5, hann periodic, center=True
+//
+// Output T_har = (L_high - n_fft + n_fft) / hop + 1 = L_high/hop + 1
+//              = 600*T_frames/5 + 1 = 120*T_frames + 1.
+// ---------------------------------------------------------------------------
+
+static const float kKokoroTwoPi = 6.283185307179586f;
+
+static float* kokoro_make_har(const kokoro_context* c, const float* f0_curve, int T_frames,
+                              int* out_T_har, std::mt19937& rng) {
+    const int upsample_scale = 300;        // prod(upsample_rates) * hop
+    const int harmonic_num = 8;
+    const int dim = harmonic_num + 1;      // 9
+    const int sample_rate = 24000;
+    const float sine_amp = 0.1f;
+    const float noise_std = 0.003f;
+    const float voiced_threshold = 10.0f;
+    const int n_fft = 20;
+    const int hop = 5;
+    const int n_bins = n_fft / 2 + 1;      // 11
+
+    const int L_low = 2 * T_frames;
+    const int L_high = upsample_scale * L_low;
+
+    // ---- f0_upsamp: nn.Upsample(scale_factor=300) → default mode='nearest'.
+    // Each f0 sample is repeated upsample_scale times.
+    std::vector<float> f0_up((size_t)L_high);
+    for (int i = 0; i < L_low; i++) {
+        const float v = f0_curve[i];
+        for (int j = 0; j < upsample_scale; j++)
+            f0_up[(size_t)i * upsample_scale + j] = v;
+    }
+
+    // ---- SineGen._f02sine ----
+    // 1. fn[t, k] = f0[t] * (k+1)
+    // 2. rad[t, k] = (fn[t, k] / sr) mod 1
+    // 3. rand_ini at t=0 for k>=1
+    // 4. Downsample rad by 1/upsample_scale (linear interp, align_corners=False)
+    // 5. cumsum * 2π → phase_low
+    // 6. Upsample phase_low * upsample_scale by upsample_scale (linear)
+    // 7. sin(phase) * sine_amp = sines
+    std::vector<float> rad((size_t)L_high * dim);
+    for (int t = 0; t < L_high; t++) {
+        const float fv = f0_up[t];
+        for (int k = 0; k < dim; k++) {
+            float fn = fv * (float)(k + 1);
+            float r = fn / (float)sample_rate;
+            r = r - std::floor(r);
+            rad[(size_t)t * dim + k] = r;
+        }
+    }
+    // rand_ini: per-(B, dim) noise, B=1; entry at [0] zeroed; only first time step gets noise.
+    std::uniform_real_distribution<float> uni01(0.0f, 1.0f);
+    std::vector<float> rand_ini((size_t)dim, 0.0f);
+    for (int k = 1; k < dim; k++)
+        rand_ini[k] = uni01(rng);
+    for (int k = 0; k < dim; k++)
+        rad[(size_t)0 * dim + k] += rand_ini[k];
+
+    // Downsample rad (L_high → L_low). PyTorch F.interpolate(linear, align_corners=False):
+    //   src_idx = (dst + 0.5) * scale - 0.5    (with scale = L_high / L_low = upsample_scale)
+    std::vector<float> rad_low((size_t)L_low * dim);
+    for (int j = 0; j < L_low; j++) {
+        float src_idx = ((float)j + 0.5f) * (float)upsample_scale - 0.5f;
+        float clamped = std::max(0.0f, std::min((float)(L_high - 1), src_idx));
+        int i0 = (int)std::floor(clamped);
+        int i1 = std::min(i0 + 1, L_high - 1);
+        float frac = clamped - (float)i0;
+        for (int k = 0; k < dim; k++) {
+            float v0 = rad[(size_t)i0 * dim + k];
+            float v1 = rad[(size_t)i1 * dim + k];
+            rad_low[(size_t)j * dim + k] = v0 * (1.0f - frac) + v1 * frac;
+        }
+    }
+    // cumsum * 2π
+    std::vector<float> phase_low((size_t)L_low * dim);
+    for (int k = 0; k < dim; k++) {
+        float acc = 0.0f;
+        for (int t = 0; t < L_low; t++) {
+            acc += rad_low[(size_t)t * dim + k];
+            phase_low[(size_t)t * dim + k] = acc * kKokoroTwoPi;
+        }
+    }
+    // Upsample phase_low * upsample_scale (L_low → L_high), linear interp.
+    std::vector<float> sines((size_t)L_high * dim);
+    for (int t = 0; t < L_high; t++) {
+        float src_idx = ((float)t + 0.5f) / (float)upsample_scale - 0.5f;
+        float clamped = std::max(0.0f, std::min((float)(L_low - 1), src_idx));
+        int i0 = (int)std::floor(clamped);
+        int i1 = std::min(i0 + 1, L_low - 1);
+        float frac = clamped - (float)i0;
+        for (int k = 0; k < dim; k++) {
+            float v0 = phase_low[(size_t)i0 * dim + k] * (float)upsample_scale;
+            float v1 = phase_low[(size_t)i1 * dim + k] * (float)upsample_scale;
+            float ph = v0 * (1.0f - frac) + v1 * frac;
+            sines[(size_t)t * dim + k] = std::sin(ph) * sine_amp;
+        }
+    }
+
+    // uv mask + noise + apply.
+    std::normal_distribution<float> norm(0.0f, 1.0f);
+    std::vector<float> sine_waves((size_t)L_high * dim);
+    for (int t = 0; t < L_high; t++) {
+        const float uv = (f0_up[t] > voiced_threshold) ? 1.0f : 0.0f;
+        const float noise_a = uv * noise_std + (1.0f - uv) * sine_amp / 3.0f;
+        for (int k = 0; k < dim; k++) {
+            float n = noise_a * norm(rng);
+            sine_waves[(size_t)t * dim + k] = sines[(size_t)t * dim + k] * uv + n;
+        }
+    }
+
+    // ---- m_source: l_linear (9 → 1) + tanh ----
+    // weight ne=(9, 1) F16; bias ne=(1,) F32.
+    ggml_tensor* lw = require(c, "dec.gen.m_source.weight");
+    ggml_tensor* lb = require(c, "dec.gen.m_source.bias");
+    if (!lw || !lb)
+        return nullptr;
+    std::vector<uint16_t> w_f16((size_t)dim);
+    std::vector<float> w_f32((size_t)dim);
+    ggml_backend_tensor_get(lw, w_f16.data(), 0, (size_t)dim * sizeof(uint16_t));
+    ggml_fp16_to_fp32_row((const ggml_fp16_t*)w_f16.data(), w_f32.data(), dim);
+    float bias_v = 0.0f;
+    ggml_backend_tensor_get(lb, &bias_v, 0, sizeof(float));
+
+    std::vector<float> har_source((size_t)L_high);
+    for (int t = 0; t < L_high; t++) {
+        float s = bias_v;
+        for (int k = 0; k < dim; k++)
+            s += sine_waves[(size_t)t * dim + k] * w_f32[k];
+        har_source[t] = std::tanh(s);
+    }
+
+    // ---- STFT (n_fft=20, hop=5, hann periodic, center=True, pad_mode=reflect) ----
+    const int pad_n = n_fft / 2;            // 10
+    const int L_pad = L_high + 2 * pad_n;
+    std::vector<float> padded((size_t)L_pad);
+    for (int t = 0; t < L_high; t++)
+        padded[t + pad_n] = har_source[t];
+    // PyTorch reflect: 'b a | a b c ... y z | z y' actually non-replicated:
+    //   padded[pad - 1 - i] = signal[i + 1]   for i in [0, pad-1]
+    //   padded[pad + L + i] = signal[L - 2 - i]
+    for (int i = 0; i < pad_n; i++) {
+        if (i + 1 < L_high)
+            padded[pad_n - 1 - i] = har_source[i + 1];
+        if (L_high - 2 - i >= 0)
+            padded[pad_n + L_high + i] = har_source[L_high - 2 - i];
+    }
+    // Hann periodic: w[n] = 0.5 - 0.5 cos(2π n / N).
+    std::vector<float> hann((size_t)n_fft);
+    for (int n = 0; n < n_fft; n++)
+        hann[n] = 0.5f - 0.5f * std::cos(kKokoroTwoPi * (float)n / (float)n_fft);
+
+    const int T_har = L_high / hop + 1;
+    // Direct DFT (n_fft=20 makes 20² = 400 ops/frame trivial).
+    // Pre-compute twiddles cos/sin for k in 0..n_bins-1, n in 0..n_fft-1.
+    std::vector<float> tw_cos((size_t)n_bins * n_fft);
+    std::vector<float> tw_sin((size_t)n_bins * n_fft);
+    for (int k = 0; k < n_bins; k++) {
+        for (int n = 0; n < n_fft; n++) {
+            float ang = -kKokoroTwoPi * (float)k * (float)n / (float)n_fft;
+            tw_cos[(size_t)k * n_fft + n] = std::cos(ang);
+            tw_sin[(size_t)k * n_fft + n] = std::sin(ang);
+        }
+    }
+
+    float* har = (float*)std::malloc((size_t)22 * T_har * sizeof(float));
+    if (!har)
+        return nullptr;
+    for (int frame = 0; frame < T_har; frame++) {
+        const int t0 = frame * hop;
+        for (int k = 0; k < n_bins; k++) {
+            float re = 0.0f, im = 0.0f;
+            const float* tc = &tw_cos[(size_t)k * n_fft];
+            const float* ts = &tw_sin[(size_t)k * n_fft];
+            for (int n = 0; n < n_fft; n++) {
+                const float xn = padded[t0 + n] * hann[n];
+                re += xn * tc[n];
+                im += xn * ts[n];
+            }
+            const float mag = std::sqrt(re * re + im * im);
+            const float ph = std::atan2(im, re);
+            // (22, T_har) channel-major: element (c, t) at offset c + t*22.
+            har[(size_t)frame * 22 + k] = mag;
+            har[(size_t)frame * 22 + n_bins + k] = ph;
+        }
+    }
+    if (out_T_har)
+        *out_T_har = T_har;
+    return har;
+}
+
+// ---------------------------------------------------------------------------
+// Generator graph builder.
+//
+// Inputs (graph-level):
+//   "x_in"   ne=(512, 2*T_frames) F32  — dec_decode_3_out
+//   "har"    ne=(22,  T_har)      F32  — pre-computed CPU-side
+// Style is baked from the voice pack (decoder half).
+//
+// Outputs:
+//   "gen_pre_post_out"  ne=(128, T_har)  — last leaky_relu output, before conv_post
+//   "mag"               ne=(11, T_har)   — exp(x[:11]) after conv_post
+//   "phase"             ne=(11, T_har)   — sin(x[11:]) after conv_post
+// ---------------------------------------------------------------------------
+
+static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames, int T_har, int L_raw) {
+    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
+    ggml_context* ctx0 = ggml_init(ip);
+    // Each AdaINResBlock1 has 3 sub-blocks × ~14 ops (adain ×2 + snake ×2 + conv ×2 + add).
+    // 8 such blocks (2 noise_res + 6 resblocks). Plus 2 ups, 2 noise_convs, conv_post.
+    // Roughly 8*40 + 6*30 + 60 = 600 ops, comfortably within 32k.
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 65536, false);
+
+    ggml_tensor* x = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 512, 2 * T_frames);
+    ggml_set_name(x, "x_in");
+    ggml_set_input(x);
+
+    ggml_tensor* har = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 22, T_har);
+    ggml_set_name(har, "har");
+    ggml_set_input(har);
+
+    ggml_tensor* style = kokoro_voice_style_dec_view(ctx0, c, L_raw);   // (128, 1)
+
+    // Load all generator weights up-front.
+    ggml_tensor* ups0_w = require(c, "dec.gen.ups.0.weight");
+    ggml_tensor* ups0_b = require(c, "dec.gen.ups.0.bias");
+    ggml_tensor* ups1_w = require(c, "dec.gen.ups.1.weight");
+    ggml_tensor* ups1_b = require(c, "dec.gen.ups.1.bias");
+    ggml_tensor* nc0_w  = require(c, "dec.gen.noise_convs.0.weight");
+    ggml_tensor* nc0_b  = require(c, "dec.gen.noise_convs.0.bias");
+    ggml_tensor* nc1_w  = require(c, "dec.gen.noise_convs.1.weight");
+    ggml_tensor* nc1_b  = require(c, "dec.gen.noise_convs.1.bias");
+    ggml_tensor* cp_w   = require(c, "dec.gen.conv_post.weight");
+    ggml_tensor* cp_b   = require(c, "dec.gen.conv_post.bias");
+
+    const int dilations[3] = {1, 3, 5};
+    kokoro_resblock1_w noise_res0, noise_res1;
+    kokoro_load_resblock1(c, noise_res0, "dec.gen.noise_res.0", /*K=*/7,  dilations);
+    kokoro_load_resblock1(c, noise_res1, "dec.gen.noise_res.1", /*K=*/11, dilations);
+    kokoro_resblock1_w resblocks[6];
+    const int rb_K[3] = {3, 7, 11};
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 3; j++) {
+            char prefix[64];
+            std::snprintf(prefix, sizeof(prefix), "dec.gen.resblocks.%d", i * 3 + j);
+            kokoro_load_resblock1(c, resblocks[i * 3 + j], prefix, rb_K[j], dilations);
+        }
+    }
+
+    // ---- Upsample loop ----
+    for (int i = 0; i < 2; i++) {
+        // x = LeakyReLU(0.1)(x)
+        x = ggml_leaky_relu(ctx0, x, /*slope=*/0.1f, /*inplace=*/false);
+
+        // x_source = noise_convs[i](har); noise_res[i](x_source, s_dec)
+        ggml_tensor* x_source;
+        if (i == 0) {
+            // k=12, s=6, p=(s+1)/2=3
+            x_source = kokoro_conv1d_ks(ctx0, har, nc0_w, nc0_b, /*s*/ 6, /*p*/ 3);
+            x_source = kokoro_resblock1_forward(ctx0, x_source, style, noise_res0);
+        } else {
+            // k=1, s=1, p=0
+            x_source = kokoro_conv1d_ks(ctx0, har, nc1_w, nc1_b, /*s*/ 1, /*p*/ 0);
+            x_source = kokoro_resblock1_forward(ctx0, x_source, style, noise_res1);
+        }
+
+        // x = ups[i](x)  with PyTorch padding handled via post-crop
+        if (i == 0) {
+            // k=20, s=10, p=(k-s)/2 = 5
+            x = kokoro_convt1d_pad(ctx0, x, ups0_w, ups0_b, /*s*/ 10, /*p*/ 5);
+        } else {
+            // k=12, s=6, p=(k-s)/2 = 3
+            x = kokoro_convt1d_pad(ctx0, x, ups1_w, ups1_b, /*s*/ 6, /*p*/ 3);
+        }
+
+        // Last upsample: reflection_pad((1, 0)) — 1 sample on the left, 0 on the right.
+        // ggml_pad_reflect_1d works on the LAST dim (innermost), so transpose
+        // (C, T) → (T, C), pad along T, transpose back.
+        if (i == 1) {
+            ggml_tensor* xT = ggml_cont(ctx0, ggml_transpose(ctx0, x));      // (T, C)
+            xT = ggml_pad_reflect_1d(ctx0, xT, /*left=*/1, /*right=*/0);     // (T+1, C)
+            x = ggml_cont(ctx0, ggml_transpose(ctx0, xT));                   // (C, T+1)
+        }
+
+        x = ggml_add(ctx0, x, x_source);
+
+        // Average of 3 resblocks at indices i*3+0, i*3+1, i*3+2.
+        ggml_tensor* xs = nullptr;
+        for (int j = 0; j < 3; j++) {
+            ggml_tensor* xj = kokoro_resblock1_forward(ctx0, x, style, resblocks[i * 3 + j]);
+            xs = (xs == nullptr) ? xj : ggml_add(ctx0, xs, xj);
+        }
+        x = ggml_scale(ctx0, xs, 1.0f / 3.0f);
+    }
+
+    // x = LeakyReLU(0.01)(x)  — default PyTorch slope, NOT 0.1.
+    x = ggml_leaky_relu(ctx0, x, /*slope=*/0.01f, /*inplace=*/false);
+    ggml_tensor* gen_pre_post = ggml_cont(ctx0, x);
+    ggml_set_name(gen_pre_post, "gen_pre_post_out");
+    ggml_set_output(gen_pre_post);
+    ggml_build_forward_expand(gf, gen_pre_post);
+
+    // conv_post: Conv1d(128, 22, k=7, p=3). Same-padding output length = T_har.
+    x = kokoro_conv1d_ks(ctx0, gen_pre_post, cp_w, cp_b, /*s*/ 1, /*p*/ 3);   // (22, T_har)
+
+    // Split (22, T_har) along ne[0]: rows 0..10 = mag-side, 11..21 = phase-side.
+    // View along ne[0] is non-contiguous (stride between rows mismatches ne[0]),
+    // so cont after the view to give exp/sin a clean buffer.
+    ggml_tensor* mag_view = ggml_view_2d(ctx0, x, 11, T_har, x->nb[1], 0);
+    ggml_tensor* mag_in   = ggml_cont(ctx0, mag_view);
+    ggml_tensor* mag = ggml_exp(ctx0, mag_in);
+    ggml_set_name(mag, "mag");
+    ggml_set_output(mag);
+    ggml_build_forward_expand(gf, mag);
+
+    ggml_tensor* phase_view = ggml_view_2d(ctx0, x, 11, T_har, x->nb[1],
+                                           (size_t)11 * sizeof(float));
+    ggml_tensor* phase_in   = ggml_cont(ctx0, phase_view);
+    ggml_tensor* phase = ggml_sin(ctx0, phase_in);
+    ggml_set_name(phase, "phase");
+    ggml_set_output(phase);
+    ggml_build_forward_expand(gf, phase);
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Run the full pre-generator chain (predictor → align → F0Ntrain → decoder
+// body) plus the generator graph itself, and return the named stage as
+// malloc'd float[]. Stages handled:
+//   "gen_pre_post_out" → (128, T_har)
+//   "mag"              → (11, T_har)
+//   "phase"            → (11, T_har)
+//
+// rng is seeded from KOKORO_SEED env (default 0x12345) so the SineGen noise
+// is reproducible run-to-run; the diff-harness M11 dumper should set the
+// same seed on the Python side.
+static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, int n_raw,
+                                   const char* stage_name, int* out_n) {
+    if (out_n) *out_n = 0;
+    if (!c->vp_loaded) {
+        fprintf(stderr, "kokoro: generator needs voice pack\n");
+        return nullptr;
+    }
+
+    // 1. dec_decode_3_out — runs predictor + align + F0Ntrain + decoder body.
+    int n_x = 0;
+    float* x_in = kokoro_run_decoder_body(c, raw_ids, n_raw, "dec_decode_3_out", &n_x);
+    if (!x_in) return nullptr;
+    const int two_T = n_x / 512;
+    if (two_T * 512 != n_x) {
+        fprintf(stderr, "kokoro: dec_decode_3_out size %d not divisible by 512\n", n_x);
+        std::free(x_in); return nullptr;
+    }
+    const int T_frames = two_T / 2;
+    if (T_frames <= 0) {
+        fprintf(stderr, "kokoro: T_frames=%d invalid\n", T_frames);
+        std::free(x_in); return nullptr;
+    }
+
+    // 2. f0_curve — used by SineGen to build `har`.
+    int n_f0 = 0;
+    float* f0 = kokoro_run_f0n(c, raw_ids, n_raw, "f0_curve", &n_f0);
+    if (!f0) { std::free(x_in); return nullptr; }
+    if (n_f0 != 2 * T_frames) {
+        fprintf(stderr, "kokoro: f0_curve length %d != 2*T_frames=%d\n", n_f0, 2 * T_frames);
+        std::free(x_in); std::free(f0); return nullptr;
+    }
+
+    // 3. Build `har` (22, T_har) on CPU.
+    const char* seed_env = std::getenv("KOKORO_SEED");
+    uint32_t seed = seed_env ? (uint32_t)std::strtoul(seed_env, nullptr, 0) : 0x12345u;
+    std::mt19937 rng(seed);
+    int T_har = 0;
+    float* har = kokoro_make_har(c, f0, T_frames, &T_har, rng);
+    std::free(f0);
+    if (!har) { std::free(x_in); return nullptr; }
+
+    // 4. Build + run the generator graph on gen_sched (multi-backend, with
+    //    conv_transpose_1d pinned to CPU unless gen_force_metal=true).
+    ggml_cgraph* gf = kokoro_build_graph_generator(c, T_frames, T_har, n_raw);
+    if (!gf) { std::free(x_in); std::free(har); return nullptr; }
+    ggml_backend_sched_reset(c->gen_sched);
+    if (!c->params.gen_force_metal && c->backend_cpu && c->backend_cpu != c->backend) {
+        // Pin every conv_transpose_1d output to CPU to dodge the Metal hang
+        // (LEARNINGS.md: stride-10 kernel-20 ConvTranspose1d on M1).
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_nodes; i++) {
+            ggml_tensor* n = ggml_graph_node(gf, i);
+            if (n->op == GGML_OP_CONV_TRANSPOSE_1D)
+                ggml_backend_sched_set_tensor_backend(c->gen_sched, n, c->backend_cpu);
+        }
+    }
+    if (!ggml_backend_sched_alloc_graph(c->gen_sched, gf)) {
+        fprintf(stderr, "kokoro: sched_alloc_graph failed for generator\n");
+        std::free(x_in); std::free(har); return nullptr;
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x_in, 0,
+                            (size_t)512 * 2 * T_frames * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "har"), har, 0,
+                            (size_t)22 * T_har * sizeof(float));
+    std::free(x_in);
+    std::free(har);
+
+    if (ggml_backend_sched_graph_compute(c->gen_sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "kokoro: generator graph compute failed\n");
+        return nullptr;
+    }
+
+    ggml_tensor* out = ggml_graph_get_tensor(gf, stage_name);
+    if (!out) {
+        fprintf(stderr, "kokoro: generator graph missing output '%s'\n", stage_name);
+        return nullptr;
+    }
+    const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
+    float* r = (float*)std::malloc(n_floats * sizeof(float));
+    if (!r) return nullptr;
+    ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
+    if (out_n) *out_n = (int)n_floats;
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// M8 — iSTFT (CPU)
+//
+// Reference: torch.istft(filter_length=20, hop=5, win_length=20,
+//                        window=hann_window(20, periodic=True), center=True).
+//
+// For each frame m in 0..T_har-1:
+//   X[k] = mag[k, m] * exp(j * phase[k, m])    for k in 0..10  (n_bins)
+//   Mirror to full 20-bin: X[20-k] = conj(X[k]) for k in 1..9
+//   y_frame[n] = (1/N) * Re(sum_k X[k] * exp(j*2π*k*n/N))      for n in 0..19
+//   y_frame *= window
+//   out[m*hop : m*hop + N] += y_frame
+//   ola_norm[m*hop : m*hop + N] += window²
+// out /= ola_norm  (where ola_norm > 0); strip pad samples.
+// Output length = (T_har - 1) * hop = 600 * T_frames.
+// ---------------------------------------------------------------------------
+
+static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, int* out_T_audio) {
+    const int n_fft = 20;
+    const int hop = 5;
+    const int n_bins = n_fft / 2 + 1;
+    const int pad_n = n_fft / 2;
+
+    // Hann periodic.
+    std::vector<float> hann((size_t)n_fft);
+    for (int n = 0; n < n_fft; n++)
+        hann[n] = 0.5f - 0.5f * std::cos(kKokoroTwoPi * (float)n / (float)n_fft);
+
+    // L_padded covers the OLA region; L_audio is the unpadded output (center=True
+    // strips n_fft/2 samples from each end).
+    const int L_padded = (T_har - 1) * hop + n_fft;
+    const int L_audio  = L_padded - 2 * pad_n;
+    if (L_audio <= 0) {
+        if (out_T_audio) *out_T_audio = 0;
+        return nullptr;
+    }
+
+    std::vector<float> y((size_t)L_padded, 0.0f);
+    std::vector<float> wsum((size_t)L_padded, 0.0f);
+
+    // Pre-compute IDFT twiddles: cos/sin(2π k n / N) for k in 0..n_bins-1.
+    // For k in [n_bins, n_fft-1] we exploit Hermitian symmetry (see below).
+    std::vector<float> tw_cos((size_t)n_bins * n_fft);
+    std::vector<float> tw_sin((size_t)n_bins * n_fft);
+    for (int k = 0; k < n_bins; k++) {
+        for (int n = 0; n < n_fft; n++) {
+            float ang = kKokoroTwoPi * (float)k * (float)n / (float)n_fft;
+            tw_cos[(size_t)k * n_fft + n] = std::cos(ang);
+            tw_sin[(size_t)k * n_fft + n] = std::sin(ang);
+        }
+    }
+
+    // Per frame: IDFT directly from half-spectrum using Hermitian symmetry.
+    // For real-valued y[n]:
+    //   y[n] = (1/N) * (Xr[0] + (-1)^n * Xr[N/2]
+    //                   + 2 * sum_{k=1}^{N/2-1} (Xr[k]*cos(2πkn/N) - Xi[k]*sin(2πkn/N)))
+    const float invN = 1.0f / (float)n_fft;
+    for (int m = 0; m < T_har; m++) {
+        // mag/phase have layout (n_bins, T_har) F32 contiguous: element (k, m) at k + m*n_bins.
+        const int t0 = m * hop;
+        for (int n = 0; n < n_fft; n++) {
+            float acc = mag[(size_t)m * n_bins + 0];                                  // X[0] (real)
+            // X[N/2]: real, sign alternates with n.
+            const float xN2 = mag[(size_t)m * n_bins + (n_bins - 1)] *
+                              std::cos(phase[(size_t)m * n_bins + (n_bins - 1)]);
+            acc += ((n & 1) ? -xN2 : xN2);
+            // k = 1..N/2-1: doubled Hermitian pair.
+            for (int k = 1; k < n_bins - 1; k++) {
+                const float r = mag[(size_t)m * n_bins + k];
+                const float ph = phase[(size_t)m * n_bins + k];
+                const float xr = r * std::cos(ph);
+                const float xi = r * std::sin(ph);
+                acc += 2.0f * (xr * tw_cos[(size_t)k * n_fft + n]
+                              - xi * tw_sin[(size_t)k * n_fft + n]);
+            }
+            const float yval = acc * invN * hann[n];
+            y[(size_t)t0 + n] += yval;
+            wsum[(size_t)t0 + n] += hann[n] * hann[n];
+        }
+    }
+
+    // Normalize by window-sum and strip the center=True padding.
+    float* out = (float*)std::malloc((size_t)L_audio * sizeof(float));
+    if (!out) {
+        if (out_T_audio) *out_T_audio = 0;
+        return nullptr;
+    }
+    const float wsum_eps = 1e-11f;
+    for (int t = 0; t < L_audio; t++) {
+        const float w = wsum[(size_t)pad_n + t];
+        out[t] = (w > wsum_eps) ? y[(size_t)pad_n + t] / w : 0.0f;
+    }
+    if (out_T_audio) *out_T_audio = L_audio;
+    return out;
+}
+
+// Stage extractor entry for the iSTFT'd audio. Runs the full chain
+// (preamble → decoder body → generator → iSTFT) and returns the audio buffer.
+static float* kokoro_run_audio(kokoro_context* c, const int32_t* raw_ids, int n_raw, int* out_n) {
+    if (out_n) *out_n = 0;
+    int n_mag = 0;
+    float* mag = kokoro_run_generator(c, raw_ids, n_raw, "mag", &n_mag);
+    if (!mag) return nullptr;
+    int n_phase = 0;
+    float* phase = kokoro_run_generator(c, raw_ids, n_raw, "phase", &n_phase);
+    if (!phase) { std::free(mag); return nullptr; }
+    if (n_mag != n_phase || n_mag % 11 != 0) {
+        fprintf(stderr, "kokoro: mag/phase length mismatch %d vs %d\n", n_mag, n_phase);
+        std::free(mag); std::free(phase); return nullptr;
+    }
+    const int T_har = n_mag / 11;
+    int T_audio = 0;
+    float* audio = kokoro_run_istft(mag, phase, T_har, &T_audio);
+    std::free(mag); std::free(phase);
+    if (!audio) return nullptr;
+    if (out_n) *out_n = T_audio;
+    return audio;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1698,11 +2412,19 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model,
             return nullptr;
         }
 
-        // Generator scheduler — single-backend (CPU by default; GPU only if
-        // KOKORO_GEN_FORCE_METAL=1). Same node ceiling: the generator graph
-        // is dominated by snake-α + transpose-1d + the 22-channel conv_post.
-        ggml_backend_t gen_backends[1] = {c->gen_backend};
-        c->gen_sched = ggml_backend_sched_new(gen_backends, nullptr, 1, /*graph_size=*/262144, false, false);
+        // Generator scheduler — multi-backend (CPU + Metal/GPU when present),
+        // because the generator weights live on `c->backend` and the sched
+        // needs cross-backend access. The Metal-hang workaround is enforced
+        // at graph build time: every conv_transpose_1d output is pinned to
+        // CPU via ggml_backend_sched_set_tensor_backend (unless
+        // KOKORO_GEN_FORCE_METAL=1, in which case nothing is pinned and the
+        // sched picks freely — useful for repro'ing the hang).
+        ggml_backend_t gen_backends[2];
+        int n_gb = 0;
+        gen_backends[n_gb++] = c->backend;
+        if (c->backend_cpu && c->backend_cpu != c->backend)
+            gen_backends[n_gb++] = c->backend_cpu;
+        c->gen_sched = ggml_backend_sched_new(gen_backends, nullptr, n_gb, /*graph_size=*/262144, false, false);
         if (!c->gen_sched) {
             fprintf(stderr, "kokoro: failed to allocate generator scheduler\n");
             kokoro_free(c);
@@ -1862,22 +2584,71 @@ extern "C" int32_t* kokoro_phonemes_to_ids(struct kokoro_context* ctx, const cha
     return out;
 }
 
-extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text, int* out_n_samples) {
-    if (out_n_samples)
-        *out_n_samples = 0;
-    (void)ctx;
-    (void)text;
-    fprintf(stderr, "kokoro: synthesize not yet implemented (M9 milestone)\n");
-    return nullptr;
-}
-
 extern "C" float* kokoro_synthesize_phonemes(struct kokoro_context* ctx, const char* phonemes, int* out_n_samples) {
     if (out_n_samples)
         *out_n_samples = 0;
-    (void)ctx;
-    (void)phonemes;
-    fprintf(stderr, "kokoro: synthesize_phonemes not yet implemented (M9 milestone)\n");
-    return nullptr;
+    if (!ctx || !phonemes)
+        return nullptr;
+
+    int n_ids = 0;
+    int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
+    if (!ids || n_ids == 0) {
+        std::free(ids);
+        fprintf(stderr, "kokoro: empty phoneme tokenisation for '%s'\n", phonemes);
+        return nullptr;
+    }
+    int n_audio = 0;
+    float* audio = kokoro_run_audio(ctx, ids, n_ids, &n_audio);
+    std::free(ids);
+    if (!audio || n_audio <= 0)
+        return nullptr;
+    if (out_n_samples)
+        *out_n_samples = n_audio;
+    return audio;
+}
+
+extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text, int* out_n_samples) {
+    if (out_n_samples)
+        *out_n_samples = 0;
+    if (!ctx || !text || !*text)
+        return nullptr;
+
+    // Shell out to espeak-ng to get IPA phonemes, then call synthesize_phonemes.
+    // We use popen("espeak-ng -q --ipa=3 -v LANG TEXT") — requires espeak-ng in PATH.
+    std::string cmd = "espeak-ng -q --ipa=3 -v ";
+    cmd += ctx->espeak_lang;
+    cmd += " ";
+    // Quote the text to handle spaces / special chars. Escape single quotes
+    // by closing/reopening the quoted region.
+    cmd += "'";
+    for (const char* p = text; *p; ++p) {
+        if (*p == '\'') cmd += "'\\''";
+        else            cmd += *p;
+    }
+    cmd += "'";
+
+    FILE* f = popen(cmd.c_str(), "r");
+    if (!f) {
+        fprintf(stderr, "kokoro: failed to popen espeak-ng — is it installed?\n");
+        return nullptr;
+    }
+    std::string phonemes;
+    char buf[1024];
+    while (size_t n = std::fread(buf, 1, sizeof(buf), f))
+        phonemes.append(buf, n);
+    pclose(f);
+    // Strip leading/trailing whitespace.
+    size_t b = 0, e = phonemes.size();
+    while (b < e && std::isspace((unsigned char)phonemes[b])) b++;
+    while (e > b && std::isspace((unsigned char)phonemes[e - 1])) e--;
+    phonemes = phonemes.substr(b, e - b);
+    if (phonemes.empty()) {
+        fprintf(stderr, "kokoro: espeak-ng produced no phonemes for '%s'\n", text);
+        return nullptr;
+    }
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "kokoro: espeak-ng phonemes: '%s'\n", phonemes.c_str());
+    return kokoro_synthesize_phonemes(ctx, phonemes.c_str(), out_n_samples);
 }
 
 extern "C" float* kokoro_extract_stage(struct kokoro_context* ctx, const char* phonemes, const char* stage_name,
@@ -1975,6 +2746,34 @@ extern "C" float* kokoro_extract_stage(struct kokoro_context* ctx, const char* p
             return nullptr;
         }
         float* r = kokoro_run_decoder_body(ctx, ids, n_ids, stage_name, out_n);
+        std::free(ids);
+        return r;
+    }
+
+    if (std::strcmp(stage_name, "gen_pre_post_out") == 0 ||
+        std::strcmp(stage_name, "mag") == 0 ||
+        std::strcmp(stage_name, "phase") == 0) {
+        int n_ids = 0;
+        int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
+        if (!ids || n_ids == 0) {
+            std::free(ids);
+            fprintf(stderr, "kokoro: empty phoneme tokenisation for '%s'\n", phonemes);
+            return nullptr;
+        }
+        float* r = kokoro_run_generator(ctx, ids, n_ids, stage_name, out_n);
+        std::free(ids);
+        return r;
+    }
+
+    if (std::strcmp(stage_name, "audio_out") == 0) {
+        int n_ids = 0;
+        int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
+        if (!ids || n_ids == 0) {
+            std::free(ids);
+            fprintf(stderr, "kokoro: empty phoneme tokenisation for '%s'\n", phonemes);
+            return nullptr;
+        }
+        float* r = kokoro_run_audio(ctx, ids, n_ids, out_n);
         std::free(ids);
         return r;
     }
