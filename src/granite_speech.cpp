@@ -14,6 +14,8 @@
 #include "core/ffn.h"
 #include "core/attention.h"
 #include "core/bpe.h"
+#include "core/cpu_ops.h"
+#include "core/fft.h"
 #include "core/mel.h"
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -815,64 +817,9 @@ extern "C" void granite_speech_free(struct granite_speech_context* ctx) {
 }
 
 // ===========================================================================
-// Mel spectrogram (80 bins, n_fft=512, hop=160, per-utterance max norm)
+// Mel spectrogram (80 bins, n_fft=512, hop=160, per-utterance max norm).
+// FFT lives in core/fft.h (shared with granite_nle).
 // ===========================================================================
-
-static void granite_fft(float* in, int N, float* out) {
-    if (N <= 1) {
-        out[0] = in[0];
-        out[1] = 0;
-        return;
-    }
-    if (N % 2 != 0) {
-        // DFT fallback for odd sizes
-        for (int k = 0; k < N; k++) {
-            double re = 0, im = 0;
-            for (int n = 0; n < N; n++) {
-                double a = -2.0 * M_PI * k * n / N;
-                re += in[n] * cos(a);
-                im += in[n] * sin(a);
-            }
-            out[2 * k] = (float)re;
-            out[2 * k + 1] = (float)im;
-        }
-        return;
-    }
-    int half = N / 2;
-    std::vector<float> even(half), odd(half);
-    for (int i = 0; i < half; i++) {
-        even[i] = in[2 * i];
-        odd[i] = in[2 * i + 1];
-    }
-    std::vector<float> E(2 * half), O(2 * half);
-    granite_fft(even.data(), half, E.data());
-    granite_fft(odd.data(), half, O.data());
-    for (int k = 0; k < half; k++) {
-        double a = -2.0 * M_PI * k / N;
-        float wr = (float)cos(a), wi = (float)sin(a);
-        float tre = wr * O[2 * k] - wi * O[2 * k + 1];
-        float tim = wr * O[2 * k + 1] + wi * O[2 * k];
-        out[2 * k] = E[2 * k] + tre;
-        out[2 * k + 1] = E[2 * k + 1] + tim;
-        out[2 * (k + half)] = E[2 * k] - tre;
-        out[2 * (k + half) + 1] = E[2 * k + 1] - tim;
-    }
-}
-
-// granite_fft is non-const in-place recursive (like voxtral/qwen3). Wrap
-// it for the const-input core_mel::FftR2C contract using thread-local
-// scratch buffers (~4*N and ~8*N floats respectively).
-static void granite_fft_wrapper(const float* in, int N, float* out) {
-    static thread_local std::vector<float> scratch_in;
-    static thread_local std::vector<float> scratch_out;
-    if ((int)scratch_in.size() < 4 * N)
-        scratch_in.assign((size_t)4 * N, 0.0f);
-    if ((int)scratch_out.size() < 8 * N)
-        scratch_out.assign((size_t)8 * N, 0.0f);
-    std::memcpy(scratch_in.data(), in, (size_t)N * sizeof(float));
-    granite_fft(scratch_in.data(), N, scratch_out.data());
-    std::memcpy(out, scratch_out.data(), (size_t)(2 * N) * sizeof(float));
-}
 
 extern "C" float* granite_speech_compute_mel(struct granite_speech_context* ctx, const float* samples, int n_samples,
                                              int* out_n_mels, int* out_T_mel) {
@@ -932,7 +879,7 @@ extern "C" float* granite_speech_compute_mel(struct granite_speech_context* ctx,
 
     int T_stacked = 0;
     auto stacked = core_mel::compute(samples, n_samples, hann.data(), win_length, filt.data(), n_freqs,
-                                     granite_fft_wrapper, p, T_stacked);
+                                     core_fft::fft_radix2_wrapper, p, T_stacked);
 
     if (stacked.empty())
         return nullptr;
@@ -1436,33 +1383,12 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
     return result;
 }
 
-// Build a tiny ggml graph for a single matmul: out = W @ x [+ bias]
-// x: (d_in, T), W: ggml tensor, out: (d_out, T)
-static bool run_matmul(granite_speech_context* ctx, float* out, const float* x, int d_in, int T, ggml_tensor* W,
-                       ggml_tensor* bias, int d_out) {
-    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
-    ggml_context* ctx0 = ggml_init(ip);
-    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 64, false);
-
-    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_in, T);
-    ggml_set_name(inp, "mm_in");
-    ggml_set_input(inp);
-
-    ggml_tensor* r = ggml_mul_mat(ctx0, W, inp);
-    if (bias)
-        r = ggml_add(ctx0, r, bias);
-    ggml_set_name(r, "mm_out");
-    ggml_build_forward_expand(gf, r);
-    ggml_free(ctx0);
-
-    ggml_backend_sched_reset(ctx->sched);
-    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
-        return false;
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "mm_in"), x, 0, (size_t)d_in * T * sizeof(float));
-    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
-        return false;
-    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "mm_out"), out, 0, (size_t)d_out * T * sizeof(float));
-    return true;
+// Single-matmul dispatcher (out = W @ x [+ bias]) lives in
+// core/cpu_ops.h::matmul. Local wrapper that adapts the call to take
+// `ctx` so existing call sites stay readable.
+static inline bool run_matmul(granite_speech_context* ctx, float* out, const float* x, int d_in, int T, ggml_tensor* W,
+                              ggml_tensor* bias, int d_out) {
+    return core_cpu::matmul(ctx->compute_meta, ctx->sched, out, x, d_in, T, W, bias, d_out);
 }
 
 // Run two matmuls with the same input in a single graph dispatch. ggml
@@ -1662,29 +1588,7 @@ static bool run_ffn(granite_speech_context* ctx, float* out, const float* x, int
     return true;
 }
 
-// CPU LayerNorm: out = (x - mean) / sqrt(var + eps) * w + b
-// Parallel over time frames — each frame's stats and output are independent.
-// Supports in-place operation (out == x) because each iteration reads and
-// writes disjoint rows.
-static void cpu_layernorm(float* out, const float* x, const float* w, const float* b, int d, int T, float eps) {
-#pragma omp parallel for schedule(static)
-    for (int t = 0; t < T; t++) {
-        const float* xt = x + (size_t)t * d;
-        float* ot = out + (size_t)t * d;
-        float mean = 0, var = 0;
-        for (int i = 0; i < d; i++)
-            mean += xt[i];
-        mean /= d;
-        for (int i = 0; i < d; i++) {
-            float v = xt[i] - mean;
-            var += v * v;
-        }
-        var /= d;
-        float inv = 1.0f / std::sqrt(var + eps);
-        for (int i = 0; i < d; i++)
-            ot[i] = (xt[i] - mean) * inv * (w ? w[i] : 1.0f) + (b ? b[i] : 0.0f);
-    }
-}
+// CPU LayerNorm lives in core/cpu_ops.h::layernorm.
 
 extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx, const float* mel, int n_mels,
                                              int T_mel, int* out_N, int* out_dim) {
@@ -1876,8 +1780,8 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
                 ggml_backend_tensor_get(b.post_norm_w, nw.data(), 0, d * sizeof(float));
             if (b.post_norm_b)
                 ggml_backend_tensor_get(b.post_norm_b, nb.data(), 0, d * sizeof(float));
-            cpu_layernorm(hidden.data(), hidden.data(), b.post_norm_w ? nw.data() : nullptr,
-                          b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
+            core_cpu::layernorm(hidden.data(), hidden.data(), b.post_norm_w ? nw.data() : nullptr,
+                                b.post_norm_b ? nb.data() : nullptr, d, T, 1e-5f);
         }
 
         // PLUS: snapshot the post-norm hidden state at any cat_layer index.
