@@ -62,6 +62,41 @@ you get a more memory-hungry but more forgiving path that works with
 either layout. All three of voxtral, voxtral4b, qwen3, and granite LLM
 blocks do the explicit expand for simplicity.
 
+### Capture tensors MUST call `ggml_set_output()`, not just `ggml_set_name()`
+
+Found while wiring stage-by-stage diff captures into the mimo-asr
+prefill graph. We had:
+
+```cpp
+ggml_tensor* audio_features = ggml_cont(ctx0, x);
+ggml_set_name(audio_features, "prefill_audio_features");
+ggml_build_forward_expand(gf, audio_features);  // not enough!
+// ... later in the same graph ...
+ggml_tensor* inputs_embeds = ggml_add(ctx0, text_embeds, x); // shares x with cont above
+```
+
+Both `audio_features` (cont of x) and `inputs_embeds` (consumes x)
+read from the same MUL output buffer. With only `set_name`, the
+backend scheduler treated audio_features as an ordinary intermediate
+and reused its buffer when allocating later ops in the same graph.
+By the time we read it back via `ggml_graph_get_tensor`, the values
+were post-clobber. Symptom: per-stage cosines look fine in isolation
+(audio_features cos≈0.998), but a downstream consumer's output
+collapses to ~0 against the reference (inputs_embeds cos≈0.003)
+even though both inputs to its `ggml_add` extracted at cos≥0.99
+individually.
+
+Fix: every tensor that the host plans to extract via
+`ggml_graph_get_tensor` (or via `ggml_backend_tensor_get` against a
+named graph node) must be marked `ggml_set_output(...)` in addition
+to `ggml_set_name(...)`. `set_output` tells the scheduler the buffer
+must persist past compute; `build_forward_expand` only marks the node
+as a graph target, not as a long-lived output.
+
+The same pattern applies to any backend that mixes "named capture
+points" with "downstream consumers of the same intermediate" in one
+forward graph.
+
 ### `ggml_backend_sched` lifetime
 
 Two common patterns, with very different performance:
