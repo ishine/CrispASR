@@ -29,7 +29,10 @@
 
 #include "kokoro.h"
 
+#include "core/activation.h"
+#include "core/align.h"
 #include "core/attention.h"
+#include "core/conv.h"
 #include "core/gguf_loader.h"
 #include "core/lstm.h"
 #include "ggml-alloc.h"
@@ -645,24 +648,9 @@ static float* kokoro_run_bert(kokoro_context* c, const int32_t* raw_ids, int n_r
 // Returns malloc'd (D, T_frames) F32 buffer with T_frames = sum(durations).
 // ---------------------------------------------------------------------------
 
-static float* kokoro_align_repeat(const float* features, int D, int L, const int* durations, int* out_T_frames) {
-    int T = 0;
-    for (int i = 0; i < L; i++)
-        T += durations[i];
-    if (out_T_frames) *out_T_frames = T;
-    if (T <= 0) return nullptr;
-    float* out = (float*)std::malloc((size_t)D * T * sizeof(float));
-    if (!out) return nullptr;
-    int j = 0;
-    for (int i = 0; i < L; i++) {
-        const int n = durations[i];
-        const float* col = features + (size_t)i * D;
-        for (int k = 0; k < n; k++) {
-            std::memcpy(out + (size_t)j * D, col, (size_t)D * sizeof(float));
-            j++;
-        }
-    }
-    return out;
+static inline float* kokoro_align_repeat(const float* features, int D, int L,
+                                         const int* durations, int* out_T_frames) {
+    return core_align::repeat_interleave(features, D, L, durations, out_T_frames);
 }
 
 // ---------------------------------------------------------------------------
@@ -709,64 +697,14 @@ static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggm
     return out;
 }
 
-// ---------------------------------------------------------------------------
-// Depthwise ConvTranspose1d for the AdainResBlk1d pool layer.
-//
-// Specific shape used by the predictor's F0/N pool: kernel (3, 1, C),
-// stride 2, padding 1, output_padding 1. Output length = 2*T (per
-// ConvTranspose1d formula). ggml has no `groups` argument on
-// conv_transpose_1d, so we open-code the math.
-//
-// With s=2, k=3, p=1, op=1 the output collapses to:
-//   y[c, 2t]   = w[c, 1] * x[c, t]
-//   y[c, 2t+1] = w[c, 2] * x[c, t] + w[c, 0] * x[c, t+1]    (x[c, T]=0 boundary)
-// Plus per-channel bias.
-//
-// Derivation: PyTorch ConvTranspose1d sums input[j] * weight[k] over (j, k)
-// satisfying j*stride + k - padding = output_idx. For i=2t+1: j=t (k=2) and
-// j=t+1 (k=0) contribute, hence the w[2]·x[t] + w[0]·x[t+1] split.
-// ---------------------------------------------------------------------------
-
-static inline ggml_tensor* kokoro_pool_2x_depthwise(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w_kernel,
-                                                   ggml_tensor* w_bias) {
-    const int C = (int)x->ne[0];
-    const int T = (int)x->ne[1];
-
-    // w_kernel ne=(K=3, 1, C) F16. Permute to (C, 3, 1), cast to F32 (so the
-    // element-wise muls below work — F32*F16 mul is not portable across
-    // backends), reshape to (C, 3), then take 3 column views.
-    ggml_tensor* w_perm = ggml_cont(ctx, ggml_permute(ctx, w_kernel, 2, 0, 1, 3));   // (C, 3, 1) F16
-    ggml_tensor* w_perm_f32 = ggml_cast(ctx, w_perm, GGML_TYPE_F32);
-    ggml_tensor* w_2d = ggml_reshape_2d(ctx, w_perm_f32, C, 3);                      // (C, 3) F32
-    const size_t row_b = w_2d->nb[1];
-    ggml_tensor* w0 = ggml_view_2d(ctx, w_2d, C, 1, row_b, (size_t)0 * row_b);
-    ggml_tensor* w1 = ggml_view_2d(ctx, w_2d, C, 1, row_b, (size_t)1 * row_b);
-    ggml_tensor* w2 = ggml_view_2d(ctx, w_2d, C, 1, row_b, (size_t)2 * row_b);
-
-    // x_shifted[c, t] = x[c, t+1] for t < T-1, 0 for t = T-1.
-    // Take x[:, 1:] (C, T-1) and zero-pad on the right to (C, T).
-    ggml_tensor* x_tail = ggml_view_2d(ctx, x, C, T - 1, x->nb[1], x->nb[1]);        // (C, T-1)
-    x_tail = ggml_cont(ctx, x_tail);                                                  // contiguous
-    ggml_tensor* x_shifted = ggml_pad_ext(ctx, x_tail, 0, 0, 0, 1, 0, 0, 0, 0);       // (C, T)
-
-    // y_even (C, T) = w1 ⊙ x  (broadcast w1 over T)
-    ggml_tensor* y_even = ggml_mul(ctx, x, w1);
-    // y_odd (C, T) = w2 ⊙ x + w0 ⊙ x_shifted   (PyTorch ConvTranspose1d kernel
-    // indexing — see derivation note above the function)
-    ggml_tensor* y_odd = ggml_add(ctx, ggml_mul(ctx, x, w2), ggml_mul(ctx, x_shifted, w0));
-
-    // Interleave: reshape both to (C, 1, T), concat dim=1 → (C, 2, T),
-    // reshape to (C, 2*T). Memory layout means consecutive time positions
-    // alternate even/odd, which is the desired interleaving.
-    ggml_tensor* even_3d = ggml_reshape_3d(ctx, y_even, C, 1, T);
-    ggml_tensor* odd_3d  = ggml_reshape_3d(ctx, y_odd,  C, 1, T);
-    ggml_tensor* stacked = ggml_concat(ctx, even_3d, odd_3d, /*dim=*/1);              // (C, 2, T)
-    ggml_tensor* y = ggml_cont(ctx, ggml_reshape_2d(ctx, stacked, C, 2 * T));         // (C, 2T)
-
-    // Per-channel bias (broadcast over time).
-    if (w_bias)
-        y = ggml_add(ctx, y, w_bias);
-    return y;
+// Thin alias for the depthwise ConvTranspose1d pool layer used by
+// every Kokoro AdainResBlk1d with `upsample=True` (predictor F0[1] /
+// N[1] and decoder.decode[3]). See core_convt::convt1d_depthwise_2x_k3
+// for the (k=3, s=2, p=1, op=1) derivation, including the wrong-end
+// trap that the M11 diff harness caught.
+static inline ggml_tensor* kokoro_pool_2x_depthwise(ggml_context* ctx, ggml_tensor* x,
+                                                   ggml_tensor* w_kernel, ggml_tensor* w_bias) {
+    return core_convt::convt1d_depthwise_2x_k3(ctx, x, w_kernel, w_bias);
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,16 +1518,10 @@ static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids,
 // which uses LeakyReLU(0.2).
 // ---------------------------------------------------------------------------
 
-// Snake-α activation. x: (C, T) F32. alpha: ne=(1, C, 1) F16 — reshape +
-// cast → (C, 1) F32 broadcasts on T. Returns (C, T) F32.
+// Snake-α activation. Thin alias to core_act::snake_alpha — see that
+// header for the (1, C, 1) layout convention and Metal-typing notes.
 static inline ggml_tensor* kokoro_snake1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
-    const int C = (int)x->ne[0];
-    ggml_tensor* a = ggml_reshape_2d(ctx, alpha, C, 1);
-    a = ggml_cast(ctx, a, GGML_TYPE_F32);                 // (C, 1) F32
-    ggml_tensor* ax = ggml_mul(ctx, x, a);                // α·x (broadcast α on T)
-    ggml_tensor* sin_sq = ggml_sqr(ctx, ggml_sin(ctx, ax));
-    ggml_tensor* div = ggml_div(ctx, sin_sq, a);          // sin²(α·x) / α
-    return ggml_add(ctx, x, div);
+    return core_act::snake_alpha(ctx, x, alpha);
 }
 
 // AdaINResBlock1 (NOTE the capital "B" — this is the Generator's class, not
