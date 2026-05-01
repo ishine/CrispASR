@@ -43,6 +43,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "mimo_tokenizer.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -91,8 +92,10 @@ struct mimo_asr_context {
     std::map<std::string, ggml_tensor*> tensors;
 
     // Tokeniser GGUF path — set via mimo_asr_set_tokenizer_path before
-    // the first transcribe call. Empty until set.
+    // the first transcribe call. Empty until set. The tokenizer context
+    // is instantiated lazily on first transcribe (heavy: 569 tensors).
     std::string tokenizer_path;
+    mimo_tokenizer_context* tokenizer = nullptr;
 
     std::vector<std::string> vocab;
 };
@@ -200,9 +203,23 @@ extern "C" int mimo_asr_set_tokenizer_path(struct mimo_asr_context* ctx, const c
     return 0;
 }
 
-extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* /*ctx*/, const float* /*pcm*/, int /*n_samples*/) {
-    // PLAN #51 — full forward pass not yet implemented. The model
-    // loads cleanly; we just don't run the encoder + LLM yet.
+extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* ctx, const float* /*pcm*/, int /*n_samples*/) {
+    // PLAN #51 — full forward pass not yet implemented.
+    //
+    // Lazy-init the tokenizer context here so callers see a concrete
+    // tokenizer-load error before they hit the LLM-side stub. The
+    // tokenizer's own forward path is also unimplemented (PLAN #51
+    // step 2/3); see src/mimo_tokenizer.cpp for the remaining work.
+    if (ctx && !ctx->tokenizer && !ctx->tokenizer_path.empty()) {
+        auto tp = mimo_tokenizer_context_default_params();
+        tp.n_threads = ctx->n_threads;
+        tp.use_gpu = ctx->params.use_gpu;
+        tp.verbosity = ctx->params.verbosity;
+        ctx->tokenizer = mimo_tokenizer_init_from_file(ctx->tokenizer_path.c_str(), tp);
+        if (!ctx->tokenizer && ctx->params.verbosity >= 1) {
+            fprintf(stderr, "mimo_asr: failed to lazy-load tokenizer at '%s'\n", ctx->tokenizer_path.c_str());
+        }
+    }
     static const char kStub[] = "[mimo_asr: forward pass not yet implemented — PLAN #51]";
     char* out = (char*)malloc(sizeof(kStub));
     if (out)
@@ -213,6 +230,8 @@ extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* /*ctx*/, const flo
 extern "C" void mimo_asr_free(struct mimo_asr_context* ctx) {
     if (!ctx)
         return;
+    if (ctx->tokenizer)
+        mimo_tokenizer_free(ctx->tokenizer);
     if (ctx->buf_w)
         ggml_backend_buffer_free(ctx->buf_w);
     if (ctx->ctx_w)

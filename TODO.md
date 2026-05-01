@@ -181,6 +181,65 @@ direction; do not interleave.
 - **MiMo-V2.5-ASR** — **[IN PROGRESS]** Converters done, F16+Q4_K on HF.
   Runtime is scaffolded (loads cleanly) but `mimo_asr_transcribe` is
   a stub. Forward pass is PLAN #51. MIT.
+
+  **PLAN #51 status (2026-05-01):**
+  Tokenizer scaffold + Python reference dumper landed (commits
+  12374d7 + b608b91). `mimo_tokenizer_init_from_file` loads
+  `cstr/mimo-tokenizer-GGUF` Q4_K cleanly (569 tensors, 32 enc layers,
+  20 RVQ stages on disk; ASR uses the first 8). `mimo_asr_transcribe`
+  now lazy-loads the tokenizer context, but the forward path is still
+  the stub.
+
+  **What's left (in order):**
+  1. **Tokenizer encoder forward pass** — mel → conv stem → 32-layer
+     transformer (RoPE θ=10000, head_dim=64; q/v/o have biases, k has
+     none; GELU FFN 1280→5120; skip-add from output of layer 2 added
+     to output of final layer) → final LayerNorm → down_sample
+     (Conv1d k=2 s=2 no-bias) + GELU + LayerNorm → 8-stage Euclidean
+     RVQ encode (CPU-side argmin; codebooks F16 → F32 at distance
+     compute time, matches upstream `quantizer.float()`). Six
+     diff-harness stages already declared in mimo_tokenizer.h.
+     Recommendation: gate GPU acceleration behind a flag and start
+     CPU-pinned (mirror kokoro `gen_sched`) — the conv stack is the
+     same shape that hit the M1 `kernel_conv_transpose_1d` watchdog
+     hang on qwen3-tts.
+  2. **LM half** — speech_embeddings + speech_group_downcast
+     (audio.group_proj) + 6-layer input_local_transformer
+     (input_full_attention=true, so bidirectional within a group of
+     `group_size=4`) + hidden_states_downcast (audio.hidden_proj) →
+     audio_features. 36-layer Qwen2 prefill (hidden=4096, heads=32,
+     kv_heads=8, head_dim=128, intermediate=11008, vocab=151680,
+     rope_theta=640000, **attention_bias=true** — Qwen2 has Q/K/V
+     biases unlike Qwen3; `core_attn::kv_self_attn` does NOT yet
+     accept bias inputs and will need either a sibling helper or an
+     extension). lm_head not tied. Greedy decode against vocab,
+     filtering `<|empty|>`/`<|eot|>`/`<|eostm|>`.
+  3. **Prompt format** — chat with thinking. The full Python entry
+     point is `MimoAudio.asr_sft` in
+     `ref/mimo/github/src/mimo_audio/mimo_audio.py`; key bits to
+     port: input_ids shape `[1, audio_channels+1, T]` with channel 0
+     = text (mostly `<|empty|>`), channels 1..8 = audio codes; pad
+     audio length to a multiple of `group_size=4`; assistant-side
+     prefix is `<think>\n\n</think>\n<audio_tag>` (audio_tag is
+     `<chinese>`/`<english>`/empty). `MimoStopper` stops on
+     `eos_token_id` or `<|im_end|>`.
+  4. **Diff-harness backend** — add `mimo-tokenizer` clause to
+     `examples/cli/crispasr_diff_main.cpp`; pattern after the
+     `qwen3-tts-codec` block (single-stage extract loop with
+     cos_min ≥ 0.999 threshold).
+  5. **Validation** — running the Python reference dumper requires
+     the upstream safetensors which were NOT downloaded in the
+     2026-05-01 session (disk pressure on `/Volumes/backups`,
+     16 GiB free at session start). The tokenizer safetensors are
+     ~2.4 GB; the LM is ~14 GB. Plan: download tokenizer-only
+     first, validate the encoder bit-by-bit, defer LM-side ground
+     truth until disk frees up.
+
+  Upstream Python source for reference is at
+  `ref/mimo/github/src/mimo_audio_tokenizer/` and
+  `ref/mimo/github/src/mimo_audio/`. config.json for both halves
+  lives at `ref/mimo/MiMo-V2.5-ASR/` and
+  `ref/mimo/MiMo-Audio-Tokenizer/`.
 - **Qwen3-TTS** — **[WORKS, default path]** End-to-end synthesis is
   functional and correct on default settings. HF release
   `cstr/qwen3-tts-0.6b-base-GGUF` ships F16 + Q8_0 + Q4_K talker;
