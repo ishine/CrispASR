@@ -26,7 +26,7 @@ namespace core_rvq {
 // inner argmin into a 2 x·E[k] − ||E[k]||² shootout that skips the
 // constant ||x||² term.
 struct Codebook {
-    const float* embed = nullptr;      // (codebook_size, dim) row-major
+    const float* embed = nullptr;         // (codebook_size, dim) row-major
     const float* embed_norm_sq = nullptr; // (codebook_size,)
     int codebook_size = 0;
     int dim = 0;

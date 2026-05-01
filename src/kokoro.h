@@ -25,8 +25,8 @@ extern "C" {
 struct kokoro_context;
 
 struct kokoro_context_params {
-    int  n_threads;
-    int  verbosity;       // 0=silent, 1=normal, 2=verbose
+    int n_threads;
+    int verbosity; // 0=silent, 1=normal, 2=verbose
     bool use_gpu;
     bool gen_force_metal; // KOKORO_GEN_FORCE_METAL=1 — debug only; default false
                           // pins the iSTFTNet generator to backend_cpu to avoid

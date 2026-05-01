@@ -31,10 +31,10 @@ namespace core_act {
 static inline ggml_tensor* snake_alpha(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
     const int C = (int)x->ne[0];
     ggml_tensor* a = ggml_reshape_2d(ctx, alpha, C, 1);
-    a = ggml_cast(ctx, a, GGML_TYPE_F32);            // (C, 1) F32 (Metal needs F32×F32)
-    ggml_tensor* ax = ggml_mul(ctx, x, a);           // α·x with α broadcast on T
+    a = ggml_cast(ctx, a, GGML_TYPE_F32);  // (C, 1) F32 (Metal needs F32×F32)
+    ggml_tensor* ax = ggml_mul(ctx, x, a); // α·x with α broadcast on T
     ggml_tensor* sin_sq = ggml_sqr(ctx, ggml_sin(ctx, ax));
-    ggml_tensor* div = ggml_div(ctx, sin_sq, a);     // sin²(α·x) / α
+    ggml_tensor* div = ggml_div(ctx, sin_sq, a); // sin²(α·x) / α
     return ggml_add(ctx, x, div);
 }
 

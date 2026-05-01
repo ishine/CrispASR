@@ -416,10 +416,10 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
         // V_new_perm are F32 throughout the helper (mul_mat → reshape →
         // optional rms_norm/mul → rope_ext, all type-preserving), and the
         // F32→F16 store into the cache is handled by the op itself.
-        ggml_tensor* k_layer = ggml_view_3d(ctx0, kv_k, hd, kv_k->ne[1], n_kv, kv_k->nb[1], kv_k->nb[2],
-                                            (size_t)il * kv_k->nb[3]);
-        ggml_tensor* v_layer = ggml_view_3d(ctx0, kv_v, hd, kv_v->ne[1], n_kv, kv_v->nb[1], kv_v->nb[2],
-                                            (size_t)il * kv_v->nb[3]);
+        ggml_tensor* k_layer =
+            ggml_view_3d(ctx0, kv_k, hd, kv_k->ne[1], n_kv, kv_k->nb[1], kv_k->nb[2], (size_t)il * kv_k->nb[3]);
+        ggml_tensor* v_layer =
+            ggml_view_3d(ctx0, kv_v, hd, kv_v->ne[1], n_kv, kv_v->nb[1], kv_v->nb[2], (size_t)il * kv_v->nb[3]);
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, k_layer, K_new_perm, kv_indices));
         ggml_build_forward_expand(gf, ggml_set_rows(ctx0, v_layer, V_new_perm, kv_indices));
     } else {

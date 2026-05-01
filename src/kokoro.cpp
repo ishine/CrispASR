@@ -64,30 +64,30 @@ bool env_bool(const char* k) {
 // Hyperparameters read from `kokoro.*` and `kokoro.plbert.*` GGUF KV.
 struct kokoro_hp {
     // Top-level
-    uint32_t hidden_dim   = 512;
-    uint32_t style_dim    = 128;
-    uint32_t max_dur      = 50;
-    uint32_t n_token      = 178;
-    uint32_t n_mels       = 80;  // unused by the synthesis path; kept for completeness
-    uint32_t n_layer      = 3;   // duration-encoder depth
-    uint32_t text_enc_k   = 5;
-    uint32_t sample_rate  = 24000;
-    uint32_t vocab_size   = 178;
+    uint32_t hidden_dim = 512;
+    uint32_t style_dim = 128;
+    uint32_t max_dur = 50;
+    uint32_t n_token = 178;
+    uint32_t n_mels = 80; // unused by the synthesis path; kept for completeness
+    uint32_t n_layer = 3; // duration-encoder depth
+    uint32_t text_enc_k = 5;
+    uint32_t sample_rate = 24000;
+    uint32_t vocab_size = 178;
 
     // PL-BERT (custom 12-layer parameter-shared ALBERT)
-    uint32_t plbert_embd_size  = 128;
-    uint32_t plbert_hidden     = 768;
-    uint32_t plbert_n_layers   = 12;
-    uint32_t plbert_n_heads    = 12;
-    uint32_t plbert_ff         = 2048;
-    uint32_t plbert_max_pos    = 512;
+    uint32_t plbert_embd_size = 128;
+    uint32_t plbert_hidden = 768;
+    uint32_t plbert_n_layers = 12;
+    uint32_t plbert_n_heads = 12;
+    uint32_t plbert_ff = 2048;
+    uint32_t plbert_max_pos = 512;
     uint32_t plbert_vocab_size = 178;
 
     // iSTFTNet
-    uint32_t istft_init_ch  = 512;
-    uint32_t istft_n_fft    = 20;
-    uint32_t istft_hop      = 5;
-    uint32_t istft_n_dilations = 3; // entries per resblock
+    uint32_t istft_init_ch = 512;
+    uint32_t istft_n_fft = 20;
+    uint32_t istft_hop = 5;
+    uint32_t istft_n_dilations = 3;                    // entries per resblock
     std::vector<uint32_t> istft_upsample_rates;        // [10, 6]
     std::vector<uint32_t> istft_upsample_kernel_sizes; // [20, 12]
     std::vector<uint32_t> istft_resblock_kernel_sizes; // [3, 7, 11]
@@ -95,16 +95,16 @@ struct kokoro_hp {
 };
 
 struct kokoro_vocab {
-    std::vector<std::string> id_to_token;                   // size = vocab_size
-    std::unordered_map<std::string, int32_t> token_to_id;   // lookup for tokenizer
-    int32_t pad_id = 0;                                     // index of "$" (Kokoro/StyleTTS2 pad)
+    std::vector<std::string> id_to_token;                 // size = vocab_size
+    std::unordered_map<std::string, int32_t> token_to_id; // lookup for tokenizer
+    int32_t pad_id = 0;                                   // index of "$" (Kokoro/StyleTTS2 pad)
 };
 
 struct kokoro_voice_pack {
     std::string name;
     uint32_t max_phonemes = 0;
     uint32_t style_dim = 0;
-    ggml_tensor* pack = nullptr;            // (max_phon, 1, 256) F32 — owned by vp_ctx_w/vp_buf_w
+    ggml_tensor* pack = nullptr; // (max_phon, 1, 256) F32 — owned by vp_ctx_w/vp_buf_w
     ggml_context* vp_ctx_w = nullptr;
     ggml_backend_buffer_t vp_buf_w = nullptr;
     std::map<std::string, ggml_tensor*> tensors;
@@ -117,14 +117,14 @@ struct kokoro_context {
     int n_threads = 4;
     std::string espeak_lang = "en-us";
 
-    kokoro_hp    hp;
+    kokoro_hp hp;
     kokoro_vocab vocab;
 
     // Backends. `backend` is the user's choice (Metal/CUDA/CPU); `backend_cpu`
     // is always present. `gen_backend` is forced to CPU when
     // gen_force_metal=false (the default — see header) to avoid a known
     // Metal hang on stride-10 ConvTranspose1d in iSTFTNet's `gen.ups.0`.
-    ggml_backend_t backend     = nullptr;
+    ggml_backend_t backend = nullptr;
     ggml_backend_t backend_cpu = nullptr;
     ggml_backend_t gen_backend = nullptr; // either backend or backend_cpu
 
@@ -133,7 +133,7 @@ struct kokoro_context {
     // Metal-hang workaround); `bert_sched` is the same as `sched` (BERT
     // is light enough not to need its own scheduler — kept as a named
     // alias so the BERT graph code can stay decoupled).
-    ggml_backend_sched_t sched     = nullptr;
+    ggml_backend_sched_t sched = nullptr;
     ggml_backend_sched_t gen_sched = nullptr;
 
     // Primary weights (talker GGUF). Tensors stay resident here for the
@@ -191,20 +191,13 @@ std::vector<uint32_t> kv_u32_array(gguf_context* g, const char* key) {
 // names; load_weights already provides the full map).
 bool sanity_check_weights(const kokoro_context* c) {
     const char* must_have[] = {
-        "bert.embd.tok.weight",
-        "bert.embd_proj.weight",
-        "bert.attn_q.weight",
-        "bert.attn_q.bias",
-        "bert.ffn_up.weight",
-        "bert.pooler.weight",
-        "bert_proj.weight",
-        "bert_proj.bias",
-        "text_enc.embd.weight",
-        "text_enc.cnn.0.conv.weight",
-        "text_enc.lstm.weight_ih_l0",
-        "text_enc.lstm.weight_ih_l0_reverse",
-        "pred.F0_proj.weight",
-        "pred.N_proj.weight",
+        "bert.embd.tok.weight",       "bert.embd_proj.weight",
+        "bert.attn_q.weight",         "bert.attn_q.bias",
+        "bert.ffn_up.weight",         "bert.pooler.weight",
+        "bert_proj.weight",           "bert_proj.bias",
+        "text_enc.embd.weight",       "text_enc.cnn.0.conv.weight",
+        "text_enc.lstm.weight_ih_l0", "text_enc.lstm.weight_ih_l0_reverse",
+        "pred.F0_proj.weight",        "pred.N_proj.weight",
         "dec.gen.conv_post.weight",
     };
     bool ok = true;
@@ -243,11 +236,11 @@ static const float kBertLayerNormEps = 1e-12f;
 // name: "bert_pooler_out" (768, L) and "bert_proj_out" (512, L).
 static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     const auto& hp = c->hp;
-    const int D_emb = (int)hp.plbert_embd_size;   // 128
-    const int D     = (int)hp.plbert_hidden;      // 768
-    const int n_h   = (int)hp.plbert_n_heads;     // 12
-    const int n_lay = (int)hp.plbert_n_layers;    // 12 shared
-    const int hd    = D / n_h;                    // 64
+    const int D_emb = (int)hp.plbert_embd_size; // 128
+    const int D = (int)hp.plbert_hidden;        // 768
+    const int n_h = (int)hp.plbert_n_heads;     // 12
+    const int n_lay = (int)hp.plbert_n_layers;  // 12 shared
+    const int hd = D / n_h;                     // 64
     const float attn_scale = 1.0f / std::sqrt((float)hd);
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
@@ -264,19 +257,19 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     ggml_set_input(positions);
 
     // ---- Embeddings ----
-    ggml_tensor* tok_w  = require(c, "bert.embd.tok.weight");
-    ggml_tensor* pos_w  = require(c, "bert.embd.pos.weight");
-    ggml_tensor* tt_w   = require(c, "bert.embd.tt.weight");
-    ggml_tensor* eln_w  = require(c, "bert.embd.ln.weight");
-    ggml_tensor* eln_b  = require(c, "bert.embd.ln.bias");
-    ggml_tensor* ep_w   = require(c, "bert.embd_proj.weight");
-    ggml_tensor* ep_b   = require(c, "bert.embd_proj.bias");
+    ggml_tensor* tok_w = require(c, "bert.embd.tok.weight");
+    ggml_tensor* pos_w = require(c, "bert.embd.pos.weight");
+    ggml_tensor* tt_w = require(c, "bert.embd.tt.weight");
+    ggml_tensor* eln_w = require(c, "bert.embd.ln.weight");
+    ggml_tensor* eln_b = require(c, "bert.embd.ln.bias");
+    ggml_tensor* ep_w = require(c, "bert.embd_proj.weight");
+    ggml_tensor* ep_b = require(c, "bert.embd_proj.bias");
 
-    ggml_tensor* tok_emb = ggml_get_rows(ctx0, tok_w, ids);          // (D_emb, L) F32
-    ggml_tensor* pos_emb = ggml_get_rows(ctx0, pos_w, positions);    // (D_emb, L) F32
+    ggml_tensor* tok_emb = ggml_get_rows(ctx0, tok_w, ids);       // (D_emb, L) F32
+    ggml_tensor* pos_emb = ggml_get_rows(ctx0, pos_w, positions); // (D_emb, L) F32
     // token_type_ids defaults to zero — slice tt_w[:, 0:1] and broadcast on L.
-    ggml_tensor* tt_view = ggml_view_2d(ctx0, tt_w, D_emb, 1, tt_w->nb[1], 0);  // (D_emb, 1) F16
-    ggml_tensor* tt_emb  = ggml_cast(ctx0, tt_view, GGML_TYPE_F32);             // (D_emb, 1) F32
+    ggml_tensor* tt_view = ggml_view_2d(ctx0, tt_w, D_emb, 1, tt_w->nb[1], 0); // (D_emb, 1) F16
+    ggml_tensor* tt_emb = ggml_cast(ctx0, tt_view, GGML_TYPE_F32);             // (D_emb, 1) F32
 
     ggml_tensor* x = ggml_add(ctx0, tok_emb, pos_emb);
     x = ggml_add(ctx0, x, tt_emb);
@@ -288,17 +281,17 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
 
     // embd_proj: Linear D_emb → D
     x = ggml_mul_mat(ctx0, ep_w, x);
-    x = ggml_add(ctx0, x, ep_b);                                     // (D, L)
+    x = ggml_add(ctx0, x, ep_b); // (D, L)
 
     // ---- 12 shared ALBERT layers ----
-    ggml_tensor* q_w  = require(c, "bert.attn_q.weight");
-    ggml_tensor* q_b  = require(c, "bert.attn_q.bias");
-    ggml_tensor* k_w  = require(c, "bert.attn_k.weight");
-    ggml_tensor* k_b  = require(c, "bert.attn_k.bias");
-    ggml_tensor* v_w  = require(c, "bert.attn_v.weight");
-    ggml_tensor* v_b  = require(c, "bert.attn_v.bias");
-    ggml_tensor* o_w  = require(c, "bert.attn_o.weight");
-    ggml_tensor* o_b  = require(c, "bert.attn_o.bias");
+    ggml_tensor* q_w = require(c, "bert.attn_q.weight");
+    ggml_tensor* q_b = require(c, "bert.attn_q.bias");
+    ggml_tensor* k_w = require(c, "bert.attn_k.weight");
+    ggml_tensor* k_b = require(c, "bert.attn_k.bias");
+    ggml_tensor* v_w = require(c, "bert.attn_v.weight");
+    ggml_tensor* v_b = require(c, "bert.attn_v.bias");
+    ggml_tensor* o_w = require(c, "bert.attn_o.weight");
+    ggml_tensor* o_b = require(c, "bert.attn_o.bias");
     ggml_tensor* aln_w = require(c, "bert.attn_ln.weight");
     ggml_tensor* aln_b = require(c, "bert.attn_ln.bias");
     ggml_tensor* fu_w = require(c, "bert.ffn_up.weight");
@@ -309,20 +302,19 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     ggml_tensor* fln_b = require(c, "bert.ffn_ln.bias");
 
     core_attn::EncoderSelfAttnParams eap{};
-    eap.n_heads     = n_h;
-    eap.n_kv_heads  = n_h;       // MHA
-    eap.head_dim    = hd;
-    eap.n_kv_grp    = 1;
-    eap.attn_scale  = attn_scale;
-    eap.n_ctx_orig  = 0;
-    eap.rope_theta  = 0.0f;
+    eap.n_heads = n_h;
+    eap.n_kv_heads = n_h; // MHA
+    eap.head_dim = hd;
+    eap.n_kv_grp = 1;
+    eap.attn_scale = attn_scale;
+    eap.n_ctx_orig = 0;
+    eap.rope_theta = 0.0f;
     eap.permute_cont = true;
 
     for (int il = 0; il < n_lay; il++) {
         // Self-attention with biased Q/K/V/O, no RoPE, no mask.
-        ggml_tensor* attn_out = core_attn::encoder_self_attn(
-            ctx0, x, q_w, q_b, k_w, k_b, v_w, v_b, o_w, o_b,
-            /*positions*/ nullptr, /*mask*/ nullptr, eap);
+        ggml_tensor* attn_out = core_attn::encoder_self_attn(ctx0, x, q_w, q_b, k_w, k_b, v_w, v_b, o_w, o_b,
+                                                             /*positions*/ nullptr, /*mask*/ nullptr, eap);
         x = ggml_add(ctx0, x, attn_out);
         x = ggml_norm(ctx0, x, kBertLayerNormEps);
         x = ggml_mul(ctx0, x, aln_w);
@@ -331,7 +323,7 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
         // FFN: up → GELU(tanh approx, "gelu_new") → down (with biases).
         ggml_tensor* ffn = ggml_mul_mat(ctx0, fu_w, x);
         ffn = ggml_add(ctx0, ffn, fu_b);
-        ffn = ggml_gelu(ctx0, ffn);                                  // tanh-approx == ALBERT "gelu_new"
+        ffn = ggml_gelu(ctx0, ffn); // tanh-approx == ALBERT "gelu_new"
         ffn = ggml_mul_mat(ctx0, fd_w, ffn);
         ffn = ggml_add(ctx0, ffn, fd_b);
         x = ggml_add(ctx0, x, ffn);
@@ -342,7 +334,7 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
 
     // Per-token last_hidden_state — exposed for diff-harness as the
     // "bert_pooler_out" stage (legacy name; not actually pooled).
-    ggml_tensor* seq = x;                                            // (D, L)
+    ggml_tensor* seq = x; // (D, L)
     seq = ggml_cont(ctx0, seq);
     ggml_set_name(seq, "bert_pooler_out");
     ggml_set_output(seq);
@@ -351,7 +343,7 @@ static ggml_cgraph* kokoro_build_graph_bert(kokoro_context* c, int L) {
     // bert_proj: Linear 768 → 512, applied per-token.
     ggml_tensor* bp_w = require(c, "bert_proj.weight");
     ggml_tensor* bp_b = require(c, "bert_proj.bias");
-    ggml_tensor* proj = ggml_mul_mat(ctx0, bp_w, seq);               // (512, L)
+    ggml_tensor* proj = ggml_mul_mat(ctx0, bp_w, seq); // (512, L)
     proj = ggml_add(ctx0, proj, bp_b);
     ggml_set_name(proj, "bert_proj_out");
     ggml_set_output(proj);
@@ -395,8 +387,8 @@ static std::vector<int32_t> kokoro_pad_wrap_ids(const kokoro_context* c, const i
 // Output: (C, T) F32.
 static const float kAdaLnEps = 1e-5f;
 
-static inline ggml_tensor* kokoro_adaln(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style,
-                                        ggml_tensor* fc_w, ggml_tensor* fc_b) {
+static inline ggml_tensor* kokoro_adaln(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, ggml_tensor* fc_w,
+                                        ggml_tensor* fc_b) {
     const int C = (int)x->ne[0];
     // h = fc(s) → (2C, 1)
     ggml_tensor* h = ggml_mul_mat(ctx, fc_w, style);
@@ -404,7 +396,7 @@ static inline ggml_tensor* kokoro_adaln(ggml_context* ctx, ggml_tensor* x, ggml_
     // chunk along ne[0]: γ ∈ [0, C), β ∈ [C, 2C).
     const size_t ts = ggml_type_size(GGML_TYPE_F32);
     ggml_tensor* gamma = ggml_view_2d(ctx, h, C, 1, h->nb[1], (size_t)0 * C * ts);
-    ggml_tensor* beta  = ggml_view_2d(ctx, h, C, 1, h->nb[1], (size_t)1 * C * ts);
+    ggml_tensor* beta = ggml_view_2d(ctx, h, C, 1, h->nb[1], (size_t)1 * C * ts);
 
     ggml_tensor* normed = ggml_norm(ctx, x, kAdaLnEps);
     // x*γ + x → broadcast γ (C, 1) over T
@@ -432,13 +424,13 @@ static inline ggml_tensor* kokoro_adaln(ggml_context* ctx, ggml_tensor* x, ggml_
 // ---------------------------------------------------------------------------
 
 static const float kTextEncLayerNormEps = 1e-5f;
-static const float kTextEncLeakySlope   = 0.2f;
+static const float kTextEncLeakySlope = 0.2f;
 
 static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
     const auto& hp = c->hp;
-    const int D = (int)hp.hidden_dim;       // 512
-    const int H_lstm = D / 2;               // 256 (bidir → 2*H = D)
-    const int K = (int)hp.text_enc_k;       // 5
+    const int D = (int)hp.hidden_dim; // 512
+    const int H_lstm = D / 2;         // 256 (bidir → 2*H = D)
+    const int K = (int)hp.text_enc_k; // 5
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -453,7 +445,7 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
 
     // ---- Embedding: (178, 512) → (D, L) ----
     ggml_tensor* emb_w = require(c, "text_enc.embd.weight");
-    ggml_tensor* x = ggml_get_rows(ctx0, emb_w, ids);     // (D, L) F32
+    ggml_tensor* x = ggml_get_rows(ctx0, emb_w, ids); // (D, L) F32
 
     // ---- 3× Conv1d(k=5, pad=2) + LN(channel) + LeakyReLU(0.2) ----
     // Layout flow per block:
@@ -480,14 +472,14 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
         ggml_tensor* lb = require(c, nm);
 
         // (D, L) → (L, D) for conv input layout.
-        x = ggml_cont(ctx0, ggml_transpose(ctx0, x));     // (L, D)
+        x = ggml_cont(ctx0, ggml_transpose(ctx0, x));                       // (L, D)
         x = ggml_conv_1d(ctx0, cw, x, /*s=*/1, /*p=*/(K - 1) / 2, /*d=*/1); // (L, D, 1)
         x = ggml_add(ctx0, x, bias_1d(cb));
         // Drop the trailing batch dim → (L, D).
         x = ggml_reshape_2d(ctx0, x, L, D);
 
         // (L, D) → (D, L) for channel-major LN.
-        x = ggml_cont(ctx0, ggml_transpose(ctx0, x));     // (D, L)
+        x = ggml_cont(ctx0, ggml_transpose(ctx0, x)); // (D, L)
         x = ggml_norm(ctx0, x, kTextEncLayerNormEps);
         x = ggml_mul(ctx0, x, lg);
         x = ggml_add(ctx0, x, lb);
@@ -505,11 +497,9 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
     ggml_tensor* b_ih_r = require(c, "text_enc.lstm.bias_ih_l0_reverse");
     ggml_tensor* b_hh_r = require(c, "text_enc.lstm.bias_hh_l0_reverse");
 
-    ggml_tensor* lstm_out = core_lstm::lstm_bidir(
-        ctx0, gf, x,
-        W_ih_f, W_hh_f, b_ih_f, b_hh_f,
-        W_ih_r, W_hh_r, b_ih_r, b_hh_r,
-        H_lstm);  // (2H = D, L)
+    ggml_tensor* lstm_out =
+        core_lstm::lstm_bidir(ctx0, gf, x, W_ih_f, W_hh_f, b_ih_f, b_hh_f, W_ih_r, W_hh_r, b_ih_r, b_hh_r,
+                              H_lstm); // (2H = D, L)
 
     ggml_set_name(lstm_out, "text_enc_out");
     ggml_set_output(lstm_out);
@@ -521,8 +511,8 @@ static ggml_cgraph* kokoro_build_graph_text_enc(kokoro_context* c, int L) {
 
 // Run text_enc and copy the named stage back to a malloc'd float buffer.
 // Pad-wraps the raw ids before computing.
-static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int n_raw,
-                                  const char* stage_name, int* out_n) {
+static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
+                                  int* out_n) {
     if (out_n)
         *out_n = 0;
     if (n_raw <= 0)
@@ -530,8 +520,7 @@ static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int
     std::vector<int32_t> padded = kokoro_pad_wrap_ids(c, raw_ids, n_raw);
     const int L = (int)padded.size();
     if (L > (int)c->hp.plbert_max_pos) {
-        fprintf(stderr, "kokoro: text_enc L_padded=%d exceeds max=%u\n",
-                L, c->hp.plbert_max_pos);
+        fprintf(stderr, "kokoro: text_enc L_padded=%d exceeds max=%u\n", L, c->hp.plbert_max_pos);
         return nullptr;
     }
 
@@ -574,8 +563,8 @@ static float* kokoro_run_text_enc(kokoro_context* c, const int32_t* raw_ids, int
 // number of float elements (D × L_padded) on success. The input `ids`
 // are RAW phoneme ids; this function adds the StyleTTS2 pad-wrap before
 // computing, so the output corresponds to L+2 tokens.
-static float* kokoro_run_bert(kokoro_context* c, const int32_t* raw_ids, int n_raw,
-                              const char* stage_name, int* out_n) {
+static float* kokoro_run_bert(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
+                              int* out_n) {
     if (out_n)
         *out_n = 0;
     if (n_raw <= 0) {
@@ -585,8 +574,7 @@ static float* kokoro_run_bert(kokoro_context* c, const int32_t* raw_ids, int n_r
     std::vector<int32_t> padded = kokoro_pad_wrap_ids(c, raw_ids, n_raw);
     const int L = (int)padded.size();
     if (L > (int)c->hp.plbert_max_pos) {
-        fprintf(stderr, "kokoro: bert L_padded=%d exceeds max_position_embeddings=%u\n",
-                L, c->hp.plbert_max_pos);
+        fprintf(stderr, "kokoro: bert L_padded=%d exceeds max_position_embeddings=%u\n", L, c->hp.plbert_max_pos);
         return nullptr;
     }
 
@@ -648,8 +636,7 @@ static float* kokoro_run_bert(kokoro_context* c, const int32_t* raw_ids, int n_r
 // Returns malloc'd (D, T_frames) F32 buffer with T_frames = sum(durations).
 // ---------------------------------------------------------------------------
 
-static inline float* kokoro_align_repeat(const float* features, int D, int L,
-                                         const int* durations, int* out_T_frames) {
+static inline float* kokoro_align_repeat(const float* features, int D, int L, const int* durations, int* out_T_frames) {
     return core_align::repeat_interleave(features, D, L, durations, out_T_frames);
 }
 
@@ -671,24 +658,24 @@ static inline float* kokoro_align_repeat(const float* features, int D, int L,
 // which is exactly instance norm 1D. So we transpose, norm, transpose back.
 // ---------------------------------------------------------------------------
 
-static const float kAdaIn1dEps = 1e-5f;   // PyTorch InstanceNorm1d default
+static const float kAdaIn1dEps = 1e-5f; // PyTorch InstanceNorm1d default
 
-static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style,
-                                          ggml_tensor* fc_w, ggml_tensor* fc_b) {
+static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, ggml_tensor* fc_w,
+                                          ggml_tensor* fc_b) {
     const int C = (int)x->ne[0];
 
     // Instance norm: transpose (C, T) → (T, C); ggml_norm normalises along ne[0]=T
     // per other dim ⇒ per-channel mean+var along T; transpose back.
     ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x));
     xt = ggml_norm(ctx, xt, kAdaIn1dEps);
-    ggml_tensor* normed = ggml_cont(ctx, ggml_transpose(ctx, xt));   // (C, T)
+    ggml_tensor* normed = ggml_cont(ctx, ggml_transpose(ctx, xt)); // (C, T)
 
     // gamma, beta from fc(s).
     ggml_tensor* h = ggml_mul_mat(ctx, fc_w, style);
     h = ggml_add(ctx, h, fc_b);
     const size_t ts = ggml_type_size(GGML_TYPE_F32);
     ggml_tensor* gamma = ggml_view_2d(ctx, h, C, 1, h->nb[1], (size_t)0 * C * ts);
-    ggml_tensor* beta  = ggml_view_2d(ctx, h, C, 1, h->nb[1], (size_t)1 * C * ts);
+    ggml_tensor* beta = ggml_view_2d(ctx, h, C, 1, h->nb[1], (size_t)1 * C * ts);
 
     // (1 + γ) * normed + β  →  normed + normed*γ + β  (saves the "1" tensor).
     ggml_tensor* x_gamma = ggml_mul(ctx, normed, gamma);
@@ -702,8 +689,8 @@ static inline ggml_tensor* kokoro_adain1d(ggml_context* ctx, ggml_tensor* x, ggm
 // N[1] and decoder.decode[3]). See core_convt::convt1d_depthwise_2x_k3
 // for the (k=3, s=2, p=1, op=1) derivation, including the wrong-end
 // trap that the M11 diff harness caught.
-static inline ggml_tensor* kokoro_pool_2x_depthwise(ggml_context* ctx, ggml_tensor* x,
-                                                   ggml_tensor* w_kernel, ggml_tensor* w_bias) {
+static inline ggml_tensor* kokoro_pool_2x_depthwise(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w_kernel,
+                                                    ggml_tensor* w_bias) {
     return core_convt::convt1d_depthwise_2x_k3(ctx, x, w_kernel, w_bias);
 }
 
@@ -735,42 +722,40 @@ static inline ggml_tensor* kokoro_pool_2x_depthwise(ggml_context* ctx, ggml_tens
 static const float kAdainLeakySlope = 0.2f;
 
 static inline ggml_tensor* kokoro_adain_resblk(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style,
-                                              ggml_tensor* adain1_w, ggml_tensor* adain1_b,
-                                              ggml_tensor* adain2_w, ggml_tensor* adain2_b,
-                                              ggml_tensor* conv1_w, ggml_tensor* conv1_b,
-                                              ggml_tensor* conv2_w, ggml_tensor* conv2_b,
-                                              ggml_tensor* pool_w, ggml_tensor* pool_b,
-                                              ggml_tensor* conv1x1_w) {
+                                               ggml_tensor* adain1_w, ggml_tensor* adain1_b, ggml_tensor* adain2_w,
+                                               ggml_tensor* adain2_b, ggml_tensor* conv1_w, ggml_tensor* conv1_b,
+                                               ggml_tensor* conv2_w, ggml_tensor* conv2_b, ggml_tensor* pool_w,
+                                               ggml_tensor* pool_b, ggml_tensor* conv1x1_w) {
     const bool upsample = (pool_w != nullptr);
     const int dim_in = (int)x->ne[0];
     (void)dim_in;
 
     // ---- Residual path ----
-    ggml_tensor* xt = kokoro_adain1d(ctx, x, style, adain1_w, adain1_b);              // (Cin, T)
+    ggml_tensor* xt = kokoro_adain1d(ctx, x, style, adain1_w, adain1_b); // (Cin, T)
     xt = ggml_leaky_relu(ctx, xt, kAdainLeakySlope, /*inplace=*/false);
 
     if (upsample) {
-        xt = kokoro_pool_2x_depthwise(ctx, xt, pool_w, pool_b);                       // (Cin, 2T)
+        xt = kokoro_pool_2x_depthwise(ctx, xt, pool_w, pool_b); // (Cin, 2T)
     }
 
     // conv1: Conv1d(dim_in → dim_out, k=3, pad=1). Layout flow:
     //   (Cin, T') → transpose → (T', Cin) → ggml_conv_1d → (T', Cout, 1) → squeeze → (T', Cout) → transpose → (Cout, T')
     auto conv_k3 = [&](ggml_tensor* in, ggml_tensor* w, ggml_tensor* b) -> ggml_tensor* {
         const int Tin = (int)in->ne[1];
-        ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in));                     // (T, Cin)
-        y = ggml_conv_1d(ctx, w, y, /*s*/ 1, /*p*/ 1, /*d*/ 1);                       // (T, Cout, 1)
+        ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in)); // (T, Cin)
+        y = ggml_conv_1d(ctx, w, y, /*s*/ 1, /*p*/ 1, /*d*/ 1);   // (T, Cout, 1)
         // Add bias broadcast: bias ne=(Cout,) → reshape (1, Cout, 1)
         ggml_tensor* b3 = ggml_reshape_3d(ctx, b, 1, b->ne[0], 1);
         y = ggml_add(ctx, y, b3);
         const int Cout = (int)w->ne[2];
-        y = ggml_reshape_2d(ctx, y, Tin, Cout);                                       // (T, Cout)
-        return ggml_cont(ctx, ggml_transpose(ctx, y));                                // (Cout, T)
+        y = ggml_reshape_2d(ctx, y, Tin, Cout);        // (T, Cout)
+        return ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T)
     };
 
-    xt = conv_k3(xt, conv1_w, conv1_b);                                               // (Cout, T')
-    xt = kokoro_adain1d(ctx, xt, style, adain2_w, adain2_b);                          // (Cout, T')
+    xt = conv_k3(xt, conv1_w, conv1_b);                      // (Cout, T')
+    xt = kokoro_adain1d(ctx, xt, style, adain2_w, adain2_b); // (Cout, T')
     xt = ggml_leaky_relu(ctx, xt, kAdainLeakySlope, /*inplace=*/false);
-    xt = conv_k3(xt, conv2_w, conv2_b);                                               // (Cout, T')
+    xt = conv_k3(xt, conv2_w, conv2_b); // (Cout, T')
 
     // ---- Shortcut path ----
     ggml_tensor* sc = x;
@@ -778,17 +763,17 @@ static inline ggml_tensor* kokoro_adain_resblk(ggml_context* ctx, ggml_tensor* x
         // F.interpolate(scale=2, mode='nearest'): each input column is duplicated.
         // Equivalent to (Cin, 1, T) → concat with itself on a new dim → (Cin, 2, T) → reshape (Cin, 2T).
         ggml_tensor* sc_3d = ggml_reshape_3d(ctx, sc, sc->ne[0], 1, sc->ne[1]);
-        ggml_tensor* sc_dup = ggml_concat(ctx, sc_3d, sc_3d, /*dim=*/1);              // (Cin, 2, T)
+        ggml_tensor* sc_dup = ggml_concat(ctx, sc_3d, sc_3d, /*dim=*/1); // (Cin, 2, T)
         sc = ggml_cont(ctx, ggml_reshape_2d(ctx, sc_dup, sc->ne[0], 2 * (int)sc->ne[1]));
     }
     if (conv1x1_w) {
         // Conv1d k=1, no bias. (Cin, T') → transpose → (T', Cin) → conv → (T', Cout, 1) → reshape → transpose
         const int Tin = (int)sc->ne[1];
-        ggml_tensor* sct = ggml_cont(ctx, ggml_transpose(ctx, sc));                   // (T', Cin)
-        sct = ggml_conv_1d(ctx, conv1x1_w, sct, /*s*/ 1, /*p*/ 0, /*d*/ 1);           // (T', Cout, 1)
+        ggml_tensor* sct = ggml_cont(ctx, ggml_transpose(ctx, sc));         // (T', Cin)
+        sct = ggml_conv_1d(ctx, conv1x1_w, sct, /*s*/ 1, /*p*/ 0, /*d*/ 1); // (T', Cout, 1)
         const int Cout = (int)conv1x1_w->ne[2];
-        sct = ggml_reshape_2d(ctx, sct, Tin, Cout);                                   // (T', Cout)
-        sc = ggml_cont(ctx, ggml_transpose(ctx, sct));                                // (Cout, T')
+        sct = ggml_reshape_2d(ctx, sct, Tin, Cout);    // (T', Cout)
+        sc = ggml_cont(ctx, ggml_transpose(ctx, sct)); // (Cout, T')
     }
 
     // out = (xt + sc) / sqrt(2)
@@ -833,14 +818,14 @@ static ggml_tensor* kokoro_voice_style_slice(ggml_context* ctx, kokoro_context* 
     ggml_tensor* pack = c->vp.pack;
     const uint32_t max_phon = (uint32_t)pack->ne[2];
     int idx = L_raw;
-    if (idx < 1) idx = 1;
+    if (idx < 1)
+        idx = 1;
     if (idx > (int)max_phon) {
         fprintf(stderr, "kokoro: L_raw=%d clamped to max_phon=%u for voice pack\n", L_raw, max_phon);
         idx = (int)max_phon;
     }
     idx -= 1;
-    ggml_tensor* slice = ggml_view_2d(ctx, pack, /*ne0*/ 256, /*ne1*/ 1, pack->nb[1],
-                                      (size_t)idx * pack->nb[2]);
+    ggml_tensor* slice = ggml_view_2d(ctx, pack, /*ne0*/ 256, /*ne1*/ 1, pack->nb[1], (size_t)idx * pack->nb[2]);
     return ggml_view_2d(ctx, slice, /*ne0*/ 128, /*ne1*/ 1, slice->nb[1], (size_t)byte_offset);
 }
 
@@ -856,9 +841,9 @@ static ggml_tensor* kokoro_voice_style_dec_view(ggml_context* ctx, kokoro_contex
 
 static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L_raw) {
     const auto& hp = c->hp;
-    const int D     = (int)hp.hidden_dim;       // 512
-    const int Hsty  = (int)hp.style_dim;        // 128
-    const int H_lstm = D / 2;                    // 256
+    const int D = (int)hp.hidden_dim;   // 512
+    const int Hsty = (int)hp.style_dim; // 128
+    const int H_lstm = D / 2;           // 256
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -878,11 +863,11 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
     // s_pred is F16 (the voice pack is loaded F32 — wait, voice.pack is F32
     // per the GGUF dump — so style is F32 and ggml_mul_mat with the AdaLN
     // fc_w (F16) works fine).
-    ggml_tensor* style_pred = kokoro_voice_style_pred_view(ctx0, c, L_raw);  // (128, 1) F32
+    ggml_tensor* style_pred = kokoro_voice_style_pred_view(ctx0, c, L_raw); // (128, 1) F32
 
     // Broadcast style to (Hsty, L) for the cat operations.
     ggml_tensor* s_template = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, Hsty, L);
-    ggml_tensor* s_broad = ggml_repeat(ctx0, style_pred, s_template);  // (128, L)
+    ggml_tensor* s_broad = ggml_repeat(ctx0, style_pred, s_template); // (128, L)
 
     // Initial cat([bert_dur, s_broad], dim=0) → (D + Hsty, L) = (640, L)
     ggml_tensor* x = ggml_concat(ctx0, bert_dur, s_broad, /*dim=*/0);
@@ -908,15 +893,15 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
         ggml_tensor* b_hh_r = require(c, buf);
 
         x = core_lstm::lstm_bidir(ctx0, gf, x, W_ih_f, W_hh_f, b_ih_f, b_hh_f, W_ih_r, W_hh_r, b_ih_r, b_hh_r,
-                                  H_lstm);  // (512, L)
+                                  H_lstm); // (512, L)
 
         std::snprintf(buf, sizeof(buf), "pred.dur_enc.%d.adaln.weight", il);
         ggml_tensor* fc_w = require(c, buf);
         std::snprintf(buf, sizeof(buf), "pred.dur_enc.%d.adaln.bias", il);
         ggml_tensor* fc_b = require(c, buf);
-        x = kokoro_adaln(ctx0, x, style_pred, fc_w, fc_b);                    // (512, L)
+        x = kokoro_adaln(ctx0, x, style_pred, fc_w, fc_b); // (512, L)
 
-        x = ggml_concat(ctx0, x, s_broad, /*dim=*/0);                          // (640, L)
+        x = ggml_concat(ctx0, x, s_broad, /*dim=*/0); // (640, L)
     }
 
     // dur_enc_out — the (640, L) input to pred.lstm and to alignment.
@@ -936,18 +921,18 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
     ggml_tensor* pl_b_hh_r = require(c, "pred.lstm.bias_hh_l0_reverse");
 
     ggml_tensor* pl_out = core_lstm::lstm_bidir(ctx0, gf, dur_enc_out, pl_W_ih_f, pl_W_hh_f, pl_b_ih_f, pl_b_hh_f,
-                                                 pl_W_ih_r, pl_W_hh_r, pl_b_ih_r, pl_b_hh_r, H_lstm);  // (512, L)
+                                                pl_W_ih_r, pl_W_hh_r, pl_b_ih_r, pl_b_hh_r, H_lstm); // (512, L)
     ggml_set_name(pl_out, "pred_lstm_out");
     ggml_set_output(pl_out);
 
     // ---- pred.dur_proj: Linear(512 → 50) ----
-    ggml_tensor* dp_w = require(c, "pred.dur_proj.weight");                    // ne=(512, 50)
-    ggml_tensor* dp_b = require(c, "pred.dur_proj.bias");                      // ne=(50,)
-    ggml_tensor* dp = ggml_mul_mat(ctx0, dp_w, pl_out);                        // (50, L)
+    ggml_tensor* dp_w = require(c, "pred.dur_proj.weight"); // ne=(512, 50)
+    ggml_tensor* dp_b = require(c, "pred.dur_proj.bias");   // ne=(50,)
+    ggml_tensor* dp = ggml_mul_mat(ctx0, dp_w, pl_out);     // (50, L)
     dp = ggml_add(ctx0, dp, dp_b);
     dp = ggml_sigmoid(ctx0, dp);
     // sum over the 50 dim (ne[0]) → (1, L). Runtime does the round+clamp.
-    ggml_tensor* dur_pre = ggml_sum_rows(ctx0, dp);                            // (1, L)
+    ggml_tensor* dur_pre = ggml_sum_rows(ctx0, dp); // (1, L)
     ggml_set_name(dur_pre, "durations_pre");
     ggml_set_output(dur_pre);
     ggml_build_forward_expand(gf, dur_pre);
@@ -960,8 +945,8 @@ static ggml_cgraph* kokoro_build_graph_predictor(kokoro_context* c, int L, int L
 // Stage handling:
 //   "dur_enc_out"  → (640, L) raw output
 //   "durations"    → (L,) post-round, post-clamp(min=1), cast to float
-static float* kokoro_run_predictor(kokoro_context* c, const int32_t* raw_ids, int n_raw,
-                                   const char* stage_name, int* out_n) {
+static float* kokoro_run_predictor(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
+                                   int* out_n) {
     if (out_n)
         *out_n = 0;
     if (!c->vp_loaded) {
@@ -1009,9 +994,11 @@ static float* kokoro_run_predictor(kokoro_context* c, const int32_t* raw_ids, in
         ggml_tensor* out = ggml_graph_get_tensor(gf, "dur_enc_out");
         const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
         float* r = (float*)std::malloc(n_floats * sizeof(float));
-        if (!r) return nullptr;
+        if (!r)
+            return nullptr;
         ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-        if (out_n) *out_n = (int)n_floats;
+        if (out_n)
+            *out_n = (int)n_floats;
         return r;
     }
     if (std::strcmp(stage_name, "durations") == 0) {
@@ -1023,22 +1010,27 @@ static float* kokoro_run_predictor(kokoro_context* c, const int32_t* raw_ids, in
         // fesetround(FE_TONEAREST) is already set globally for nearbyintf
         // to use round-half-to-even; we set it once at process init below.
         float* r = (float*)std::malloc((size_t)L * sizeof(float));
-        if (!r) return nullptr;
+        if (!r)
+            return nullptr;
         for (int i = 0; i < L; i++) {
             float v = std::nearbyintf(raw_dur[i]);
-            if (v < 1.0f) v = 1.0f;
+            if (v < 1.0f)
+                v = 1.0f;
             r[i] = v;
         }
-        if (out_n) *out_n = L;
+        if (out_n)
+            *out_n = L;
         return r;
     }
     if (std::strcmp(stage_name, "pred_lstm_out") == 0) {
         ggml_tensor* out = ggml_graph_get_tensor(gf, "pred_lstm_out");
         const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
         float* r = (float*)std::malloc(n_floats * sizeof(float));
-        if (!r) return nullptr;
+        if (!r)
+            return nullptr;
         ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-        if (out_n) *out_n = (int)n_floats;
+        if (out_n)
+            *out_n = (int)n_floats;
         return r;
     }
     fprintf(stderr, "kokoro: unknown predictor stage '%s'\n", stage_name);
@@ -1067,8 +1059,8 @@ static float* kokoro_run_predictor(kokoro_context* c, const int32_t* raw_ids, in
 
 static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int L_raw) {
     const auto& hp = c->hp;
-    const int D     = (int)hp.hidden_dim;       // 512
-    const int H_lstm = D / 2;                    // 256
+    const int D = (int)hp.hidden_dim; // 512
+    const int H_lstm = D / 2;         // 256
 
     ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), /*no_alloc=*/true};
     ggml_context* ctx0 = ggml_init(ip);
@@ -1082,7 +1074,7 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     ggml_set_input(en);
 
     // ---- Style: bake voice-pack predictor slice ----
-    ggml_tensor* style_pred = kokoro_voice_style_pred_view(ctx0, c, L_raw);          // (128, 1) F32
+    ggml_tensor* style_pred = kokoro_voice_style_pred_view(ctx0, c, L_raw); // (128, 1) F32
 
     // ---- pred.shared bidir LSTM (640 → 512) ----
     ggml_tensor* sh_W_ih_f = require(c, "pred.shared.weight_ih_l0");
@@ -1094,33 +1086,49 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
     ggml_tensor* sh_b_ih_r = require(c, "pred.shared.bias_ih_l0_reverse");
     ggml_tensor* sh_b_hh_r = require(c, "pred.shared.bias_hh_l0_reverse");
 
-    ggml_tensor* shared_out = core_lstm::lstm_bidir(ctx0, gf, en, sh_W_ih_f, sh_W_hh_f, sh_b_ih_f, sh_b_hh_f,
-                                                     sh_W_ih_r, sh_W_hh_r, sh_b_ih_r, sh_b_hh_r,
-                                                     H_lstm);                        // (512, T_frames)
+    ggml_tensor* shared_out = core_lstm::lstm_bidir(ctx0, gf, en, sh_W_ih_f, sh_W_hh_f, sh_b_ih_f, sh_b_hh_f, sh_W_ih_r,
+                                                    sh_W_hh_r, sh_b_ih_r, sh_b_hh_r,
+                                                    H_lstm); // (512, T_frames)
 
     // Helper to load AdainResBlk1d weights for prefix "pred.X.{idx}".
     auto load_resblk = [&](const char* prefix, int idx, bool has_pool) {
         struct W {
-            ggml_tensor* a1w; ggml_tensor* a1b;
-            ggml_tensor* a2w; ggml_tensor* a2b;
-            ggml_tensor* c1w; ggml_tensor* c1b;
-            ggml_tensor* c2w; ggml_tensor* c2b;
-            ggml_tensor* poolw; ggml_tensor* poolb;
+            ggml_tensor* a1w;
+            ggml_tensor* a1b;
+            ggml_tensor* a2w;
+            ggml_tensor* a2b;
+            ggml_tensor* c1w;
+            ggml_tensor* c1b;
+            ggml_tensor* c2w;
+            ggml_tensor* c2b;
+            ggml_tensor* poolw;
+            ggml_tensor* poolb;
             ggml_tensor* sc;
         } w;
         char buf[96];
-        std::snprintf(buf, sizeof(buf), "%s.%d.adain1.weight", prefix, idx); w.a1w = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.%d.adain1.bias",   prefix, idx); w.a1b = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.%d.adain2.weight", prefix, idx); w.a2w = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.%d.adain2.bias",   prefix, idx); w.a2b = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.%d.conv1.weight",  prefix, idx); w.c1w = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.%d.conv1.bias",    prefix, idx); w.c1b = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.%d.conv2.weight",  prefix, idx); w.c2w = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.%d.conv2.bias",    prefix, idx); w.c2b = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.%d.adain1.weight", prefix, idx);
+        w.a1w = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.%d.adain1.bias", prefix, idx);
+        w.a1b = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.%d.adain2.weight", prefix, idx);
+        w.a2w = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.%d.adain2.bias", prefix, idx);
+        w.a2b = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.%d.conv1.weight", prefix, idx);
+        w.c1w = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.%d.conv1.bias", prefix, idx);
+        w.c1b = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.%d.conv2.weight", prefix, idx);
+        w.c2w = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.%d.conv2.bias", prefix, idx);
+        w.c2b = require(c, buf);
         if (has_pool) {
-            std::snprintf(buf, sizeof(buf), "%s.%d.pool.weight", prefix, idx); w.poolw = require(c, buf);
-            std::snprintf(buf, sizeof(buf), "%s.%d.pool.bias",   prefix, idx); w.poolb = require(c, buf);
-            std::snprintf(buf, sizeof(buf), "%s.%d.conv1x1.weight", prefix, idx); w.sc = require(c, buf);
+            std::snprintf(buf, sizeof(buf), "%s.%d.pool.weight", prefix, idx);
+            w.poolw = require(c, buf);
+            std::snprintf(buf, sizeof(buf), "%s.%d.pool.bias", prefix, idx);
+            w.poolb = require(c, buf);
+            std::snprintf(buf, sizeof(buf), "%s.%d.conv1x1.weight", prefix, idx);
+            w.sc = require(c, buf);
         } else {
             w.poolw = w.poolb = w.sc = nullptr;
         }
@@ -1133,32 +1141,26 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
         auto w0 = load_resblk(prefix, 0, /*has_pool=*/false);
         auto w1 = load_resblk(prefix, 1, /*has_pool=*/true);
         auto w2 = load_resblk(prefix, 2, /*has_pool=*/false);
-        y = kokoro_adain_resblk(ctx0, y, style_pred,
-                                w0.a1w, w0.a1b, w0.a2w, w0.a2b,
-                                w0.c1w, w0.c1b, w0.c2w, w0.c2b,
+        y = kokoro_adain_resblk(ctx0, y, style_pred, w0.a1w, w0.a1b, w0.a2w, w0.a2b, w0.c1w, w0.c1b, w0.c2w, w0.c2b,
                                 /*pool*/ nullptr, nullptr, /*conv1x1*/ nullptr);
-        y = kokoro_adain_resblk(ctx0, y, style_pred,
-                                w1.a1w, w1.a1b, w1.a2w, w1.a2b,
-                                w1.c1w, w1.c1b, w1.c2w, w1.c2b,
+        y = kokoro_adain_resblk(ctx0, y, style_pred, w1.a1w, w1.a1b, w1.a2w, w1.a2b, w1.c1w, w1.c1b, w1.c2w, w1.c2b,
                                 w1.poolw, w1.poolb, w1.sc);
-        y = kokoro_adain_resblk(ctx0, y, style_pred,
-                                w2.a1w, w2.a1b, w2.a2w, w2.a2b,
-                                w2.c1w, w2.c1b, w2.c2w, w2.c2b,
+        y = kokoro_adain_resblk(ctx0, y, style_pred, w2.a1w, w2.a1b, w2.a2w, w2.a2b, w2.c1w, w2.c1b, w2.c2w, w2.c2b,
                                 /*pool*/ nullptr, nullptr, /*conv1x1*/ nullptr);
-        return y;   // (256, 2*T_frames)
+        return y; // (256, 2*T_frames)
     };
 
     // F0 stack
     ggml_tensor* F0 = run_stack("pred.F0", shared_out);
     // F0_proj: Conv1d(256 → 1, k=1).
-    ggml_tensor* fp_w = require(c, "pred.F0_proj.weight");                            // ne=(1, 256, 1)
-    ggml_tensor* fp_b = require(c, "pred.F0_proj.bias");                              // ne=(1,)
+    ggml_tensor* fp_w = require(c, "pred.F0_proj.weight"); // ne=(1, 256, 1)
+    ggml_tensor* fp_b = require(c, "pred.F0_proj.bias");   // ne=(1,)
     {
         const int Tf = (int)F0->ne[1];
-        ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, F0));                   // (T, 256)
-        y = ggml_conv_1d(ctx0, fp_w, y, /*s*/ 1, /*p*/ 0, /*d*/ 1);                   // (T, 1, 1)
-        y = ggml_add(ctx0, y, ggml_reshape_3d(ctx0, fp_b, 1, 1, 1));                  // bias broadcast
-        F0 = ggml_reshape_2d(ctx0, y, Tf, 1);                                         // (T, 1)
+        ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, F0));  // (T, 256)
+        y = ggml_conv_1d(ctx0, fp_w, y, /*s*/ 1, /*p*/ 0, /*d*/ 1);  // (T, 1, 1)
+        y = ggml_add(ctx0, y, ggml_reshape_3d(ctx0, fp_b, 1, 1, 1)); // bias broadcast
+        F0 = ggml_reshape_2d(ctx0, y, Tf, 1);                        // (T, 1)
         // ggml_squeeze isn't available; just keep as (T, 1) and treat the 1 dim
         // as a no-op channel for the downstream extractor.
     }
@@ -1192,9 +1194,9 @@ static ggml_cgraph* kokoro_build_graph_f0n(kokoro_context* c, int T_frames, int 
 //   "align_out" → (640, T_frames)
 //   "f0_curve"  → (2*T_frames,)   (already squeezed from (1, 2*T_frames))
 //   "n_curve"   → (2*T_frames,)
-static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_raw,
-                             const char* stage_name, int* out_n) {
-    if (out_n) *out_n = 0;
+static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name, int* out_n) {
+    if (out_n)
+        *out_n = 0;
     if (!c->vp_loaded) {
         fprintf(stderr, "kokoro: F0Ntrain needs voice pack\n");
         return nullptr;
@@ -1202,38 +1204,53 @@ static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_ra
     // 1. Run predictor → dur_enc_out + durations.
     int n_de = 0, n_dr = 0;
     float* de = kokoro_run_predictor(c, raw_ids, n_raw, "dur_enc_out", &n_de);
-    if (!de) return nullptr;
+    if (!de)
+        return nullptr;
     float* dr = kokoro_run_predictor(c, raw_ids, n_raw, "durations", &n_dr);
-    if (!dr) { std::free(de); return nullptr; }
+    if (!dr) {
+        std::free(de);
+        return nullptr;
+    }
 
     const int D = 640;
     const int L = n_dr;
     if (n_de != D * L) {
         fprintf(stderr, "kokoro: dur_enc/durations length mismatch %d vs %d*%d\n", n_de, D, L);
-        std::free(de); std::free(dr); return nullptr;
+        std::free(de);
+        std::free(dr);
+        return nullptr;
     }
 
     // 2. CPU alignment (M6).
     std::vector<int> dur_int((size_t)L);
-    for (int i = 0; i < L; i++) dur_int[i] = (int)dr[i];
+    for (int i = 0; i < L; i++)
+        dur_int[i] = (int)dr[i];
     std::free(dr);
     int T_frames = 0;
     float* en = kokoro_align_repeat(de, D, L, dur_int.data(), &T_frames);
     std::free(de);
-    if (!en || T_frames <= 0) { std::free(en); return nullptr; }
+    if (!en || T_frames <= 0) {
+        std::free(en);
+        return nullptr;
+    }
 
     if (std::strcmp(stage_name, "align_out") == 0) {
-        if (out_n) *out_n = D * T_frames;
+        if (out_n)
+            *out_n = D * T_frames;
         return en;
     }
 
     // 3. Run F0/N graph.
     ggml_cgraph* gf = kokoro_build_graph_f0n(c, T_frames, n_raw);
-    if (!gf) { std::free(en); return nullptr; }
+    if (!gf) {
+        std::free(en);
+        return nullptr;
+    }
     ggml_backend_sched_reset(c->sched);
     if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
         fprintf(stderr, "kokoro: sched_alloc_graph failed for F0Ntrain\n");
-        std::free(en); return nullptr;
+        std::free(en);
+        return nullptr;
     }
     ggml_tensor* in_en = ggml_graph_get_tensor(gf, "en");
     ggml_backend_tensor_set(in_en, en, 0, (size_t)D * T_frames * sizeof(float));
@@ -1244,7 +1261,7 @@ static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_ra
         return nullptr;
     }
 
-    const char* tname = stage_name;   // "f0_curve" or "n_curve" — names match graph
+    const char* tname = stage_name; // "f0_curve" or "n_curve" — names match graph
     ggml_tensor* out = ggml_graph_get_tensor(gf, tname);
     if (!out) {
         fprintf(stderr, "kokoro: F0Ntrain graph missing output '%s'\n", tname);
@@ -1252,9 +1269,11 @@ static float* kokoro_run_f0n(kokoro_context* c, const int32_t* raw_ids, int n_ra
     }
     const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
     float* r = (float*)std::malloc(n_floats * sizeof(float));
-    if (!r) return nullptr;
+    if (!r)
+        return nullptr;
     ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-    if (out_n) *out_n = (int)n_floats;
+    if (out_n)
+        *out_n = (int)n_floats;
     return r;
 }
 
@@ -1300,50 +1319,63 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
     ggml_set_name(n_in, "n");
     ggml_set_input(n_in);
 
-    ggml_tensor* style_dec = kokoro_voice_style_dec_view(ctx0, c, L_raw);             // (128, 1)
+    ggml_tensor* style_dec = kokoro_voice_style_dec_view(ctx0, c, L_raw); // (128, 1)
 
     // ---- F0_conv / N_conv: Conv1d(1, 1, k=3, s=2, pad=1) ----
     auto small_conv1d = [&](ggml_tensor* x, ggml_tensor* w, ggml_tensor* b, int s, int p) {
         // Input x ne=(1, 2T). Conv expects (T, C, 1) layout — we have (1, 2T) which IS (C=1, T=2T) in ggml,
         // but conv_1d wants (T, C). Transpose to (2T, 1).
         const int Tin = (int)x->ne[1];
-        ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, x));                    // (2T, 1)
-        y = ggml_conv_1d(ctx0, w, y, s, p, /*d*/ 1);                                  // (Tout, 1, 1)
+        ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, x)); // (2T, 1)
+        y = ggml_conv_1d(ctx0, w, y, s, p, /*d*/ 1);               // (Tout, 1, 1)
         const int Cout = (int)w->ne[2];
         ggml_tensor* b3 = ggml_reshape_3d(ctx0, b, 1, b->ne[0], 1);
         y = ggml_add(ctx0, y, b3);
         const int Tout = (int)y->ne[0];
         y = ggml_reshape_2d(ctx0, y, Tout, Cout);
         (void)Tin;
-        return ggml_cont(ctx0, ggml_transpose(ctx0, y));                              // (Cout, Tout)
+        return ggml_cont(ctx0, ggml_transpose(ctx0, y)); // (Cout, Tout)
     };
     ggml_tensor* F0_conv_w = require(c, "dec.F0_conv.weight");
     ggml_tensor* F0_conv_b = require(c, "dec.F0_conv.bias");
-    ggml_tensor* N_conv_w  = require(c, "dec.N_conv.weight");
-    ggml_tensor* N_conv_b  = require(c, "dec.N_conv.bias");
-    ggml_tensor* F0_d = small_conv1d(f0_in, F0_conv_w, F0_conv_b, /*s*/ 2, /*p*/ 1);  // (1, T_frames)
-    ggml_tensor* N_d  = small_conv1d(n_in,  N_conv_w,  N_conv_b,  /*s*/ 2, /*p*/ 1);  // (1, T_frames)
+    ggml_tensor* N_conv_w = require(c, "dec.N_conv.weight");
+    ggml_tensor* N_conv_b = require(c, "dec.N_conv.bias");
+    ggml_tensor* F0_d = small_conv1d(f0_in, F0_conv_w, F0_conv_b, /*s*/ 2, /*p*/ 1); // (1, T_frames)
+    ggml_tensor* N_d = small_conv1d(n_in, N_conv_w, N_conv_b, /*s*/ 2, /*p*/ 1);     // (1, T_frames)
 
     // ---- cat([asr, F0_d, N_d], axis=0) → (514, T_frames) ----
     ggml_tensor* x = ggml_concat(ctx0, asr_in, F0_d, /*dim=*/0);
-    x = ggml_concat(ctx0, x, N_d, /*dim=*/0);                                          // (514, T)
+    x = ggml_concat(ctx0, x, N_d, /*dim=*/0); // (514, T)
 
     // ---- encode: AdainResBlk1d(514→1024) ----
     auto load_decoder_resblk = [&](const char* prefix, bool has_pool) {
-        struct W { ggml_tensor* a1w, *a1b, *a2w, *a2b, *c1w, *c1b, *c2w, *c2b, *poolw, *poolb, *sc; } w;
+        struct W {
+            ggml_tensor *a1w, *a1b, *a2w, *a2b, *c1w, *c1b, *c2w, *c2b, *poolw, *poolb, *sc;
+        } w;
         char buf[96];
-        std::snprintf(buf, sizeof(buf), "%s.adain1.weight", prefix); w.a1w = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.adain1.bias",   prefix); w.a1b = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.adain2.weight", prefix); w.a2w = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.adain2.bias",   prefix); w.a2b = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.conv1.weight",  prefix); w.c1w = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.conv1.bias",    prefix); w.c1b = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.conv2.weight",  prefix); w.c2w = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.conv2.bias",    prefix); w.c2b = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.conv1x1.weight", prefix); w.sc = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain1.weight", prefix);
+        w.a1w = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain1.bias", prefix);
+        w.a1b = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain2.weight", prefix);
+        w.a2w = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain2.bias", prefix);
+        w.a2b = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.conv1.weight", prefix);
+        w.c1w = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.conv1.bias", prefix);
+        w.c1b = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.conv2.weight", prefix);
+        w.c2w = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.conv2.bias", prefix);
+        w.c2b = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.conv1x1.weight", prefix);
+        w.sc = require(c, buf);
         if (has_pool) {
-            std::snprintf(buf, sizeof(buf), "%s.pool.weight", prefix); w.poolw = require(c, buf);
-            std::snprintf(buf, sizeof(buf), "%s.pool.bias",   prefix); w.poolb = require(c, buf);
+            std::snprintf(buf, sizeof(buf), "%s.pool.weight", prefix);
+            w.poolw = require(c, buf);
+            std::snprintf(buf, sizeof(buf), "%s.pool.bias", prefix);
+            w.poolb = require(c, buf);
         } else {
             w.poolw = w.poolb = nullptr;
         }
@@ -1352,10 +1384,8 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
 
     {
         auto e = load_decoder_resblk("dec.encode", /*has_pool=*/false);
-        x = kokoro_adain_resblk(ctx0, x, style_dec,
-                                e.a1w, e.a1b, e.a2w, e.a2b,
-                                e.c1w, e.c1b, e.c2w, e.c2b,
-                                /*pool*/ nullptr, nullptr, e.sc);                      // (1024, T)
+        x = kokoro_adain_resblk(ctx0, x, style_dec, e.a1w, e.a1b, e.a2w, e.a2b, e.c1w, e.c1b, e.c2w, e.c2b,
+                                /*pool*/ nullptr, nullptr, e.sc); // (1024, T)
     }
     ggml_tensor* dec_encode_out = ggml_cont(ctx0, x);
     ggml_set_name(dec_encode_out, "dec_encode_out");
@@ -1368,30 +1398,28 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
     ggml_tensor* asr_res_out;
     {
         const int Tin = (int)asr_in->ne[1];
-        ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, asr_in));                // (T, 512)
-        y = ggml_conv_1d(ctx0, asr_res_w, y, /*s*/ 1, /*p*/ 0, /*d*/ 1);               // (T, 64, 1)
+        ggml_tensor* y = ggml_cont(ctx0, ggml_transpose(ctx0, asr_in));  // (T, 512)
+        y = ggml_conv_1d(ctx0, asr_res_w, y, /*s*/ 1, /*p*/ 0, /*d*/ 1); // (T, 64, 1)
         ggml_tensor* b3 = ggml_reshape_3d(ctx0, asr_res_b, 1, asr_res_b->ne[0], 1);
         y = ggml_add(ctx0, y, b3);
-        y = ggml_reshape_2d(ctx0, y, Tin, 64);                                          // (T, 64)
-        asr_res_out = ggml_cont(ctx0, ggml_transpose(ctx0, y));                         // (64, T)
+        y = ggml_reshape_2d(ctx0, y, Tin, 64);                  // (T, 64)
+        asr_res_out = ggml_cont(ctx0, ggml_transpose(ctx0, y)); // (64, T)
     }
 
     // ---- 4× decode AdainResBlk1d, with cat([x, asr_res, F0_d, N_d]) before each ----
     x = dec_encode_out;
     for (int il = 0; il < 4; il++) {
         // cat → (1024 + 64 + 1 + 1, T) = (1090, T)
-        ggml_tensor* xc = ggml_concat(ctx0, x, asr_res_out, /*dim=*/0);                 // (1088, T)
+        ggml_tensor* xc = ggml_concat(ctx0, x, asr_res_out, /*dim=*/0); // (1088, T)
         xc = ggml_concat(ctx0, xc, F0_d, /*dim=*/0);
-        xc = ggml_concat(ctx0, xc, N_d, /*dim=*/0);                                     // (1090, T)
+        xc = ggml_concat(ctx0, xc, N_d, /*dim=*/0); // (1090, T)
 
         char prefix[64];
         std::snprintf(prefix, sizeof(prefix), "dec.decode.%d", il);
         const bool has_pool = (il == 3);
         auto w = load_decoder_resblk(prefix, has_pool);
-        x = kokoro_adain_resblk(ctx0, xc, style_dec,
-                                w.a1w, w.a1b, w.a2w, w.a2b,
-                                w.c1w, w.c1b, w.c2w, w.c2b,
-                                w.poolw, w.poolb, w.sc);
+        x = kokoro_adain_resblk(ctx0, xc, style_dec, w.a1w, w.a1b, w.a2w, w.a2b, w.c1w, w.c1b, w.c2w, w.c2b, w.poolw,
+                                w.poolb, w.sc);
     }
     // After block 3 (upsample=True): x is (512, 2*T_frames).
     ggml_tensor* dec_decode_3_out = ggml_cont(ctx0, x);
@@ -1405,9 +1433,10 @@ static ggml_cgraph* kokoro_build_graph_decoder_body(kokoro_context* c, int T_fra
 
 // Run the full preamble (BERT, predictor, alignment, F0Ntrain, text_enc) +
 // decoder body, returning the named stage as malloc'd float[].
-static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids, int n_raw,
-                                      const char* stage_name, int* out_n) {
-    if (out_n) *out_n = 0;
+static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
+                                      int* out_n) {
+    if (out_n)
+        *out_n = 0;
     if (!c->vp_loaded) {
         fprintf(stderr, "kokoro: decoder needs voice pack\n");
         return nullptr;
@@ -1416,53 +1445,82 @@ static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids,
     // 1. dur_enc_out + durations from predictor.
     int n_de = 0, n_dr = 0;
     float* de = kokoro_run_predictor(c, raw_ids, n_raw, "dur_enc_out", &n_de);
-    if (!de) return nullptr;
+    if (!de)
+        return nullptr;
     float* dr = kokoro_run_predictor(c, raw_ids, n_raw, "durations", &n_dr);
-    if (!dr) { std::free(de); return nullptr; }
+    if (!dr) {
+        std::free(de);
+        return nullptr;
+    }
     const int L = n_dr;
     std::vector<int> dur_int((size_t)L);
-    for (int i = 0; i < L; i++) dur_int[i] = (int)dr[i];
+    for (int i = 0; i < L; i++)
+        dur_int[i] = (int)dr[i];
     std::free(dr);
     int T_frames = 0;
     float* en = kokoro_align_repeat(de, 640, L, dur_int.data(), &T_frames);
     std::free(de);
-    if (!en) return nullptr;
+    if (!en)
+        return nullptr;
 
     // 2. F0/N curves from F0Ntrain (uses en internally — recompute here for simplicity).
     int n_f = 0, n_nc = 0;
     float* f0 = kokoro_run_f0n(c, raw_ids, n_raw, "f0_curve", &n_f);
-    if (!f0) { std::free(en); return nullptr; }
+    if (!f0) {
+        std::free(en);
+        return nullptr;
+    }
     float* nc = kokoro_run_f0n(c, raw_ids, n_raw, "n_curve", &n_nc);
-    if (!nc) { std::free(en); std::free(f0); return nullptr; }
+    if (!nc) {
+        std::free(en);
+        std::free(f0);
+        return nullptr;
+    }
 
     // 3. text_enc_out, then duration-align to asr.
     int n_te = 0;
     float* te = kokoro_run_text_enc(c, raw_ids, n_raw, "text_enc_out", &n_te);
-    if (!te) { std::free(en); std::free(f0); std::free(nc); return nullptr; }
+    if (!te) {
+        std::free(en);
+        std::free(f0);
+        std::free(nc);
+        return nullptr;
+    }
     int T_frames_asr = 0;
     float* asr = kokoro_align_repeat(te, 512, L, dur_int.data(), &T_frames_asr);
     std::free(te);
     if (!asr || T_frames_asr != T_frames) {
         fprintf(stderr, "kokoro: T_frames mismatch (%d != %d)\n", T_frames_asr, T_frames);
-        std::free(asr); std::free(en); std::free(f0); std::free(nc); return nullptr;
+        std::free(asr);
+        std::free(en);
+        std::free(f0);
+        std::free(nc);
+        return nullptr;
     }
-    std::free(en);   // not directly used by decoder body — F0Ntrain consumed it already
+    std::free(en); // not directly used by decoder body — F0Ntrain consumed it already
 
     // 4. Build + run decoder-body graph.
     ggml_cgraph* gf = kokoro_build_graph_decoder_body(c, T_frames, n_raw);
-    if (!gf) { std::free(asr); std::free(f0); std::free(nc); return nullptr; }
+    if (!gf) {
+        std::free(asr);
+        std::free(f0);
+        std::free(nc);
+        return nullptr;
+    }
     ggml_backend_sched_reset(c->sched);
     if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
         fprintf(stderr, "kokoro: sched_alloc_graph failed for decoder body\n");
-        std::free(asr); std::free(f0); std::free(nc); return nullptr;
+        std::free(asr);
+        std::free(f0);
+        std::free(nc);
+        return nullptr;
     }
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "asr"), asr, 0,
-                            (size_t)512 * T_frames * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "f0"),  f0,  0,
-                            (size_t)2 * T_frames * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "n"),   nc,  0,
-                            (size_t)2 * T_frames * sizeof(float));
-    std::free(asr); std::free(f0); std::free(nc);
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "asr"), asr, 0, (size_t)512 * T_frames * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "f0"), f0, 0, (size_t)2 * T_frames * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "n"), nc, 0, (size_t)2 * T_frames * sizeof(float));
+    std::free(asr);
+    std::free(f0);
+    std::free(nc);
 
     if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "kokoro: decoder-body graph compute failed\n");
@@ -1476,9 +1534,11 @@ static float* kokoro_run_decoder_body(kokoro_context* c, const int32_t* raw_ids,
     }
     const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
     float* r = (float*)std::malloc(n_floats * sizeof(float));
-    if (!r) return nullptr;
+    if (!r)
+        return nullptr;
     ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-    if (out_n) *out_n = (int)n_floats;
+    if (out_n)
+        *out_n = (int)n_floats;
     return r;
 }
 
@@ -1531,52 +1591,68 @@ static inline ggml_tensor* kokoro_snake1d(ggml_context* ctx, ggml_tensor* x, ggm
 struct kokoro_resblock1_w {
     int K = 0;
     int dilations[3] = {1, 3, 5};
-    ggml_tensor* a1w[3] = {}; ggml_tensor* a1b[3] = {};
-    ggml_tensor* a2w[3] = {}; ggml_tensor* a2b[3] = {};
-    ggml_tensor* alpha1[3] = {}; ggml_tensor* alpha2[3] = {};
-    ggml_tensor* c1w[3] = {}; ggml_tensor* c1b[3] = {};
-    ggml_tensor* c2w[3] = {}; ggml_tensor* c2b[3] = {};
+    ggml_tensor* a1w[3] = {};
+    ggml_tensor* a1b[3] = {};
+    ggml_tensor* a2w[3] = {};
+    ggml_tensor* a2b[3] = {};
+    ggml_tensor* alpha1[3] = {};
+    ggml_tensor* alpha2[3] = {};
+    ggml_tensor* c1w[3] = {};
+    ggml_tensor* c1b[3] = {};
+    ggml_tensor* c2w[3] = {};
+    ggml_tensor* c2b[3] = {};
 };
 
-static void kokoro_load_resblock1(const kokoro_context* c, kokoro_resblock1_w& w,
-                                  const char* prefix, int K, const int dilations[3]) {
+static void kokoro_load_resblock1(const kokoro_context* c, kokoro_resblock1_w& w, const char* prefix, int K,
+                                  const int dilations[3]) {
     char buf[128];
     w.K = K;
-    for (int j = 0; j < 3; j++) w.dilations[j] = dilations[j];
+    for (int j = 0; j < 3; j++)
+        w.dilations[j] = dilations[j];
     for (int j = 0; j < 3; j++) {
-        std::snprintf(buf, sizeof(buf), "%s.adain1.%d.weight", prefix, j); w.a1w[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.adain1.%d.bias",   prefix, j); w.a1b[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.adain2.%d.weight", prefix, j); w.a2w[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.adain2.%d.bias",   prefix, j); w.a2b[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.alpha1.%d", prefix, j);        w.alpha1[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.alpha2.%d", prefix, j);        w.alpha2[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.convs1.%d.weight", prefix, j); w.c1w[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.convs1.%d.bias",   prefix, j); w.c1b[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.convs2.%d.weight", prefix, j); w.c2w[j] = require(c, buf);
-        std::snprintf(buf, sizeof(buf), "%s.convs2.%d.bias",   prefix, j); w.c2b[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain1.%d.weight", prefix, j);
+        w.a1w[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain1.%d.bias", prefix, j);
+        w.a1b[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain2.%d.weight", prefix, j);
+        w.a2w[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.adain2.%d.bias", prefix, j);
+        w.a2b[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.alpha1.%d", prefix, j);
+        w.alpha1[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.alpha2.%d", prefix, j);
+        w.alpha2[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.convs1.%d.weight", prefix, j);
+        w.c1w[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.convs1.%d.bias", prefix, j);
+        w.c1b[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.convs2.%d.weight", prefix, j);
+        w.c2w[j] = require(c, buf);
+        std::snprintf(buf, sizeof(buf), "%s.convs2.%d.bias", prefix, j);
+        w.c2b[j] = require(c, buf);
     }
 }
 
 // Conv1d helper used by AdaINResBlock1: kernel size K, dilation d, same-padding.
 // in: (Cin, T) F32. w: ne=(K, Cin, Cout) F16. b: ne=(Cout,) F32.
 // Returns (Cout, T) F32.
-static inline ggml_tensor* kokoro_conv1d_kd(ggml_context* ctx, ggml_tensor* in,
-                                            ggml_tensor* w, ggml_tensor* b, int K, int d) {
+static inline ggml_tensor* kokoro_conv1d_kd(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b, int K,
+                                            int d) {
     const int Tin = (int)in->ne[1];
     const int Cout = (int)w->ne[2];
-    const int p = d * (K - 1) / 2;       // same-padding for stride=1
-    ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in));    // (T, Cin)
-    y = ggml_conv_1d(ctx, w, y, /*s*/ 1, p, d);                  // (T, Cout, 1)
+    const int p = d * (K - 1) / 2;                            // same-padding for stride=1
+    ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in)); // (T, Cin)
+    y = ggml_conv_1d(ctx, w, y, /*s*/ 1, p, d);               // (T, Cout, 1)
     if (b) {
         ggml_tensor* b3 = ggml_reshape_3d(ctx, b, 1, b->ne[0], 1);
         y = ggml_add(ctx, y, b3);
     }
-    y = ggml_reshape_2d(ctx, y, Tin, Cout);                      // (T, Cout)
-    return ggml_cont(ctx, ggml_transpose(ctx, y));               // (Cout, T)
+    y = ggml_reshape_2d(ctx, y, Tin, Cout);        // (T, Cout)
+    return ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T)
 }
 
-static inline ggml_tensor* kokoro_resblock1_forward(ggml_context* ctx, ggml_tensor* x,
-                                                    ggml_tensor* style, const kokoro_resblock1_w& w) {
+static inline ggml_tensor* kokoro_resblock1_forward(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style,
+                                                    const kokoro_resblock1_w& w) {
     for (int j = 0; j < 3; j++) {
         ggml_tensor* xt = kokoro_adain1d(ctx, x, style, w.a1w[j], w.a1b[j]);
         xt = kokoro_snake1d(ctx, xt, w.alpha1[j]);
@@ -1597,24 +1673,22 @@ static inline ggml_tensor* kokoro_resblock1_forward(ggml_context* ctx, ggml_tens
 //
 // in: (Cin, T) F32. w: ne=(K, Cout, Cin) F16. b: ne=(Cout,) F32.
 // Returns (Cout, T_out) F32.
-static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in,
-                                              ggml_tensor* w, ggml_tensor* b, int stride, int pad) {
+static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b,
+                                              int stride, int pad) {
     const int Cout = (int)w->ne[1];
-    ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, in));              // (T, Cin)
-    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xT, stride, 0, 1);      // (T_unpad, Cout, 1, 1)
+    ggml_tensor* xT = ggml_cont(ctx, ggml_transpose(ctx, in));         // (T, Cin)
+    ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xT, stride, 0, 1); // (T_unpad, Cout, 1, 1)
     const int T_unpad = (int)y->ne[0];
     const int T_out = T_unpad - 2 * pad;
-    y = ggml_reshape_2d(ctx, y, T_unpad, Cout);                              // (T_unpad, Cout)
+    y = ggml_reshape_2d(ctx, y, T_unpad, Cout); // (T_unpad, Cout)
     if (pad > 0) {
         // Slice [pad : pad + T_out] along the time (ne[0]) axis.
-        y = ggml_view_2d(ctx, y, T_out, Cout,
-                         (size_t)T_unpad * sizeof(float),
-                         (size_t)pad * sizeof(float));
-        y = ggml_cont(ctx, y);                                               // (T_out, Cout)
+        y = ggml_view_2d(ctx, y, T_out, Cout, (size_t)T_unpad * sizeof(float), (size_t)pad * sizeof(float));
+        y = ggml_cont(ctx, y); // (T_out, Cout)
     }
-    ggml_tensor* yT = ggml_cont(ctx, ggml_transpose(ctx, y));                // (Cout, T_out)
+    ggml_tensor* yT = ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T_out)
     if (b)
-        yT = ggml_add(ctx, yT, b);                                           // bias broadcasts on T
+        yT = ggml_add(ctx, yT, b); // bias broadcasts on T
     return yT;
 }
 
@@ -1622,18 +1696,18 @@ static inline ggml_tensor* kokoro_convt1d_pad(ggml_context* ctx, ggml_tensor* in
 // and stride may be non-trivial (k=12,s=6 for noise_convs[0]; k=1,s=1 for
 // noise_convs[1]). Does PyTorch-style same-output handling via explicit
 // padding param.
-static inline ggml_tensor* kokoro_conv1d_ks(ggml_context* ctx, ggml_tensor* in,
-                                            ggml_tensor* w, ggml_tensor* b, int s, int p) {
+static inline ggml_tensor* kokoro_conv1d_ks(ggml_context* ctx, ggml_tensor* in, ggml_tensor* w, ggml_tensor* b, int s,
+                                            int p) {
     const int Cout = (int)w->ne[2];
-    ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in));    // (T, Cin)
-    y = ggml_conv_1d(ctx, w, y, s, p, /*d*/ 1);                  // (T_out, Cout, 1)
+    ggml_tensor* y = ggml_cont(ctx, ggml_transpose(ctx, in)); // (T, Cin)
+    y = ggml_conv_1d(ctx, w, y, s, p, /*d*/ 1);               // (T_out, Cout, 1)
     if (b) {
         ggml_tensor* b3 = ggml_reshape_3d(ctx, b, 1, b->ne[0], 1);
         y = ggml_add(ctx, y, b3);
     }
     const int Tout = (int)y->ne[0];
     y = ggml_reshape_2d(ctx, y, Tout, Cout);
-    return ggml_cont(ctx, ggml_transpose(ctx, y));               // (Cout, T_out)
+    return ggml_cont(ctx, ggml_transpose(ctx, y)); // (Cout, T_out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1654,18 +1728,18 @@ static inline ggml_tensor* kokoro_conv1d_ks(ggml_context* ctx, ggml_tensor* in,
 
 static const float kKokoroTwoPi = 6.283185307179586f;
 
-static float* kokoro_make_har(const kokoro_context* c, const float* f0_curve, int T_frames,
-                              int* out_T_har, std::mt19937& rng) {
-    const int upsample_scale = 300;        // prod(upsample_rates) * hop
+static float* kokoro_make_har(const kokoro_context* c, const float* f0_curve, int T_frames, int* out_T_har,
+                              std::mt19937& rng) {
+    const int upsample_scale = 300; // prod(upsample_rates) * hop
     const int harmonic_num = 8;
-    const int dim = harmonic_num + 1;      // 9
+    const int dim = harmonic_num + 1; // 9
     const int sample_rate = 24000;
     const float sine_amp = 0.1f;
     const float noise_std = 0.003f;
     const float voiced_threshold = 10.0f;
     const int n_fft = 20;
     const int hop = 5;
-    const int n_bins = n_fft / 2 + 1;      // 11
+    const int n_bins = n_fft / 2 + 1; // 11
 
     const int L_low = 2 * T_frames;
     const int L_high = upsample_scale * L_low;
@@ -1779,7 +1853,7 @@ static float* kokoro_make_har(const kokoro_context* c, const float* f0_curve, in
     }
 
     // ---- STFT (n_fft=20, hop=5, hann periodic, center=True, pad_mode=reflect) ----
-    const int pad_n = n_fft / 2;            // 10
+    const int pad_n = n_fft / 2; // 10
     const int L_pad = L_high + 2 * pad_n;
     std::vector<float> padded((size_t)L_pad);
     for (int t = 0; t < L_high; t++)
@@ -1867,23 +1941,23 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
     ggml_set_name(har, "har");
     ggml_set_input(har);
 
-    ggml_tensor* style = kokoro_voice_style_dec_view(ctx0, c, L_raw);   // (128, 1)
+    ggml_tensor* style = kokoro_voice_style_dec_view(ctx0, c, L_raw); // (128, 1)
 
     // Load all generator weights up-front.
     ggml_tensor* ups0_w = require(c, "dec.gen.ups.0.weight");
     ggml_tensor* ups0_b = require(c, "dec.gen.ups.0.bias");
     ggml_tensor* ups1_w = require(c, "dec.gen.ups.1.weight");
     ggml_tensor* ups1_b = require(c, "dec.gen.ups.1.bias");
-    ggml_tensor* nc0_w  = require(c, "dec.gen.noise_convs.0.weight");
-    ggml_tensor* nc0_b  = require(c, "dec.gen.noise_convs.0.bias");
-    ggml_tensor* nc1_w  = require(c, "dec.gen.noise_convs.1.weight");
-    ggml_tensor* nc1_b  = require(c, "dec.gen.noise_convs.1.bias");
-    ggml_tensor* cp_w   = require(c, "dec.gen.conv_post.weight");
-    ggml_tensor* cp_b   = require(c, "dec.gen.conv_post.bias");
+    ggml_tensor* nc0_w = require(c, "dec.gen.noise_convs.0.weight");
+    ggml_tensor* nc0_b = require(c, "dec.gen.noise_convs.0.bias");
+    ggml_tensor* nc1_w = require(c, "dec.gen.noise_convs.1.weight");
+    ggml_tensor* nc1_b = require(c, "dec.gen.noise_convs.1.bias");
+    ggml_tensor* cp_w = require(c, "dec.gen.conv_post.weight");
+    ggml_tensor* cp_b = require(c, "dec.gen.conv_post.bias");
 
     const int dilations[3] = {1, 3, 5};
     kokoro_resblock1_w noise_res0, noise_res1;
-    kokoro_load_resblock1(c, noise_res0, "dec.gen.noise_res.0", /*K=*/7,  dilations);
+    kokoro_load_resblock1(c, noise_res0, "dec.gen.noise_res.0", /*K=*/7, dilations);
     kokoro_load_resblock1(c, noise_res1, "dec.gen.noise_res.1", /*K=*/11, dilations);
     kokoro_resblock1_w resblocks[6];
     const int rb_K[3] = {3, 7, 11};
@@ -1925,9 +1999,9 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
         // ggml_pad_reflect_1d works on the LAST dim (innermost), so transpose
         // (C, T) → (T, C), pad along T, transpose back.
         if (i == 1) {
-            ggml_tensor* xT = ggml_cont(ctx0, ggml_transpose(ctx0, x));      // (T, C)
-            xT = ggml_pad_reflect_1d(ctx0, xT, /*left=*/1, /*right=*/0);     // (T+1, C)
-            x = ggml_cont(ctx0, ggml_transpose(ctx0, xT));                   // (C, T+1)
+            ggml_tensor* xT = ggml_cont(ctx0, ggml_transpose(ctx0, x));  // (T, C)
+            xT = ggml_pad_reflect_1d(ctx0, xT, /*left=*/1, /*right=*/0); // (T+1, C)
+            x = ggml_cont(ctx0, ggml_transpose(ctx0, xT));               // (C, T+1)
         }
 
         x = ggml_add(ctx0, x, x_source);
@@ -1949,21 +2023,20 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
     ggml_build_forward_expand(gf, gen_pre_post);
 
     // conv_post: Conv1d(128, 22, k=7, p=3). Same-padding output length = T_har.
-    x = kokoro_conv1d_ks(ctx0, gen_pre_post, cp_w, cp_b, /*s*/ 1, /*p*/ 3);   // (22, T_har)
+    x = kokoro_conv1d_ks(ctx0, gen_pre_post, cp_w, cp_b, /*s*/ 1, /*p*/ 3); // (22, T_har)
 
     // Split (22, T_har) along ne[0]: rows 0..10 = mag-side, 11..21 = phase-side.
     // View along ne[0] is non-contiguous (stride between rows mismatches ne[0]),
     // so cont after the view to give exp/sin a clean buffer.
     ggml_tensor* mag_view = ggml_view_2d(ctx0, x, 11, T_har, x->nb[1], 0);
-    ggml_tensor* mag_in   = ggml_cont(ctx0, mag_view);
+    ggml_tensor* mag_in = ggml_cont(ctx0, mag_view);
     ggml_tensor* mag = ggml_exp(ctx0, mag_in);
     ggml_set_name(mag, "mag");
     ggml_set_output(mag);
     ggml_build_forward_expand(gf, mag);
 
-    ggml_tensor* phase_view = ggml_view_2d(ctx0, x, 11, T_har, x->nb[1],
-                                           (size_t)11 * sizeof(float));
-    ggml_tensor* phase_in   = ggml_cont(ctx0, phase_view);
+    ggml_tensor* phase_view = ggml_view_2d(ctx0, x, 11, T_har, x->nb[1], (size_t)11 * sizeof(float));
+    ggml_tensor* phase_in = ggml_cont(ctx0, phase_view);
     ggml_tensor* phase = ggml_sin(ctx0, phase_in);
     ggml_set_name(phase, "phase");
     ggml_set_output(phase);
@@ -1983,9 +2056,10 @@ static ggml_cgraph* kokoro_build_graph_generator(kokoro_context* c, int T_frames
 // rng is seeded from KOKORO_SEED env (default 0x12345) so the SineGen noise
 // is reproducible run-to-run; the diff-harness M11 dumper should set the
 // same seed on the Python side.
-static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, int n_raw,
-                                   const char* stage_name, int* out_n) {
-    if (out_n) *out_n = 0;
+static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, int n_raw, const char* stage_name,
+                                   int* out_n) {
+    if (out_n)
+        *out_n = 0;
     if (!c->vp_loaded) {
         fprintf(stderr, "kokoro: generator needs voice pack\n");
         return nullptr;
@@ -1994,25 +2068,33 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
     // 1. dec_decode_3_out — runs predictor + align + F0Ntrain + decoder body.
     int n_x = 0;
     float* x_in = kokoro_run_decoder_body(c, raw_ids, n_raw, "dec_decode_3_out", &n_x);
-    if (!x_in) return nullptr;
+    if (!x_in)
+        return nullptr;
     const int two_T = n_x / 512;
     if (two_T * 512 != n_x) {
         fprintf(stderr, "kokoro: dec_decode_3_out size %d not divisible by 512\n", n_x);
-        std::free(x_in); return nullptr;
+        std::free(x_in);
+        return nullptr;
     }
     const int T_frames = two_T / 2;
     if (T_frames <= 0) {
         fprintf(stderr, "kokoro: T_frames=%d invalid\n", T_frames);
-        std::free(x_in); return nullptr;
+        std::free(x_in);
+        return nullptr;
     }
 
     // 2. f0_curve — used by SineGen to build `har`.
     int n_f0 = 0;
     float* f0 = kokoro_run_f0n(c, raw_ids, n_raw, "f0_curve", &n_f0);
-    if (!f0) { std::free(x_in); return nullptr; }
+    if (!f0) {
+        std::free(x_in);
+        return nullptr;
+    }
     if (n_f0 != 2 * T_frames) {
         fprintf(stderr, "kokoro: f0_curve length %d != 2*T_frames=%d\n", n_f0, 2 * T_frames);
-        std::free(x_in); std::free(f0); return nullptr;
+        std::free(x_in);
+        std::free(f0);
+        return nullptr;
     }
 
     // 3. Build `har` (22, T_har) on CPU.
@@ -2022,12 +2104,19 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
     int T_har = 0;
     float* har = kokoro_make_har(c, f0, T_frames, &T_har, rng);
     std::free(f0);
-    if (!har) { std::free(x_in); return nullptr; }
+    if (!har) {
+        std::free(x_in);
+        return nullptr;
+    }
 
     // 4. Build + run the generator graph on gen_sched (multi-backend, with
     //    conv_transpose_1d pinned to CPU unless gen_force_metal=true).
     ggml_cgraph* gf = kokoro_build_graph_generator(c, T_frames, T_har, n_raw);
-    if (!gf) { std::free(x_in); std::free(har); return nullptr; }
+    if (!gf) {
+        std::free(x_in);
+        std::free(har);
+        return nullptr;
+    }
     ggml_backend_sched_reset(c->gen_sched);
     if (!c->params.gen_force_metal && c->backend_cpu && c->backend_cpu != c->backend) {
         // Pin every conv_transpose_1d output to CPU to dodge the Metal hang
@@ -2041,12 +2130,12 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
     }
     if (!ggml_backend_sched_alloc_graph(c->gen_sched, gf)) {
         fprintf(stderr, "kokoro: sched_alloc_graph failed for generator\n");
-        std::free(x_in); std::free(har); return nullptr;
+        std::free(x_in);
+        std::free(har);
+        return nullptr;
     }
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x_in, 0,
-                            (size_t)512 * 2 * T_frames * sizeof(float));
-    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "har"), har, 0,
-                            (size_t)22 * T_har * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x_in, 0, (size_t)512 * 2 * T_frames * sizeof(float));
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "har"), har, 0, (size_t)22 * T_har * sizeof(float));
     std::free(x_in);
     std::free(har);
 
@@ -2062,9 +2151,11 @@ static float* kokoro_run_generator(kokoro_context* c, const int32_t* raw_ids, in
     }
     const size_t n_floats = (size_t)out->ne[0] * (size_t)out->ne[1];
     float* r = (float*)std::malloc(n_floats * sizeof(float));
-    if (!r) return nullptr;
+    if (!r)
+        return nullptr;
     ggml_backend_tensor_get(out, r, 0, n_floats * sizeof(float));
-    if (out_n) *out_n = (int)n_floats;
+    if (out_n)
+        *out_n = (int)n_floats;
     return r;
 }
 
@@ -2099,9 +2190,10 @@ static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, 
     // L_padded covers the OLA region; L_audio is the unpadded output (center=True
     // strips n_fft/2 samples from each end).
     const int L_padded = (T_har - 1) * hop + n_fft;
-    const int L_audio  = L_padded - 2 * pad_n;
+    const int L_audio = L_padded - 2 * pad_n;
     if (L_audio <= 0) {
-        if (out_T_audio) *out_T_audio = 0;
+        if (out_T_audio)
+            *out_T_audio = 0;
         return nullptr;
     }
 
@@ -2129,10 +2221,10 @@ static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, 
         // mag/phase have layout (n_bins, T_har) F32 contiguous: element (k, m) at k + m*n_bins.
         const int t0 = m * hop;
         for (int n = 0; n < n_fft; n++) {
-            float acc = mag[(size_t)m * n_bins + 0];                                  // X[0] (real)
+            float acc = mag[(size_t)m * n_bins + 0]; // X[0] (real)
             // X[N/2]: real, sign alternates with n.
-            const float xN2 = mag[(size_t)m * n_bins + (n_bins - 1)] *
-                              std::cos(phase[(size_t)m * n_bins + (n_bins - 1)]);
+            const float xN2 =
+                mag[(size_t)m * n_bins + (n_bins - 1)] * std::cos(phase[(size_t)m * n_bins + (n_bins - 1)]);
             acc += ((n & 1) ? -xN2 : xN2);
             // k = 1..N/2-1: doubled Hermitian pair.
             for (int k = 1; k < n_bins - 1; k++) {
@@ -2140,8 +2232,7 @@ static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, 
                 const float ph = phase[(size_t)m * n_bins + k];
                 const float xr = r * std::cos(ph);
                 const float xi = r * std::sin(ph);
-                acc += 2.0f * (xr * tw_cos[(size_t)k * n_fft + n]
-                              - xi * tw_sin[(size_t)k * n_fft + n]);
+                acc += 2.0f * (xr * tw_cos[(size_t)k * n_fft + n] - xi * tw_sin[(size_t)k * n_fft + n]);
             }
             const float yval = acc * invN * hann[n];
             y[(size_t)t0 + n] += yval;
@@ -2152,7 +2243,8 @@ static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, 
     // Normalize by window-sum and strip the center=True padding.
     float* out = (float*)std::malloc((size_t)L_audio * sizeof(float));
     if (!out) {
-        if (out_T_audio) *out_T_audio = 0;
+        if (out_T_audio)
+            *out_T_audio = 0;
         return nullptr;
     }
     const float wsum_eps = 1e-11f;
@@ -2160,30 +2252,41 @@ static float* kokoro_run_istft(const float* mag, const float* phase, int T_har, 
         const float w = wsum[(size_t)pad_n + t];
         out[t] = (w > wsum_eps) ? y[(size_t)pad_n + t] / w : 0.0f;
     }
-    if (out_T_audio) *out_T_audio = L_audio;
+    if (out_T_audio)
+        *out_T_audio = L_audio;
     return out;
 }
 
 // Stage extractor entry for the iSTFT'd audio. Runs the full chain
 // (preamble → decoder body → generator → iSTFT) and returns the audio buffer.
 static float* kokoro_run_audio(kokoro_context* c, const int32_t* raw_ids, int n_raw, int* out_n) {
-    if (out_n) *out_n = 0;
+    if (out_n)
+        *out_n = 0;
     int n_mag = 0;
     float* mag = kokoro_run_generator(c, raw_ids, n_raw, "mag", &n_mag);
-    if (!mag) return nullptr;
+    if (!mag)
+        return nullptr;
     int n_phase = 0;
     float* phase = kokoro_run_generator(c, raw_ids, n_raw, "phase", &n_phase);
-    if (!phase) { std::free(mag); return nullptr; }
+    if (!phase) {
+        std::free(mag);
+        return nullptr;
+    }
     if (n_mag != n_phase || n_mag % 11 != 0) {
         fprintf(stderr, "kokoro: mag/phase length mismatch %d vs %d\n", n_mag, n_phase);
-        std::free(mag); std::free(phase); return nullptr;
+        std::free(mag);
+        std::free(phase);
+        return nullptr;
     }
     const int T_har = n_mag / 11;
     int T_audio = 0;
     float* audio = kokoro_run_istft(mag, phase, T_har, &T_audio);
-    std::free(mag); std::free(phase);
-    if (!audio) return nullptr;
-    if (out_n) *out_n = T_audio;
+    std::free(mag);
+    std::free(phase);
+    if (!audio)
+        return nullptr;
+    if (out_n)
+        *out_n = T_audio;
     return audio;
 }
 
@@ -2203,8 +2306,7 @@ extern "C" struct kokoro_context_params kokoro_context_default_params(void) {
     return p;
 }
 
-extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model,
-                                                         struct kokoro_context_params params) {
+extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model, struct kokoro_context_params params) {
     if (!path_model) {
         fprintf(stderr, "kokoro: null model path\n");
         return nullptr;
@@ -2240,33 +2342,33 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model,
         }
 
         auto& hp = c->hp;
-        hp.hidden_dim   = core_gguf::kv_u32(g, "kokoro.hidden_dim", hp.hidden_dim);
-        hp.style_dim    = core_gguf::kv_u32(g, "kokoro.style_dim", hp.style_dim);
-        hp.max_dur      = core_gguf::kv_u32(g, "kokoro.max_dur", hp.max_dur);
-        hp.n_token      = core_gguf::kv_u32(g, "kokoro.n_token", hp.n_token);
-        hp.n_mels       = core_gguf::kv_u32(g, "kokoro.n_mels", hp.n_mels);
-        hp.n_layer      = core_gguf::kv_u32(g, "kokoro.n_layer", hp.n_layer);
-        hp.text_enc_k   = core_gguf::kv_u32(g, "kokoro.text_encoder_kernel_size", hp.text_enc_k);
-        hp.sample_rate  = core_gguf::kv_u32(g, "kokoro.sample_rate", hp.sample_rate);
-        hp.vocab_size   = core_gguf::kv_u32(g, "kokoro.vocab_size", hp.vocab_size);
+        hp.hidden_dim = core_gguf::kv_u32(g, "kokoro.hidden_dim", hp.hidden_dim);
+        hp.style_dim = core_gguf::kv_u32(g, "kokoro.style_dim", hp.style_dim);
+        hp.max_dur = core_gguf::kv_u32(g, "kokoro.max_dur", hp.max_dur);
+        hp.n_token = core_gguf::kv_u32(g, "kokoro.n_token", hp.n_token);
+        hp.n_mels = core_gguf::kv_u32(g, "kokoro.n_mels", hp.n_mels);
+        hp.n_layer = core_gguf::kv_u32(g, "kokoro.n_layer", hp.n_layer);
+        hp.text_enc_k = core_gguf::kv_u32(g, "kokoro.text_encoder_kernel_size", hp.text_enc_k);
+        hp.sample_rate = core_gguf::kv_u32(g, "kokoro.sample_rate", hp.sample_rate);
+        hp.vocab_size = core_gguf::kv_u32(g, "kokoro.vocab_size", hp.vocab_size);
 
-        hp.plbert_embd_size  = core_gguf::kv_u32(g, "kokoro.plbert.embedding_size", hp.plbert_embd_size);
-        hp.plbert_hidden     = core_gguf::kv_u32(g, "kokoro.plbert.hidden_size", hp.plbert_hidden);
-        hp.plbert_n_layers   = core_gguf::kv_u32(g, "kokoro.plbert.num_hidden_layers", hp.plbert_n_layers);
-        hp.plbert_n_heads    = core_gguf::kv_u32(g, "kokoro.plbert.num_attention_heads", hp.plbert_n_heads);
-        hp.plbert_ff         = core_gguf::kv_u32(g, "kokoro.plbert.intermediate_size", hp.plbert_ff);
-        hp.plbert_max_pos    = core_gguf::kv_u32(g, "kokoro.plbert.max_position_embeddings", hp.plbert_max_pos);
+        hp.plbert_embd_size = core_gguf::kv_u32(g, "kokoro.plbert.embedding_size", hp.plbert_embd_size);
+        hp.plbert_hidden = core_gguf::kv_u32(g, "kokoro.plbert.hidden_size", hp.plbert_hidden);
+        hp.plbert_n_layers = core_gguf::kv_u32(g, "kokoro.plbert.num_hidden_layers", hp.plbert_n_layers);
+        hp.plbert_n_heads = core_gguf::kv_u32(g, "kokoro.plbert.num_attention_heads", hp.plbert_n_heads);
+        hp.plbert_ff = core_gguf::kv_u32(g, "kokoro.plbert.intermediate_size", hp.plbert_ff);
+        hp.plbert_max_pos = core_gguf::kv_u32(g, "kokoro.plbert.max_position_embeddings", hp.plbert_max_pos);
         hp.plbert_vocab_size = core_gguf::kv_u32(g, "kokoro.plbert.vocab_size", hp.plbert_vocab_size);
 
-        hp.istft_init_ch     = core_gguf::kv_u32(g, "kokoro.istft.init_channel", hp.istft_init_ch);
-        hp.istft_n_fft       = core_gguf::kv_u32(g, "kokoro.istft.n_fft", hp.istft_n_fft);
-        hp.istft_hop         = core_gguf::kv_u32(g, "kokoro.istft.hop_size", hp.istft_hop);
+        hp.istft_init_ch = core_gguf::kv_u32(g, "kokoro.istft.init_channel", hp.istft_init_ch);
+        hp.istft_n_fft = core_gguf::kv_u32(g, "kokoro.istft.n_fft", hp.istft_n_fft);
+        hp.istft_hop = core_gguf::kv_u32(g, "kokoro.istft.hop_size", hp.istft_hop);
         hp.istft_n_dilations = core_gguf::kv_u32(g, "kokoro.istft.resblock_n_dilations", hp.istft_n_dilations);
 
-        hp.istft_upsample_rates        = kv_u32_array(g, "kokoro.istft.upsample_rates");
+        hp.istft_upsample_rates = kv_u32_array(g, "kokoro.istft.upsample_rates");
         hp.istft_upsample_kernel_sizes = kv_u32_array(g, "kokoro.istft.upsample_kernel_sizes");
         hp.istft_resblock_kernel_sizes = kv_u32_array(g, "kokoro.istft.resblock_kernel_sizes");
-        hp.istft_resblock_dilations    = kv_u32_array(g, "kokoro.istft.resblock_dilation_sizes");
+        hp.istft_resblock_dilations = kv_u32_array(g, "kokoro.istft.resblock_dilation_sizes");
 
         if (hp.istft_upsample_rates.empty())
             hp.istft_upsample_rates = {10, 6};
@@ -2295,10 +2397,8 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model,
         fprintf(stderr,
                 "kokoro: arch=kokoro  hidden=%u style=%u max_dur=%u n_token=%u "
                 "vocab=%zu plbert=%uL/%uH/ff=%u  iSTFT n_fft=%u hop=%u sr=%u\n",
-                hp.hidden_dim, hp.style_dim, hp.max_dur, hp.n_token,
-                c->vocab.id_to_token.size(),
-                hp.plbert_n_layers, hp.plbert_hidden, hp.plbert_ff,
-                hp.istft_n_fft, hp.istft_hop, hp.sample_rate);
+                hp.hidden_dim, hp.style_dim, hp.max_dur, hp.n_token, c->vocab.id_to_token.size(), hp.plbert_n_layers,
+                hp.plbert_hidden, hp.plbert_ff, hp.istft_n_fft, hp.istft_hop, hp.sample_rate);
     }
 
     // ---- Backends ----
@@ -2371,8 +2471,7 @@ extern "C" struct kokoro_context* kokoro_init_from_file(const char* path_model,
     c->compute_meta.resize(ggml_tensor_overhead() * 262144 + ggml_graph_overhead_custom(262144, false));
 
     if (params.verbosity >= 1) {
-        fprintf(stderr, "kokoro: loaded %zu tensors from '%s'  gen=%s\n",
-                c->tensors.size(), path_model,
+        fprintf(stderr, "kokoro: loaded %zu tensors from '%s'  gen=%s\n", c->tensors.size(), path_model,
                 c->gen_backend == c->backend_cpu ? "CPU (Metal-hang workaround)" : "GPU (KOKORO_GEN_FORCE_METAL)");
     }
     return c;
@@ -2392,16 +2491,16 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
 
         std::string arch = core_gguf::kv_str(g, "general.architecture", "");
         if (arch != "kokoro-voice") {
-            fprintf(stderr, "kokoro: voice pack '%s' has architecture='%s' (want 'kokoro-voice')\n",
-                    path, arch.c_str());
+            fprintf(stderr, "kokoro: voice pack '%s' has architecture='%s' (want 'kokoro-voice')\n", path,
+                    arch.c_str());
             gguf_free(g);
             return -1;
         }
 
         kokoro_voice_pack vp;
-        vp.name          = core_gguf::kv_str(g, "kokoro_voice.name", "");
-        vp.max_phonemes  = core_gguf::kv_u32(g, "kokoro_voice.max_phonemes", 0);
-        vp.style_dim     = core_gguf::kv_u32(g, "kokoro_voice.style_dim", 0);
+        vp.name = core_gguf::kv_str(g, "kokoro_voice.name", "");
+        vp.max_phonemes = core_gguf::kv_u32(g, "kokoro_voice.max_phonemes", 0);
+        vp.style_dim = core_gguf::kv_u32(g, "kokoro_voice.style_dim", 0);
         gguf_free(g);
 
         // Replace any previously-loaded pack.
@@ -2430,15 +2529,15 @@ extern "C" int kokoro_load_voice_pack(struct kokoro_context* ctx, const char* pa
         return -1;
     }
 
-    ctx->vp.tensors  = std::move(wl.tensors);
-    ctx->vp.pack     = it->second;
+    ctx->vp.tensors = std::move(wl.tensors);
+    ctx->vp.pack = it->second;
     ctx->vp.vp_ctx_w = wl.ctx;
     ctx->vp.vp_buf_w = wl.buf;
-    ctx->vp_loaded   = true;
+    ctx->vp_loaded = true;
 
     if (ctx->params.verbosity >= 1) {
-        fprintf(stderr, "kokoro: voice '%s' (max_phonemes=%u style_dim=%u) loaded from '%s'\n",
-                ctx->vp.name.c_str(), ctx->vp.max_phonemes, ctx->vp.style_dim, path);
+        fprintf(stderr, "kokoro: voice '%s' (max_phonemes=%u style_dim=%u) loaded from '%s'\n", ctx->vp.name.c_str(),
+                ctx->vp.max_phonemes, ctx->vp.style_dim, path);
     }
     return 0;
 }
@@ -2466,10 +2565,14 @@ extern "C" int32_t* kokoro_phonemes_to_ids(struct kokoro_context* ctx, const cha
     ids.reserve(std::strlen(phonemes));
 
     auto utf8_len = [](unsigned char c) -> int {
-        if ((c & 0x80) == 0)    return 1;
-        if ((c & 0xE0) == 0xC0) return 2;
-        if ((c & 0xF0) == 0xE0) return 3;
-        if ((c & 0xF8) == 0xF0) return 4;
+        if ((c & 0x80) == 0)
+            return 1;
+        if ((c & 0xE0) == 0xC0)
+            return 2;
+        if ((c & 0xF0) == 0xE0)
+            return 3;
+        if ((c & 0xF8) == 0xF0)
+            return 4;
         return 1; // invalid leading byte — consume one byte and move on
     };
 
@@ -2559,8 +2662,10 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
     // by closing/reopening the quoted region.
     cmd += "'";
     for (const char* p = text; *p; ++p) {
-        if (*p == '\'') cmd += "'\\''";
-        else            cmd += *p;
+        if (*p == '\'')
+            cmd += "'\\''";
+        else
+            cmd += *p;
     }
     cmd += "'";
 
@@ -2576,8 +2681,10 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
     pclose(f);
     // Strip leading/trailing whitespace.
     size_t b = 0, e = phonemes.size();
-    while (b < e && std::isspace((unsigned char)phonemes[b])) b++;
-    while (e > b && std::isspace((unsigned char)phonemes[e - 1])) e--;
+    while (b < e && std::isspace((unsigned char)phonemes[b]))
+        b++;
+    while (e > b && std::isspace((unsigned char)phonemes[e - 1]))
+        e--;
     phonemes = phonemes.substr(b, e - b);
     if (phonemes.empty()) {
         fprintf(stderr, "kokoro: espeak-ng produced no phonemes for '%s'\n", text);
@@ -2589,7 +2696,7 @@ extern "C" float* kokoro_synthesize(struct kokoro_context* ctx, const char* text
 }
 
 extern "C" float* kokoro_extract_stage(struct kokoro_context* ctx, const char* phonemes, const char* stage_name,
-                                        int* out_n) {
+                                       int* out_n) {
     if (out_n)
         *out_n = 0;
     if (!ctx || !phonemes || !stage_name)
@@ -2616,8 +2723,7 @@ extern "C" float* kokoro_extract_stage(struct kokoro_context* ctx, const char* p
         return out;
     }
 
-    if (std::strcmp(stage_name, "bert_pooler_out") == 0 ||
-        std::strcmp(stage_name, "bert_proj_out") == 0) {
+    if (std::strcmp(stage_name, "bert_pooler_out") == 0 || std::strcmp(stage_name, "bert_proj_out") == 0) {
         int n_ids = 0;
         int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
         if (!ids || n_ids == 0) {
@@ -2643,8 +2749,7 @@ extern "C" float* kokoro_extract_stage(struct kokoro_context* ctx, const char* p
         return r;
     }
 
-    if (std::strcmp(stage_name, "dur_enc_out") == 0 ||
-        std::strcmp(stage_name, "durations") == 0 ||
+    if (std::strcmp(stage_name, "dur_enc_out") == 0 || std::strcmp(stage_name, "durations") == 0 ||
         std::strcmp(stage_name, "pred_lstm_out") == 0) {
         int n_ids = 0;
         int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
@@ -2658,9 +2763,8 @@ extern "C" float* kokoro_extract_stage(struct kokoro_context* ctx, const char* p
         return r;
     }
 
-    if (std::strcmp(stage_name, "align_out") == 0 ||
-        std::strcmp(stage_name, "f0_curve")  == 0 ||
-        std::strcmp(stage_name, "n_curve")   == 0) {
+    if (std::strcmp(stage_name, "align_out") == 0 || std::strcmp(stage_name, "f0_curve") == 0 ||
+        std::strcmp(stage_name, "n_curve") == 0) {
         int n_ids = 0;
         int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
         if (!ids || n_ids == 0) {
@@ -2673,8 +2777,7 @@ extern "C" float* kokoro_extract_stage(struct kokoro_context* ctx, const char* p
         return r;
     }
 
-    if (std::strcmp(stage_name, "dec_encode_out") == 0 ||
-        std::strcmp(stage_name, "dec_decode_3_out") == 0) {
+    if (std::strcmp(stage_name, "dec_encode_out") == 0 || std::strcmp(stage_name, "dec_decode_3_out") == 0) {
         int n_ids = 0;
         int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);
         if (!ids || n_ids == 0) {
@@ -2687,8 +2790,7 @@ extern "C" float* kokoro_extract_stage(struct kokoro_context* ctx, const char* p
         return r;
     }
 
-    if (std::strcmp(stage_name, "gen_pre_post_out") == 0 ||
-        std::strcmp(stage_name, "mag") == 0 ||
+    if (std::strcmp(stage_name, "gen_pre_post_out") == 0 || std::strcmp(stage_name, "mag") == 0 ||
         std::strcmp(stage_name, "phase") == 0) {
         int n_ids = 0;
         int32_t* ids = kokoro_phonemes_to_ids(ctx, phonemes, &n_ids);

@@ -1509,23 +1509,22 @@ static bool nle_proj_layer_proj(granite_nle_context* ctx, std::vector<float>& ou
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
         return false;
     out.assign((size_t)hidden * T, 0.0f);
-    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "proj_a_out"), out.data(), 0,
-                            (size_t)hidden * T * sizeof(float));
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "proj_a_out"), out.data(), 0, (size_t)hidden * T * sizeof(float));
     return true;
 }
 
 static ggml_cgraph* nle_proj_build_block(granite_nle_context* ctx) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
-    const int hidden = (int)hp.proj_hidden_size;          // 2048
-    const int llm_d = (int)hp.proj_llm_dim;               // 2048
-    const int n_heads = (int)hp.proj_n_heads;             // 32
-    const int hd = hidden / n_heads;                      // 64
-    const int n_layers = (int)hp.proj_n_layers;           // 2
-    const int block_size = (int)hp.proj_block_size;       // 15
-    const int down = (int)hp.proj_downsample_rate;        // 5
-    const int q_len = block_size / down;                  // 3
-    const int mlp_h = hidden * (int)hp.proj_mlp_ratio;    // 4096
+    const int hidden = (int)hp.proj_hidden_size;       // 2048
+    const int llm_d = (int)hp.proj_llm_dim;            // 2048
+    const int n_heads = (int)hp.proj_n_heads;          // 32
+    const int hd = hidden / n_heads;                   // 64
+    const int n_layers = (int)hp.proj_n_layers;        // 2
+    const int block_size = (int)hp.proj_block_size;    // 15
+    const int down = (int)hp.proj_downsample_rate;     // 5
+    const int q_len = block_size / down;               // 3
+    const int mlp_h = hidden * (int)hp.proj_mlp_ratio; // 4096
     const float eps = hp.proj_layernorm_eps;
     const float attn_scale = 1.0f / std::sqrt((float)hd);
 
@@ -1684,9 +1683,8 @@ extern "C" float* granite_nle_run_projector(struct granite_nle_context* ctx, con
                                 (size_t)hidden * block_size * sizeof(float));
         if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
             return nullptr;
-        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "proj_b_out"),
-                                all_out.data() + (size_t)blk * q_len * llm_d, 0,
-                                (size_t)q_len * llm_d * sizeof(float));
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "proj_b_out"), all_out.data() + (size_t)blk * q_len * llm_d,
+                                0, (size_t)q_len * llm_d * sizeof(float));
     }
 
     if (ctx->params.verbosity >= 2) {
@@ -1744,8 +1742,10 @@ static ggml_tensor* nle_llm_attn_noncausal(ggml_context* ctx0, ggml_tensor* x, g
     K = ggml_reshape_3d(ctx0, K, hd, n_kv, T);
     V = ggml_reshape_3d(ctx0, V, hd, n_kv, T);
 
-    Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-    K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    Q = ggml_rope_ext(ctx0, Q, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
+                      0.0f);
+    K = ggml_rope_ext(ctx0, K, positions, nullptr, hd, GGML_ROPE_TYPE_NEOX, 0, rope_theta, 1.0f, 0.0f, 1.0f, 0.0f,
+                      0.0f);
 
     Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
     K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
@@ -2036,8 +2036,8 @@ extern "C" char* granite_nle_transcribe(struct granite_nle_context* ctx, const f
 
     // 9. LLM editing forward.
     int edit_n = 0, edit_V = 0;
-    float* edit_logits = granite_nle_run_llm_editing(ctx, audio_embs.data(), n_audio_kept, text_ids.data(), total_len,
-                                                     &edit_n, &edit_V);
+    float* edit_logits =
+        granite_nle_run_llm_editing(ctx, audio_embs.data(), n_audio_kept, text_ids.data(), total_len, &edit_n, &edit_V);
     if (!edit_logits) {
         fprintf(stderr, "granite_nle: llm_editing failed\n");
         return nullptr;

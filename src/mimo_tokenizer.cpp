@@ -64,12 +64,12 @@ struct mimo_tok_hp {
     uint32_t encoder_layers = 32;
     uint32_t encoder_heads = 20;
     uint32_t encoder_ffn_dim = 5120;
-    uint32_t num_quantizers = 20;     // total stages on disk; ASR uses first 8
+    uint32_t num_quantizers = 20; // total stages on disk; ASR uses first 8
     uint32_t sampling_rate = 24000;
     uint32_t hop_length = 240;
-    uint32_t stride_size = 2;         // conv2 stride
-    uint32_t avg_pooler = 2;          // down_sample stride
-    uint32_t kernel_size = 3;         // conv stem kernel
+    uint32_t stride_size = 2; // conv2 stride
+    uint32_t avg_pooler = 2;  // down_sample stride
+    uint32_t kernel_size = 3; // conv stem kernel
     // Defaults below come from MiMo-Audio-Tokenizer/config.json — they are
     // not yet written into the GGUF by the converter, so we baked them in.
     uint32_t encoder_skip_layer_id = 3; // skip-connection saved AFTER layer 2
@@ -142,7 +142,7 @@ struct mimo_tokenizer_context {
     ggml_tensor* conv2_b = nullptr;
     ggml_tensor* final_norm_w = nullptr;
     ggml_tensor* final_norm_b = nullptr;
-    ggml_tensor* down_w = nullptr;       // Conv1d (1280, 1280, k=2, s=2, no bias)
+    ggml_tensor* down_w = nullptr; // Conv1d (1280, 1280, k=2, s=2, no bias)
     ggml_tensor* down_norm_w = nullptr;
     ggml_tensor* down_norm_b = nullptr;
     std::vector<mimo_tok_layer> layers;
@@ -342,7 +342,7 @@ static std::vector<float> compute_tokenizer_mel(const float* pcm16k, int n_in, c
     p.win_length = win_length;
     p.n_mels = n_mels;
     p.log_base = core_mel::LogBase::Ln;
-    p.log_guard = core_mel::LogGuard::MaxClip; // log(max(spec, 1e-7))
+    p.log_guard = core_mel::LogGuard::MaxClip;   // log(max(spec, 1e-7))
     p.spec_kind = core_mel::SpecKind::Magnitude; // power=1.0
     p.norm = core_mel::Normalization::None;
     p.layout = core_mel::Layout::MelsTime; // (n_mels, T)
@@ -353,8 +353,8 @@ static std::vector<float> compute_tokenizer_mel(const float* pcm16k, int n_in, c
     p.drop_last_frame = false;
 
     int T = 0;
-    std::vector<float> mel = core_mel::compute(pcm24k.data(), (int)pcm24k.size(), hann.data(), win_length, mel_fb.data(),
-                                               n_freqs, mimo_fft_wrapper, p, T);
+    std::vector<float> mel = core_mel::compute(pcm24k.data(), (int)pcm24k.size(), hann.data(), win_length,
+                                               mel_fb.data(), n_freqs, mimo_fft_wrapper, p, T);
     T_mel_out = T;
     return mel;
 }
@@ -433,9 +433,7 @@ extern "C" struct mimo_tokenizer_context* mimo_tokenizer_init_from_file(const ch
     // because the upstream uses `conv1`/`conv2`/`down_sample_layer`, which
     // the rename list doesn't match). Per-layer tensors land at `enc.blk.*`.
     auto& T = ctx->tensors;
-    auto bind = [&](const char* name) -> ggml_tensor* {
-        return core_gguf::require(T, name, "mimo_tokenizer");
-    };
+    auto bind = [&](const char* name) -> ggml_tensor* { return core_gguf::require(T, name, "mimo_tokenizer"); };
 
     ctx->conv1_w = bind("encoder.conv1.weight");
     ctx->conv1_b = bind("encoder.conv1.bias");
@@ -451,21 +449,36 @@ extern "C" struct mimo_tokenizer_context* mimo_tokenizer_init_from_file(const ch
     char buf[128];
     for (uint32_t i = 0; i < hp.encoder_layers; i++) {
         auto& L = ctx->layers[i];
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn_norm.weight", i); L.attn_norm_w = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn_norm.bias", i);   L.attn_norm_b = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.q.weight", i);    L.q_w = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.q.bias", i);      L.q_b = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.k.weight", i);    L.k_w = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.v.weight", i);    L.v_w = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.v.bias", i);      L.v_b = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.o.weight", i);    L.o_w = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.o.bias", i);      L.o_b = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.ffn_norm.weight", i);  L.ffn_norm_w = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.ffn_norm.bias", i);    L.ffn_norm_b = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.fc1.weight", i);       L.fc1_w = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.fc1.bias", i);         L.fc1_b = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.fc2.weight", i);       L.fc2_w = bind(buf);
-        snprintf(buf, sizeof(buf), "enc.blk.%u.fc2.bias", i);         L.fc2_b = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn_norm.weight", i);
+        L.attn_norm_w = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn_norm.bias", i);
+        L.attn_norm_b = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.q.weight", i);
+        L.q_w = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.q.bias", i);
+        L.q_b = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.k.weight", i);
+        L.k_w = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.v.weight", i);
+        L.v_w = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.v.bias", i);
+        L.v_b = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.o.weight", i);
+        L.o_w = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.attn.o.bias", i);
+        L.o_b = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.ffn_norm.weight", i);
+        L.ffn_norm_w = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.ffn_norm.bias", i);
+        L.ffn_norm_b = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.fc1.weight", i);
+        L.fc1_w = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.fc1.bias", i);
+        L.fc1_b = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.fc2.weight", i);
+        L.fc2_w = bind(buf);
+        snprintf(buf, sizeof(buf), "enc.blk.%u.fc2.bias", i);
+        L.fc2_b = bind(buf);
     }
 
     // RVQ codebooks. Only the first 8 are needed for ASR; bind any present.
@@ -547,9 +560,9 @@ extern "C" void mimo_tokenizer_set_n_threads(struct mimo_tokenizer_context* ctx,
 
 static ggml_cgraph* mimo_tok_build_encoder_graph(mimo_tokenizer_context* ctx, int T_mel, int T_xfmr, int T_pool) {
     const auto& hp = ctx->hp;
-    const int d = (int)hp.d_model;          // 1280
-    const int n_q = (int)hp.encoder_heads;  // 20
-    const int hd = d / n_q;                 // 64
+    const int d = (int)hp.d_model;               // 1280
+    const int n_q = (int)hp.encoder_heads;       // 20
+    const int hd = d / n_q;                      // 64
     const int n_layers = (int)hp.encoder_layers; // 32
     const int n_mels = (int)hp.n_mels;
     const int skip_after = (int)hp.encoder_skip_layer_id - 1; // = 2 (0-indexed)
@@ -614,12 +627,8 @@ static ggml_cgraph* mimo_tok_build_encoder_graph(mimo_tokenizer_context* ctx, in
         ap.attn_scale = attn_scale;
         ap.n_ctx_orig = 0; // unused with no scaling
         ap.rope_theta = hp.rope_theta;
-        ggml_tensor* attn = core_attn::encoder_self_attn(ctx0, x,
-            L.q_w, L.q_b,
-            L.k_w, /*k_b*/ nullptr,
-            L.v_w, L.v_b,
-            L.o_w, L.o_b,
-            positions, /*mask*/ nullptr, ap);
+        ggml_tensor* attn = core_attn::encoder_self_attn(ctx0, x, L.q_w, L.q_b, L.k_w, /*k_b*/ nullptr, L.v_w, L.v_b,
+                                                         L.o_w, L.o_b, positions, /*mask*/ nullptr, ap);
         cur = ggml_add(ctx0, residual, attn);
 
         // Pre-FFN LN + plain GELU MLP with biases (NOT SwiGLU).
@@ -691,8 +700,8 @@ struct EncoderOutputs {
     std::vector<float> pool_out;  // (T_pool, d)
 };
 
-static bool run_encoder(mimo_tokenizer_context* ctx, const float* pcm16k, int n_in, EncoderOutputs& out, bool need_conv1,
-                        bool need_conv2, bool need_xfmr, bool need_pool) {
+static bool run_encoder(mimo_tokenizer_context* ctx, const float* pcm16k, int n_in, EncoderOutputs& out,
+                        bool need_conv1, bool need_conv2, bool need_xfmr, bool need_pool) {
     if (!ctx || !pcm16k || n_in <= 0)
         return false;
     const auto& hp = ctx->hp;

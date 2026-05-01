@@ -4655,7 +4655,7 @@ extern "C" float* qwen3_tts_run_talker_with_embeds(struct qwen3_tts_context* ctx
 }
 
 extern "C" float* qwen3_tts_run_code_pred_step(struct qwen3_tts_context* ctx, const float* embeds, int n_tokens,
-                                                int n_past, int lm_head_idx, int* out_vocab) {
+                                               int n_past, int lm_head_idx, int* out_vocab) {
     if (out_vocab) {
         *out_vocab = 0;
     }

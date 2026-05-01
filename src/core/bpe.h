@@ -221,8 +221,8 @@ inline std::string token_bytes_to_utf8(const std::string& token) {
             cp = ((c & 0x1F) << 6) | ((unsigned char)token[i + 1] & 0x3F);
             len = 2;
         } else if ((c & 0xF0) == 0xE0 && i + 2 < token.size()) {
-            cp = ((c & 0x0F) << 12) | (((unsigned char)token[i + 1] & 0x3F) << 6) |
-                 ((unsigned char)token[i + 2] & 0x3F);
+            cp =
+                ((c & 0x0F) << 12) | (((unsigned char)token[i + 1] & 0x3F) << 6) | ((unsigned char)token[i + 2] & 0x3F);
             len = 3;
         } else if ((c & 0xF8) == 0xF0 && i + 3 < token.size()) {
             cp = ((c & 0x07) << 18) | (((unsigned char)token[i + 1] & 0x3F) << 12) |

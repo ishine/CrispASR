@@ -45,8 +45,8 @@ struct mimo_tokenizer_context* mimo_tokenizer_init_from_file(const char* path_mo
 // int32 buffer of shape [n_frames * 8] (row-major, time-first), and writes
 // `n_frames` to *n_frames_out. Caller must free() the returned pointer.
 // Returns nullptr on failure.
-int32_t* mimo_tokenizer_encode_pcm16k(struct mimo_tokenizer_context* ctx,
-                                      const float* pcm, int n_samples, int* n_frames_out);
+int32_t* mimo_tokenizer_encode_pcm16k(struct mimo_tokenizer_context* ctx, const float* pcm, int n_samples,
+                                      int* n_frames_out);
 
 // Diff-harness stage extraction. Runs the encoder on the given 16 kHz PCM
 // and returns a freshly-malloc'd float32 buffer holding the named stage

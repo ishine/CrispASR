@@ -33,15 +33,17 @@ namespace core_align {
 // Layout: features[i] is the i-th token's column at offset i·D in the
 // flat buffer, matching ggml's ne=(D, L) storage. The output preserves
 // the same channel-major layout.
-static inline float* repeat_interleave(const float* features, int D, int L,
-                                       const int* durations, int* out_T_frames) {
+static inline float* repeat_interleave(const float* features, int D, int L, const int* durations, int* out_T_frames) {
     int T = 0;
     for (int i = 0; i < L; i++)
         T += durations[i];
-    if (out_T_frames) *out_T_frames = T;
-    if (T <= 0) return nullptr;
+    if (out_T_frames)
+        *out_T_frames = T;
+    if (T <= 0)
+        return nullptr;
     float* out = (float*)std::malloc((size_t)D * T * sizeof(float));
-    if (!out) return nullptr;
+    if (!out)
+        return nullptr;
     int j = 0;
     for (int i = 0; i < L; i++) {
         const int n = durations[i];

@@ -44,17 +44,17 @@ namespace core_convt {
 //              over time). Pass nullptr to skip.
 //
 // Output: (C, 2·T) F32.
-static inline ggml_tensor* convt1d_depthwise_2x_k3(ggml_context* ctx, ggml_tensor* x,
-                                                   ggml_tensor* w_kernel, ggml_tensor* w_bias) {
+static inline ggml_tensor* convt1d_depthwise_2x_k3(ggml_context* ctx, ggml_tensor* x, ggml_tensor* w_kernel,
+                                                   ggml_tensor* w_bias) {
     const int C = (int)x->ne[0];
     const int T = (int)x->ne[1];
 
     // Permute kernel (K=3, 1, C) → (C, 3, 1), cast to F32 (F16 view + F32
     // mul fails on Metal at the kernel-dispatch level), reshape to
     // (C, 3), then take three column views w0/w1/w2.
-    ggml_tensor* w_perm = ggml_cont(ctx, ggml_permute(ctx, w_kernel, 2, 0, 1, 3));   // (C, 3, 1) F16
+    ggml_tensor* w_perm = ggml_cont(ctx, ggml_permute(ctx, w_kernel, 2, 0, 1, 3)); // (C, 3, 1) F16
     ggml_tensor* w_perm_f32 = ggml_cast(ctx, w_perm, GGML_TYPE_F32);
-    ggml_tensor* w_2d = ggml_reshape_2d(ctx, w_perm_f32, C, 3);                      // (C, 3) F32
+    ggml_tensor* w_2d = ggml_reshape_2d(ctx, w_perm_f32, C, 3); // (C, 3) F32
     const size_t row_b = w_2d->nb[1];
     ggml_tensor* w0 = ggml_view_2d(ctx, w_2d, C, 1, row_b, (size_t)0 * row_b);
     ggml_tensor* w1 = ggml_view_2d(ctx, w_2d, C, 1, row_b, (size_t)1 * row_b);
@@ -62,9 +62,9 @@ static inline ggml_tensor* convt1d_depthwise_2x_k3(ggml_context* ctx, ggml_tenso
 
     // x_shifted[c, t] = x[c, t+1] for t < T-1, 0 for t = T-1.
     // Take x[:, 1:] (C, T-1) and zero-pad on the right to (C, T).
-    ggml_tensor* x_tail = ggml_view_2d(ctx, x, C, T - 1, x->nb[1], x->nb[1]);        // (C, T-1)
-    x_tail = ggml_cont(ctx, x_tail);                                                  // contiguous
-    ggml_tensor* x_shifted = ggml_pad_ext(ctx, x_tail, 0, 0, 0, 1, 0, 0, 0, 0);       // (C, T)
+    ggml_tensor* x_tail = ggml_view_2d(ctx, x, C, T - 1, x->nb[1], x->nb[1]);   // (C, T-1)
+    x_tail = ggml_cont(ctx, x_tail);                                            // contiguous
+    ggml_tensor* x_shifted = ggml_pad_ext(ctx, x_tail, 0, 0, 0, 1, 0, 0, 0, 0); // (C, T)
 
     // y_even (C, T) = w1 ⊙ x  (broadcast w1 over T)
     ggml_tensor* y_even = ggml_mul(ctx, x, w1);
@@ -76,9 +76,9 @@ static inline ggml_tensor* convt1d_depthwise_2x_k3(ggml_context* ctx, ggml_tenso
     // reshape to (C, 2T). Memory layout means consecutive time positions
     // alternate even/odd, which is the desired interleaving.
     ggml_tensor* even_3d = ggml_reshape_3d(ctx, y_even, C, 1, T);
-    ggml_tensor* odd_3d  = ggml_reshape_3d(ctx, y_odd,  C, 1, T);
-    ggml_tensor* stacked = ggml_concat(ctx, even_3d, odd_3d, /*dim=*/1);              // (C, 2, T)
-    ggml_tensor* y = ggml_cont(ctx, ggml_reshape_2d(ctx, stacked, C, 2 * T));         // (C, 2T)
+    ggml_tensor* odd_3d = ggml_reshape_3d(ctx, y_odd, C, 1, T);
+    ggml_tensor* stacked = ggml_concat(ctx, even_3d, odd_3d, /*dim=*/1);      // (C, 2, T)
+    ggml_tensor* y = ggml_cont(ctx, ggml_reshape_2d(ctx, stacked, C, 2 * T)); // (C, 2T)
 
     if (w_bias)
         y = ggml_add(ctx, y, w_bias);

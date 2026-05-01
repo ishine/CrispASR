@@ -1519,15 +1519,13 @@ int main(int argc, char** argv) {
         // af_heart pack.
         const std::string phonemes = ref.meta("kokoro_phonemes");
         if (phonemes.empty()) {
-            fprintf(stderr,
-                    "crispasr-diff kokoro: reference is missing kokoro_phonemes metadata. "
-                    "Re-dump with KOKORO_PHONEMES=<ipa> set.\n");
+            fprintf(stderr, "crispasr-diff kokoro: reference is missing kokoro_phonemes metadata. "
+                            "Re-dump with KOKORO_PHONEMES=<ipa> set.\n");
             return 4;
         }
         const char* voice_env = std::getenv("KOKORO_VOICE_GGUF");
-        const std::string voice_gguf = (voice_env && *voice_env)
-            ? voice_env
-            : "/tmp/kokoro_voices/kokoro-voice-af_heart.gguf";
+        const std::string voice_gguf =
+            (voice_env && *voice_env) ? voice_env : "/tmp/kokoro_voices/kokoro-voice-af_heart.gguf";
 
         auto cp = kokoro_context_default_params();
         cp.n_threads = 4;
@@ -1555,25 +1553,25 @@ int main(int argc, char** argv) {
             float threshold;
         };
         static const KStage kokoro_stages[] = {
-            {"token_ids",        COS_THRESHOLD},
-            {"bert_pooler_out",  COS_THRESHOLD},
-            {"bert_proj_out",    COS_THRESHOLD},
-            {"text_enc_out",     COS_THRESHOLD},
-            {"dur_enc_out",      COS_THRESHOLD},
-            {"pred_lstm_out",    COS_THRESHOLD},
-            {"durations",        COS_THRESHOLD},
-            {"align_out",        COS_THRESHOLD},
-            {"f0_curve",         COS_THRESHOLD},
-            {"n_curve",          COS_THRESHOLD},
-            {"dec_encode_out",   COS_THRESHOLD},
+            {"token_ids", COS_THRESHOLD},
+            {"bert_pooler_out", COS_THRESHOLD},
+            {"bert_proj_out", COS_THRESHOLD},
+            {"text_enc_out", COS_THRESHOLD},
+            {"dur_enc_out", COS_THRESHOLD},
+            {"pred_lstm_out", COS_THRESHOLD},
+            {"durations", COS_THRESHOLD},
+            {"align_out", COS_THRESHOLD},
+            {"f0_curve", COS_THRESHOLD},
+            {"n_curve", COS_THRESHOLD},
+            {"dec_encode_out", COS_THRESHOLD},
             {"dec_decode_3_out", COS_THRESHOLD},
             // RNG-divergent stages — looser cosine threshold (still
             // catches structural breakage; deterministic content is the
             // bulk of magnitude in mag/phase/audio).
             {"gen_pre_post_out", 0.95f},
-            {"mag",              0.95f},
-            {"phase",            0.95f},
-            {"audio_out",        0.95f},
+            {"mag", 0.95f},
+            {"phase", 0.95f},
+            {"audio_out", 0.95f},
         };
         const char* dump_dir = std::getenv("KOKORO_DUMP_STAGES");
         for (const auto& s : kokoro_stages) {
@@ -1581,7 +1579,8 @@ int main(int argc, char** argv) {
             float* mine = kokoro_extract_stage(ctx, phonemes.c_str(), s.name, &n_stage);
             if (!mine || n_stage <= 0) {
                 printf("[ERR ] %-22s kokoro_extract_stage returned null\n", s.name);
-                if (mine) free(mine);
+                if (mine)
+                    free(mine);
                 n_fail++;
                 continue;
             }

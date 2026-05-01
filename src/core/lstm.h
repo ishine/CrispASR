@@ -82,13 +82,12 @@ static inline ggml_tensor* lstm_unidir(ggml_context* ctx, ggml_cgraph* gf, ggml_
         const int t = t0 + step * dt;
 
         // proj_x slice for this timestep: (4H, 1) F32, contiguous.
-        ggml_tensor* px =
-            ggml_view_2d(ctx, proj_x, H4, 1, row_stride_4h, (size_t)t * row_stride_4h);
+        ggml_tensor* px = ggml_view_2d(ctx, proj_x, H4, 1, row_stride_4h, (size_t)t * row_stride_4h);
 
         // pre = px + (W_hh @ h + b_hh) — at step 0 the W_hh@0 term vanishes.
         ggml_tensor* pre;
         if (h) {
-            ggml_tensor* ph = ggml_mul_mat(ctx, W_hh, h);  // (4H, 1)
+            ggml_tensor* ph = ggml_mul_mat(ctx, W_hh, h); // (4H, 1)
             ph = ggml_add(ctx, ph, b_hh);
             pre = ggml_add(ctx, px, ph);
         } else {
