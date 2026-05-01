@@ -16,7 +16,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | Priority | Item | Effort | Status |
 |---|---|---|---|
 | **HIGH** | [#52 Qwen3-TTS](#52-qwen3-tts) — speaker_encoder forward | Medium | talker + code_predictor + codec done; ECAPA next |
-| **HIGH** | [#51 MiMo-V2.5-ASR runtime](#51-mimo-v25-asr-runtime) | Large | converters done; runtime is a stub |
+| **DONE** | [#51 MiMo-V2.5-ASR runtime](#51-mimo-v25-asr-runtime--done-may-2026) | Large | end-to-end JFK matches reference; F16+Q4_K on HF; perf follow-ups (51a mmap loader, 51b step-only graph) at LOW |
 | **HIGH** | [#54 granite-speech-4.1 plus / nar](#54-granite-speech-41-plus--nar-variants) | Small | base + plus + nar runtimes all DONE; only NAR quant + HF upload remain |
 | **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phase 1 (Qwen3-TTS-CustomVoice) in progress; phases 2-5 queued |
 | **MEDIUM** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet/cohere DONE; canary remaining |
@@ -206,23 +206,60 @@ No response. HF model card has no license field.
 
 ---
 
-## 51. MiMo-V2.5-ASR runtime
+## ~~51. MiMo-V2.5-ASR runtime~~ — **DONE (May 2026)**
 
-Converter done (`models/convert-mimo-asr-to-gguf.py` plus the
-audio-tokenizer side `models/convert-mimo-tokenizer-to-gguf.py`).
-Runtime not yet written.
+End-to-end JFK transcription matches the upstream Python
+`MimoAudio.asr_sft` reference verbatim. F16 + Q4_K shipped to
+[`cstr/mimo-asr-GGUF`](https://huggingface.co/cstr/mimo-asr-GGUF)
+with corrected vocab (151680) + merges (151291). See HISTORY entry
+56 for the full bug post-mortem. Remaining (low-priority) follow-ups:
 
-- **Architecture:** 6-layer input_local_transformer + 36-layer Qwen2
-  LLM (4096d, 32Q/8KV, SiLU, RoPE).
-- **Audio path:** 8-channel RVQ tokens from `cstr/mimo-tokenizer-GGUF`
-  (separate model) get fed into the input_local_transformer, which
-  produces embeddings the Qwen2 LLM consumes.
-- **Reuse:** Qwen2 LLM core can lean on `core_attn::kv_self_attn` +
-  `core_ffn::swiglu` — both already in production via qwen3-asr.
+### 51a. mmap-style GGUF loader for large F16 models
 
-**Effort:** Large (~1000 LOC), but most of it is the audio-tokenizer
-runtime (RVQ encoder/decoder over conv stacks). The Qwen2 part
-mostly slots into the existing core helpers.
+`core_gguf::load_weights` currently `memmove`s tensor data from the
+mmap'd source into a freshly allocated CPU backend buffer. For the
+14.9 GB F16 mimo-asr GGUF this peaks at ~13 GB resident, so the
+diff harness can't run on a 16 GB Mac without 25+ minutes of swap
+thrashing. Q4_K (4.5 GB) fits fine, so the symptom is hidden on
+production paths — but blocks F16 + fp32-ref strict cos≥0.999
+validation that the rest of the diff harness flow assumes.
+
+Options: (a) ggml backend-buffer mmap support — the cleanest fix,
+plumbs through to MTLBuffer-newBufferWithBytesNoCopy on Metal,
+zero-copy on CPU, and is already a pattern in upstream llama.cpp;
+(b) per-tensor on-demand loading where weights are `mmap`'d once
+and just held by reference — also clean but needs lifecycle care
+across the existing weight-binding loop. Effort: **Medium**.
+
+### 51b. Step-decode KV cache reuse
+
+The greedy step decode currently rebuilds the full prefill graph
+each step (`mimo_asr_run_lm` calls `mimo_asr_build_prefill_graph`
+inside a fresh `ggml_backend_sched_reset`). The audio-path branches
+are dead in the step graph (every position is a non-empty text
+token, so `text_zero_mask` zeroes them) but still allocated. Two
+wins available:
+
+- **Step-only graph variant** that skips the audio path entirely
+  (input_ids row 0 only, no per-channel speech_codes/combined_mask
+  inputs). Should drop step-decode time roughly 2× by skipping the
+  6-layer input_local_transformer + group_proj.
+- **Cached graph + KV reuse** — the qwen3-tts O15 path is the
+  reference template (build the T=gs decode graph once with
+  fixed-shape inputs; reuse across steps with `ggml_set_rows`-style
+  K/V appends). Should drop another ~30% by avoiding per-step graph
+  alloc + Metal pipeline rebuilds.
+
+Effort: **Medium** for step-only graph, **Medium** more for caching.
+
+### 51c. F16 step decode
+
+Q4_K dequant on every matmul is the largest single cost at decode
+time. F16 weights are ~2× larger but skip the dequant loop
+entirely. Once 51a (mmap loader) lands, F16 decode on M1 should
+hit ≥1× realtime on the JFK clip (Q4_K is currently 0.3×).
+
+Effort: **Small** once 51a is in.
 
 ---
 

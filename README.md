@@ -77,6 +77,7 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 | **omniasr** | [`facebook/omniASR-CTC-{300M,1B}`](https://huggingface.co/cstr/omniASR-CTC-1B-GGUF) | wav2vec2-style CNN + 24–48L transformer + CTC head | **1600+** | Apache-2.0 |
 | **omniasr** | [`omniASR-LLM-300M-v2`](https://huggingface.co/cstr/omniasr-llm-300m-v2-GGUF) | Same encoder + 12L LLaMA decoder (SwiGLU, RoPE); autoregressive, best quality | **1600+** | Apache-2.0 |
 | **vibevoice** | [`microsoft/VibeVoice-ASR`](https://huggingface.co/cstr/vibevoice-asr-GGUF) | σ-VAE ConvNeXt encoders + Qwen2.5-7B decoder; timestamps, diarization, hotwords | 50+ | MIT |
+| **mimo-asr** | [`XiaomiMiMo/MiMo-V2.5-ASR`](https://huggingface.co/cstr/mimo-asr-GGUF) | 6L input_local_transformer (1024d) + 36L Qwen2 LM (4096d, 32Q/8KV); 8-channel RVQ codes from separate MiMo-Audio-Tokenizer GGUF (`--codec-model`); JFK matches reference verbatim | Mandarin (Wu/Cantonese/Hokkien/Sichuanese dialects) + English + code-switching | MIT |
 
 **Text-to-Speech models** (TTS — `--tts` flag):
 
@@ -407,6 +408,31 @@ curl -L -o parakeet.gguf \
 ```bash
 ./build/bin/crispasr --backend qwen3 -m auto -f audio.zh.wav
 ```
+
+### MiMo-V2.5-ASR (Mandarin + dialects + English, 7.5B Qwen2 LM)
+
+```bash
+# Download the LM + audio tokenizer (the tokenizer is a separate model)
+huggingface-cli download cstr/mimo-asr-GGUF mimo-asr-q4_k.gguf \
+    --local-dir ~/.cache/crispasr
+huggingface-cli download cstr/mimo-tokenizer-GGUF mimo-tokenizer-q4_k.gguf \
+    --local-dir ~/.cache/crispasr
+
+# Transcribe (auto-discovers tokenizer if it sits next to the LM)
+./build/bin/crispasr \
+    --backend mimo-asr \
+    -m ~/.cache/crispasr/mimo-asr-q4_k.gguf \
+    --codec-model ~/.cache/crispasr/mimo-tokenizer-q4_k.gguf \
+    -f samples/jfk.wav
+# Output: And so, my fellow Americans, ask not what your country can do
+# for you. Ask what you can do for your country.
+```
+
+The 4.5 GB Q4_K is the recommended quant; F16 (14.9 GB) needs ~16 GB
+RAM during inference. JFK matches the upstream Python
+`MimoAudio.asr_sft` reference verbatim; performance on M1+Metal is
+~0.3× realtime (Q4_K dequant per step is the bottleneck — F16 +
+KV-reuse follow-ups are queued under PLAN #51a/b/c).
 
 ### Wav2Vec2 (lightweight CTC, any HF Wav2Vec2ForCTC model)
 

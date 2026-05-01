@@ -351,9 +351,6 @@ direction; do not interleave.
   `tools/reference_backends/gemma4.py` (audio-only path fits 8 GB
   RAM via `_dump_audio_only`). Apache 2.0.
   Open polish: speed (currently ~0.2× realtime — see #17 below).
-- **MiMo-V2.5-ASR** — **[IN PROGRESS]** Xiaomi 8B Qwen2 + 1.2B RVQ audio tokenizer.
-  Both converters DONE. F16 GGUFs on HF: `cstr/mimo-asr-GGUF` (15.3 GB),
-  `cstr/mimo-tokenizer-GGUF` (Q4_K 377 MB). Runtime not yet written. MIT.
 - **German wav2vec2 models** — **[DONE]** 5 models on HF, all Apache 2.0 / MIT:
   `wav2vec2-large-xlsr-53-german` (222 MB Q4_K), `wav2vec2-large-xlsr-53-german-cv13` (212 MB),
   `wav2vec2-base-german-cv9` (80 MB, MIT), plus 1B models converting on Kaggle.
@@ -374,9 +371,11 @@ direction; do not interleave.
   See HISTORY.md.
 - **MiMo-V2.5-ASR** — **[WORKS, default path]** End-to-end JFK
   transcription matches the upstream Python `MimoAudio.asr_sft`
-  reference verbatim. PLAN #51 SHIPPED. F16 + Q4_K regenerated
-  locally; HF re-upload to `cstr/mimo-asr-GGUF` is deferred (destructive
-  shared-state op, needs user OK). MIT.
+  reference verbatim. PLAN #51 SHIPPED. F16 (14.9 GB) + Q4_K
+  (4.5 GB) on [`cstr/mimo-asr-GGUF`](https://huggingface.co/cstr/mimo-asr-GGUF)
+  with corrected vocab (151680) + merges (151291). MIT.
+  Perf follow-ups (mmap loader, step-only graph, F16 decode) at
+  PLAN #51a/b/c.
 
   **PLAN #51 status (2026-05-01, late session):**
 

@@ -5386,3 +5386,132 @@ audio with the runtime correctly logging the `language_id=2074`
 override. Catching a regression in this path without ASR roundtrip
 would mean noticing wrong-prosody Chinese audio by ear — a much
 weaker gate.
+
+# MiMo-V2.5-ASR (PLAN #51 / issue #45)
+
+End-to-end JFK transcription matches the upstream `MimoAudio.asr_sft`
+reference verbatim. Five lessons that bit hard during the port —
+documented so the next 7B-class speech-LLM porter doesn't have to
+re-discover them.
+
+## Lesson 1 — torch+OpenMP deadlock during bf16→f16 conversion
+
+**MUST APPLY** to every `python models/convert-*-to-gguf.py`
+invocation in this project, not just MiMo.
+
+Symptom: `torch.Tensor.to(torch.float16)` on bf16 weights goes through
+`at::native::DEFAULT::copy_kernel` which in turn enters
+`__kmpc_fork_call` → `__kmp_join_barrier` → `__kmp_suspend_64` → an
+indefinite `_pthread_cond_wait`. The master thread is parked waiting
+for an OpenMP worker that never wakes up. Process appears alive (RSS
+stable, mmap'd weights resident, STAT=S, 0.0% CPU) but the GGUFWriter
+temp file stops growing after ~50 tensors. We lost ~30 minutes
+diagnosing this on the MiMo-ASR convert run before sample(1) showed
+the parked stack.
+
+Workaround (zero downside — the cast is memory-bound, not
+compute-bound, so single-threaded is just as fast):
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
+  PYTHONUNBUFFERED=1 \
+  python models/convert-mimo-asr-to-gguf.py …
+```
+
+`PYTHONUNBUFFERED=1` is unrelated to the deadlock but pairs naturally
+because (a) `python | tee log.file` blocks `print()` flushes for many
+minutes otherwise, hiding genuine progress, and (b) makes diagnosing
+the deadlock easy — the last buffered line tells you exactly where
+torch parked.
+
+## Lesson 2 — Capture tensors MUST call `ggml_set_output()`
+
+This is a re-statement of the existing "ggml / inference engine"
+lesson, but the stakes were so high during MiMo prefill that it bears
+repeating: any tensor read out of a graph via
+`ggml_graph_get_tensor()` (i.e. for diff-harness extraction) must
+call `ggml_set_output()` in addition to `ggml_set_name()`. Without
+it, the scheduler treats the named cont/add nodes as ordinary
+intermediates and reuses their buffers when allocating later ops
+that consume the same upstream tensor.
+
+We hit this on MiMo as `prefill_inputs_embeds` reading back as
+post-clobber data — `cos≈0.003` against the reference even though
+the fusion math was provably correct. The fix is one line per
+capture (`ggml_set_output(t)`) but the symptom looks like a tensor
+math bug, not a scheduler bug, and burned ~3 hours.
+
+## Lesson 3 — `core_gguf::load_weights` materialises tensors into RAM
+
+Specifically for the diff harness: the F16 GGUF for a 7.5B-class
+model is ~15 GB. `core_gguf::load_weights` calls `_platform_memmove`
+to copy mmap'd source data into a freshly allocated CPU backend
+buffer. On a 16 GB Mac, this thrashes swap for 25+ minutes and never
+completes (we saw the process parked in `_platform_memmove` with
+12.7 GB physical footprint and only 1.5 sec CPU time accumulated
+after 25 minutes wall clock). Q4_K weights (4.5 GB) fit comfortably,
+so the bug is invisible on production paths but blocks F16 +
+fp32-ref strict cos≥0.999 validation that the diff harness assumes.
+
+Decision: validated step 9 against Q4_K instead — the cosines
+exactly reproduce step 7 numbers, confirming no regression. Tracked
+as PLAN #51a to add mmap-style backend buffer allocation (already a
+pattern in upstream llama.cpp, plumbs through to
+MTLBuffer-newBufferWithBytesNoCopy on Metal).
+
+Generalisable: when porting any 7B+ class model to a memory-tight
+host, prefer Q4_K + bf16-ref validation paths; expect to touch the
+loader before F16 + fp32-ref will run.
+
+## Lesson 4 — `process_speechdata.InputSegment` is the contract, copy it byte-for-byte
+
+The MiMo asr_sft prompt has a deceptively simple shape: `[9, T]`
+where row 0 is text and rows 1–8 are 8-channel RVQ codes. The
+non-obvious bits:
+
+- For TEXT segments (no audio), the upstream calls
+  `insert_between(tokens, gs-1, value=-100)` which produces
+  `[tok, -100, -100, -100, tok, -100, ...]` with text tokens at
+  stride `gs` and `-100` fillers everywhere else. The `-100` is
+  meaningless (the LM only reads `ids[:, 0, ::gs]`) but the row
+  length must be `len(tokens) * gs` to align with the audio rows.
+  Audio rows for text segments are uniformly `speech_zeroemb_idx[c]`.
+- For AUDIO segments, row 0 is `[<|sosp|>, ...empty*n_groups...,
+  <|eosp|>]` insert-between'd; audio rows have the codes flanked by
+  `gs`-wide pads of `speech_zeroemb_idx[c]`.
+- The 6 segments concatenate along time, so total `T_total =
+  Σ T_seg`. `T_groups = T_total / gs` is what the LM body sees.
+- During step decode, the upstream `slm_sample` replicates the new
+  text token across all `gs` positions of the new group via
+  `next_text_tokens.expand(B, gs, 1)`. The replication doesn't
+  matter (LM reads stride-gs only) but matching it makes the C++
+  code line up trivially with the Python ref.
+
+If you skip any of these, `prefill_inputs_embeds` looks fine in
+isolation but cosine drifts on token-level alignment with the
+reference. Always dump `prefill_input_ids` as a stage and compare
+it against the Python reference's `wrap.get_input_ids()` output
+BEFORE looking at downstream cosines. Most "bug" reports in the
+diff harness for [ids, codes] backends are off-by-one in the prompt
+construction, not in the model.
+
+## Lesson 5 — `tokenize_simple` is not enough for chat-template prompts
+
+`core_bpe::tokenize_simple` is fine for prompt fragments that contain
+only plain text. For chat templates with `<|im_start|>...<|im_end|>`
+and other special tokens, you need the **qwen3-asr-style splitter**:
+greedy match `<|...|>` against `token_to_id` first, emit those ids
+directly, THEN `bytes_to_unicode + bpe_one` for the residue.
+`tokenize_simple` byte-encodes the `<`, `|`, `>` characters and
+tries to BPE-merge them — produces tokens unrelated to the special-
+token id, and the LM never sees the chat structure it was trained on.
+
+In MiMo's case this would have collapsed silently — the per-byte
+fallback produces a syntactically valid token sequence that the LM
+just doesn't know how to interpret, and you'd see the LM produce
+`<|empty|>` tokens forever or random text rather than a clean
+crash. The qwen3-asr-style splitter lives in
+`src/qwen3_asr.cpp:qwen3_asr_tokenize` and we duplicated it inline
+in `mimo_asr_tokenize_text`. If a third backend needs this pattern,
+factor it out to `core_bpe::tokenize_with_specials(token_to_id,
+merge_rank, text)`.

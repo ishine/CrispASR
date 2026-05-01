@@ -754,3 +754,86 @@ total ~1070 LOC (fft 93 + cpu_ops 98 + ctc 129 + conformer_ibm 336 +
 granite_llm 162 + qformer 255). Roughly half of those core LOC are
 deduplicated math (the rest is comments + struct/API plumbing). Plus a
 clean separation of "backbone" (in core) from "plumbing" (in TUs).
+
+### 56. MiMo-V2.5-ASR end-to-end — PLAN #51 SHIPPED (May 2026)
+
+XiaomiMiMo's 7.5B-class speech-LLM (8-channel RVQ encoder + 36-layer
+Qwen2 LM, vocab=151680, MIT) ships fully working. JFK transcription
+matches the upstream Python `MimoAudio.asr_sft` reference verbatim:
+"And so, my fellow Americans, ask not what your country can do for
+you. Ask what you can do for your country." 11 s of audio in ~37 s
+on M1+Q4_K+Metal (0.3× realtime).
+
+**The forward path landed in two phases.** First, prefill numerical
+correctness (commit `9faccdd`) — five stages (audio_features,
+text_embeds, inputs_embeds, last_hidden, logits_step0) match the
+bf16 PyTorch reference within Q4_K + bf16 tolerance, with cos_mean
+between 0.96–0.998. Argmax of step-0 logits hits token 1597
+(`' And'`), matching the reference. The fix-it-or-lose-it bug:
+**capture tensors in a ggml graph need `ggml_set_output()`, not just
+`ggml_set_name()`.** Without `set_output`, the scheduler treats
+named tensors as ordinary intermediates and reuses their buffers
+when allocating later ops in the same graph. Symptom we hit:
+`prefill_inputs_embeds` collapsed to cos≈0.003 (looked like a
+broadcasting bug for hours) before tracing the buffer aliasing.
+LEARNINGS.md "Capture tensors MUST call `ggml_set_output()`"
+documents the recipe — apply universally to any tensor read out
+via `ggml_graph_get_tensor` for diff-harness extraction.
+
+Three other prefill bugs fixed in the same commit: (a) the
+input_local_block was permuting `(hd,n_h,gs,ng) → (hd,gs,n_h,ng)`
+*before* `ggml_rope_ext`, putting `n_h` at ne[2] where positions[gs]
+expected — assertion failed. Fix: rope-then-permute. (b) After the
+o-projection, `attn` was 2D `[d, gs*ng]` while the residual was
+3D `[d, gs, ng]` — ggml_add broadcast assert. Fix: reshape_3d.
+(c) The on-disk Q4_K had a truncated vocab (151643 entries, missing
+`<|empty|>`) so the empty-token fallback was hitting Qwen2's
+`<|endoftext|>`, which never appears in the prompt — every position
+was treated as non-empty, zeroing the audio path entirely. Fix
+in step 9 below.
+
+Second, transcribe path (commit `dae361f`) — full prompt
+construction in C++, mirroring `process_speechdata.InputSegment`
+byte-for-byte. Each text segment becomes a `[9, T_seg]` block (row
+0: tokens at stride gs, -100 fillers; rows 1–8: per-channel
+`speech_zeroemb_idx`). Audio segment becomes `[9, T_audio + 2*gs]`
+with `<|sosp|>` / `<|eosp|>` wrapping the empty-token text row and
+codes flanked by speech_zeroemb pads on the audio rows. The 6
+segments (user header, audio, template, end, assistant header,
+think+language tag) concatenate into the prefill input_ids.
+`mimo_asr_build_prefill_graph` gained an `n_past` parameter so
+step decode reuses the same builder with T=gs and advancing n_past.
+The decode loop replicates each generated text token across the
+gs positions of the new group and fills audio rows with
+`speech_zeroemb_idx[c]` (matches `slm_sample`'s `expand(group_size)`
++ `zero_embed_tensor` path). Stops on `<|im_end|>`/eos, strips
+`<|empty|>`/`<|eot|>`/`<|eostm|>`/language tags.
+
+The tokenizer follows the qwen3-asr-style splitter: greedy match
+`<|...|>` against the vocab, then GPT-2-style whitespace pre-split
++ `bytes_to_unicode` + `bpe_one` for the rest. Works only because
+step 9 reconverted the GGUF with `tokenizer.ggml.merges` populated
+(151291 entries — the converter fix from commit `2191a70` had
+landed earlier but the GGUFs predating it carried no merges, so
+BPE collapsed to per-byte and the prompt didn't match upstream).
+
+**Step 9 dragon: torch+OpenMP deadlock.** The bf16→f16 cast in
+`models/convert-mimo-asr-to-gguf.py` (via `t.to(torch.float16)`)
+goes through `at::native::DEFAULT::copy_kernel` → OpenMP barrier
+→ `__kmp_suspend_64` → indefinite `_pthread_cond_wait`. Process
+appears alive (RSS stable, mmap'd weights resident, STAT=S, 0.0%
+CPU) but the temp file stops growing after ~50 tensors. Workaround
+made permanent: prefix all torch-based converters with
+`OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+PYTHONUNBUFFERED=1`. Cost is negligible — the cast is memory-bound,
+not compute-bound. Without the env vars: hangs forever. With them:
+~20 min for the 14.9 GB F16 on M1, ~5 min more for Q4_K quantize.
+LEARNINGS.md repeats this so the next person doesn't lose 30
+minutes diagnosing it.
+
+**HF release.** [`cstr/mimo-asr-GGUF`](https://huggingface.co/cstr/mimo-asr-GGUF) ships F16 (14.9 GB) + Q4_K
+(4.5 GB) with the corrected vocab and merges. Pair with
+[`cstr/mimo-tokenizer-GGUF`](https://huggingface.co/cstr/mimo-tokenizer-GGUF) — the audio tokenizer is a separate
+encoder model. Q2_K and the legacy `mimo-asr.gguf` are kept for
+history but were built before the vocab/merges fix and should not
+be used.
