@@ -141,11 +141,26 @@ target_link_libraries(crispasr-diff PRIVATE
     qwen3_tts
     kokoro
     gemma4_e2b
+    mimo_tokenizer
     crispasr-diff-lib
     ${FFMPEG_LIBRARIES}
     ${CMAKE_THREAD_LIBS_INIT}
 )
 install(TARGETS crispasr-diff RUNTIME BUNDLE DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# mimo-tokenizer-smoke — finiteness/magnitude smoke test for the MiMo
+# tokenizer encoder forward path. Used during PLAN #51 step 2 development
+# while the upstream safetensors download is in flight.
+# ---------------------------------------------------------------------------
+add_executable(mimo-tokenizer-smoke mimo_tokenizer_smoke.cpp)
+target_link_libraries(mimo-tokenizer-smoke PRIVATE
+    common
+    crispasr
+    mimo_tokenizer
+    ${FFMPEG_LIBRARIES}
+    ${CMAKE_THREAD_LIBS_INIT}
+)
 
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
 

@@ -37,12 +37,14 @@
 #include "voxtral4b.h"
 #include "qwen3_asr.h"
 #include "qwen3_tts.h"
+#include "kokoro.h"
 #include "granite_speech.h"
 #include "granite_nle.h"
 #include "parakeet.h"
 #include "canary.h"
 #include "cohere.h"
 #include "gemma4_e2b.h"
+#include "mimo_tokenizer.h"
 
 #include "common-crispasr.h"
 
@@ -441,9 +443,10 @@ int main(int argc, char** argv) {
         fprintf(stderr,
                 "usage: %s <backend> <model.gguf> <reference.gguf> <audio.wav>\n"
                 "\n"
-                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, granite, granite-4.1, "
+                "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
+                "granite-4.1, "
                 "granite-nle, parakeet, "
-                "canary, cohere, gemma4\n"
+                "canary, cohere, gemma4, mimo-tokenizer\n"
                 "  model.gguf    crispasr-compatible model weights\n"
                 "  reference.gguf  archive produced by tools/dump_reference.py\n"
                 "  audio.wav     16 kHz mono WAV\n",
@@ -1151,6 +1154,35 @@ int main(int argc, char** argv) {
         }
         qwen3_tts_free(ctx);
 
+    } else if (backend_name == "mimo-tokenizer") {
+        auto cp = mimo_tokenizer_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        cp.use_gpu = true;
+        mimo_tokenizer_context* ctx = mimo_tokenizer_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load mimo-tokenizer model '%s'\n", model_path.c_str());
+            return 4;
+        }
+        // Stage list matches DEFAULT_STAGES in tools/reference_backends/mimo_tokenizer.py
+        static const char* stages[] = {
+            "tok_mel", "tok_conv1_out", "tok_conv2_out", "tok_xfmr_out", "tok_pool_out", "tok_codes",
+        };
+        for (const char* stage : stages) {
+            int n_stage = 0;
+            float* our_data = mimo_tokenizer_extract_stage(ctx, samples.data(), (int)samples.size(), stage, &n_stage);
+            if (!our_data) {
+                printf("[ERR ] %-22s  extract returned null\n", stage);
+                n_fail++;
+                continue;
+            }
+            auto rep = ref.compare(stage, our_data, (size_t)n_stage);
+            print_row(stage, rep, COS_THRESHOLD);
+            record(rep);
+            free(our_data);
+        }
+        mimo_tokenizer_free(ctx);
+
     } else if (backend_name == "granite" || backend_name == "granite-4.1") {
         auto cp = granite_speech_context_default_params();
         cp.n_threads = 4;
@@ -1478,11 +1510,110 @@ int main(int argc, char** argv) {
         }
 
         gemma4_e2b_free(ctx);
+    } else if (backend_name == "kokoro") {
+        // Kokoro / StyleTTS2: text-driven TTS, the 4th positional arg
+        // (audio.wav) is unused — phonemes come from the reference
+        // archive's `kokoro_phonemes` metadata (written by the Python
+        // dumper). The voice-pack GGUF path comes from the
+        // KOKORO_VOICE_GGUF env var, defaulting to the canonical
+        // af_heart pack.
+        const std::string phonemes = ref.meta("kokoro_phonemes");
+        if (phonemes.empty()) {
+            fprintf(stderr,
+                    "crispasr-diff kokoro: reference is missing kokoro_phonemes metadata. "
+                    "Re-dump with KOKORO_PHONEMES=<ipa> set.\n");
+            return 4;
+        }
+        const char* voice_env = std::getenv("KOKORO_VOICE_GGUF");
+        const std::string voice_gguf = (voice_env && *voice_env)
+            ? voice_env
+            : "/tmp/kokoro_voices/kokoro-voice-af_heart.gguf";
+
+        auto cp = kokoro_context_default_params();
+        cp.n_threads = 4;
+        cp.verbosity = 0;
+        kokoro_context* ctx = kokoro_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load kokoro model '%s'\n", model_path.c_str());
+            return 4;
+        }
+        if (kokoro_load_voice_pack(ctx, voice_gguf.c_str()) != 0) {
+            fprintf(stderr, "failed to load voice pack '%s'\n", voice_gguf.c_str());
+            kokoro_free(ctx);
+            return 4;
+        }
+        printf("crispasr-diff kokoro: phonemes=%s  voice=%s\n", phonemes.c_str(), voice_gguf.c_str());
+
+        // Stage list mirrors DEFAULT_STAGES in tools/reference_backends/kokoro.py.
+        // Tolerance split: stages 0..11 are deterministic and must hit
+        // cos ≥ 0.999; stages 12..15 (gen_pre_post_out, mag, phase,
+        // audio_out) depend on SineGen's RNG, which the Python and C++
+        // sides cannot match exactly (PyTorch RNG ≠ std::mt19937), so
+        // they only need to clear cos ≥ 0.95.
+        struct KStage {
+            const char* name;
+            float threshold;
+        };
+        static const KStage kokoro_stages[] = {
+            {"token_ids",        COS_THRESHOLD},
+            {"bert_pooler_out",  COS_THRESHOLD},
+            {"bert_proj_out",    COS_THRESHOLD},
+            {"text_enc_out",     COS_THRESHOLD},
+            {"dur_enc_out",      COS_THRESHOLD},
+            {"pred_lstm_out",    COS_THRESHOLD},
+            {"durations",        COS_THRESHOLD},
+            {"align_out",        COS_THRESHOLD},
+            {"f0_curve",         COS_THRESHOLD},
+            {"n_curve",          COS_THRESHOLD},
+            {"dec_encode_out",   COS_THRESHOLD},
+            {"dec_decode_3_out", COS_THRESHOLD},
+            // RNG-divergent stages — looser cosine threshold (still
+            // catches structural breakage; deterministic content is the
+            // bulk of magnitude in mag/phase/audio).
+            {"gen_pre_post_out", 0.95f},
+            {"mag",              0.95f},
+            {"phase",            0.95f},
+            {"audio_out",        0.95f},
+        };
+        const char* dump_dir = std::getenv("KOKORO_DUMP_STAGES");
+        for (const auto& s : kokoro_stages) {
+            int n_stage = 0;
+            float* mine = kokoro_extract_stage(ctx, phonemes.c_str(), s.name, &n_stage);
+            if (!mine || n_stage <= 0) {
+                printf("[ERR ] %-22s kokoro_extract_stage returned null\n", s.name);
+                if (mine) free(mine);
+                n_fail++;
+                continue;
+            }
+            if (dump_dir && *dump_dir) {
+                char path[512];
+                snprintf(path, sizeof(path), "%s/cpp_%s.bin", dump_dir, s.name);
+                FILE* fp = fopen(path, "wb");
+                if (fp) {
+                    fwrite(mine, sizeof(float), (size_t)n_stage, fp);
+                    fclose(fp);
+                }
+            }
+            auto rep = ref.compare(s.name, mine, (size_t)n_stage);
+            // print_row uses a fixed threshold for PASS/FAIL; route the
+            // looser-tolerance stages through their own threshold so
+            // they're tagged correctly.
+            print_row(s.name, rep, s.threshold);
+            if (!rep.found) {
+                n_skip++;
+            } else if (rep.is_pass(s.threshold)) {
+                n_pass++;
+            } else {
+                n_fail++;
+            }
+            free(mine);
+        }
+        kokoro_free(ctx);
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
-                "Supported: voxtral, voxtral4b, qwen3, granite, granite-4.1, granite-nle, parakeet, canary, cohere, "
-                "gemma4.\n",
+                "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
+                "granite-nle, parakeet, canary, cohere, gemma4.\n",
                 backend_name.c_str());
         return 5;
     }
