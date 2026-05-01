@@ -377,8 +377,10 @@ direction; do not interleave.
   reference verbatim. PLAN #51 SHIPPED. F16 (14.9 GB) + Q4_K
   (4.5 GB) on [`cstr/mimo-asr-GGUF`](https://huggingface.co/cstr/mimo-asr-GGUF)
   with corrected vocab (151680) + merges (151291). MIT.
-  Perf follow-ups (mmap loader, step-only graph, F16 decode) at
-  PLAN #51a/b/c.
+  Perf wave 51b/b' shipped (HISTORY section 60): step-only decode
+  graph + O15-style cache, 1.46× per-step decode, JFK transcript
+  byte-identical. Remaining perf follow-ups (51a mmap loader,
+  51c F16 decode) at LOW priority.
 
   **PLAN #51 status (2026-05-01, late session):**
 

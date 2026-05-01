@@ -16,7 +16,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | Priority | Item | Effort | Status |
 |---|---|---|---|
 | **HIGH** | [#52 Qwen3-TTS](#52-qwen3-tts) — speaker_encoder forward | Medium | talker + code_predictor + codec done; ECAPA next |
-| **DONE** | [#51 MiMo-V2.5-ASR runtime](#51-mimo-v25-asr-runtime--done-may-2026) | Large | end-to-end JFK matches reference; F16+Q4_K on HF; perf follow-ups (51a mmap loader, 51b step-only graph) at LOW |
+| **DONE** | [#51 MiMo-V2.5-ASR runtime](#51-mimo-v25-asr-runtime--done-may-2026) | Large | end-to-end JFK matches reference; F16+Q4_K on HF; 51b/b' shipped (step-only + cached step graph, 1.46× decode); 51a mmap loader + 51c F16 step still LOW |
 | **HIGH** | [#54 granite-speech-4.1 plus / nar](#54-granite-speech-41-plus--nar-variants) | Small | base + plus + nar runtimes all DONE; only NAR quant + HF upload remain |
 | **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phase 1 (Qwen3-TTS-{CustomVoice 0.6B/1.7B, Base 1.7B, VoiceDesign 1.7B}) DONE; Phase 2 Orpheus-3B base DONE (slice c, commit `a0982d3`); Kartoffel_Orpheus + lex-au unblocked as checkpoint swaps; phases 3-5 queued |
 | **MEDIUM** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet/cohere DONE; canary remaining |
@@ -166,33 +166,35 @@ zero-copy on CPU, and is already a pattern in upstream llama.cpp;
 and just held by reference — also clean but needs lifecycle care
 across the existing weight-binding loop. Effort: **Medium**.
 
-### 51b. Step-decode KV cache reuse
+### ~~51b. Step-decode KV cache reuse~~ — **DONE (May 2026)**
 
-The greedy step decode currently rebuilds the full prefill graph
-each step (`mimo_asr_run_lm` calls `mimo_asr_build_prefill_graph`
-inside a fresh `ggml_backend_sched_reset`). The audio-path branches
-are dead in the step graph (every position is a non-empty text
-token, so `text_zero_mask` zeroes them) but still allocated. Two
-wins available:
+Both wins shipped in HISTORY section 60. JFK transcript still
+matches gold byte-for-byte; per-step decode 1.46× faster
+(1.15 s → 0.79 s on M1+Metal+Q4_K).
 
-- **Step-only graph variant** that skips the audio path entirely
-  (input_ids row 0 only, no per-channel speech_codes/combined_mask
-  inputs). Should drop step-decode time roughly 2× by skipping the
-  6-layer input_local_transformer + group_proj.
-- **Cached graph + KV reuse** — the qwen3-tts O15 path is the
-  reference template (build the T=gs decode graph once with
-  fixed-shape inputs; reuse across steps with `ggml_set_rows`-style
-  K/V appends). Should drop another ~30% by avoiding per-step graph
-  alloc + Metal pipeline rebuilds.
+- **Step-only graph variant** — `mimo_asr_build_step_graph`
+  feeds `embed_w[next]` straight into the 36L LM trunk; the
+  6L input_local_transformer + group_proj + fusion are skipped
+  (their decode-time output is provably zero per the masks).
+- **Cached graph + KV reuse** — `ctx->step_t1_gf` mirrors the
+  qwen3-tts O15 path (`fixed_kv_len = kv_max_ctx`,
+  `kv_indices = lm_positions`, `ggml_set_rows`-keyed K/V scatter).
+  Plan reused across all decode steps; invalidated at every
+  transcribe entry and after `extract_stage` rebuilds the prefill
+  graph.
 
-Effort: **Medium** for step-only graph, **Medium** more for caching.
+Plus a diag-capture gate: production transcribe drops 4
+`ggml_set_output` calls + 2 `ggml_cont` clones, diff harness
+keeps them. `MIMO_ASR_BENCH=1` env exposes prefill/decode
+timing.
 
 ### 51c. F16 step decode
 
 Q4_K dequant on every matmul is the largest single cost at decode
 time. F16 weights are ~2× larger but skip the dequant loop
 entirely. Once 51a (mmap loader) lands, F16 decode on M1 should
-hit ≥1× realtime on the JFK clip (Q4_K is currently 0.3×).
+hit ≥1× realtime on the JFK clip (Q4_K is currently 0.2×
+including Metal JIT, ~0.3× warm).
 
 Effort: **Small** once 51a is in.
 

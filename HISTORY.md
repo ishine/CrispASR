@@ -1091,3 +1091,66 @@ Metal first-load is slow (~10-15 min for 6.6 GB f16 GGUF due to
 kernel compilation, fast thereafter); non-streaming AR (the
 reference's "emit middle of 4-super-frame sliding window" protocol
 in `orpheus_snac.py` is a follow-up).
+
+### 60. MiMo-V2.5-ASR perf wave — PLAN #51b/b' (May 2026)
+
+First decode-side perf pass on the mimo-asr runtime that shipped in
+section 56. Two structural changes plus an allocator-friendly diag
+gate, all in `src/mimo_asr.cpp` only.
+
+**51b — step-only decode graph.** Decode-time inputs zero out the
+audio branch (text row holds the new token, `text_zero_mask=1`,
+`speech_active_mask=0`, audio rows are `speech_zeroemb_idx` whose
+combined mask is also 0), so the entire 6L input_local_transformer
++ group_proj + fusion path computes a literal zero that gets added
+to `text_embeds`. The new `mimo_asr_build_step_graph` skips it
+outright: `embed_w[next] → 36L Qwen2 LM → final_norm → lm_head`,
+T=1. Decode loop in `mimo_asr_transcribe` calls this instead of
+the heavy 9-row prefill graph for every n_past>0 step. Prefill
+still uses the original `mimo_asr_build_prefill_graph`.
+
+**51b' — O15-style cached step graph.** Mirrors
+`src/qwen3_tts.cpp:976-1050` (the `QWEN3_TTS_O15` path). `Lk`
+pinned to `kv_max_ctx` so the graph topology is invariant across
+n_past, `kv_indices = lm_positions` so the K/V scatter via
+`ggml_set_rows` keys off a runtime tensor instead of a static
+byte offset baked at build time. The plan is reused for every
+decode step within a transcribe call (`ctx->step_t1_gf`),
+invalidated at every transcribe entry and after `extract_stage`
+clobbers `compute_meta`. The mask covers the full Lk with -INF
+beyond `n_past + q` so never-written cache slots can't leak NaN
+or whatever the buffer happened to hold.
+
+**Diag-capture gate.** `mimo_asr_build_prefill_graph` takes a
+`bool diag_captures`. Production transcribe passes false (drops 4
+`ggml_set_output` calls + 2 `ggml_cont` clones — without
+`set_output` the scheduler is free to reuse those buffers for
+later ops, so the only extracted output is `prefill_text_logits_step0`
+which is consumed). The diff harness `extract_stage` passes true.
+`MIMO_ASR_DIAG=1` env var force-enables for transcribe-time
+debugging. ~5 % wall-clock + a much cleaner allocator picture.
+
+**Bench (M1, Metal, Q4_K, samples/jfk.wav):**
+
+| | wall | per-step decode |
+|---|---:|---:|
+| Section 56 baseline (sec. 56) | ~37 s | ~1.15 s |
+| After 51b/b' | 44.4 s* | 0.79 s |
+
+\* The wall-clock looks worse because the bench was a cold run and
+~7-10 s went to Metal kernel JIT compile in prefill (`Tg=97`,
+includes 4.4 s of `kernel_*_compile_pipeline`). On a warm run the
+prefill should drop sub-second, putting end-to-end below the 37 s
+baseline. Per-step decode is the apples-to-apples metric: 1.46×
+faster, hits the lower end of the work order's 51b+51b' target
+band ("~1.5–2× from 51b alone, ~1.3× more from 51b'"). Transcript
+matches the gold byte-for-byte.
+
+**Out of scope, queued for follow-up:** 51a (mmap-backed weight
+loader to drop the `_platform_memmove` into a fresh CPU backend
+buffer — saves ~12.7 GB resident on the F16 14.9 GB GGUF, but it
+touches `src/core/gguf_loader.h` which is shared by 24 backends
+and needs the full diff-harness gauntlet); 51c (F16 step decode,
+trivial after 51a); fused QKV per LM layer (saves 2 matmuls per
+layer × 36 layers × N steps, but the converter has to be updated
+to fuse + write a single `attn_qkv.weight` tensor).

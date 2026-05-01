@@ -5694,3 +5694,118 @@ throughput collapse (cf. the gigabyte-scale slowdown documented in
 Setting `use_temp_file=False` writes tensors directly and side-steps the
 issue at the cost of holding the full tensor list in RAM during
 write — fine for 6.6 GB f16, will need re-evaluation for VoxCPM2.
+
+# MiMo-V2.5-ASR perf wave — PLAN #51b/b' lessons (May 2026)
+
+Three portable lessons from the first decode-side perf pass on the
+mimo-asr runtime (HISTORY section 60). 1.46× per-step decode
+speedup; the patterns generalise to any speech-LLM with a heavy
+prefill branch that's dead at decode.
+
+## Lesson 1 — when a decode branch mathematically zeroes out, elide it
+
+mimo-asr's prefill graph has two parallel branches: a 6-layer audio
+input_local_transformer + group_proj + fusion (audio path), and
+a text embed lookup + zero-mask (text path). The two are summed at
+`prefill_inputs_embeds`. At decode time, every step's text row
+holds the new generated token (so `text_zero_mask[g] = 1`,
+`speech_active_mask[g] = 0`) and the audio rows hold
+`speech_zeroemb_idx[c]` whose combined-mask gates all contributions
+to zero. The audio path's contribution to `inputs_embeds` is
+provably zero. Reusing the prefill graph means computing 6 audio
+layers + the group_proj matmul + the fusion add per step, all of
+which are dead ops.
+
+The fix: build a separate `mimo_asr_build_step_graph` that skips
+the audio branch outright (`embed_w[next] → 36L LM trunk`). Decode
+loop calls it for n_past>0; prefill keeps using the full graph for
+n_past=0 (where the audio path is alive).
+
+This pattern generalises. For any multi-modal speech-LLM where
+decode-step inputs zero out the prefill-only branch via
+build-pattern-fixed masks (`speech_active_mask=0` is the giveaway
+— if you can prove the mask is identically zero across all decode
+steps, the entire branch is dead), splitting into prefill-graph +
+step-graph is a free perf win. Watch for this on:
+
+- granite-speech NAR/AR (Q-Former projector dead at decode)
+- voxtral / voxtral4b (audio encoder dead at decode)
+- qwen3-asr (whisper encoder dead at decode)
+
+The diff is small — roughly half a graph builder, copy/paste from
+the prefill builder minus the audio nodes. The validation is
+free: greedy decode is deterministic, so the existing
+JFK-transcript-equality test catches any divergence.
+
+## Lesson 2 — the qwen3-tts O15 cached-graph pattern transfers cleanly
+
+The cached T=1 step graph from `src/qwen3_tts.cpp:976-1050`
+(opt-in via `QWEN3_TTS_O15=1` for the code-predictor; the talker
+runs uncached) ports directly to mimo-asr without modification.
+The recipe in three lines:
+
+1. `fixed_kv_len = kv_max_ctx` so graph topology is invariant
+   across n_past (every step has the same Lk-shaped K/V read view
+   and mask).
+2. `kv_indices = positions` (the same I32 tensor that drives RoPE)
+   so the K/V cache write becomes a runtime-keyed
+   `ggml_set_rows(k_layer, K_new_perm, kv_indices)` instead of a
+   static byte offset baked into the graph at build time.
+3. Cache the `gf` pointer in the context. On every subsequent step,
+   skip `ggml_backend_sched_reset` + `_alloc_graph` (the qwen3-tts
+   `skip_plan` path); only update the input tensor values
+   (`text_input_ids`, `lm_positions`, `lm_causal_mask`).
+
+Two non-negotiables, both already documented elsewhere in this
+file but worth re-stating because they bit hard for qwen3-tts and
+will bite again:
+
+- **The KV buffer must be zero-cleared after `ggml_backend_alloc_buffer`.**
+  Otherwise the never-written tail slots hold whatever bytes the
+  allocator handed back, and the partial-CPU / Metal fallback
+  paths read past the masked region anyway. mimo-asr already had
+  the `ggml_backend_buffer_clear` in `mimo_asr_kv_init` — keep
+  it. (See qwen3-tts commit `7298dd5` for the reference
+  regression.)
+- **Cache invalidation is a real concern.** The cached graph
+  lives in `ctx->compute_meta`. Any other graph-build call into
+  the same buffer (a fresh prefill, an `extract_stage` invocation
+  from the diff harness, even a different context's graph if you
+  share `compute_meta`) clobbers the cached pointer. Set
+  `ctx->step_t1_gf = nullptr` at every transcribe entry and after
+  every other graph-build call into the same arena. The fact that
+  this is `nullptr`-safe (the runner just rebuilds) means the
+  failure mode is "no perf win" rather than "crash" — quietly
+  bad, hence document the invariant.
+
+The pattern transfers to **any** KV-cached autoregressive
+decoder, not just speech-LLMs. Talker / code-predictor / LLM
+trunk / NAR — they all have the same shape.
+
+## Lesson 3 — `ggml_set_output` is allocator-pressure, not a feature flag
+
+Lesson 2 of the section above ("Capture tensors MUST call
+`ggml_set_output()`") is the safety side. The other side is: in
+production paths where you don't actually read the captured
+tensor back, **do not** call `ggml_set_output` — it pins the
+buffer past its last consumer and forces the allocator to keep it
+resident.
+
+mimo-asr's prefill graph captures 5 named stages
+(`prefill_audio_features`, `prefill_text_embeds`,
+`prefill_inputs_embeds`, `prefill_last_hidden`,
+`prefill_text_logits_step0`), only the last of which is consumed
+by `mimo_asr_run_lm`. The other four are diff-harness-only.
+Gating them behind a `bool diag_captures` parameter (production
+transcribe passes `false`, diff harness `extract_stage` passes
+`true`, `MIMO_ASR_DIAG=1` env force-enables for transcribe-time
+debug) drops 4 `ggml_set_output` calls + 2 `ggml_cont` clones on
+the production path. ~5 % wall-clock + a measurably cleaner
+allocator picture (smaller peak metadata footprint on the
+scheduler).
+
+The pattern: any backend whose stage-extract API and production
+forward share a graph builder should parameterise the captures.
+Same shape applies to vibevoice (4 prefill stages),
+qwen3-asr (3 prefill stages), parakeet (encoder-side stages) —
+all currently capture all stages unconditionally.
