@@ -118,6 +118,12 @@ def map_tensor_name(hf_name: str) -> str | None:
     n = n.replace("talker.code_predictor.lm_head.", "code_pred.output.")
     n = n.replace("talker.code_predictor.model.norm.", "code_pred.output_norm.")
     n = n.replace("talker.code_predictor.model.layers.", "code_pred.blk.")
+    # 1.7B-only: Linear(talker_hidden→cp_hidden, bias=True) that bridges
+    # the talker's last-hidden into the code predictor's narrower input
+    # space. Identity (and absent from the checkpoint) when both sides
+    # share hidden_size — i.e. for 0.6B variants. See
+    # modeling_qwen3_tts.py:1171.
+    n = n.replace("talker.code_predictor.small_to_mtp_projection.", "code_pred.small_to_mtp.")
 
     # ── Talker (the audio-code AR LM) ──────────────────────────────────
     # HF prefix is `talker.` at top level (no leading `model.`). Map
@@ -203,7 +209,12 @@ def main():
     print(f"  Safetensors:   {len(name_to_idx)} tensors in {len(st_files)} file(s)")
 
     out_path = Path(args.output)
-    w = GGUFWriter(str(out_path), arch="qwen3tts", use_temp_file=True)
+    # use_temp_file=False streams tensors directly to the output file —
+    # avoids the 2x peak disk usage of the spooled-tempfile path. Matters
+    # for 1.7B variants on tight disks (the temp file would hit /tmp on
+    # macOS where boot is also small, or /Volumes/backups where the
+    # output already lives).
+    w = GGUFWriter(str(out_path), arch="qwen3tts", use_temp_file=False)
 
     # ----- metadata -----------------------------------------------------
     w.add_name(f"qwen3-tts-{cfg.get('tts_model_size', '?')}-{cfg.get('tts_model_type', '?')}")

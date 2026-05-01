@@ -388,6 +388,11 @@ struct g3t_code_predictor {
     std::vector<ggml_tensor*> lm_head;    // size 15
     std::vector<g3t_layer> blocks;        // 5 layers
     ggml_tensor* output_norm_w = nullptr;
+    // 1.7B-only: Linear(talker_hidden → cp_hidden, bias=True) bridging
+    // the talker's last-hidden into the narrower code-predictor input.
+    // null on 0.6B variants (talker_hidden == cp_hidden, no projection).
+    ggml_tensor* small_to_mtp_w = nullptr;
+    ggml_tensor* small_to_mtp_b = nullptr;
 };
 
 struct g3t_vocab {
@@ -786,6 +791,8 @@ bool load_talker(qwen3_tts_context* c) {
 bool load_code_predictor(qwen3_tts_context* c) {
     auto& p = c->code_pred;
     p.output_norm_w = try_get(c, "code_pred.output_norm.weight");
+    p.small_to_mtp_w = try_get(c, "code_pred.small_to_mtp.weight");
+    p.small_to_mtp_b = try_get(c, "code_pred.small_to_mtp.bias");
     p.codec_embd.resize(c->hp.cp_n_code_groups - 1);
     p.lm_head.resize(c->hp.cp_n_code_groups - 1);
     char buf[128];
@@ -1415,6 +1422,7 @@ int top_k_sample(const float* logits, int n, int top_k, float temperature, uint6
 
 // Forward-declared: defined in the prefill section below.
 float* lookup_rows(qwen3_tts_context* c, ggml_tensor* weight, const int32_t* ids, int n_ids);
+bool apply_small_to_mtp(qwen3_tts_context* c, const float* in, float* out);
 
 // One step of the code-predictor AR loop. Builds + runs the graph
 // against a caller-supplied (T, d) embedding tensor and the lm_head
@@ -1582,9 +1590,22 @@ bool code_pred_generate_15(qwen3_tts_context* c, const float* past_hidden_d, con
     const char* dump_dir = env_str("QWEN3_TTS_DUMP_DIR");
 
     // ---- step 0: inputs_embeds = (past_hidden, last_id_hidden), n_past=0 ----
+    // For 1.7B variants (talker_hidden=2048, cp_hidden=1024) the talker's
+    // outputs need to flow through `small_to_mtp_projection` (Linear with
+    // bias) before the code predictor consumes them. 0.6B variants have
+    // matched dims and no projection in the GGUF — fall through to memcpy.
     std::vector<float> step0((size_t)2 * d);
-    std::memcpy(step0.data(), past_hidden_d, (size_t)d * sizeof(float));
-    std::memcpy(step0.data() + d, last_id_hidden_d, (size_t)d * sizeof(float));
+    if (cp.small_to_mtp_w) {
+        if (!apply_small_to_mtp(c, past_hidden_d, step0.data())) {
+            return false;
+        }
+        if (!apply_small_to_mtp(c, last_id_hidden_d, step0.data() + d)) {
+            return false;
+        }
+    } else {
+        std::memcpy(step0.data(), past_hidden_d, (size_t)d * sizeof(float));
+        std::memcpy(step0.data() + d, last_id_hidden_d, (size_t)d * sizeof(float));
+    }
     if (getenv("QWEN3_TTS_EMBD_CHECK")) {
         float ph_l1 = 0.0f, lih_l1 = 0.0f;
         for (int j = 0; j < d; j++)
@@ -1853,6 +1874,46 @@ float* lookup_rows(qwen3_tts_context* c, ggml_tensor* weight, const int32_t* ids
     float* r = (float*)malloc((size_t)n_ids * d * sizeof(float));
     ggml_backend_tensor_get(outT, r, 0, (size_t)n_ids * d * sizeof(float));
     return r;
+}
+
+// Apply the talker→code_predictor bridge projection (1.7B-only):
+// `out = bias + W @ in`. Caller supplies float buffers sized d_in
+// (= hp.d_model) and d_out (= hp.cp_d_model). Returns false on failure.
+// Caller should check `c->code_pred.small_to_mtp_w != nullptr` before
+// calling — for 0.6B this returns false (no projection in the GGUF).
+bool apply_small_to_mtp(qwen3_tts_context* c, const float* in, float* out) {
+    auto& p = c->code_pred;
+    if (!p.small_to_mtp_w) {
+        return false;
+    }
+    const int d_in = (int)p.small_to_mtp_w->ne[0];
+    const int d_out = (int)p.small_to_mtp_w->ne[1];
+
+    ggml_init_params ip = {c->compute_meta.size(), c->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16, false);
+    ggml_tensor* xT = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, d_in);
+    ggml_set_name(xT, "x");
+    ggml_set_input(xT);
+    ggml_tensor* y = ggml_mul_mat(ctx0, p.small_to_mtp_w, xT); // (d_out,)
+    if (p.small_to_mtp_b) {
+        y = ggml_add(ctx0, y, p.small_to_mtp_b);
+    }
+    ggml_set_name(y, "y");
+    ggml_build_forward_expand(gf, y);
+    ggml_free(ctx0);
+
+    ggml_backend_sched_reset(c->sched);
+    if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
+        return false;
+    }
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x"), in, 0, (size_t)d_in * sizeof(float));
+    if (ggml_backend_sched_graph_compute(c->sched, gf) != GGML_STATUS_SUCCESS) {
+        return false;
+    }
+    ggml_tensor* yT = ggml_graph_get_tensor(gf, "y");
+    ggml_backend_tensor_get(yT, out, 0, (size_t)d_out * sizeof(float));
+    return true;
 }
 
 // Like lookup_rows but uses a caller-supplied scheduler.
