@@ -54,6 +54,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <string>
 #include <unordered_map>
@@ -161,6 +162,16 @@ struct mimo_asr_context {
     ggml_tensor* kv_v = nullptr;
     int kv_max_ctx = 0;
     int kv_n_used = 0;
+
+    // 51b' cached T=1 step graph. Built lazily on first decode step of a
+    // transcribe call with fixed_kv_len = kv_max_ctx so the topology is
+    // invariant across n_past; subsequent steps reuse the same plan via
+    // skip_plan (no reset/alloc), updating only input tensor values.
+    // Reset to nullptr at the start of every transcribe (kv_max_ctx may
+    // change) and after extract_stage runs (which rebuilds the prefill
+    // graph in the shared compute_meta).
+    ggml_cgraph* step_t1_gf = nullptr;
+    int step_t1_fixed_kv_len = 0;
 
     // Tokeniser GGUF path — set via mimo_asr_set_tokenizer_path before
     // the first transcribe call. Empty until set. The tokenizer context
@@ -580,7 +591,15 @@ static ggml_tensor* build_input_local_block(ggml_context* ctx0, ggml_cgraph* gf,
 //   prefill_inputs_embeds        [llm_hidden, T_groups] F32 (LM input)
 //   prefill_last_hidden          [llm_hidden, 1]        F32 (post final norm)
 //   prefill_text_logits_step0    [vocab, 1]             F32 (lm_head out)
-static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_groups, int n_past) {
+//
+// `diag_captures` controls whether the four diag stages above are kept
+// resident as graph outputs. The diff harness (mimo_asr_extract_stage)
+// passes true to read them back; the production transcribe path passes
+// false so the scheduler can reuse those buffers earlier — same compute,
+// less memory pressure on the allocator. `prefill_text_logits_step0` is
+// the consumed output and is always kept. (~5% win + cleaner alloc per
+// PLAN #51 perf wave.)
+static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_groups, int n_past, bool diag_captures) {
     const auto& hp = ctx->hp;
     const auto& m = ctx->model;
     const int d = (int)hp.llm_hidden;
@@ -665,11 +684,14 @@ static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_gr
     // ops (e.g. inputs_embeds), so the values read back via
     // ggml_graph_get_tensor end up clobbered. Symptom: the per-stage
     // cosine looks fine in isolation but inputs_embeds collapses to
-    // ~0 against the ref.
-    ggml_tensor* audio_features = ggml_cont(ctx0, x);
-    ggml_set_name(audio_features, "prefill_audio_features");
-    ggml_set_output(audio_features);
-    ggml_build_forward_expand(gf, audio_features);
+    // ~0 against the ref. Gated on diag_captures: the production path
+    // skips the cont entirely (it's a pure clone of x).
+    if (diag_captures) {
+        ggml_tensor* audio_features = ggml_cont(ctx0, x);
+        ggml_set_name(audio_features, "prefill_audio_features");
+        ggml_set_output(audio_features);
+        ggml_build_forward_expand(gf, audio_features);
+    }
 
     // ---- Text embedding lookup + zero mask + fusion ----
     ggml_tensor* text_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
@@ -685,16 +707,20 @@ static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_gr
 
     // Capture post-mask text_embeds in isolation, so we can bisect
     // text-vs-audio-vs-fusion when inputs_embeds drifts.
-    ggml_tensor* dbg_text_embeds = ggml_cont(ctx0, text_embeds);
-    ggml_set_name(dbg_text_embeds, "prefill_text_embeds");
-    ggml_set_output(dbg_text_embeds); // see prefill_audio_features comment
-    ggml_build_forward_expand(gf, dbg_text_embeds);
+    if (diag_captures) {
+        ggml_tensor* dbg_text_embeds = ggml_cont(ctx0, text_embeds);
+        ggml_set_name(dbg_text_embeds, "prefill_text_embeds");
+        ggml_set_output(dbg_text_embeds); // see prefill_audio_features comment
+        ggml_build_forward_expand(gf, dbg_text_embeds);
+    }
 
     ggml_tensor* inputs_embeds = ggml_add(ctx0, text_embeds, x); // [d, T]
-    ggml_set_name(inputs_embeds, "prefill_inputs_embeds");
-    ggml_set_output(inputs_embeds);
-    // Mark as build-target so it survives optimisation.
-    ggml_build_forward_expand(gf, inputs_embeds);
+    if (diag_captures) {
+        ggml_set_name(inputs_embeds, "prefill_inputs_embeds");
+        ggml_set_output(inputs_embeds);
+        // Mark as build-target so it survives optimisation.
+        ggml_build_forward_expand(gf, inputs_embeds);
+    }
 
     // ---- 36L Qwen2 LM (KV-cached prefill / step decode) ----
     GGML_ASSERT(ctx->kv_k && ctx->kv_v);
@@ -764,13 +790,128 @@ static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_gr
         last_hidden = ggml_view_2d(ctx0, cur, d, 1, cur->nb[1], (size_t)(T - 1) * cur->nb[1]);
     }
     last_hidden = ggml_cont(ctx0, last_hidden);
-    ggml_set_name(last_hidden, "prefill_last_hidden");
-    ggml_set_output(last_hidden);
-    ggml_build_forward_expand(gf, last_hidden);
+    if (diag_captures) {
+        ggml_set_name(last_hidden, "prefill_last_hidden");
+        ggml_set_output(last_hidden);
+        ggml_build_forward_expand(gf, last_hidden);
+    }
 
-    // lm_head on last position.
+    // lm_head on last position. Always kept — this is the consumed output.
     ggml_tensor* logits = ggml_mul_mat(ctx0, m.llm.lm_head_w, last_hidden);
     ggml_set_name(logits, "prefill_text_logits_step0");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+// 51b — Step decode graph (T=1, n_past>0). Skips the audio path entirely:
+// during decode, every step's text row is the new text token (replicated
+// gs times), the audio rows are speech_zeroemb_idx pads, the
+// speech_active_mask is zero everywhere and the text_zero_mask is one,
+// so the audio branch contributes a literal zero to the LM input. We
+// elide it and feed embed_w[next] straight into the LM trunk.
+//
+// `fixed_kv_len`/`kv_indices` mirror the qwen3-tts O15 path:
+//   fixed_kv_len > 0  → pin Lk so the topology is invariant across n_past
+//   kv_indices != nullptr → scatter-write K/V via ggml_set_rows so the
+//                            destination slot is a runtime input rather
+//                            than baked into the graph as a byte offset.
+// Pass them together to enable the cached-graph reuse path; pass both
+// zero/null for the single-call form.
+//
+// Inputs (set externally before compute):
+//   text_input_ids   [1] I32        — the new text token
+//   lm_positions    [1] I32        — [n_past] (also reused as kv_indices)
+//   lm_causal_mask  [Lk, 1] F16    — 0 for k <= n_past, -INF beyond
+//
+// Output (read by name):
+//   step_logits     [vocab, 1] F32 — lm_head out
+static ggml_cgraph* mimo_asr_build_step_graph(mimo_asr_context* ctx, int n_past, int fixed_kv_len) {
+    const auto& hp = ctx->hp;
+    const auto& m = ctx->model;
+    const int n_q = (int)hp.llm_heads;
+    const int n_kv = (int)hp.llm_kv_heads;
+    const int hd = (int)hp.llm_head_dim;
+    const int n_kv_grp = n_q / n_kv;
+    const float eps = hp.llm_rms_eps;
+    const float theta = hp.llm_rope_theta;
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int T = 1;
+    const int Lk = fixed_kv_len > 0 ? fixed_kv_len : (n_past + T);
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    // Embed lookup straight from llm.embed_w (no audio fusion).
+    ggml_tensor* text_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_input(text_ids);
+    ggml_set_name(text_ids, "text_input_ids");
+    ggml_tensor* inputs_embeds = ggml_get_rows(ctx0, m.llm.embed_w, text_ids); // [d, 1]
+
+    // Positions for RoPE; doubles as kv_indices when fixed_kv_len > 0.
+    ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_input(positions);
+    ggml_set_name(positions, "lm_positions");
+
+    // Causal mask is always declared at T=1 in the cached path so the
+    // topology stays invariant (matches qwen3_tts.cpp O15 pattern).
+    ggml_tensor* causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
+    ggml_set_input(causal_mask);
+    ggml_set_name(causal_mask, "lm_causal_mask");
+
+    GGML_ASSERT(ctx->kv_k && ctx->kv_v);
+    GGML_ASSERT(n_past + T <= ctx->kv_max_ctx);
+    GGML_ASSERT(Lk <= ctx->kv_max_ctx);
+
+    const core_attn::KvSelfAttnParams kvp = {
+        /*n_heads*/ n_q,
+        /*n_kv_heads*/ n_kv,
+        /*head_dim*/ hd,
+        /*n_kv_grp*/ n_kv_grp,
+        /*n_ctx_orig*/ (int)hp.llm_max_pos,
+        /*rope_theta*/ theta,
+        /*rope_beta_fast*/ 0.0f,
+        /*rope_beta_slow*/ 0.0f,
+        /*attn_scale*/ attn_scale,
+        /*qk_norm_eps*/ eps,
+        /*gqa_mode*/ core_attn::GQA_MANUAL_CONT,
+    };
+
+    // When fixed_kv_len is set, hand `positions` to kv_self_attn as the
+    // kv_indices tensor — it scatters K/V via ggml_set_rows keyed by the
+    // runtime n_past, so the cached graph stays correct across steps.
+    ggml_tensor* eff_kv_indices = (fixed_kv_len > 0) ? positions : nullptr;
+
+    ggml_tensor* cur = inputs_embeds;
+    for (uint32_t il = 0; il < hp.llm_layers; il++) {
+        const auto& b = m.llm.blocks[il];
+        ggml_tensor* residual = cur;
+
+        ggml_tensor* h = ggml_rms_norm(ctx0, cur, eps);
+        h = ggml_mul(ctx0, h, b.attn_norm_w);
+
+        ggml_tensor* attn = core_attn::kv_self_attn(
+            ctx0, gf, h, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_o_w,
+            /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, causal_mask, ctx->kv_k, ctx->kv_v, (int)il,
+            /*n_past*/ n_past, kvp,
+            /*qkv_w*/ nullptr, /*fixed_kv_len*/ fixed_kv_len, /*kv_indices*/ eff_kv_indices, b.attn_q_b, b.attn_k_b,
+            b.attn_v_b, /*o_b*/ nullptr);
+        cur = ggml_add(ctx0, residual, attn);
+
+        residual = cur;
+        h = ggml_rms_norm(ctx0, cur, eps);
+        h = ggml_mul(ctx0, h, b.ffn_norm_w);
+        ggml_tensor* mlp = core_ffn::swiglu(ctx0, h, b.ffn_gate_w, b.ffn_up_w, b.ffn_down_w);
+        cur = ggml_add(ctx0, residual, mlp);
+    }
+
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, m.llm.final_norm_w);
+    ggml_tensor* logits = ggml_mul_mat(ctx0, m.llm.lm_head_w, cur); // [vocab, 1]
+    ggml_set_name(logits, "step_logits");
     ggml_set_output(logits);
     ggml_build_forward_expand(gf, logits);
 
@@ -879,7 +1020,12 @@ extern "C" float* mimo_asr_extract_stage(struct mimo_asr_context* ctx, const int
 
     PrefillInputs pi = make_prefill_inputs(hp, input_ids_9xT, T_total, empty_id);
 
-    ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg, /*n_past*/ 0);
+    ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg, /*n_past*/ 0, /*diag_captures*/ true);
+    // Building a fresh prefill graph in compute_meta invalidates any cached
+    // step graph from a prior transcribe — drop the pointer so the next
+    // decode loop rebuilds rather than reading clobbered metadata.
+    ctx->step_t1_gf = nullptr;
+    ctx->step_t1_fixed_kv_len = 0;
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "mimo_asr_extract_stage: failed to alloc graph\n");
@@ -1159,6 +1305,97 @@ static std::vector<int32_t> mimo_asr_concat_segments(int channels_plus_text,
     return out;
 }
 
+// 51b/51b' — Step decode runner. Builds the lightweight T=1 step graph
+// (no audio path) on first call, then reuses the cached plan via
+// skip_plan on every subsequent step within the same transcribe call.
+// `next_token` is the most recent argmax; `n_past_groups` is the number
+// of LM groups already in the KV cache.
+//
+// Cached-graph contract (matches qwen3-tts O15):
+//   • Lk pinned to ctx->kv_max_ctx so the graph topology is invariant
+//     across n_past — any change in n_past is a tensor *value* change,
+//     not a graph-topology change.
+//   • kv_indices is the same `lm_positions` tensor so the K/V scatter
+//     destination is a runtime input rather than a static byte offset.
+//   • Causal mask is shaped (Lk, 1) and filled so columns
+//     [0..n_past] are zero (visible) and the rest are -INF — masking
+//     the never-written tail slots so they can't leak NaN/garbage.
+//   • The KV buffer is zero-cleared at mimo_asr_kv_init (already in
+//     place at line ~459) — required to avoid CUDA / partial-CPU
+//     noise from uninit'd KV pages (cf. qwen3-tts commit 7298dd5).
+static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, int n_past_groups) {
+    const auto& hp = ctx->hp;
+    const int vocab = (int)hp.llm_vocab;
+    GGML_ASSERT(ctx->kv_k && ctx->kv_v);
+    if (n_past_groups + 1 > ctx->kv_max_ctx) {
+        fprintf(stderr, "mimo_asr_run_lm_step: kv overflow (%d+1 > %d)\n", n_past_groups, ctx->kv_max_ctx);
+        return nullptr;
+    }
+
+    const int fixed_kv = ctx->kv_max_ctx;
+    const bool can_skip = (ctx->step_t1_gf != nullptr && ctx->step_t1_fixed_kv_len == fixed_kv);
+
+    ggml_cgraph* gf;
+    if (can_skip) {
+        gf = ctx->step_t1_gf;
+    } else {
+        // n_past=0 here is intentional — only kv_indices (= lm_positions)
+        // controls the cache write slot when fixed_kv_len > 0, and Lk is
+        // already pinned to fixed_kv. The `n_past` parameter is unused
+        // by core_attn::kv_self_attn in that mode (the static-offset
+        // write path is suppressed by kv_indices != nullptr).
+        gf = mimo_asr_build_step_graph(ctx, /*n_past*/ 0, /*fixed_kv_len*/ fixed_kv);
+        if (!gf)
+            return nullptr;
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+            fprintf(stderr, "mimo_asr_run_lm_step: alloc_graph failed\n");
+            return nullptr;
+        }
+        ctx->step_t1_gf = gf;
+        ctx->step_t1_fixed_kv_len = fixed_kv;
+    }
+
+    auto set_t = [&](const char* nm, const void* data, size_t bytes) {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+        if (!t)
+            return false;
+        ggml_backend_tensor_set(t, data, 0, bytes);
+        return true;
+    };
+
+    int32_t tok = next_token;
+    int32_t pos = n_past_groups;
+    if (!set_t("text_input_ids", &tok, sizeof(tok)))
+        return nullptr;
+    if (!set_t("lm_positions", &pos, sizeof(pos)))
+        return nullptr;
+
+    // Causal mask shape (fixed_kv, 1): visible up to and including
+    // position n_past_groups, -INF beyond.
+    std::vector<ggml_fp16_t> mask((size_t)fixed_kv);
+    const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+    for (int k = 0; k < fixed_kv; k++)
+        mask[k] = (k <= n_past_groups) ? z : ninf;
+    if (!set_t("lm_causal_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t)))
+        return nullptr;
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "mimo_asr_run_lm_step: compute failed\n");
+        return nullptr;
+    }
+
+    ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "step_logits");
+    if (!logits_t)
+        return nullptr;
+    float* out = (float*)malloc((size_t)vocab * sizeof(float));
+    if (!out)
+        return nullptr;
+    ggml_backend_tensor_get(logits_t, out, 0, (size_t)vocab * sizeof(float));
+    return out;
+}
+
 // Run the prefill/step graph and return malloc'd logits for the *last*
 // position. T_total must be a multiple of group_size. n_past is the
 // number of LM groups already in the KV cache. Returns nullptr on failure.
@@ -1171,7 +1408,11 @@ static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9x
 
     PrefillInputs pi = make_prefill_inputs(hp, input_ids_9xT, T_total, (uint32_t)ctx->id_empty);
 
-    ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg, n_past);
+    // Production path: skip diag captures (~5% win + cleaner allocator,
+    // PLAN #51 perf wave). Honour MIMO_ASR_DIAG=1 to keep the diag tensors
+    // resident when debugging a transcribe-time regression directly.
+    const bool diag_env = std::getenv("MIMO_ASR_DIAG") != nullptr;
+    ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg, n_past, /*diag_captures*/ diag_env);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
         return nullptr;
@@ -1304,12 +1545,28 @@ extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* ctx, const float* 
     if (!mimo_asr_kv_init(ctx, T_total / gs + max_new + 16))
         return nullptr;
 
+    // The cached step graph from a prior transcribe is invalid: kv_max_ctx
+    // may have changed, and even when it didn't, mimo_asr_run_lm below
+    // rebuilds the prefill graph in the shared compute_meta and clobbers
+    // the old step graph's metadata. Drop the pointer so the first decode
+    // step rebuilds.
+    ctx->step_t1_gf = nullptr;
+    ctx->step_t1_fixed_kv_len = 0;
+
     // 5. Prefill.
+    const bool bench = std::getenv("MIMO_ASR_BENCH") != nullptr;
+    auto now_ms = []() {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+    };
+    const double t_prefill0 = bench ? now_ms() : 0.0;
     float* logits = mimo_asr_run_lm(ctx, input_ids.data(), T_total, /*n_past*/ 0);
     if (!logits) {
         fprintf(stderr, "mimo_asr_transcribe: prefill failed\n");
         return nullptr;
     }
+    const double t_prefill1 = bench ? now_ms() : 0.0;
     int vocab = (int)ctx->hp.llm_vocab;
     auto argmax = [&](const float* L) {
         int best = 0;
@@ -1329,27 +1586,34 @@ extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* ctx, const float* 
     free(logits);
     generated.push_back(next);
 
-    // 6. Greedy decode loop. Each step runs a [9, gs] graph with the
-    //    new text token replicated across the gs positions of the new
-    //    group, and audio rows filled with speech_zeroemb_idx.
+    // 6. Greedy decode loop. Each step uses the lightweight T=1 step
+    //    graph (51b/51b'): no audio path, fixed Lk for cached-graph
+    //    reuse across steps. The full [9, gs] step would compute zero
+    //    in the audio branch (speech_active_mask=0, all audio inputs
+    //    zero-mask out) so we skip it entirely.
+    const double t_decode0 = bench ? now_ms() : 0.0;
+    int decode_steps = 0;
     for (int step = 1; step < max_new; step++) {
         if (next == ctx->id_im_end || next == ctx->id_eos)
             break;
-        std::vector<int32_t> step_ids((size_t)(channels + 1) * gs);
-        for (int t = 0; t < gs; t++)
-            step_ids[t] = next;
-        for (int c = 0; c < channels; c++) {
-            int32_t pad = (int32_t)ctx->hp.speech_zeroemb_idx[c];
-            for (int t = 0; t < gs; t++)
-                step_ids[(size_t)(1 + c) * gs + t] = pad;
-        }
-        float* L = mimo_asr_run_lm(ctx, step_ids.data(), gs, /*n_past*/ n_past_groups);
+        float* L = mimo_asr_run_lm_step(ctx, next, n_past_groups);
         if (!L)
             return nullptr;
         next = argmax(L);
         free(L);
         n_past_groups++;
         generated.push_back(next);
+        decode_steps++;
+    }
+    const double t_decode1 = bench ? now_ms() : 0.0;
+    if (bench) {
+        const double prefill_ms = t_prefill1 - t_prefill0;
+        const double decode_ms = t_decode1 - t_decode0;
+        const double per_step_ms = decode_steps > 0 ? decode_ms / (double)decode_steps : 0.0;
+        fprintf(stderr,
+                "mimo_asr_bench: prefill=%.1f ms (Tg=%d)  decode=%.1f ms over %d steps "
+                "(%.2f ms/step)  total_lm=%.1f ms\n",
+                prefill_ms, T_total / gs, decode_ms, decode_steps, per_step_ms, prefill_ms + decode_ms);
     }
 
     // 7. Detokenize. The upstream drops the last token (typically
