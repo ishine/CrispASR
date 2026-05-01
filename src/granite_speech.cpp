@@ -271,9 +271,13 @@ struct granite_speech_context {
 
     int n_threads = 4;
 
-    // Precomputed relative position embedding lookup (200, 200, 128) F32
-    // rpe_lookup[c][r][d] = rel_pos_emb(attention_dists[c][r])[d]
-    std::vector<float> rpe_lookup;
+    // Precomputed relative position embedding lookup, per encoder block.
+    // Layout: rpe_per_layer[il][c * C * hd + r * hd + d] = rel_pos_emb(attention_dists[c][r])[d]
+    // granite-speech-4.1-2b stores DIFFERENT attn_rel_pos.weight per encoder
+    // block — they are NOT tied across layers, despite older comments in the
+    // tree. The graph encoder used to reuse layer 0's table for all 16 blocks
+    // and silently dropped half the JFK transcript (PLAN #16).
+    std::vector<std::vector<float>> rpe_per_layer;
 
     // For granite-speech-4.1-2b-plus: 0-indexed encoder layer indices whose
     // hidden states are concatenated (along the feature dim) with the final
@@ -723,24 +727,34 @@ extern "C" struct granite_speech_context* granite_speech_init_from_file(const ch
             fprintf(stderr, "granite_speech: BN folded for %d encoder layers\n", folded);
     }
 
-    // Precompute Shaw RPE lookup table (built via
+    // Precompute Shaw RPE lookup table per layer (built via
     // core_conformer_ibm::build_shaw_rpe_lookup; shared with granite_nle).
-    // granite_speech ties RPE across layers, so we build one table from
-    // layer 0's attn_rel_pos_w and reuse it everywhere.
+    // granite-speech-4.1-2b stores DIFFERENT attn_rel_pos.weight per encoder
+    // block — they are NOT tied across layers. The earlier "tied" assumption
+    // silently used layer 0's RPE for all 16 layers in the graph encoder
+    // path, which is what regressed JFK on `GRANITE_ENCODER_GRAPH=1` (PLAN #16).
     {
         const int C = (int)ctx->model.hparams.enc_context_size;
         const int max_pos = (int)ctx->model.hparams.enc_max_pos_emb;
         const int hd = (int)ctx->model.hparams.enc_head_dim;
-        ggml_tensor* rpe_w = ctx->model.encoder.blocks[0].attn_rel_pos_w;
-        if (rpe_w) {
-            if (!core_conformer_ibm::build_shaw_rpe_lookup(rpe_w, C, hd, max_pos, ctx->rpe_lookup)) {
-                fprintf(stderr, "granite_speech: unsupported RPE type %s — skipping RPE\n",
-                        ggml_type_name(rpe_w->type));
-                ctx->rpe_lookup.clear();
-            } else if (params.verbosity >= 1) {
-                fprintf(stderr, "granite_speech: RPE lookup precomputed (%d × %d × %d)\n", C, C, hd);
+        const int n_layers = (int)ctx->model.hparams.enc_n_layers;
+        ctx->rpe_per_layer.assign(n_layers, {});
+        int built = 0;
+        for (int il = 0; il < n_layers; il++) {
+            ggml_tensor* rpe_w = ctx->model.encoder.blocks[il].attn_rel_pos_w;
+            if (!rpe_w)
+                continue;
+            if (!core_conformer_ibm::build_shaw_rpe_lookup(rpe_w, C, hd, max_pos, ctx->rpe_per_layer[il])) {
+                fprintf(stderr, "granite_speech: unsupported RPE type %s at layer %d — skipping\n",
+                        ggml_type_name(rpe_w->type), il);
+                ctx->rpe_per_layer[il].clear();
+            } else {
+                built++;
             }
         }
+        if (params.verbosity >= 1)
+            fprintf(stderr, "granite_speech: RPE lookups precomputed (%d × %d × %d, %d/%d layers)\n", C, C, hd, built,
+                    n_layers);
     }
 
     // Create scheduler
@@ -989,6 +1003,19 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
     if (m.encoder.input_b)
         cur = ggml_add(ctx0, cur, m.encoder.input_b);
 
+    // PLUS variant: collect post-norm hidden states from configured cat_layers.
+    // HF convention: index N = output of encoder block N-1. Index 0 means the
+    // input embedding (this point in the graph). The captured tensors stay
+    // alive because they're sources of the final ggml_concat below — fanout
+    // off the residual stream, no extra compute.
+    const auto& cat_idx = ctx->proj_cat_layers_parsed;
+    const bool do_cat_concat = !cat_idx.empty();
+    std::vector<ggml_tensor*> cat_taps(cat_idx.size(), nullptr);
+    for (size_t k = 0; k < cat_idx.size(); k++) {
+        if (cat_idx[k] == 0)
+            cat_taps[k] = cur;
+    }
+
     // Block-local attention with Shaw relative position embeddings
     const int ctx_size = (int)hp.enc_context_size;
     const int n_blocks_attn = (T + ctx_size - 1) / ctx_size;
@@ -1005,17 +1032,21 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
         ggml_set_input(block_mask);
     }
 
-    // RPE lookup as input: (ctx_size * head_dim, ctx_size) = (200*128, 200) F32.
-    // Memory layout: rpe[k=(r*hd + d), c]; element flat-offset = (r*hd + d) +
-    // (ctx_size*hd) * c. That's identical to the CPU vector's layout
-    // cpu_rpe[c * ctx_size * hd + r * hd + d], so the upload is a direct memcpy.
-    // Reshaping to ne=[hd, ctx_size, ctx_size] gives axes [d, r, c].
-    ggml_tensor* rpe_tensor = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ctx_size * hd, ctx_size);
+    // RPE lookup as input: stacked across layers.
+    // Shape: (ctx_size * head_dim, ctx_size, n_layers) F32.
+    // Memory layout per layer: rpe[k=(r*hd + d), c]; element flat-offset =
+    // (r*hd + d) + (ctx_size*hd) * c. That matches the CPU vector layout
+    // cpu_rpe[c * ctx_size * hd + r * hd + d] so each layer's upload is a
+    // direct memcpy at offset il * (ctx_size * hd * ctx_size).
+    // Reshaping to ne=[hd, ctx_size, ctx_size, n_layers] gives axes
+    // [d, r, c, layer]; per-layer slicing uses ggml_view_3d on the layer dim.
+    ggml_tensor* rpe_tensor =
+        ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, ctx_size * hd, ctx_size, with_rpe ? n_layers : 1);
     ggml_set_name(rpe_tensor, "rpe_lookup");
     ggml_set_input(rpe_tensor);
 
-    // Reshape once for the per-block subgraph path: (hd, ctx_size_r, ctx_size_c).
-    ggml_tensor* rpe_3d = with_rpe ? ggml_reshape_3d(ctx0, rpe_tensor, hd, ctx_size, ctx_size) : nullptr;
+    ggml_tensor* rpe_4d =
+        with_rpe ? ggml_reshape_4d(ctx0, rpe_tensor, hd, ctx_size, ctx_size, n_layers) : nullptr;
 
     // 16 × Conformer blocks
     for (int il = 0; il < n_layers; il++) {
@@ -1071,6 +1102,12 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
                 // bit-identical math, but emitted as ggml ops so the whole
                 // 16-layer encoder stays a single graph dispatch. For each
                 // block we compute scores = Q·K^T + Q·RPE, softmax, then ·V.
+                //
+                // This layer's RPE = a (hd, ctx_size, ctx_size) view into the
+                // stacked rpe_4d on the layer (4th) axis.
+                ggml_tensor* rpe_3d_il = ggml_view_3d(ctx0, rpe_4d, hd, ctx_size, ctx_size, rpe_4d->nb[1],
+                                                     rpe_4d->nb[2], (size_t)il * rpe_4d->nb[3]);
+
                 std::vector<ggml_tensor*> block_outs;
                 block_outs.reserve(n_blocks_attn);
                 for (int blk = 0; blk < n_blocks_attn; blk++) {
@@ -1093,8 +1130,9 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
                     //   B = Q_blk_4d   : (hd, 1,         blk_len_c, n_heads)
                     //   out            : (blk_len_r, 1, blk_len_c, n_heads)
                     // Broadcasting in batch dim 0 (1 → n_heads).
-                    ggml_tensor* rpe_blk = ggml_cont(
-                        ctx0, ggml_view_3d(ctx0, rpe_3d, hd, blk_len, blk_len, rpe_3d->nb[1], rpe_3d->nb[2], 0));
+                    ggml_tensor* rpe_blk =
+                        ggml_cont(ctx0, ggml_view_3d(ctx0, rpe_3d_il, hd, blk_len, blk_len, rpe_3d_il->nb[1],
+                                                     rpe_3d_il->nb[2], 0));
                     ggml_tensor* rpe_blk_4d = ggml_reshape_4d(ctx0, rpe_blk, hd, blk_len, blk_len, 1);
                     ggml_tensor* Q_blk_4d = ggml_reshape_4d(ctx0, Q_blk, hd, 1, blk_len, n_heads);
                     ggml_tensor* pos_bias_4d = ggml_mul_mat(ctx0, rpe_blk_4d, Q_blk_4d);
@@ -1245,6 +1283,15 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
                 cur = ggml_add(ctx0, cur, b.post_norm_b);
         }
 
+        // PLUS: snapshot the post-norm hidden state for any cat_layer index
+        // that maps to this block. HF index il+1 = output of block il.
+        // Captured BEFORE the mid-CTC residual so it matches HF's
+        // output_hidden_states tuple (CPU loop does the same).
+        for (size_t k = 0; k < cat_idx.size(); k++) {
+            if (cat_idx[k] == il + 1)
+                cat_taps[k] = cur;
+        }
+
         // Mid-CTC residual at layer 8 (after 8th layer = index 7)
         if (il == n_layers / 2 - 1 && m.encoder.ctc_out_w && m.encoder.ctc_mid_w) {
             // out: (d → ctc_dim) → softmax → out_mid: (ctc_dim → d) → add to hidden
@@ -1259,6 +1306,20 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
         }
     }
 
+    // PLUS: concat captured cat_layer hiddens + final encoder output along
+    // the feature dim (ne[0]). Layout per frame: [cat_0, cat_1, ..., final],
+    // each (d) wide → total (n_cat + 1) * d. Matches the projector's
+    // expected input width and the CPU loop's wide buffer layout.
+    if (do_cat_concat) {
+        ggml_tensor* wide = nullptr;
+        for (size_t k = 0; k < cat_taps.size(); k++) {
+            ggml_tensor* t = cat_taps[k] ? cat_taps[k] : cur; // safety: shouldn't happen
+            wide = wide ? ggml_concat(ctx0, wide, t, 0) : t;
+        }
+        wide = ggml_concat(ctx0, wide, cur, 0);
+        cur = wide;
+    }
+
     ggml_set_name(cur, "enc_output");
     ggml_build_forward_expand(gf, cur);
     ggml_free(ctx0);
@@ -1271,24 +1332,26 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bo
 // different output from the CPU path. The main benefit is that the graph
 // automatically uses ggml's optimised matmul/conv kernels and can run on
 // GPU via the scheduler.
-static float* granite_run_encoder_graph(granite_speech_context* ctx, const float* mel, int n_mels, int T, int d) {
+static float* granite_run_encoder_graph(granite_speech_context* ctx, const float* mel, int n_mels, int T, int d,
+                                        int* out_dim) {
+    (void)d;
     const auto& hp = ctx->model.hparams;
     const int hd = (int)hp.enc_head_dim; // 128
     const int ctx_size = (int)hp.enc_context_size;
 
-    // GRANITE_ENCODER_GRAPH_RPE=1 selects the per-block manual-attention path
-    // that includes Shaw RPE (bit-identical to the CPU loop). Default behaviour
-    // (no env or value=0) keeps the existing flash_attn_ext path that drops
-    // the RPE bias — kept for A/B comparison.
-    bool with_rpe = false;
-    if (const char* e = std::getenv("GRANITE_ENCODER_GRAPH_RPE"))
-        with_rpe = (e[0] != '0' && e[0] != '\0');
-
-    if (with_rpe && ctx->rpe_lookup.empty()) {
-        fprintf(stderr, "granite_encoder_graph: GRANITE_ENCODER_GRAPH_RPE=1 requested but rpe_lookup is empty — "
-                        "falling back to no-RPE path\n");
-        with_rpe = false;
+    // Default: per-block manual-attention path with Shaw RPE bias
+    // (bit-identical to the CPU loop). Falls back to flash_attn_ext without
+    // RPE only when rpe_per_layer is missing entries — that path is
+    // numerically approximate and is kept just so the encoder still runs on
+    // models with an unsupported RPE weight type.
+    const int n_layers = (int)ctx->model.hparams.enc_n_layers;
+    bool with_rpe = (int)ctx->rpe_per_layer.size() == n_layers;
+    for (int il = 0; il < n_layers && with_rpe; il++) {
+        if (ctx->rpe_per_layer[il].empty())
+            with_rpe = false;
     }
+    if (!with_rpe)
+        fprintf(stderr, "granite_encoder_graph: rpe_per_layer missing entries — using approximate no-RPE path\n");
 
     ggml_cgraph* gf = granite_build_encoder(ctx, T, with_rpe);
     ggml_backend_sched_reset(ctx->sched);
@@ -1314,19 +1377,28 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
     }
 
-    // RPE lookup. With with_rpe=true, upload the precomputed CPU table; both
-    // layouts (CPU vector and graph tensor) flat-index to the same offsets, so
-    // it's a direct memcpy. Without with_rpe, the tensor still exists in the
-    // graph (declared as input) but is unused — fill with zeros to satisfy the
-    // scheduler.
+    // RPE lookup. With with_rpe=true, upload the per-layer precomputed CPU
+    // tables stacked along the third axis (one (ctx_size*hd, ctx_size) slab
+    // per layer). Each layer's flat layout matches the CPU vector
+    // cpu_rpe[c * ctx_size * hd + r * hd + d] so the per-layer copy is a
+    // direct memcpy at offset il * per_layer.
+    // Without with_rpe, the tensor still exists in the graph (declared as
+    // input) but is unused — fill with zeros to satisfy the scheduler.
     ggml_tensor* rpe_t = ggml_graph_get_tensor(gf, "rpe_lookup");
     if (rpe_t) {
-        const size_t need = (size_t)ctx_size * hd * ctx_size;
+        const size_t per_layer = (size_t)ctx_size * hd * ctx_size;
         if (with_rpe) {
-            ggml_backend_tensor_set(rpe_t, ctx->rpe_lookup.data(), 0, need * sizeof(float));
+            std::vector<float> stacked(per_layer * n_layers, 0.0f);
+            for (int il = 0; il < n_layers; il++) {
+                if ((int)ctx->rpe_per_layer.size() > il && ctx->rpe_per_layer[il].size() == per_layer) {
+                    std::memcpy(stacked.data() + (size_t)il * per_layer, ctx->rpe_per_layer[il].data(),
+                                per_layer * sizeof(float));
+                }
+            }
+            ggml_backend_tensor_set(rpe_t, stacked.data(), 0, stacked.size() * sizeof(float));
         } else {
-            std::vector<float> rpe_zeros(need, 0.0f);
-            ggml_backend_tensor_set(rpe_t, rpe_zeros.data(), 0, need * sizeof(float));
+            std::vector<float> rpe_zeros(per_layer, 0.0f);
+            ggml_backend_tensor_set(rpe_t, rpe_zeros.data(), 0, rpe_zeros.size() * sizeof(float));
         }
     }
 
@@ -1338,7 +1410,12 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
     ggml_tensor* out = ggml_graph_get_tensor(gf, "enc_output");
     if (!out)
         return nullptr;
-    size_t total = (size_t)T * d;
+    // ne[0] is the feature dim — `d` for the base graph, `(n_cat + 1) * d`
+    // for the PLUS variant after the in-graph concat.
+    const int actual_dim = (int)out->ne[0];
+    if (out_dim)
+        *out_dim = actual_dim;
+    size_t total = (size_t)T * actual_dim;
     float* result = (float*)malloc(total * sizeof(float));
     ggml_backend_tensor_get(out, result, 0, total * sizeof(float));
     return result;
@@ -1404,19 +1481,28 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
     const auto& hp = ctx->model.hparams;
     const int d = (int)hp.enc_d_model; // 1024
 
-    // Experimental: run the full encoder as a single ggml graph instead of
-    // the manual per-op CPU loop path. Enable with GRANITE_ENCODER_GRAPH=1.
-    // The graph path omits Shaw RPE (approximate), so output may differ
-    // slightly from the CPU path. Useful for benchmarking and GPU testing.
-    if (std::getenv("GRANITE_ENCODER_GRAPH")) {
+    // Default path: run the full 16-layer encoder as a single ggml graph
+    // (PLAN #16). The graph encoder includes Shaw RPE per-layer and is
+    // bit-near-identical to the per-op CPU loop while being ~2.3× faster
+    // end-to-end on M1 + Q4_K. PLUS variant (cat_layers) is supported via
+    // an in-graph concat of the captured per-layer post-norm hiddens with
+    // the final encoder output. Set GRANITE_DISABLE_ENCODER_GRAPH=1 to
+    // fall back to the CPU loop (slower but kept around for debugging).
+    bool use_graph = true;
+    if (const char* e = std::getenv("GRANITE_DISABLE_ENCODER_GRAPH"))
+        if (e[0] != '0' && e[0] != '\0')
+            use_graph = false;
+    if (use_graph) {
         if (ctx->params.verbosity >= 1)
-            fprintf(stderr, "  encoder: using ggml graph path (GRANITE_ENCODER_GRAPH=1)\n");
-        float* result = granite_run_encoder_graph(ctx, mel, n_mels, T_mel, d);
+            fprintf(stderr, "  encoder: using ggml graph path%s\n",
+                    ctx->proj_cat_layers_parsed.empty() ? "" : " (PLUS in-graph concat)");
+        int graph_dim = d;
+        float* result = granite_run_encoder_graph(ctx, mel, n_mels, T_mel, d, &graph_dim);
         if (result) {
             if (out_N)
                 *out_N = T_mel;
             if (out_dim)
-                *out_dim = d;
+                *out_dim = graph_dim;
             return result;
         }
         fprintf(stderr, "  encoder: graph path failed, falling back to CPU loops\n");
@@ -1479,22 +1565,9 @@ extern "C" float* granite_speech_run_encoder(struct granite_speech_context* ctx,
     std::vector<float> attn_out((size_t)d * T);
     std::vector<float> conv_out((size_t)d * T);
 
-    // Precompute per-layer Shaw RPE lookups (built via
-    // core_conformer_ibm::build_shaw_rpe_lookup; shared with granite_nle).
-    std::vector<std::vector<float>> rpe_per_layer(n_layers);
-    {
-        const int max_pos = (int)hp.enc_max_pos_emb;
-        for (int il = 0; il < n_layers; il++) {
-            ggml_tensor* rpe_w = ctx->model.encoder.blocks[il].attn_rel_pos_w;
-            if (!rpe_w)
-                continue;
-            if (!core_conformer_ibm::build_shaw_rpe_lookup(rpe_w, ctx_size, hd, max_pos, rpe_per_layer[il])) {
-                fprintf(stderr, "granite_speech: unsupported RPE type %s at layer %d\n", ggml_type_name(rpe_w->type),
-                        il);
-                rpe_per_layer[il].clear();
-            }
-        }
-    }
+    // Use the per-layer Shaw RPE lookups precomputed at load time
+    // (ctx->rpe_per_layer, built via core_conformer_ibm::build_shaw_rpe_lookup).
+    const auto& rpe_per_layer = ctx->rpe_per_layer;
 
     for (int il = 0; il < n_layers; il++) {
         const auto& b = ctx->model.encoder.blocks[il];

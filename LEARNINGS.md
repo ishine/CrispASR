@@ -4450,10 +4450,13 @@ bias (bit-near-identical to the CPU loop, well above
 `cos_min ≥ 0.999` on JFK). Numbers on M1 / Q4_K (encoder F32) for
 an 11 s JFK clip:
 
-| Path                                         | total   | realtime |
-|----------------------------------------------|--------:|---------:|
-| CPU loops (`GRANITE_DISABLE_ENCODER_GRAPH=1`)|  4.85 s |   2.3×   |
-| Graph (default)                              |  2.11 s | **5.2×** |
+| Variant            | CPU loop      | Graph (default) | Speedup |
+|--------------------|--------------:|----------------:|--------:|
+| `granite-4.1`      | 4.78 s (2.3×) | **2.31 s (4.8×)** | ~2.1×  |
+| `granite-4.1-plus` | 9.41 s (1.2×) | **3.74 s (2.9×)** | ~2.5×  |
+| `granite-4.1-nar`  | 19.27 s¹       | **6.41 s (1.7×)** | ~3.0×  |
+
+¹ NAR CPU-loop run was disk-contended; both transcripts byte-for-byte identical.
 
 **Per-block subgraph shape.** Mirrors the projector's windowed
 dispatch: `ctx_size=200` blocks, `ceil(T/200)` blocks per layer, all
@@ -4464,6 +4467,21 @@ table is precomputed once per layer at load time
 single stacked input tensor of shape
 `(ctx_size*hd, ctx_size, n_layers)`, sliced per-layer via
 `ggml_view_3d` on the layer axis.
+
+**Variant-specific bits in the graph.** The PLUS variant captures
+post-norm hidden states at every `cat_hidden_layers` index and
+concatenates them with the final encoder output along the feature dim
+inside the graph (`ggml_concat` axis 0) — fanout off the residual
+stream, no extra compute. The NAR variant adds a self-conditioning
+residual at the configurable layer (default 8), taps `softmax(mid_logits)`
+so the runner can pull per-frame `blank_prob` for the BPE auxiliary
+head's `posterior_weighted_pool`, and exposes the final CTC logits as
+a named graph output. The pool itself stays on CPU (windowed reduce
+that doesn't fit a single ggml op); `bpe_out_w` matmul rides the same
+scheduler. The PLUS / NAR-specific concat tensors live in
+`granite_build_encoder` (granite-speech) and `granite_nle_build_encoder`
+(NAR) — both share the per-block attention + Macaron + conv module
+shape via `core/conformer_ibm.h`.
 
 **Regression that motivated this** *(May 2026, fixed in this commit).*
 The earlier `GRANITE_ENCODER_GRAPH=1` baseline silently produced
@@ -5432,7 +5450,7 @@ repeating: any tensor read out of a graph via
 `ggml_graph_get_tensor()` (i.e. for diff-harness extraction) must
 call `ggml_set_output()` in addition to `ggml_set_name()`. Without
 it, the scheduler treats the named cont/add nodes as ordinary
-intermediates and reuses their buffers when allocating later ops
+intermediates and may reuse their buffers when allocating later ops
 that consume the same upstream tensor.
 
 We hit this on MiMo as `prefill_inputs_embeds` reading back as

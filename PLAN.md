@@ -26,7 +26,6 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | |
 | **LOW** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | |
 | **LOW** | [#11 WebSocket server](#11-websocket-streaming-server) | High | |
-| **DONE** | [#16 Shaw RPE](#16-shaw-rpe-for-granite-graph) | Medium | graph encoder path now default — ~2.3× total realtime; per-layer RPE fix landed |
 | **BLOCKED** | [#42 VibeVoice-ASR 7B](#42-vibevoice-asr-7b) | High | Needs ≥16 GB RAM |
 | **BLOCKED** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | License unclear |
 
@@ -104,84 +103,19 @@ support WebSocket — need custom protocol or library.
 ---
 
 
-## 16. Shaw RPE for granite graph
+## ~~16. Shaw RPE for granite graph~~ — **DONE (May 2026)**
 
-Today the encoder runs as ~96 small ggml graphs (one per matmul / per
-layer) dispatched serially through `ggml_backend_sched`. With Metal
-each dispatch is a full command-buffer round-trip — encoder time
-dominates at ~3.6 s of a ~5 s total on M1 + Q4_K. The opt-in
-`GRANITE_ENCODER_GRAPH=1` path builds the whole 16-layer encoder as
-ONE graph; numbers from LEARNINGS:
-
-| Path                       | run_encoder | total      | realtime |
-|----------------------------|------------:|-----------:|---------:|
-| CPU loops (default)        |  12,624 ms  |  19.6 s    | 0.6×     |
-| `GRANITE_ENCODER_GRAPH=1`  |   3,110 ms  |   7.55 s   | **1.5×** |
-
-It's not the default because the graph path uses
-`ggml_flash_attn_ext`, which can't ingest a Q-dependent additive
-bias — so Shaw RPE is silently omitted and encoder output drifts
-from the CPU path. Accuracy on JFK is fine; harder material (long
-context, dense overlap) likely degrades.
-
-### Two viable approaches
-
-**Option A — flash-attn with Q-dependent bias.** Compute the
-`Q · RPE` term inside the graph (each Q row vs each precomputed
-per-position embedding row → a (T, ctx_size, hd) tensor reduced to
-(T, ctx_size) per head), feed it to `flash_attn_ext`'s mask slot as
-an additive bias. Keeps flash-attn's I/O fusion. Tricky because the
-mask slot is currently F16 and broadcastable but not per-Q-vector;
-needs either a flash-attn op extension or a manual `mul_mat`-then-
-softmax-then-`mul_mat` chain in place of flash-attn.
-
-**Option B — block-attention via per-block subgraphs (preferred for
-the prototype).** Reuse the same windowed-dispatch pattern the
-projector already uses (`ctx_size=200`, ceil(T/200) blocks). Per
-block per layer, build a small graph that does:
-
-  scores = Q · K^T  +  Q · RPE_block      // (block_len × block_len)
-  attn   = softmax(scores · attn_scale) · V
-
-The RPE bias is precomputed once per layer at load time
-(`core_conformer_ibm::build_shaw_rpe_lookup`, already lifted) and fed
-in as a static F32 input tensor. No flash-attn fusion, but the Q/K/V
-projections, ffn1/ffn2, conv module, and Shaw scoring all live in
-one graph per block per layer — still ~16× fewer dispatches than the
-current per-op path. Math is bit-identical to the CPU loop.
-
-### Plan
-
-1. **DONE (prototype, May 2026):** per-block subgraph attention with
-   Shaw RPE wired up behind `GRANITE_ENCODER_GRAPH_RPE=1`.
-2. **DONE (May 2026):** root-caused the regression — the loader built
-   only layer 0's RPE lookup (`ctx->rpe_lookup`) and the graph builder
-   reused it for all 16 layers, on the assumption that
-   granite-speech ties RPE across layers. granite-speech-4.1-2b in
-   fact stores **distinct** `attn_rel_pos.weight` per encoder block
-   (verified: layer 0 mean 0.00004, layer 1 mean -0.003, layer 2 mean
-   -0.002). Fix: precompute `rpe_per_layer[il]` at load time, declare
-   the graph's `rpe_lookup` input with shape
-   `(ctx_size*hd, ctx_size, n_layers)`, and slice per-layer via
-   `ggml_view_3d` on the layer axis. CPU loop now uses the same
-   per-layer lookups. Stage-by-stage taps confirm bit-near-identical
-   output between graph and CPU paths through all 16 layers (within
-   float precision).
-3. **DONE:** with-RPE graph path transcribes JFK byte-for-byte
-   identical to CPU loop on `granite-speech-4.1-2b-q4_k`. Encoder
-   runs at ~2.1 s vs ~4.9 s CPU baseline (≈2.3× speedup, end-to-end).
-4. **DONE:** `GRANITE_ENCODER_GRAPH_RPE=1` retired in favour of the
-   graph path being on by default. The PLUS variant (cat_layers) and
-   any model whose `attn_rel_pos.weight` type is unsupported by
-   `core_conformer_ibm::build_shaw_rpe_lookup` automatically fall back
-   to the CPU loop.
-5. **DONE:** `GRANITE_DISABLE_ENCODER_GRAPH=1` is the escape hatch
-   back to the CPU loop (slower but kept around for debugging).
-
-**Validation gate (per the methodology in LEARNINGS):** stage-by-stage
-diff. With per-layer RPE, every sub-stage of layer 0 and layer 1
-matches CPU within ~1e-3, and the final encoder output matches within
-the same tolerance — well above the cos_min ≥ 0.999 bar.
+Per-block subgraph attention with Shaw RPE landed and is now the
+default encoder path for **all three** granite variants —
+granite-speech base, PLUS (in-graph cat_layers concat), and NAR
+(`granite_nle.cpp` mirror with self-cond residual + snapshot concat
++ final CTC logits + blank-prob softmax tap). Per-layer RPE bug
+(layer 0 reused for all 16 blocks) fixed. End-to-end realtime on
+M1 + Q4_K: base 2.3× → 4.8×, plus 1.2× → 2.9×, nar 0.6× → 1.7×.
+All three transcribe JFK byte-for-byte identical to the CPU loop.
+`GRANITE_DISABLE_ENCODER_GRAPH=1` is the unified escape hatch.
+Full write-up in [HISTORY.md §55](HISTORY.md). Lesson recorded in
+LEARNINGS.
 
 ---
 
@@ -997,7 +931,8 @@ adding a codec head + sampling path. Cheaper than a full new backend.
 | Phase | Model | License | Status | Effort |
 |---|---|---|---|---|
 | 1 | Qwen3-TTS-CustomVoice 0.6B | Apache 2.0 | **DONE — runtime spk_id path landed; 4 ASR roundtrips passed (vivian / aiden / serena / dylan-dialect). Registry line added; HF upload pending.** | S |
-| 1 | Qwen3-TTS-CustomVoice 1.7B | Apache 2.0 | queued | XS |
+| 1 | Qwen3-TTS-CustomVoice 1.7B | Apache 2.0 | **DONE — `small_to_mtp_projection` now applied to code_pred per-step embeddings (steps 1..14), not just step 0. ASR roundtrips passed on Q8_0/ryan + F16/vivian (exact-match transcripts on long prompt). HF upload pending.** | S |
+| 1 | Qwen3-TTS-Base 1.7B | Apache 2.0 | **DONE — runtime parameterised `spk_enc_dim` (was hardcoded 1024) so the 1.7B's 2048-d ECAPA output stops getting truncated; registry alias `qwen3-tts-1.7b-base` + HF model-card stub landed. ASR-roundtrip word-exact on F16/Q8_0 (clone.wav English ICL). HF upload to `cstr/qwen3-tts-1.7b-base-GGUF` pending.** | S |
 | 2 | Orpheus-3B base | llama3.2 | queued | M |
 | 2 | Kartoffel_Orpheus DE (natural+synthetic) | llama3.2 | blocked on Orpheus base | XS |
 | 2 | lex-au Orpheus-3B-DE-Q8 | llama3.2 | blocked on Orpheus base (already GGUF) | XS |

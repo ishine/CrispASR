@@ -351,6 +351,9 @@ direction; do not interleave.
   `tools/reference_backends/gemma4.py` (audio-only path fits 8 GB
   RAM via `_dump_audio_only`). Apache 2.0.
   Open polish: speed (currently ~0.2× realtime — see #17 below).
+- **MiMo-V2.5-ASR** — **[IN PROGRESS]** Xiaomi 8B Qwen2 + 1.2B RVQ audio tokenizer.
+  Both converters DONE. F16 GGUFs on HF: `cstr/mimo-asr-GGUF` (15.3 GB),
+  `cstr/mimo-tokenizer-GGUF` (Q4_K 377 MB). Runtime not yet written. MIT.
 - **German wav2vec2 models** — **[DONE]** 5 models on HF, all Apache 2.0 / MIT:
   `wav2vec2-large-xlsr-53-german` (222 MB Q4_K), `wav2vec2-large-xlsr-53-german-cv13` (212 MB),
   `wav2vec2-base-german-cv9` (80 MB, MIT), plus 1B models converting on Kaggle.
@@ -1055,17 +1058,30 @@ each backend. High-value gaps to close:
   frames → `run_llm_editing` → per-row argmax + uniq + drop EOS +
   detokenize. JFK end-to-end output matches reference `final_text`
   exactly via `crispasr-diff granite-nle ... transcribe` PASS.
-- **[in-progress] Shaw RPE in graph path — per-block subgraph prototype.**
-  Prototype landed May 2026 behind `GRANITE_ENCODER_GRAPH_RPE=1` —
-  per-block subgraph attention emits `Q·K^T + Q·RPE_block → softmax → ·V`
-  using `core_conformer_ibm::build_shaw_rpe_lookup` for the per-layer
-  bias. Encoder time drops ~3× on the new path. **Blocked on validation:**
-  the upstream `GRANITE_ENCODER_GRAPH=1` (no-RPE flash) baseline is
-  itself broken on JFK in current tree (transcribes only "ask what you
-  can do for your country" instead of the full quote), so end-to-end
-  cannot distinguish "RPE math correct" from "RPE math wrong". Next
-  session: bisect the encoder-graph regression, then validate the RPE
-  addition against a working baseline. Full plan in PLAN #16.
+- **[done] Shaw RPE in graph path — per-block subgraph default,
+  all three variants on graph.** Per-block subgraph attention emits
+  `Q·K^T + Q·RPE_block → softmax → ·V` using
+  `core_conformer_ibm::build_shaw_rpe_lookup` for the per-layer bias.
+  Root-caused the regression that blocked validation: the loader was
+  building only **layer 0's** RPE lookup and the graph reused it for
+  all 16 layers (the "tied across layers" assumption is false for
+  granite-speech-4.1-2b — each block stores a distinct
+  `attn_rel_pos.weight`). Fix: precompute `ctx->rpe_per_layer[il]` at
+  load time, declare the graph's `rpe_lookup` input with shape
+  `(ctx_size*hd, ctx_size, n_layers)`, and slice per-layer via
+  `ggml_view_3d`. PLUS variant captures `cat_hidden_layers` post-norm
+  tensors inline in the graph and concats them with the final encoder
+  output via `ggml_concat`. NAR (`granite_nle.cpp`) gets the same
+  treatment in a sibling `granite_nle_build_encoder` with self-cond
+  residual at the configurable layer, blank-prob softmax tap for the
+  BPE aux head's `posterior_weighted_pool` (CPU side; bpe_out_w matmul
+  stays on the scheduler), final CTC logits as a named output, and an
+  in-graph snapshot concat across `enc_layer_indices_parsed`. All three
+  paths transcribe JFK byte-for-byte identical to CPU loop.
+  `GRANITE_DISABLE_ENCODER_GRAPH=1` is the unified escape hatch.
+  End-to-end on M1+Q4_K: base 4.78s → 2.31s (~2.1×), plus
+  9.41s → 3.74s (~2.5×), nar 19.27s → 6.41s (~3.0×, NAR CPU-loop run
+  was disk-contended).
 - **[done] NAR HF upload — F16 + 3× Q4_K.** All four GGUFs published
   to [`cstr/granite-speech-4.1-2b-nar-GGUF`](https://huggingface.co/cstr/granite-speech-4.1-2b-nar-GGUF):
   F16 (5.4 GB), Q4_K (3.2 GB; encoder F32, recommended), Q4_K-f16enc

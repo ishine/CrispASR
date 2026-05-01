@@ -755,6 +755,89 @@ granite_llm 162 + qformer 255). Roughly half of those core LOC are
 deduplicated math (the rest is comments + struct/API plumbing). Plus a
 clean separation of "backbone" (in core) from "plumbing" (in TUs).
 
+### 55. Granite encoder graph path as default — PLAN #16 (May 2026)
+
+The `GRANITE_ENCODER_GRAPH=1` no-RPE flash-attn baseline silently
+regressed: on JFK with `granite-speech-4.1-2b-q4_k` it produced only
+the back half of the quote ("ask what you can do for your country").
+The PLAN #16 prototype (per-block subgraph attention with Shaw RPE,
+gated by `GRANITE_ENCODER_GRAPH_RPE=1`) inherited the same wrong
+output, so end-to-end validation was blocked.
+
+**Root cause.** The loader built only **layer 0's** RPE lookup
+(`ctx->rpe_lookup`, single `vector<float>`) and the graph builder
+reused it for all 16 encoder blocks, on the assumption that RPE is
+tied across layers. granite-speech-4.1-2b in fact stores **distinct**
+`attn_rel_pos.weight` per block (verified: layer 0 mean ≈ 0.00004,
+layer 1 mean ≈ -0.003, layer 2 mean ≈ -0.002). Layer 0 still
+matched the CPU loop bit-for-bit, but layer 1's attention diverged
+immediately and the drift compounded across 16 layers until the LLM
+only latched onto the back half of the audio. The CPU loop was
+unaffected because it was already building per-layer RPE locally
+inside the encoder forward — that local builder shadowed the
+context-level cache and hid the bug.
+
+**Fix.** Replaced `ctx->rpe_lookup` with `ctx->rpe_per_layer`
+(`vector<vector<float>>`), built per-block at load time. The graph's
+`rpe_lookup` input now has shape `(ctx_size*hd, ctx_size, n_layers)`
+and each layer slices its block via `ggml_view_3d` on the layer
+axis. CPU loop reuses the same precomputed table.
+
+**Validation (per LEARNINGS methodology).** Stage-by-stage taps in
+both paths (input_linear, FFN1, attn, conv, FFN2, post-norm,
+block_out per layer) confirmed all sub-stages match within float
+precision (~1e-3) — well above the cos_min ≥ 0.999 bar. JFK
+transcript matches the CPU loop byte-for-byte:
+"and so my fellow americans ask not what your country can do for
+you ask what you can do for your country".
+
+**Promotion.** Made the graph path the default and renamed the
+escape hatch: `GRANITE_DISABLE_ENCODER_GRAPH=1` now opts back to
+the CPU loop. The legacy `GRANITE_ENCODER_GRAPH` and
+`GRANITE_ENCODER_GRAPH_RPE` env vars are gone — the no-RPE
+flash-attn branch survives only as automatic fallback for models
+with an unsupported `attn_rel_pos.weight` type.
+
+**PLUS on graph.** Captured `cat_hidden_layers` post-norm tensors
+inline in the graph and concatenated them with the final encoder
+output along the feature dim via `ggml_concat`, so the PLUS variant
+also rides the GPU path with no CPU-side cat_layers buffering. The
+in-graph concat is essentially free (graph fanout off the residual
+stream, no extra compute).
+
+**NAR on graph.** Mirrored the granite-speech graph builder for
+`granite_nle.cpp`. NAR-specific bits:
+1. Self-conditioning residual at `hp.enc_self_conditioning_layer`
+   (1-indexed, default = 8). Tapped `softmax(mid_logits)` on its way
+   into `ctc_mid_w` so the runner can pull per-frame
+   `blank_prob = column 0` for the BPE auxiliary head's
+   `posterior_weighted_pool`.
+2. Snapshot taps at every entry in `enc_layer_indices_parsed`
+   (HF tuple indices: 0 = input embedding, N = output of block N-1
+   *after* the self-cond residual at that block). Concatenated along
+   the feature dim into `enc_output` (matches the CPU loop's wide
+   buffer layout).
+3. Final CTC logits = `ctc_out_w @ final_hidden + b` exposed as a
+   named graph output. Cached on `ctx->last_ctc_logits` for the BPE
+   editing path.
+4. The BPE auxiliary head's `posterior_weighted_pool` stays on CPU
+   (windowed reduce that doesn't map cleanly to a single ggml op);
+   the `bpe_out_w` matmul (1024 → 100353) runs through the same
+   scheduler as before. Negligible perf cost vs the encoder body.
+
+**Numbers (M1, Q4_K encoder F32, 11 s JFK clip; lower disk-contention
+session):**
+
+| Variant            | CPU loop      | Graph (default) | Speedup |
+|--------------------|--------------:|----------------:|--------:|
+| `granite-4.1`      | 4.78 s (2.3×) | **2.31 s (4.8×)** | ~2.1×  |
+| `granite-4.1-plus` | 9.41 s (1.2×) | **3.74 s (2.9×)** | ~2.5×  |
+| `granite-4.1-nar`  | 19.27 s (0.6×, contended) | **6.41 s (1.7×)** | ~3.0×  |
+
+All three variants transcribe JFK byte-for-byte identical to their
+CPU-loop reference (including punctuation/casing for PLUS and NAR).
+The `GRANITE_DISABLE_ENCODER_GRAPH=1` escape hatch covers all three.
+
 ### 56. MiMo-V2.5-ASR end-to-end — PLAN #51 SHIPPED (May 2026)
 
 XiaomiMiMo's 7.5B-class speech-LLM (8-channel RVQ encoder + 36-layer
@@ -795,18 +878,19 @@ in step 9 below.
 Second, transcribe path (commit `dae361f`) — full prompt
 construction in C++, mirroring `process_speechdata.InputSegment`
 byte-for-byte. Each text segment becomes a `[9, T_seg]` block (row
-0: tokens at stride gs, -100 fillers; rows 1–8: per-channel
-`speech_zeroemb_idx`). Audio segment becomes `[9, T_audio + 2*gs]`
-with `<|sosp|>` / `<|eosp|>` wrapping the empty-token text row and
-codes flanked by speech_zeroemb pads on the audio rows. The 6
-segments (user header, audio, template, end, assistant header,
-think+language tag) concatenate into the prefill input_ids.
-`mimo_asr_build_prefill_graph` gained an `n_past` parameter so
-step decode reuses the same builder with T=gs and advancing n_past.
-The decode loop replicates each generated text token across the
-gs positions of the new group and fills audio rows with
-`speech_zeroemb_idx[c]` (matches `slm_sample`'s `expand(group_size)`
-+ `zero_embed_tensor` path). Stops on `<|im_end|>`/eos, strips
+0: tokens at stride gs, -100 fillers, padded to gs alignment;
+rows 1–8: per-channel `speech_zeroemb_idx`). Audio segment becomes
+`[9, T_audio + 2*gs]` with `<|sosp|>` / `<|eosp|>` wrapping the
+empty-token text row and codes flanked by speech_zeroemb pads on
+the audio rows. The 6 segments (user header, audio, template,
+end, assistant header, think+language tag) concatenate into the
+prefill input_ids. `mimo_asr_build_prefill_graph` gained an
+`n_past` parameter so step decode reuses the same builder with
+T=gs and advancing n_past. The decode loop replicates each
+generated text token across the gs positions of the new group
+and fills audio rows with `speech_zeroemb_idx[c]` (matches
+`slm_sample`'s `expand(group_size)` + `zero_embed_tensor` path).
+Stops on `<|im_end|>`/eos, strips
 `<|empty|>`/`<|eot|>`/`<|eostm|>`/language tags.
 
 The tokenizer follows the qwen3-asr-style splitter: greedy match
@@ -828,8 +912,8 @@ made permanent: prefix all torch-based converters with
 PYTHONUNBUFFERED=1`. Cost is negligible — the cast is memory-bound,
 not compute-bound. Without the env vars: hangs forever. With them:
 ~20 min for the 14.9 GB F16 on M1, ~5 min more for Q4_K quantize.
-LEARNINGS.md repeats this so the next person doesn't lose 30
-minutes diagnosing it.
+LEARNINGS.md and the `mimo-tokenizer-GGUF` README repeat this so
+the next person doesn't lose 30 minutes diagnosing it.
 
 **HF release.** [`cstr/mimo-asr-GGUF`](https://huggingface.co/cstr/mimo-asr-GGUF) ships F16 (14.9 GB) + Q4_K
 (4.5 GB) with the corrected vocab and merges. Pair with

@@ -820,11 +820,469 @@ static inline bool nle_run_matmul(granite_nle_context* ctx, float* out, const fl
 // helpers all live in core/conformer_ibm.h (shared with granite_speech).
 // CPU LayerNorm lives in core/cpu_ops.h::layernorm.
 
+// =============================================================================
+// Single-graph encoder path. Mirrors granite_build_encoder in granite_speech
+// (per-block subgraph attention with Shaw RPE bias, bit-near-identical to
+// the per-op CPU loop) and adds NAR-specific bits:
+//
+//   * self-conditioning residual at hp.enc_self_conditioning_layer (1-indexed)
+//   * blank-prob tap at that layer (column 0 of softmax(mid_logits)) for the
+//     posterior-weighted pool used by the BPE auxiliary head
+//   * snapshot taps at every entry in enc_layer_indices_parsed; the snapshots
+//     are then concatenated along the feature dim into the graph's final
+//     output (matches the CPU loop's wide buffer layout)
+//   * final CTC logits = ctc_out_w @ final_hidden for the BPE editing path
+//
+// The BPE auxiliary head's posterior_weighted_pool stays on CPU (windowed
+// reduce that doesn't map cleanly to a single ggml op); the bpe_out_w matmul
+// runs through the scheduler as it already does.
+//
+// Default ON; opt out via GRANITE_DISABLE_ENCODER_GRAPH=1 to fall back to
+// the per-op CPU loop (kept around for debugging).
+// =============================================================================
+static ggml_cgraph* granite_nle_build_encoder(granite_nle_context* ctx, int T) {
+    const auto& m = ctx->model;
+    const auto& hp = m.hparams;
+    const int n_heads = (int)hp.enc_n_heads;
+    const int hd = (int)hp.enc_head_dim;
+    const int n_layers = (int)hp.enc_n_layers;
+    const int input_dim = (int)hp.enc_input_dim;
+    const int ctx_size = (int)hp.enc_context_size;
+    const int self_cond_il = (int)hp.enc_self_conditioning_layer - 1; // 0-indexed
+    const float attn_scale = 1.0f / std::sqrt((float)hd);
+    const int n_blocks_attn = (T + ctx_size - 1) / ctx_size;
+
+    ggml_init_params ip = {ctx->compute_meta.size(), ctx->compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(ip);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    // Per-layer Shaw RPE check (graph path needs all layers populated).
+    bool with_rpe = (int)ctx->rpe_per_layer.size() == n_layers;
+    for (int il = 0; il < n_layers && with_rpe; il++) {
+        if (ctx->rpe_per_layer[il].empty())
+            with_rpe = false;
+    }
+
+    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, input_dim, T);
+    ggml_set_name(inp, "enc_input");
+    ggml_set_input(inp);
+
+    // input_linear
+    ggml_tensor* cur = ggml_mul_mat(ctx0, m.encoder.input_w, inp);
+    if (m.encoder.input_b)
+        cur = ggml_add(ctx0, cur, m.encoder.input_b);
+
+    // Snapshot taps: enc_layer_indices_parsed maps HF tuple index → position.
+    // Index 0 = the input embedding. Other indices = post-self-cond hidden
+    // at the corresponding block (captured below in the per-layer loop).
+    const auto& want = ctx->enc_layer_indices_parsed;
+    std::vector<ggml_tensor*> snap_taps(want.size(), nullptr);
+    for (size_t k = 0; k < want.size(); k++) {
+        if (want[k] == 0)
+            snap_taps[k] = cur;
+    }
+
+    // Approximate-path mask + RPE table. Layout is identical to the
+    // granite_speech version (see granite_speech.cpp for the derivation).
+    ggml_tensor* block_mask = nullptr;
+    if (!with_rpe) {
+        block_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
+        ggml_set_name(block_mask, "block_mask");
+        ggml_set_input(block_mask);
+    }
+
+    ggml_tensor* rpe_tensor =
+        ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, ctx_size * hd, ctx_size, with_rpe ? n_layers : 1);
+    ggml_set_name(rpe_tensor, "rpe_lookup");
+    ggml_set_input(rpe_tensor);
+    ggml_tensor* rpe_4d =
+        with_rpe ? ggml_reshape_4d(ctx0, rpe_tensor, hd, ctx_size, ctx_size, n_layers) : nullptr;
+
+    ggml_tensor* blank_prob_tap = nullptr;
+
+    // 16 × Conformer blocks
+    for (int il = 0; il < n_layers; il++) {
+        const auto& b = m.encoder.blocks[il];
+
+        // FFN1 (Macaron half-step)
+        {
+            ggml_tensor* x = ggml_norm(ctx0, cur, 1e-5f);
+            if (b.ff1_norm_w)
+                x = ggml_mul(ctx0, x, b.ff1_norm_w);
+            if (b.ff1_norm_b)
+                x = ggml_add(ctx0, x, b.ff1_norm_b);
+            x = ggml_mul_mat(ctx0, b.ff1_up_w, x);
+            if (b.ff1_up_b)
+                x = ggml_add(ctx0, x, b.ff1_up_b);
+            x = ggml_silu(ctx0, x);
+            x = ggml_mul_mat(ctx0, b.ff1_down_w, x);
+            if (b.ff1_down_b)
+                x = ggml_add(ctx0, x, b.ff1_down_b);
+            cur = ggml_add(ctx0, cur, ggml_scale(ctx0, x, 0.5f));
+        }
+
+        // MHSA
+        {
+            ggml_tensor* x = ggml_norm(ctx0, cur, 1e-5f);
+            if (b.attn_norm_w)
+                x = ggml_mul(ctx0, x, b.attn_norm_w);
+            if (b.attn_norm_b)
+                x = ggml_add(ctx0, x, b.attn_norm_b);
+
+            ggml_tensor* Q = ggml_mul_mat(ctx0, b.attn_q_w, x);
+            ggml_tensor* KV = ggml_mul_mat(ctx0, b.attn_kv_w, x);
+
+            int kv_dim = n_heads * hd;
+            ggml_tensor* K = ggml_cont(ctx0, ggml_view_2d(ctx0, KV, kv_dim, T, KV->nb[1], 0));
+            ggml_tensor* V = ggml_cont(
+                ctx0, ggml_view_2d(ctx0, KV, kv_dim, T, KV->nb[1], (size_t)kv_dim * ggml_type_size(KV->type)));
+
+            Q = ggml_reshape_3d(ctx0, Q, hd, n_heads, T);
+            K = ggml_reshape_3d(ctx0, K, hd, n_heads, T);
+            V = ggml_reshape_3d(ctx0, V, hd, n_heads, T);
+            Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
+            K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
+            V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
+
+            ggml_tensor* attn = nullptr;
+            if (with_rpe) {
+                ggml_tensor* rpe_3d_il = ggml_view_3d(ctx0, rpe_4d, hd, ctx_size, ctx_size, rpe_4d->nb[1],
+                                                     rpe_4d->nb[2], (size_t)il * rpe_4d->nb[3]);
+                std::vector<ggml_tensor*> block_outs;
+                block_outs.reserve(n_blocks_attn);
+                for (int blk = 0; blk < n_blocks_attn; blk++) {
+                    const int blk_start = blk * ctx_size;
+                    const int blk_len = std::min(ctx_size, T - blk_start);
+
+                    ggml_tensor* Q_blk =
+                        ggml_cont(ctx0, ggml_view_3d(ctx0, Q, hd, blk_len, n_heads, Q->nb[1], Q->nb[2],
+                                                     (size_t)blk_start * Q->nb[1]));
+                    ggml_tensor* K_blk =
+                        ggml_cont(ctx0, ggml_view_3d(ctx0, K, hd, blk_len, n_heads, K->nb[1], K->nb[2],
+                                                     (size_t)blk_start * K->nb[1]));
+                    ggml_tensor* V_blk =
+                        ggml_cont(ctx0, ggml_view_3d(ctx0, V, hd, blk_len, n_heads, V->nb[1], V->nb[2],
+                                                     (size_t)blk_start * V->nb[1]));
+
+                    ggml_tensor* scores = ggml_mul_mat(ctx0, K_blk, Q_blk);
+
+                    ggml_tensor* rpe_blk =
+                        ggml_cont(ctx0, ggml_view_3d(ctx0, rpe_3d_il, hd, blk_len, blk_len, rpe_3d_il->nb[1],
+                                                     rpe_3d_il->nb[2], 0));
+                    ggml_tensor* rpe_blk_4d = ggml_reshape_4d(ctx0, rpe_blk, hd, blk_len, blk_len, 1);
+                    ggml_tensor* Q_blk_4d = ggml_reshape_4d(ctx0, Q_blk, hd, 1, blk_len, n_heads);
+                    ggml_tensor* pos_bias_4d = ggml_mul_mat(ctx0, rpe_blk_4d, Q_blk_4d);
+                    ggml_tensor* pos_bias = ggml_reshape_3d(ctx0, pos_bias_4d, blk_len, blk_len, n_heads);
+
+                    scores = ggml_add(ctx0, scores, pos_bias);
+                    scores = ggml_soft_max_ext(ctx0, scores, /*mask*/ nullptr, attn_scale, 0.0f);
+
+                    ggml_tensor* V_blk_T = ggml_cont(ctx0, ggml_permute(ctx0, V_blk, 1, 0, 2, 3));
+                    ggml_tensor* out_blk = ggml_mul_mat(ctx0, V_blk_T, scores);
+                    block_outs.push_back(out_blk);
+                }
+                attn = block_outs[0];
+                for (size_t i = 1; i < block_outs.size(); i++)
+                    attn = ggml_concat(ctx0, attn, block_outs[i], 1);
+                attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));
+                attn = ggml_reshape_2d(ctx0, attn, n_heads * hd, T);
+            } else {
+                attn = ggml_flash_attn_ext(ctx0, Q, K, V, block_mask, attn_scale, 0.0f, 0.0f);
+                attn = ggml_reshape_2d(ctx0, attn, n_heads * hd, T);
+            }
+
+            attn = ggml_mul_mat(ctx0, b.attn_out_w, attn);
+            if (b.attn_out_b)
+                attn = ggml_add(ctx0, attn, b.attn_out_b);
+            cur = ggml_add(ctx0, cur, attn);
+        }
+
+        // Conv module
+        {
+            ggml_tensor* x = ggml_norm(ctx0, cur, 1e-5f);
+            if (b.conv_norm_w)
+                x = ggml_mul(ctx0, x, b.conv_norm_w);
+            if (b.conv_norm_b)
+                x = ggml_add(ctx0, x, b.conv_norm_b);
+            if (b.conv_up_w) {
+                int in_ch = (int)b.conv_up_w->ne[1];
+                int out_ch = (int)b.conv_up_w->ne[2];
+                x = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, b.conv_up_w, in_ch, out_ch), x);
+                if (b.conv_up_b)
+                    x = ggml_add(ctx0, x, b.conv_up_b);
+            }
+            int half_dim = (int)x->ne[0] / 2;
+            ggml_tensor* x1 = ggml_cont(ctx0, ggml_view_2d(ctx0, x, half_dim, T, x->nb[1], 0));
+            ggml_tensor* x2 =
+                ggml_cont(ctx0, ggml_view_2d(ctx0, x, half_dim, T, x->nb[1], half_dim * ggml_type_size(x->type)));
+            x = ggml_mul(ctx0, x1, ggml_sigmoid(ctx0, x2));
+
+            if (b.conv_dw_w) {
+                int K = (int)b.conv_dw_w->ne[0];
+                int inner = half_dim;
+                int dw_pad = K / 2;
+                ggml_tensor* dw_w = ggml_cast(ctx0, b.conv_dw_w, GGML_TYPE_F32);
+                ggml_tensor* dw_w_4d = ggml_reshape_4d(ctx0, dw_w, K, 1, 1, inner);
+                ggml_tensor* x_t = ggml_cont(ctx0, ggml_transpose(ctx0, x));
+                x_t = ggml_reshape_4d(ctx0, x_t, T, 1, inner, 1);
+                x_t = ggml_conv_2d_dw_direct(ctx0, dw_w_4d, x_t, 1, 1, dw_pad, 0, 1, 1);
+                x = ggml_cont(ctx0, ggml_permute(ctx0, x_t, 1, 2, 0, 3));
+                x = ggml_reshape_2d(ctx0, x, inner, T);
+            }
+
+            if (b.conv_bn_w && b.conv_bn_b) {
+                x = ggml_mul(ctx0, x, b.conv_bn_w);
+                x = ggml_add(ctx0, x, b.conv_bn_b);
+            }
+            x = ggml_silu(ctx0, x);
+
+            if (b.conv_down_w) {
+                int in_ch = (int)b.conv_down_w->ne[1];
+                int out_ch = (int)b.conv_down_w->ne[2];
+                x = ggml_mul_mat(ctx0, ggml_reshape_2d(ctx0, b.conv_down_w, in_ch, out_ch), x);
+                if (b.conv_down_b)
+                    x = ggml_add(ctx0, x, b.conv_down_b);
+            }
+
+            cur = ggml_add(ctx0, cur, x);
+        }
+
+        // FFN2 (Macaron half-step)
+        {
+            ggml_tensor* x = ggml_norm(ctx0, cur, 1e-5f);
+            if (b.ff2_norm_w)
+                x = ggml_mul(ctx0, x, b.ff2_norm_w);
+            if (b.ff2_norm_b)
+                x = ggml_add(ctx0, x, b.ff2_norm_b);
+            x = ggml_mul_mat(ctx0, b.ff2_up_w, x);
+            if (b.ff2_up_b)
+                x = ggml_add(ctx0, x, b.ff2_up_b);
+            x = ggml_silu(ctx0, x);
+            x = ggml_mul_mat(ctx0, b.ff2_down_w, x);
+            if (b.ff2_down_b)
+                x = ggml_add(ctx0, x, b.ff2_down_b);
+            cur = ggml_add(ctx0, cur, ggml_scale(ctx0, x, 0.5f));
+        }
+
+        // Post LayerNorm
+        {
+            cur = ggml_norm(ctx0, cur, 1e-5f);
+            if (b.post_norm_w)
+                cur = ggml_mul(ctx0, cur, b.post_norm_w);
+            if (b.post_norm_b)
+                cur = ggml_add(ctx0, cur, b.post_norm_b);
+        }
+
+        // Self-conditioning residual at il == self_cond_il. Captures
+        // softmax(mid_logits) so the runner can pull blank_prob[t] = column 0.
+        if (il == self_cond_il && m.encoder.ctc_out_w && m.encoder.ctc_mid_w) {
+            ggml_tensor* mid = ggml_mul_mat(ctx0, m.encoder.ctc_out_w, cur);
+            if (m.encoder.ctc_out_b)
+                mid = ggml_add(ctx0, mid, m.encoder.ctc_out_b);
+            ggml_tensor* mid_softmax = ggml_soft_max(ctx0, mid); // (ctc_dim, T)
+            ggml_set_name(mid_softmax, "mid_softmax");
+            ggml_set_output(mid_softmax);
+            blank_prob_tap = mid_softmax;
+
+            ggml_tensor* mid_back = ggml_mul_mat(ctx0, m.encoder.ctc_mid_w, mid_softmax);
+            if (m.encoder.ctc_mid_b)
+                mid_back = ggml_add(ctx0, mid_back, m.encoder.ctc_mid_b);
+            cur = ggml_add(ctx0, cur, mid_back);
+        }
+
+        // Snapshot at HF tuple index il+1 (after self-cond residual at this
+        // block, matching the CPU loop ordering).
+        for (size_t k = 0; k < want.size(); k++) {
+            if (want[k] == il + 1)
+                snap_taps[k] = cur;
+        }
+    }
+
+    // Final-hidden tap (the runner pulls it for the BPE posterior pool).
+    ggml_set_name(cur, "final_hidden");
+    ggml_set_output(cur);
+
+    // Final CTC logits = ctc_out_w @ final_hidden + b. Used by the BPE
+    // editing path's argmax / greedy decode. Cached on the context.
+    if (m.encoder.ctc_out_w) {
+        ggml_tensor* ctc_logits = ggml_mul_mat(ctx0, m.encoder.ctc_out_w, cur);
+        if (m.encoder.ctc_out_b)
+            ctc_logits = ggml_add(ctx0, ctc_logits, m.encoder.ctc_out_b);
+        ggml_set_name(ctc_logits, "final_ctc_logits");
+        ggml_set_output(ctc_logits);
+    }
+
+    // Concat snapshots → wide encoder output. Layout per frame:
+    // [snap_0[d], snap_1[d], ..., snap_{K-1}[d]], total = K*d. If
+    // enc_layer_indices_parsed is empty, the runner falls back to
+    // final_hidden directly (matches the CPU loop's behaviour).
+    ggml_tensor* enc_out = nullptr;
+    if (!snap_taps.empty()) {
+        for (size_t k = 0; k < snap_taps.size(); k++) {
+            ggml_tensor* t = snap_taps[k] ? snap_taps[k] : cur; // safety
+            enc_out = enc_out ? ggml_concat(ctx0, enc_out, t, 0) : t;
+        }
+    } else {
+        enc_out = cur;
+    }
+    ggml_set_name(enc_out, "enc_output");
+    ggml_set_output(enc_out);
+
+    ggml_build_forward_expand(gf, enc_out);
+    if (m.encoder.ctc_out_w) {
+        ggml_tensor* tt = ggml_graph_get_tensor(gf, "final_ctc_logits");
+        if (tt)
+            ggml_build_forward_expand(gf, tt);
+    }
+    ggml_build_forward_expand(gf, cur); // ensure final_hidden is reachable
+
+    (void)blank_prob_tap; // tagged via ggml_set_output above
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+// Run the NAR encoder as a single ggml graph and populate ctx side-effects
+// (last_ctc_logits + last_bpe_logits). Returns the wide concat output buffer
+// (caller takes ownership and frees with free()).
+static float* granite_nle_run_encoder_graph(granite_nle_context* ctx, const float* mel, int n_mels, int T, int* out_T,
+                                            int* out_dim) {
+    const auto& hp = ctx->model.hparams;
+    const int d = (int)hp.enc_d_model;
+    const int hd = (int)hp.enc_head_dim;
+    const int ctx_size = (int)hp.enc_context_size;
+    const int n_layers = (int)hp.enc_n_layers;
+    const int ctc_dim = (int)hp.enc_ctc_vocab;
+
+    bool with_rpe = (int)ctx->rpe_per_layer.size() == n_layers;
+    for (int il = 0; il < n_layers && with_rpe; il++) {
+        if (ctx->rpe_per_layer[il].empty())
+            with_rpe = false;
+    }
+
+    ggml_cgraph* gf = granite_nle_build_encoder(ctx, T);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        fprintf(stderr, "granite_nle_encoder_graph: alloc failed\n");
+        return nullptr;
+    }
+
+    // Inputs: mel + (optional) block mask + per-layer RPE.
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "enc_input"), mel, 0, (size_t)n_mels * T * sizeof(float));
+
+    if (ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "block_mask")) {
+        std::vector<ggml_fp16_t> mask_data((size_t)T * T);
+        const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (int r = 0; r < T; r++)
+            for (int c = 0; c < T; c++)
+                mask_data[(size_t)r * T + c] = (r / ctx_size == c / ctx_size) ? zero : neg_inf;
+        ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
+    }
+
+    if (ggml_tensor* rpe_t = ggml_graph_get_tensor(gf, "rpe_lookup")) {
+        const size_t per_layer = (size_t)ctx_size * hd * ctx_size;
+        if (with_rpe) {
+            std::vector<float> stacked(per_layer * n_layers, 0.0f);
+            for (int il = 0; il < n_layers; il++) {
+                if ((int)ctx->rpe_per_layer.size() > il && ctx->rpe_per_layer[il].size() == per_layer) {
+                    std::memcpy(stacked.data() + (size_t)il * per_layer, ctx->rpe_per_layer[il].data(),
+                                per_layer * sizeof(float));
+                }
+            }
+            ggml_backend_tensor_set(rpe_t, stacked.data(), 0, stacked.size() * sizeof(float));
+        } else {
+            std::vector<float> rpe_zeros(per_layer, 0.0f);
+            ggml_backend_tensor_set(rpe_t, rpe_zeros.data(), 0, rpe_zeros.size() * sizeof(float));
+        }
+    }
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "granite_nle_encoder_graph: compute failed\n");
+        return nullptr;
+    }
+
+    // Read back the wide encoder output.
+    ggml_tensor* enc_out = ggml_graph_get_tensor(gf, "enc_output");
+    if (!enc_out)
+        return nullptr;
+    const int wide_d = (int)enc_out->ne[0];
+    size_t total = (size_t)T * wide_d;
+    float* result = (float*)malloc(total * sizeof(float));
+    if (!result)
+        return nullptr;
+    ggml_backend_tensor_get(enc_out, result, 0, total * sizeof(float));
+
+    // Cache the final CTC logits for the BPE editing path.
+    if (ggml_tensor* ctc_t = ggml_graph_get_tensor(gf, "final_ctc_logits")) {
+        ctx->last_ctc_logits.assign((size_t)ctc_dim * T, 0.0f);
+        ggml_backend_tensor_get(ctc_t, ctx->last_ctc_logits.data(), 0, ctx->last_ctc_logits.size() * sizeof(float));
+        ctx->last_ctc_T = T;
+    } else {
+        ctx->last_ctc_logits.clear();
+        ctx->last_ctc_T = 0;
+    }
+
+    // Read final hidden + the self-cond softmax (so we can pull column 0
+    // = per-frame blank prob) and run the posterior-weighted pool +
+    // BPE auxiliary head on CPU.
+    ctx->last_bpe_logits.clear();
+    ctx->last_bpe_T = 0;
+    ggml_tensor* mid_t = ggml_graph_get_tensor(gf, "mid_softmax");
+    ggml_tensor* fhid_t = ggml_graph_get_tensor(gf, "final_hidden");
+    if (ctx->model.encoder.bpe_out_w && mid_t && fhid_t) {
+        std::vector<float> mid_softmax((size_t)ctc_dim * T);
+        ggml_backend_tensor_get(mid_t, mid_softmax.data(), 0, mid_softmax.size() * sizeof(float));
+
+        std::vector<float> final_hidden((size_t)d * T);
+        ggml_backend_tensor_get(fhid_t, final_hidden.data(), 0, final_hidden.size() * sizeof(float));
+
+        std::vector<float> importance((size_t)T);
+        for (int t = 0; t < T; t++)
+            importance[t] = 1.0f - mid_softmax[(size_t)t * ctc_dim + 0];
+
+        const int pool_window = (int)hp.enc_bpe_pooling_window;
+        const int bpe_dim = (int)hp.enc_bpe_vocab;
+        const int num_windows = core_ctc::num_windows_for(T, pool_window);
+        std::vector<float> pooled((size_t)num_windows * d);
+        core_ctc::posterior_weighted_pool(final_hidden.data(), importance.data(), T, d, pool_window, pooled.data());
+
+        ctx->last_bpe_logits.assign((size_t)bpe_dim * num_windows, 0.0f);
+        nle_run_matmul(ctx, ctx->last_bpe_logits.data(), pooled.data(), d, num_windows, ctx->model.encoder.bpe_out_w,
+                       ctx->model.encoder.bpe_out_b, bpe_dim);
+        ctx->last_bpe_T = num_windows;
+    }
+
+    if (out_T)
+        *out_T = T;
+    if (out_dim)
+        *out_dim = wide_d;
+    return result;
+}
+
 extern "C" float* granite_nle_run_encoder(struct granite_nle_context* ctx, const float* mel, int n_mels, int T_mel,
                                           int* out_T, int* out_dim) {
     if (!ctx || !mel || n_mels != (int)ctx->model.hparams.enc_input_dim)
         return nullptr;
     granite_nle_bench_stage _b("run_encoder");
+
+    // Default: run the full 16-layer encoder as one ggml graph (PLAN #16
+    // mirror for the NAR runtime). Set GRANITE_DISABLE_ENCODER_GRAPH=1 to
+    // fall back to the per-op CPU loop (slower but kept around for
+    // debugging). The graph path also populates ctx->last_ctc_logits and
+    // ctx->last_bpe_logits.
+    bool use_graph = true;
+    if (const char* e = std::getenv("GRANITE_DISABLE_ENCODER_GRAPH"))
+        if (e[0] != '0' && e[0] != '\0')
+            use_graph = false;
+    if (use_graph) {
+        if (ctx->params.verbosity >= 1)
+            fprintf(stderr, "  encoder: using ggml graph path\n");
+        float* result = granite_nle_run_encoder_graph(ctx, mel, n_mels, T_mel, out_T, out_dim);
+        if (result)
+            return result;
+        fprintf(stderr, "  encoder: graph path failed, falling back to CPU loops\n");
+    }
 
     const auto& hp = ctx->model.hparams;
     const int d = (int)hp.enc_d_model;

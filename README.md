@@ -1,15 +1,16 @@
 # CrispASR
 
-**One C++ binary, twenty-four ASR backends, zero Python dependencies.**
+**One C++ binary, twenty-four ASR backends + three TTS engines, zero Python dependencies.**
 
-CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech recognition tool** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file.
+CrispASR started as a fork of [whisper.cpp](https://github.com/ggml-org/whisper.cpp) and extends that base into a **unified speech engine** called `crispasr`, backed by full ggml C++ runtimes for major open-weights ASR *and* TTS architectures. One build, one binary, one consistent CLI — pick the backend at the command line or let CrispASR auto-detect it from your GGUF file. See [Text-to-Speech](#text-to-speech-tts) for the TTS side.
 
 ```console
-$ crispasr -m ggml-base.en.bin          -f samples/jfk.wav        # OpenAI Whisper
-$ crispasr -m parakeet-tdt-0.6b.gguf    -f samples/jfk.wav        # NVIDIA Parakeet
-$ crispasr -m canary-1b-v2.gguf         -f samples/jfk.wav        # NVIDIA Canary
-$ crispasr -m voxtral-mini-3b-2507.gguf -f samples/jfk.wav        # Mistral Voxtral
-$ crispasr --backend qwen3 -m auto      -f samples/jfk.wav        # -m auto downloads
+$ crispasr -m ggml-base.en.bin          -f samples/jfk.wav                    # OpenAI Whisper
+$ crispasr -m parakeet-tdt-0.6b.gguf    -f samples/jfk.wav                    # NVIDIA Parakeet
+$ crispasr -m canary-1b-v2.gguf         -f samples/jfk.wav                    # NVIDIA Canary
+$ crispasr -m voxtral-mini-3b-2507.gguf -f samples/jfk.wav                    # Mistral Voxtral
+$ crispasr --backend qwen3 -m auto      -f samples/jfk.wav                    # -m auto downloads
+$ crispasr --backend kokoro -m auto --tts "Hello world" --tts-output out.wav  # TTS
 ```
 
 No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one C++ binary and a GGUF file.
@@ -27,10 +28,13 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 
 ## Table of contents
 
-- [Supported backends](#supported-backends)
+- [Supported backends](#supported-backends) — [ASR](#asr-backends) + [TTS](#text-to-speech-models) + [post-processing](#post-processing-models)
 - [Feature matrix](#feature-matrix)
 - [Install & build](#install--build)
-- [Quick start](#quick-start)
+- [Quick start — ASR](#quick-start)
+- [**Text-to-Speech (TTS)**](#text-to-speech-tts) — Kokoro, Qwen3-TTS, VibeVoice
+- [Streaming & live transcription](#streaming--live-transcription)
+- [Server mode (HTTP API)](#server-mode-persistent-model-http-api)
 - [CLI reference](#cli-reference)
 - [Voice Activity Detection (VAD)](#voice-activity-detection-vad)
 - [Word-level timestamps via CTC alignment](#word-level-timestamps-via-ctc-alignment)
@@ -48,6 +52,13 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 ---
 
 ## Supported backends
+
+CrispASR ships **24 ASR backends** for transcription/translation and
+**three TTS engines** for synthesis. Pick at the CLI with `--backend NAME`,
+or omit it to let the binary auto-detect from the GGUF metadata. Jump
+to the [TTS table](#text-to-speech-models) for the synthesis side.
+
+### ASR backends
 
 | Backend | Model | Architecture | Languages | License |
 |---|---|---|---|---|
@@ -79,7 +90,11 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 | **vibevoice** | [`microsoft/VibeVoice-ASR`](https://huggingface.co/cstr/vibevoice-asr-GGUF) | σ-VAE ConvNeXt encoders + Qwen2.5-7B decoder; timestamps, diarization, hotwords | 50+ | MIT |
 | **mimo-asr** | [`XiaomiMiMo/MiMo-V2.5-ASR`](https://huggingface.co/cstr/mimo-asr-GGUF) | 6L input_local_transformer (1024d) + 36L Qwen2 LM (4096d, 32Q/8KV); 8-channel RVQ codes from separate MiMo-Audio-Tokenizer GGUF (`--codec-model`); JFK matches reference verbatim | Mandarin (Wu/Cantonese/Hokkien/Sichuanese dialects) + English + code-switching | MIT |
 
-**Text-to-Speech models** (TTS — `--tts` flag):
+### Text-to-Speech models
+
+Synthesis backends, driven by the `--tts` flag and a `--tts-output PATH.wav`.
+See the dedicated [Text-to-Speech](#text-to-speech-tts) section below for
+quick-start commands and engine selection guidance.
 
 | Backend | Models | Architecture | Languages | License |
 |---------|--------|-------------|-----------|---------|
@@ -88,7 +103,9 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 | **qwen3-tts** | [`Qwen3-TTS-12Hz-0.6B-Base`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF) | Qwen3 talker LM + 12 Hz RVQ speech tokenizer; baked voice pack GGUF or runtime WAV + `--ref-text` | multilingual, per base model | Apache-2.0 |
 | **kokoro** | [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M) + [`dida-80b/kokoro-german-hui-multispeaker-base`](https://huggingface.co/dida-80b/kokoro-german-hui-multispeaker-base) (German backbone) + [`kikiri-tts/kikiri-german-{victoria,martin}`](https://huggingface.co/kikiri-tts) (German voicepacks) | StyleTTS2 / iSTFTNet (BERT + ProsodyPredictor + iSTFTNet decoder, 82M params); per-voice GGUF; in-process libespeak-ng phonemizer with LRU cache; auto-routing for `-l de` swaps in the German-trained backbone + cascading voice fallback | en, es, fr, hi, it, ja, pt, zh native + de via Option 2b (PLAN §56) + others through espeak-ng with French/German voice fallback | Apache-2.0 (model + German backbone + kikiri voicepacks); HUI corpus CC0 |
 
-**Post-processing models** (work with all backends):
+### Post-processing models
+
+Work with all backends.
 
 | Model | Task | Architecture | Languages | License | HuggingFace |
 |---|---|---|---|---|---|
@@ -354,6 +371,8 @@ cmake --build build-ffmpeg -j$(nproc) --target crispasr
 
 ## Quick start
 
+ASR examples below; for TTS see the [Text-to-Speech](#text-to-speech-tts) section.
+
 ### Whisper (historical path, byte-identical to upstream whisper.cpp)
 
 ```bash
@@ -458,7 +477,9 @@ python models/convert-wav2vec2-to-gguf.py \
 ./build/bin/crispasr-quantize wav2vec2-de.gguf wav2vec2-de-q4k.gguf q4_k
 ```
 
-### Streaming & live transcription
+---
+
+## Streaming & live transcription
 
 ```bash
 # Pipe audio from ffmpeg, sox, or any tool that outputs raw PCM:
@@ -480,63 +501,26 @@ crispasr -m model.gguf -f audio.wav --alt
 
 Streaming works with all backends. The `--stream-step` (default 3s), `--stream-length` (default 10s), and `--stream-keep` (default 200ms overlap) flags control the sliding window.
 
-### Text-to-Speech (TTS)
+---
 
-CrispASR currently exposes three TTS backends through the unified CLI:
-`vibevoice-tts`, `qwen3-tts`, and `kokoro`. All three write 24 kHz mono
-WAV via `--tts-output`.
+## Text-to-Speech (TTS)
 
-**VibeVoice realtime** (`vibevoice-tts`, preset voice GGUF):
-```bash
-# First run downloads ~636 MB to ~/.cache/crispasr/ (Q4_K talker + emma
-# voice from cstr/vibevoice-realtime-0.5b-GGUF), then runs from cache.
-./build/bin/crispasr \
-    --backend vibevoice-tts -m auto \
-    --tts "Hello, how are you today?" \
-    --tts-output hello.wav
-```
+CrispASR ships **three open-weights TTS engines** behind the same
+`crispasr` binary, each with a distinct voice/quality/footprint trade-off:
 
-**Qwen3-TTS** (`qwen3-tts`, auto-download, runtime WAV clone):
-```bash
-# First run downloads ~1.3 GB to ~/.cache/crispasr/ (Q8_0 talker + F16 codec
-# from cstr/qwen3-tts-0.6b-base-GGUF and cstr/qwen3-tts-tokenizer-12hz-GGUF),
-# then runs from cache on subsequent invocations.
-./build/bin/crispasr \
-    --backend qwen3-tts -m auto \
-    --voice samples/qwen3_tts/clone.wav \
-    --ref-text "Okay, yeah. I resent you, I love you, I respect you. But you know what - You blew it, and thanks to you." \
-    --tts "Hello there" \
-    --tts-output hello.wav
-```
+| Backend | Why pick it | Voice cloning | First-run download |
+|---|---|---|---|
+| **`kokoro`** | Smallest + fastest. 82M-param StyleTTS2-derived model. Multilingual via espeak-ng + native German backbone. | No (preset voice packs) | Manual `wget` (no `-m auto`) |
+| **`qwen3-tts`** | Highest fidelity / strongest cloning. Speech-LLM (talker + code predictor + 12 Hz codec). | Yes (WAV + ref-text or baked voice GGUF) | ~1.3 GB via `-m auto` |
+| **`vibevoice-tts`** | Lowest-latency streaming TTS, designed for realtime. | Preset voice packs (and a 1.5B-base WAV cloning path) | ~636 MB via `-m auto` |
 
-**Qwen3-TTS** (`qwen3-tts`, F16 reference baseline, explicit paths):
-```bash
-# F16 talker (1.83 GB) is the strict-fidelity baseline. The CLI auto-discovers
-# the codec when qwen3-tts-tokenizer-12hz.gguf sits next to the talker,
-# otherwise pass --codec-model.
-./build/bin/crispasr \
-    --backend qwen3-tts \
-    -m ~/.cache/crispasr/qwen3-tts-12hz-0.6b-base.gguf \
-    --voice samples/qwen3_tts/clone.wav \
-    --ref-text "Okay, yeah. I resent you, I love you, I respect you. But you know what - You blew it, and thanks to you." \
-    --tts "Hello there" \
-    --tts-output hello.wav
-```
+All three write 24 kHz mono WAV via `--tts-output`.
 
-**Qwen3-TTS** (`qwen3-tts`, baked voice-pack GGUF):
-```bash
-./build/bin/crispasr \
-    --backend qwen3-tts -m auto \
-    --voice /tmp/qwen3-tts-voice-pack.gguf \
-    --tts "Hello there" \
-    --tts-output hello.wav
-```
+### Kokoro — multilingual, smallest
 
-**Kokoro** (`kokoro`, multilingual, voice + language flag drive routing):
-
-Kokoro does not currently support `-m auto`. Drop the GGUFs into a
-directory of your choice (`~/.cache/crispasr/` works) and pass
-explicit paths.
+Kokoro is the 82M-param StyleTTS2-derived model. It does not currently
+support `-m auto`; drop the GGUFs into a directory of your choice
+(`~/.cache/crispasr/` works) and pass explicit paths.
 
 ```bash
 # English — uses the official Kokoro-82M with the bundled af_heart voice.
@@ -578,31 +562,77 @@ as `crispasr.kokoro_resolve_for_lang(model_path, lang)` returning a
 `KokoroResolved(model_path, voice_path, voice_name, backbone_swapped)`
 record.
 
-Notes:
+### Qwen3-TTS — voice cloning, highest fidelity
 
-- `vibevoice-tts` uses `--voice` for its voice prompt or preset. The realtime
-  `0.5B` flow is typically driven by a voice GGUF.
-- `qwen3-tts` needs both the talker GGUF and the codec/tokenizer GGUF. With
-  `-m auto` both are pulled into `~/.cache/crispasr/` on first run (Q8_0
-  talker + F16 codec by default). With an explicit `-m`, the CLI auto-
-  discovers the codec when `qwen3-tts-tokenizer-12hz.gguf` sits next to
-  the talker model; otherwise pass `--codec-model` explicitly.
-- When `qwen3-tts --voice` points to a `.wav`, `--ref-text` is required.
-- When `qwen3-tts --voice` points to a `.gguf`, it is treated as a baked
-  voice pack and `--ref-text` is ignored.
-- `qwen3-tts` quantization is not quality-equivalent across variants. The
+Speech-LLM (talker + code predictor + 12 Hz codec). Needs both a
+talker GGUF and a codec/tokenizer GGUF. With `-m auto` both are pulled
+into `~/.cache/crispasr/` on first run (Q8_0 talker + F16 codec by
+default).
+
+```bash
+# Auto-download, runtime WAV clone (~1.3 GB on first run):
+./build/bin/crispasr \
+    --backend qwen3-tts -m auto \
+    --voice samples/qwen3_tts/clone.wav \
+    --ref-text "Okay, yeah. I resent you, I love you, I respect you. But you know what - You blew it, and thanks to you." \
+    --tts "Hello there" \
+    --tts-output hello.wav
+
+# F16 reference baseline (1.83 GB talker; strict-fidelity):
+./build/bin/crispasr \
+    --backend qwen3-tts \
+    -m ~/.cache/crispasr/qwen3-tts-12hz-0.6b-base.gguf \
+    --voice samples/qwen3_tts/clone.wav \
+    --ref-text "Okay, yeah. I resent you, I love you, I respect you. But you know what - You blew it, and thanks to you." \
+    --tts "Hello there" \
+    --tts-output hello.wav
+
+# Baked voice-pack GGUF (skips the WAV+ref-text step):
+./build/bin/crispasr \
+    --backend qwen3-tts -m auto \
+    --voice /tmp/qwen3-tts-voice-pack.gguf \
+    --tts "Hello there" \
+    --tts-output hello.wav
+```
+
+Notes:
+- When `--voice` points to a `.wav`, `--ref-text` is required. When it
+  points to a `.gguf`, it is treated as a baked voice pack and
+  `--ref-text` is ignored.
+- With an explicit `-m`, the CLI auto-discovers the codec when
+  `qwen3-tts-tokenizer-12hz.gguf` sits next to the talker; otherwise
+  pass `--codec-model`.
+- Quantization is **not** quality-equivalent across variants. The
   reference baseline is `f16` talker + `f16` codec. The recommended
   deployment quant is `q8_0` talker + `f16` codec — used by `-m auto`,
   ~986 MB, audibly indistinguishable from F16 on the test prompts in
   LEARNINGS.md. Lower-bit talker quants (`q6_k`, `q5_k`, `q4_k`) drift
-  noticeably in strict tensor diffs; voice similarity, prosody, and
-  multilingual robustness can change. Use them only when memory matters
-  more than strict fidelity. Quantizing the codec hurts earlier than
-  quantizing the talker — keep `qwen3-tts-tokenizer-12hz.gguf` at `f16`.
+  noticeably in strict tensor diffs. Quantizing the codec hurts
+  earlier than quantizing the talker — keep
+  `qwen3-tts-tokenizer-12hz.gguf` at `f16`.
 
-GGUF downloads: [`cstr/vibevoice-realtime-0.5b-GGUF`](https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF), [`cstr/vibevoice-1.5b-GGUF`](https://huggingface.co/cstr/vibevoice-1.5b-GGUF), [`cstr/qwen3-tts-0.6b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF), [`cstr/qwen3-tts-tokenizer-12hz-GGUF`](https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF)
+### VibeVoice — realtime streaming TTS
 
-#### qwen3-tts environment switches
+Lowest-latency TTS engine. Uses `--voice` for its voice prompt or
+preset; the realtime `0.5B` flow is typically driven by a voice GGUF.
+
+```bash
+# First run downloads ~636 MB to ~/.cache/crispasr/ (Q4_K talker + emma
+# voice from cstr/vibevoice-realtime-0.5b-GGUF), then runs from cache.
+./build/bin/crispasr \
+    --backend vibevoice-tts -m auto \
+    --tts "Hello, how are you today?" \
+    --tts-output hello.wav
+```
+
+### TTS GGUF downloads
+
+[`cstr/vibevoice-realtime-0.5b-GGUF`](https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF) ·
+[`cstr/vibevoice-1.5b-GGUF`](https://huggingface.co/cstr/vibevoice-1.5b-GGUF) ·
+[`cstr/qwen3-tts-0.6b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF) ·
+[`cstr/qwen3-tts-tokenizer-12hz-GGUF`](https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF)
+
+### qwen3-tts environment switches
 
 Diagnostic / experimental knobs. Leave them unset for normal use — the
 defaults reproduce the validated, end-to-end-tested code path.
@@ -617,7 +647,9 @@ defaults reproduce the validated, end-to-end-tested code path.
 | `QWEN3_TTS_CP_BACKEND` | unset | Pin the code predictor to a chosen backend. `cpu`, `cpu-f16`, `cpu-f32` keep its weights on the CPU backend — useful when isolating bugs to the talker vs. code-predictor or when comparing CPU and Metal end-to-end. |
 | `QWEN3_TTS_DUMP_DIR` | unset | Write per-frame intermediate tensors into the named directory. Bulky; intended for diff-harness work (`tools/dump_reference.py --backend qwen3-tts`). |
 
-### Server mode (persistent model, HTTP API)
+---
+
+## Server mode (persistent model, HTTP API)
 
 ```bash
 # Start server with model loaded once
@@ -1590,7 +1622,7 @@ reference (see [Debug a new backend against PyTorch ground truth](#debug-a-new-b
 | `VIBEVOICE_TTS_NOISE=path` | Override the per-frame Gaussian init noise. Flat little-endian float32 `[N_frames, vae_dim]` — typically the `noise.bin` written by `tools/run_official_vibevoice.py`. |
 | `VIBEVOICE_VAE_BACKEND=cpu\|metal\|cuda\|vulkan` | Pin the VAE decoder onto a specific backend. |
 | `WAV2VEC2_BENCH=1` / `WAV2VEC2_VERBOSE=1` / `WAV2VEC2_DUMP_DIR=` | wav2vec2 per-stage timings, verbose graph traces, and stage dumps. |
-| `GRANITE_ENCODER_GRAPH=1` | Switch the granite_speech encoder from per-layer CPU loops to a single ggml graph. |
+| `GRANITE_DISABLE_ENCODER_GRAPH=1` | Force the granite-speech / -plus / -nar encoder back to the per-layer CPU loop (slower but kept around for debugging). The single ggml-graph encoder with per-layer Shaw RPE is the default and is bit-near-identical to the CPU loop while being ~2× faster end-to-end across all three variants. |
 | `CRISPASR_NO_REL_POS=1` | Ablate the relative-position bias in the Gemma-4 audio encoder (development only). |
 | `ECAPA_REF_FBANK=path` | Reference filterbank tensor for the ECAPA-TDNN LID model (regression harness). |
 | `CRISPASR_SHERPA_LID_BIN=path` | Override the auto-detected sherpa-onnx LID binary. |
