@@ -5240,4 +5240,57 @@ struct. Keeps existing rows touch-free, makes the extension visually
 obvious to readers, and the indirection cost is one branch per
 auto-download — negligible compared to the HTTP round-trips.
 
+# VibeVoice silent unconditioned-voice fallback — session 2026-05-01
+
+While testing `-m auto -l de` for vibevoice-tts, the synth produced
+~1.2 sec of phonetically-English-sounding gibberish ASR-transcribed
+as "We never's a lot of...". The phrase asked for ~3 sec of German.
+
+Diagnosed in three steps:
+
+1. Cross-test (emma + DE text) → 3.05 sec, ASR "Dies ist ein Test
+   der deutschen Stimme." (close enough — synth works with English
+   speaker timbre rendering German text).
+2. Cross-test (de-Spk0_man + EN text) → still 1.2 sec gibberish.
+3. `wc -c` on the local `.gguf` → file didn't exist; I had been
+   passing a non-existent path because the German voicepacks weren't
+   in `/Volumes/.../crispasr-models/`. The model + the CLI silently
+   accepted the bad path and ran with no voice-prompt loaded.
+
+Root cause: `examples/cli/crispasr_backend_vibevoice.cpp` had
+
+    if (!voice_loaded_ && !params.tts_voice.empty()) {
+        if (vibevoice_load_voice(ctx_, params.tts_voice.c_str()) == 0)
+            voice_loaded_ = true;
+        // <-- silent on failure, falls through to synthesize()
+    }
+
+`vibevoice_synthesize` then runs without a voice prompt. The model's
+EOS classifier triggers within ~1.2 sec because there's no speaker
+context to condition on. The audio sounds like English-shaped noise
+because the LM defaults to English-ish phonemes when unconditioned.
+
+Fix (commit `49b99f8`):
+- Error out cleanly when `vibevoice_load_voice()` returns non-zero,
+  instead of falling through.
+- When `--voice` is empty, walk a sibling cascade
+  (`vibevoice-voice-<lang>-Spk1_woman.gguf` →
+  `vibevoice-voice-<lang>-Spk0_man.gguf` →
+  `vibevoice-voice-emma.gguf`) and announce the auto-pick on stderr.
+- If still nothing resolves, error out with a clear message.
+
+After the fix the same `-m auto -l de` command pulls
+`vibevoice-voice-de-Spk1_woman.gguf` via the registry's
+`k_vibevoice_tts_extras`, the CLI auto-picks it, and parakeet-v3
+roundtrips byte-perfect German. ~3 sec of audio, exactly as expected.
+
+Lesson: every TTS backend has a "model went into a degenerate
+fallback state" failure mode that produces output, not an error.
+Loud-noise gates (peak/RMS) wouldn't catch this because the audio
+hits typical TTS amplitude — the only signal is the *duration*
+(uniformly ~1.2 sec) and the ASR roundtrip ("nonsense English"
+when the input was German). Bake "voice failed to load → refuse to
+synthesise" into every TTS adapter; never paper over a missing
+voice prompt by feeding the model defaults.
+
 

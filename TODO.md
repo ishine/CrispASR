@@ -173,15 +173,51 @@ Kokoro-82M doesn't ship voices for (de, ru, ko, ar, …).
 `cstr/vibevoice-realtime-0.5b-GGUF` now bundles all 25 demo voices
 from [`microsoft/VibeVoice@main`](https://github.com/microsoft/VibeVoice/tree/main/demo/voices/streaming_model)
 (MIT). Languages: en (6 voices), de/fr/it/jp/kr/nl/pl/pt/sp (2 each),
-in/Indian-English (1, Samuel). Each voicepack is 2-6 MB. Smoke-tested:
-en-Grace_woman ASR-roundtrips byte-perfect; fr-Spk0_man near-perfect
-("voice" misread for "voix" — ASR quirk on the unfamiliar word, not
-a TTS issue); JP synth produces expected duration audio (parakeet-v3
-doesn't cover JA so couldn't roundtrip; would need parakeet-ja).
+in/Indian-English (1, Samuel). Each voicepack is 2-6 MB.
+
+**Auto-download wiring (commit `49b99f8`).** The registry's
+`vibevoice-tts` row keeps `emma` as the inline companion and adds
+`k_vibevoice_tts_extras` with `de-Spk1_woman` + `fr-Spk1_woman`. So
+`crispasr -m auto --backend vibevoice-tts -l de` pulls model + emma +
+both extras (~10 MB total extra payload), and the CLI auto-picks the
+matching voice for the requested language without `--voice`:
+
+  --voice <path>                            (explicit, always wins)
+  → vibevoice-voice-<lang>-Spk1_woman.gguf  (sibling, woman first)
+  → vibevoice-voice-<lang>-Spk0_man.gguf
+  → vibevoice-voice-emma.gguf               (English default)
+  → clear error                             (no synthesis attempted)
+
+Same commit fixes a silent-fallback bug: when `--voice` was empty AND
+no preload had run, the model previously got an unconditioned voice
+prompt and produced ~1.2 sec of EOS-truncated gibberish. The CLI now
+errors out clearly if no voice is resolvable. See
+`LEARNINGS.md` "VibeVoice silent unconditioned-voice fallback".
+
+**ASR-validated end-to-end:** `-m auto -l de --tts "Guten Tag, dies
+ist ein Test der deutschen Stimme."` → parakeet-v3 -l de roundtrip:
+
+  - de-Spk1_woman (auto-pick): byte-perfect
+  - de-Spk0_man:                "Schönen Tag, dies ist ein Test ..."
+                                (1 word substitution, both legit greetings)
+
+Smoke-tested on other languages: en-Grace_woman byte-perfect EN ASR;
+fr-Spk0_man near-perfect ("voix" → "voice", ASR quirk on rare word);
+JP synth produces expected duration audio (no parakeet-v3 JA support
+so couldn't roundtrip; would need parakeet-ja for that).
 
 Local files staged at `/Volumes/backups/ai/crispasr-models/
 vibevoice-voice-{en-Grace_woman,en-Mike_man,fr-Spk*,it-Spk*,
 jp-Spk*,kr-Spk*,nl-Spk*,pl-Spk*,pt-Spk*,sp-Spk*,in-Samuel_man}.gguf`.
+
+**Open follow-ups for vibevoice voicepacks (low priority):**
+- Other languages besides de/fr only auto-download via explicit
+  filename. If demand emerges for `-l ja` / `-l it` / etc., add to
+  `k_vibevoice_tts_extras`. Trade-off is auto-download payload size.
+- Could expose the cascade (`vibevoice-voice-<lang>-Spk0_man` →
+  `Spk1_woman` → `emma`) as a C ABI `crispasr_vibevoice_resolve_voice_for_lang`
+  so wrappers (rust/go/java/js/ruby) can use the same logic outside
+  the CLI. Mirrors the kokoro pattern. ~30 LOC if asked.
 
 ### Qwen3-TTS — no clean voicepacks available
 
