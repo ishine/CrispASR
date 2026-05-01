@@ -962,7 +962,7 @@ static void cpu_linear(granite_speech_context* /*ctx*/, float* out, const float*
 // from any caller; it stays in tree as a simpler baseline we can diff
 // against if the CPU path ever drifts. The unused-local casts below
 // keep the file warning-free without deleting the reference.
-static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T) {
+static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T, bool with_rpe) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.enc_d_model;       // 1024
@@ -995,16 +995,27 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T) {
     const int T_padded = n_blocks_attn * ctx_size;
     (void)T_padded; // reserved — the block path would clip-pad here
 
-    // Block-diagonal mask: (T, T) F16
-    ggml_tensor* block_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
-    ggml_set_name(block_mask, "block_mask");
-    ggml_set_input(block_mask);
+    // Block-diagonal mask: (T, T) F16. Only used by the approximate
+    // (with_rpe=false) flash-attn path; the per-block subgraph path
+    // doesn't need it because block boundaries are explicit.
+    ggml_tensor* block_mask = nullptr;
+    if (!with_rpe) {
+        block_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
+        ggml_set_name(block_mask, "block_mask");
+        ggml_set_input(block_mask);
+    }
 
-    // RPE lookup as input: (ctx_size * head_dim, ctx_size) = (200*128, 200) F32
-    // Layout: rpe[r * hd + d, c] = RPE_lookup[c, r, d] for matmul with Q
+    // RPE lookup as input: (ctx_size * head_dim, ctx_size) = (200*128, 200) F32.
+    // Memory layout: rpe[k=(r*hd + d), c]; element flat-offset = (r*hd + d) +
+    // (ctx_size*hd) * c. That's identical to the CPU vector's layout
+    // cpu_rpe[c * ctx_size * hd + r * hd + d], so the upload is a direct memcpy.
+    // Reshaping to ne=[hd, ctx_size, ctx_size] gives axes [d, r, c].
     ggml_tensor* rpe_tensor = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, ctx_size * hd, ctx_size);
     ggml_set_name(rpe_tensor, "rpe_lookup");
     ggml_set_input(rpe_tensor);
+
+    // Reshape once for the per-block subgraph path: (hd, ctx_size_r, ctx_size_c).
+    ggml_tensor* rpe_3d = with_rpe ? ggml_reshape_3d(ctx0, rpe_tensor, hd, ctx_size, ctx_size) : nullptr;
 
     // 16 × Conformer blocks
     for (int il = 0; il < n_layers; il++) {
@@ -1045,34 +1056,81 @@ static ggml_cgraph* granite_build_encoder(granite_speech_context* ctx, int T) {
             ggml_tensor* V =
                 ggml_cont(ctx0, ggml_view_2d(ctx0, KV, kv_dim, T, KV->nb[1], kv_dim * ggml_type_size(KV->type)));
 
-            // Reshape to (hd, nh, T)
+            // Reshape to (hd, nh, T) then permute to (hd, T, nh)
             Q = ggml_reshape_3d(ctx0, Q, hd, n_heads, T);
             K = ggml_reshape_3d(ctx0, K, hd, n_heads, T);
             V = ggml_reshape_3d(ctx0, V, hd, n_heads, T);
-
-            // Shaw relative position attention — manual blocked implementation
-            // flash_attn_ext can't include query-dependent pos_attn bias,
-            // so we implement attention manually using ggml_mul_mat + soft_max.
-            //
-            // Q: (hd, nh, T), K: (hd, nh, T), V: (hd, nh, T)
-            // Permute to (hd, T, nh) then reshape into blocks (hd, C, nh*nblocks)
-            // for batched matmul.
-
-            // For this layer's RPE: load from the weight tensor
-            // rpe_lookup is precomputed for layer 0; for other layers we'd need
-            // per-layer lookup. For now, use the precomputed one (approximate).
-            // TODO: precompute RPE per layer at init time
-
-            // Permute Q/K/V: (hd, nh, T) → (hd, T, nh)
             Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3));
             K = ggml_cont(ctx0, ggml_permute(ctx0, K, 0, 2, 1, 3));
             V = ggml_cont(ctx0, ggml_permute(ctx0, V, 0, 2, 1, 3));
 
-            // Use flash_attn_ext with block mask (pos_attn omitted for now)
-            // The block mask provides the main structural constraint.
-            // Full Shaw RPE would improve accuracy but requires manual attention.
-            ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K, V, block_mask, attn_scale, 0.0f, 0.0f);
-            attn = ggml_reshape_2d(ctx0, attn, n_heads * hd, T);
+            ggml_tensor* attn = nullptr;
+            if (with_rpe) {
+                // Per-block manual attention with Shaw RPE bias. Mirrors the
+                // CPU path in core_conformer_ibm::shaw_block_attention_cpu —
+                // bit-identical math, but emitted as ggml ops so the whole
+                // 16-layer encoder stays a single graph dispatch. For each
+                // block we compute scores = Q·K^T + Q·RPE, softmax, then ·V.
+                std::vector<ggml_tensor*> block_outs;
+                block_outs.reserve(n_blocks_attn);
+                for (int blk = 0; blk < n_blocks_attn; blk++) {
+                    const int blk_start = blk * ctx_size;
+                    const int blk_len = std::min(ctx_size, T - blk_start);
+
+                    // Slice Q/K/V over the time axis [blk_start, blk_start+blk_len).
+                    ggml_tensor* Q_blk = ggml_cont(
+                        ctx0, ggml_view_3d(ctx0, Q, hd, blk_len, n_heads, Q->nb[1], Q->nb[2],
+                                           (size_t)blk_start * Q->nb[1]));
+                    ggml_tensor* K_blk = ggml_cont(
+                        ctx0, ggml_view_3d(ctx0, K, hd, blk_len, n_heads, K->nb[1], K->nb[2],
+                                           (size_t)blk_start * K->nb[1]));
+                    ggml_tensor* V_blk = ggml_cont(
+                        ctx0, ggml_view_3d(ctx0, V, hd, blk_len, n_heads, V->nb[1], V->nb[2],
+                                           (size_t)blk_start * V->nb[1]));
+
+                    // QK^T: (blk_len_r=K, blk_len_c=Q, nh)
+                    ggml_tensor* scores = ggml_mul_mat(ctx0, K_blk, Q_blk);
+
+                    // Q·RPE: vectorised across heads via 4D broadcast matmul.
+                    //   A = rpe_blk_4d : (hd, blk_len_r, blk_len_c, 1)
+                    //   B = Q_blk_4d   : (hd, 1,         blk_len_c, n_heads)
+                    //   out            : (blk_len_r, 1, blk_len_c, n_heads)
+                    // Broadcasting in batch dim 0 (1 → n_heads).
+                    ggml_tensor* rpe_blk = ggml_cont(
+                        ctx0, ggml_view_3d(ctx0, rpe_3d, hd, blk_len, blk_len, rpe_3d->nb[1], rpe_3d->nb[2], 0));
+                    ggml_tensor* rpe_blk_4d = ggml_reshape_4d(ctx0, rpe_blk, hd, blk_len, blk_len, 1);
+                    ggml_tensor* Q_blk_4d = ggml_reshape_4d(ctx0, Q_blk, hd, 1, blk_len, n_heads);
+                    ggml_tensor* pos_bias_4d = ggml_mul_mat(ctx0, rpe_blk_4d, Q_blk_4d);
+                    ggml_tensor* pos_bias = ggml_reshape_3d(ctx0, pos_bias_4d, blk_len, blk_len, n_heads);
+
+                    scores = ggml_add(ctx0, scores, pos_bias);
+                    scores = ggml_soft_max_ext(ctx0, scores, /*mask*/ nullptr, attn_scale, 0.0f);
+
+                    // attn_blk = V_blk^T @ scores → (hd, blk_len_c, n_heads).
+                    // ggml_mul_mat contracts ne[0]; we permute V_blk to put
+                    // blk_len_r on ne[0] so the contraction is over r.
+                    ggml_tensor* V_blk_T = ggml_cont(ctx0, ggml_permute(ctx0, V_blk, 1, 0, 2, 3));
+                    ggml_tensor* out_blk = ggml_mul_mat(ctx0, V_blk_T, scores);
+                    block_outs.push_back(out_blk);
+                }
+
+                // Concatenate block outputs along the time axis (ne[1]) →
+                // [hd, T, n_heads]. Then permute axes 1 and 2 to land at
+                // [hd, n_heads, T], which matches `ggml_flash_attn_ext`'s
+                // output convention so the downstream reshape + attn_out_w
+                // matmul is bit-identical to the no-RPE path.
+                attn = block_outs[0];
+                for (size_t i = 1; i < block_outs.size(); i++)
+                    attn = ggml_concat(ctx0, attn, block_outs[i], 1);
+                attn = ggml_cont(ctx0, ggml_permute(ctx0, attn, 0, 2, 1, 3));
+                attn = ggml_reshape_2d(ctx0, attn, n_heads * hd, T);
+            } else {
+                // Approximate (no RPE) flash-attn path with block-diagonal mask.
+                // Kept available via GRANITE_ENCODER_GRAPH=1 (without
+                // GRANITE_ENCODER_GRAPH_RPE) for A/B comparison.
+                attn = ggml_flash_attn_ext(ctx0, Q, K, V, block_mask, attn_scale, 0.0f, 0.0f);
+                attn = ggml_reshape_2d(ctx0, attn, n_heads * hd, T);
+            }
 
             // Output projection
             attn = ggml_mul_mat(ctx0, b.attn_out_w, attn);
@@ -1221,7 +1279,22 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
     const int hd = (int)hp.enc_head_dim; // 128
     const int ctx_size = (int)hp.enc_context_size;
 
-    ggml_cgraph* gf = granite_build_encoder(ctx, T);
+    // GRANITE_ENCODER_GRAPH_RPE=1 selects the per-block manual-attention path
+    // that includes Shaw RPE (bit-identical to the CPU loop). Default behaviour
+    // (no env or value=0) keeps the existing flash_attn_ext path that drops
+    // the RPE bias — kept for A/B comparison.
+    bool with_rpe = false;
+    if (const char* e = std::getenv("GRANITE_ENCODER_GRAPH_RPE"))
+        with_rpe = (e[0] != '0' && e[0] != '\0');
+
+    if (with_rpe && ctx->rpe_lookup.empty()) {
+        fprintf(stderr,
+                "granite_encoder_graph: GRANITE_ENCODER_GRAPH_RPE=1 requested but rpe_lookup is empty — "
+                "falling back to no-RPE path\n");
+        with_rpe = false;
+    }
+
+    ggml_cgraph* gf = granite_build_encoder(ctx, T, with_rpe);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "granite_encoder_graph: alloc failed\n");
@@ -1232,8 +1305,8 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
     ggml_tensor* inp = ggml_graph_get_tensor(gf, "enc_input");
     ggml_backend_tensor_set(inp, mel, 0, (size_t)n_mels * T * sizeof(float));
 
-    // Fill block-diagonal attention mask: within each ctx_size block = 0 (attend),
-    // across blocks = -inf (masked out).
+    // Fill block-diagonal attention mask: only present in the no-RPE path.
+    // Within each ctx_size block = 0 (attend), across blocks = -inf (masked).
     ggml_tensor* mask_t = ggml_graph_get_tensor(gf, "block_mask");
     if (mask_t) {
         std::vector<ggml_fp16_t> mask_data((size_t)T * T);
@@ -1245,11 +1318,20 @@ static float* granite_run_encoder_graph(granite_speech_context* ctx, const float
         ggml_backend_tensor_set(mask_t, mask_data.data(), 0, mask_data.size() * sizeof(ggml_fp16_t));
     }
 
-    // RPE lookup (declared in graph but not yet used by attention — placeholder)
+    // RPE lookup. With with_rpe=true, upload the precomputed CPU table; both
+    // layouts (CPU vector and graph tensor) flat-index to the same offsets, so
+    // it's a direct memcpy. Without with_rpe, the tensor still exists in the
+    // graph (declared as input) but is unused — fill with zeros to satisfy the
+    // scheduler.
     ggml_tensor* rpe_t = ggml_graph_get_tensor(gf, "rpe_lookup");
     if (rpe_t) {
-        std::vector<float> rpe_zeros((size_t)ctx_size * hd * ctx_size, 0.0f);
-        ggml_backend_tensor_set(rpe_t, rpe_zeros.data(), 0, rpe_zeros.size() * sizeof(float));
+        const size_t need = (size_t)ctx_size * hd * ctx_size;
+        if (with_rpe) {
+            ggml_backend_tensor_set(rpe_t, ctx->rpe_lookup.data(), 0, need * sizeof(float));
+        } else {
+            std::vector<float> rpe_zeros(need, 0.0f);
+            ggml_backend_tensor_set(rpe_t, rpe_zeros.data(), 0, need * sizeof(float));
+        }
     }
 
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {

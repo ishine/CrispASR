@@ -151,15 +151,34 @@ current per-op path. Math is bit-identical to the CPU loop.
 
 ### Plan
 
-1. Land the prototype gated by a new env var
-   `GRANITE_ENCODER_GRAPH_RPE=1` (sibling of `GRANITE_ENCODER_GRAPH`).
-   Keeps the existing approximate path available for A/B comparison.
-2. Validate end-to-end on JFK: transcripts must match the CPU path
-   byte-for-byte; `crispasr-diff granite-speech` cosine numbers must
-   stay ≥ 0.99 (the existing CPU baseline).
-3. Once green, promote `GRANITE_ENCODER_GRAPH_RPE=1` to default and
+1. **DONE (prototype, May 2026):** per-block subgraph attention with
+   Shaw RPE wired up behind `GRANITE_ENCODER_GRAPH_RPE=1`. Compiles
+   clean; the new path measures encoder = ~1.18 s vs CPU baseline
+   ~3.6 s (≈3× speedup) on M1+Q4_K. Math derivation lives in the
+   source comments. **BLOCKER:** the existing `GRANITE_ENCODER_GRAPH=1`
+   baseline (no-RPE flash-attn path) is itself broken on JFK in the
+   current tree — produces only the back half of the quote ("ask what
+   you can do for your country"). My RPE addition produces the same
+   wrong output, so end-to-end validation is blocked: cannot
+   distinguish "RPE math correct" from "RPE math wrong" while the
+   no-RPE baseline is also wrong. LEARNINGS-recorded JFK accuracy on
+   the no-RPE path was "still good" at the time of writing — at some
+   point between then and now the path silently regressed.
+2. **NEXT:** debug the encoder-graph regression. Bisect granite_speech.cpp
+   commits or compare per-stage cosine against the Python reference
+   (`tools/dump_reference.py --backend granite-speech`) to localise
+   where the graph-path output starts diverging. Suspects: (a) ggml
+   flash-attn semantics changed across the recent ggml bump, (b) one
+   of the non-attention encoder ops (input_linear, FFN, conv module,
+   BN folding, mid-CTC residual) drifted, (c) the `rpe_lookup` tensor
+   was originally declared but unused — now feeding zeros may matter
+   on the no-RPE path if a graph optimisation depends on it.
+3. Once the no-RPE baseline transcribes JFK correctly, validate the
+   RPE prototype: transcripts must match the CPU path byte-for-byte;
+   `crispasr-diff granite-speech` cosine numbers must stay ≥ 0.99.
+4. Once green, promote `GRANITE_ENCODER_GRAPH_RPE=1` to default and
    retire `GRANITE_ENCODER_GRAPH` (the approximate path).
-4. Keep `GRANITE_DISABLE_ENCODER_GRAPH=1` as the escape hatch back to
+5. Keep `GRANITE_DISABLE_ENCODER_GRAPH=1` as the escape hatch back to
    CPU loops (slower but bit-identical to today's behaviour).
 
 **Effort:** ~150–250 LOC in `granite_run_encoder_graph` (granite_speech)
@@ -554,14 +573,13 @@ so existing builds don't regress.
 
    | `-l` value | preferred voice | rationale |
    |---|---|---|
-   | `de`, `de-*`, `de_*` | `df_eva` (Option 2a — Tundragoon, Apache-2.0) | German speaker timbre, healthy synth |
+   | `de`, `de-*`, `de_*` | `df_victoria` (Option 2b — kikiri-tts, Apache-2.0) → `df_eva` (Option 2a — Tundragoon, Apache-2.0) → `ff_siwis` | in-distribution to dida-80b backbone first; Tundragoon as second tier; French as last resort |
    | everything else without a native pack (ru, ko, ar, …) | `ff_siwis` (French) | non-silence baseline |
 
-   Resolution: `--voice` (explicit) → preferred per language → ff_siwis
-   if preferred missing → empty (helpful error). Explicit `--voice`
-   always wins. All three voice GGUFs (`af_heart`, `ff_siwis`,
-   `ef_dora`, `df_eva`, `dm_bernd`) live at
-   `/Volumes/backups/ai/crispasr-models/`.
+   Resolution: `--voice` (explicit) → cascade above → empty (helpful
+   error). Explicit `--voice` always wins. Voice GGUFs live at
+   `/Volumes/backups/ai/crispasr-models/kokoro-voice-{af_heart,
+   ef_dora, ff_siwis, df_eva, dm_bernd, df_victoria, dm_martin}.gguf`.
 
    **Option 2a — Recovered Tundragoon's German voice packs (DONE,
    SHIPPED 2026-05-01).**
@@ -597,51 +615,91 @@ so existing builds don't regress.
    `/Volumes/backups/ai/crispasr-models/kokoro-voice-{df_eva,dm_bernd}.gguf`.
    Wired as the German auto-fallback (Option 1 table above).
 
-   **Option 2b — Use `dida-80b/kokoro-german-hui-multispeaker-base`
-   as a second German-aware backbone (open; tracked alongside 2a so
-   we eventually ship both quality tiers).**
+   **Option 2b — Native German backbone via dida-80b (SHIPPED 2026-05-01).**
 
-   Sources (Apache-2.0 weights + recipe; CC0 dataset):
+   Sources (all Apache-2.0 weights + Apache-2.0 recipe + CC0 dataset):
    - Recipe: <https://github.com/semidark/kokoro-deutsch> — clone
      locally (recurse-submodules: `StyleTTS2/` + `kokoro/`).
-     Includes `scripts/extract_voicepack.py` (the tool we need),
-     `scripts/prepare_dataset.py`, and `scripts/prepare_training.py`.
-   - Model: <https://huggingface.co/dida-80b/kokoro-german-hui-multispeaker-base>
+     `scripts/extract_voicepack.py` is the tool for fresh per-speaker
+     voicepacks; we did not need to run it (kikiri-tts ships
+     pre-extracted voicepacks — see below).
+   - Backbone: <https://huggingface.co/dida-80b/kokoro-german-hui-multispeaker-base>
      — `first_stage.pth` + `config.json`. Stage-1 multispeaker base
      fine-tune of Kokoro-82M on HUI-Audio-Corpus-German (51 speakers,
      51 h, 10 epochs A40, mel loss 0.583 → 0.326).
+   - Pre-extracted voicepacks (kikiri-tts org, dida-80b maintainer):
+     <https://huggingface.co/kikiri-tts/kikiri-german-victoria> +
+     <https://huggingface.co/kikiri-tts/kikiri-german-martin>. Each
+     ships `voices/{victoria,martin}.pt` extracted via the kikiri
+     synthetic StyleEncoder which shares lineage with the dida-80b
+     base — saves us from running `extract_voicepack.py` ourselves
+     (the underlying HUI corpus is gated and would require a multi-step
+     LibriVox-pulling pipeline to reproduce).
 
-   Why it improves on 2a:
+   What this adds over Option 2a:
    - **Predictor + decoder are German-trained.** Solves the root
      cause behind the af_heart silence collapse on long German
      phrases — voices alone (Option 2a) only cover the speaker
      timbre, not the prosody/duration distribution.
-   - StyleEncoder is German-trained → extracted style embeddings
-     are in-distribution.
-   - Voicepack-extraction tool already exists in semidark's
-     `scripts/extract_voicepack.py`; no Stage-2 fine-tune required
-     for a deployable voice.
+   - StyleEncoder is German-trained → kikiri voicepacks are in-
+     distribution. Pairs cleanly with the dida-80b backbone.
 
-   Steps:
-   1. Spot-check the existing `models/convert-kokoro-to-gguf.py`
-      against `first_stage.pth`'s tensor names. Tundragoon's
-      [512,1,256] voicepack hint suggests dida-80b may use the same
-      bumped `max_phon=512` and the converter may need a small
-      adjustment (or just work — verify). Output:
-      `kokoro-de-hui-base-f16.gguf` (~163 MB at F16).
-   2. Use semidark's `scripts/extract_voicepack.py` to extract a
-      voice pack from one (or several) HUI speakers via the
-      *German-fine-tuned* StyleEncoder. Convert resulting `.pt` via
-      our existing `convert-kokoro-voice-to-gguf.py`. Suggested
-      candidates: 1F + 1M speaker for parity with df_eva/dm_bernd.
-   3. Per-language model routing in
-      `crispasr_backend_kokoro.cpp` (or the auto-download manifest):
-      when `-l de` is set, prefer
-      `kokoro-de-hui-base-f16.gguf` over `kokoro-82m-f16.gguf`.
-      Layer over the Option 1/2a fallback table — Option 2b becomes
-      the new German default once the GGUF is on disk.
+   Steps taken:
+   1. ✓ `models/convert-kokoro-to-gguf.py` extended for the modern
+      `torch.nn.utils.parametrize` WeightNorm form
+      (`parametrizations.weight.original0/original1`) used by dida-80b,
+      tolerated the missing `module.` DataParallel prefix on bert keys,
+      and added `--config` so the official Kokoro-82M `config.json`
+      can be reused (dida-80b ships only a HF-hub stub config without
+      vocab; the 178-symbol IPA vocab IDs are byte-identical per
+      semidark's `training/kokoro_symbols.py`).
+   2. ✓ Converted to
+      `/Volumes/backups/ai/crispasr-models/kokoro-de-hui-base-f16.gguf`
+      (163.7 MB at F16; 459 tensors mapped, 0 skipped — same byte size
+      as `kokoro-82m-f16.gguf`, confirming identical architecture).
+   3. ✓ Pulled kikiri voicepacks `voices/{victoria,martin}.pt`
+      (510×1×256 F32) via `huggingface_hub.hf_hub_download` and
+      converted them with the existing
+      `models/convert-kokoro-voice-to-gguf.py` to
+      `kokoro-voice-{df_victoria,dm_martin}.gguf` (~510 KB each,
+      `[510,1,256]` F32 — direct passthrough, no converter changes).
+   4. ✓ C ABI: new `crispasr_kokoro_resolve_model_for_lang()` and
+      `crispasr_kokoro_resolve_fallback_voice()` in `src/kokoro.h` /
+      `src/kokoro.cpp`, re-exported with the `_abi` suffix from
+      `src/crispasr_c_api.cpp` so the dylib (and every wrapper that
+      links against it) gets them.
+   5. ✓ CLI: `examples/cli/crispasr_backend_kokoro.cpp` now delegates
+      to the C ABI. When `-l de*` AND the user-passed model basename
+      starts with `kokoro-82m`, the backend silently swaps to a
+      sibling `kokoro-de-hui-base-f16.gguf` if present, then loads
+      the German fallback voice from the new cascade
+      `df_victoria → df_eva → ff_siwis`.
+   6. ✓ Python wrapper: `crispasr.kokoro_resolve_for_lang(model, lang)`
+      returns `KokoroResolved(model_path, voice_path, voice_name,
+      backbone_swapped)`; surfaced from `crispasr/__init__.py`.
 
-   For deployable single-voice production quality, run Stage-2
+   End-to-end measurements on the long German phrase
+   ("Guten Tag, dies ist ein Test des deutschen Phonemizers."), each
+   ASR-roundtripped through `parakeet-v3 -l de` so we measure
+   intelligibility and not just envelope:
+
+   | model + voice | peak | RMS | sec | ASR roundtrip |
+   |---|---:|---:|---:|---|
+   | official + df_eva (Option 2a) | 14726 | 1648 | 3.50 | "...Phonemizer." (lost trailing 's') |
+   | dida-80b + df_eva             | 23477 | 1830 | 3.50 | "...Phonemetzes." (1 word boundary error) |
+   | dida-80b + df_victoria        | 12052 | 1177 | 4.22 | "...Tester des Deutschen Phonemizers." (1 word boundary error) |
+   | dida-80b + dm_bernd           | 18948 | 2693 | 3.88 | "...Phonemetzers." (1 word boundary error) |
+   | **dida-80b + dm_martin**      | 18100 | 1546 | 3.98 | **"...Phonemizers." (perfect)** |
+
+   All four German voices clear the gate (peak ≥ 8000, RMS ≥ 1000)
+   on the dida-80b backbone, and three of four are word-perfect except
+   for one minor token-boundary error each. dm_martin is byte-perfect
+   round-trip; df_victoria handles "Phonemizers" correctly which df_eva
+   misses. This is the "fully native German signal path" the option
+   promised: predictor + decoder + StyleEncoder distribution all
+   German.
+
+   For deployable single-speaker production quality, run Stage-2
    fine-tuning on one HUI speaker (~half-day on an A40) — out of
    scope of this PLAN item; track separately if needed.
 
@@ -657,11 +715,24 @@ so existing builds don't regress.
    **Status:**
    1. ✓ Option 1 shipped (auto-fallback table per-language).
    2. ✓ Option 2a shipped (df_eva + dm_bernd recovered from r1di's
-      Git LFS, Apache-2.0; sufficient with official Kokoro-82M).
-   3. Open: Option 2b (dida-80b) for true native German prosody —
-      adds a second Kokoro GGUF variant. Track parallel to this
-      under "Native German backbone via dida-80b".
-   4. Option 3 only if 2b is blocked (it isn't — model is on HF).
+      Git LFS, Apache-2.0; works with both backbones).
+   3. ✓ Option 2b SHIPPED (dida-80b backbone + kikiri-tts voicepacks,
+      all Apache-2.0; truly native German prosody on long phrases).
+      Auto-routing kicks in when both `kokoro-82m-f16.gguf` and
+      `kokoro-de-hui-base-f16.gguf` sit in the same directory.
+   4. Option 3 not needed.
+
+   **Follow-ups (optional, separate track):**
+   - Auto-download manifest entries for `kokoro-82m-f16`,
+     `kokoro-de-hui-base-f16`, and the four German voicepacks blocks
+     on publishing GGUF mirrors to HF (cstr/* equivalents). Today users
+     either drop the files into `<model_dir>` manually or run the
+     converters in `models/`.
+   - Stage-2 fine-tune on one HUI speaker (~half-day A40) for
+     deployable single-voice production quality. Out of scope here.
+   - Wrappers besides Python (Rust/Go/Java/JS/Ruby) can adopt the
+     `crispasr_kokoro_resolve_*_abi` symbols when they grow a TTS
+     surface; the C ABI is published in `src/kokoro.h`.
 2. **Mandarin tone numbers.** espeak-ng outputs digit-suffixed
    tone markers (`ni2χˈɑu2`) that aren't in the kokoro-82m IPA vocab
    (178 symbols) and likely get dropped at tokenization, losing tone
