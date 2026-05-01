@@ -15,14 +15,15 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 
 | Priority | Item | Effort | Status |
 |---|---|---|---|
-| **HIGH** | [#52 Qwen3-TTS](#52-qwen3-tts) — speaker_encoder forward | Medium | talker + code_predictor + codec done; ECAPA next |
+| **MEDIUM** | [#52 Qwen3-TTS](#52-qwen3-tts) — perf pass | Medium | talker + code_predictor + codec + ECAPA + codec_encoder all done; only step-4 perf pass open (~137 ms/frame → real-time) |
 | **DONE** | [#51 MiMo-V2.5-ASR runtime](#51-mimo-v25-asr-runtime--done-may-2026) | Large | end-to-end JFK matches reference; F16+Q4_K on HF; 51b/b' shipped (step-only + cached step graph, 1.46× decode); 51a mmap loader + 51c F16 step still LOW |
 | **HIGH** | [#54 granite-speech-4.1 plus / nar](#54-granite-speech-41-plus--nar-variants) | Small | base + plus + nar runtimes all DONE; only NAR quant + HF upload remain |
-| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phase 1 (Qwen3-TTS-{CustomVoice 0.6B/1.7B, Base 1.7B, VoiceDesign 1.7B}) DONE; Phase 2 Orpheus-3B base DONE (slice c, commit `a0982d3`); Kartoffel_Orpheus + lex-au unblocked as checkpoint swaps; phases 3-5 queued |
+| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phase 1 (Qwen3-TTS-{CustomVoice 0.6B/1.7B, Base 1.7B, VoiceDesign 1.7B}) DONE; Phase 2 Orpheus-3B base + lex-au-orpheus-de DONE; Kartoffel_Orpheus DE checkpoint swap pending (safetensors → GGUF conversion); phases 3-5 queued |
 | **MEDIUM** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet/cohere DONE; canary remaining |
 | **MEDIUM** | [#53 core/audio_decoder.h](#53-coreaudio_decoderh--dry-across-tts--codec-backends) | Medium | DRY across qwen3-tts/mimo/vibevoice |
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
+| **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | TTS surface (incl. qwen3-tts variants) at full parity across all 7 wrappers; align/diarize/VAD/streaming/punctuation/LID/registry still C-ABI-only on Go/Java/Ruby/JS/Dart |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
 | **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | |
 | **LOW** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | |
@@ -278,16 +279,18 @@ collection: [Qwen/Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS),
        conv_transpose_1d input range tightening" — MUST RE-APPLY
        after every ggml bump. The runtime CPU-pin (`codec_sched`)
        is kept as a safety net.
-    2. **Runtime ECAPA speaker_encoder forward.** Removes the
-       `bake-qwen3-tts-voice-pack.py` dependency for new voices —
-       end users pass any ref WAV and we compute spk_embedding in
-       C++. ~250 LOC: mel(24kHz) → TDNN → 3 SE-Res2Net → MFA →
-       ASP → Conv1×1 → 1024-d. Reference: `Qwen3TTSSpeakerEncoder`
-       in `ref/Qwen3-TTS/qwen_tts/core/models/modeling_qwen3_tts.py`.
-    3. **Runtime codec encoder forward.** Mimi-based encoder (used
-       in voice cloning to extract `ref_code` from the reference
-       WAV). Closes the loop on the bake script — pure C++ pipeline.
-       Larger effort (Mimi is its own architecture).
+    2. ✓ **Runtime ECAPA speaker_encoder forward** (commits `c0a9cb3`,
+       `8a4c49e`, `38040b4`). mel(24kHz) → TDNN → 3 SE-Res2Net → MFA →
+       ASP → Conv1×1 → `spk_enc_dim` (1024 for 0.6B, 2048 for 1.7B).
+       Diff harness PASS at cos_min=0.999999. Public C ABI:
+       `qwen3_tts_compute_speaker_embedding(audio, n, sr)` and
+       `qwen3_tts_set_voice_prompt[_with_text]`.
+    3. ✓ **Runtime codec encoder forward** (commits `ef11c01`,
+       `10302b4`). SEANet (init + 4 resblocks + 4 downsample) + 8L
+       transformer + downsample + RVQ encode. Diff harness 3 stages
+       at cos_min ≥ 0.999. Closes the bake-qwen3-tts-voice-pack.py
+       loop — `qwen3_tts_set_voice_prompt(wav)` now produces both
+       spk_emb and ref_codes purely in C++.
     4. **Performance pass.** Current AR step is ~137 ms/frame on
        M1 Metal — 1.7× slower than real-time at 12.5 fps. Bottleneck
        is the 15 sequential code_predictor graph builds per frame.
@@ -902,12 +905,15 @@ CosyVoice 3 (license permitting) and partially for Fish-Speech S2
 Already-supported encoder/decoders in the tree get a TTS direction by
 adding a codec head + sampling path. Cheaper than a full new backend.
 
-- **Voxtral-TTS** — Mistral's Voxtral with a TTS head. Both
-  `mlx-community/Voxtral-4B-TTS-2603-mlx-4bit` (CC-BY-NC, the MLX
-  converter relicensed) and `TrevorJS/voxtral-tts-q4-gguf` exist;
-  use the upstream Apache 2.0 weights from Mistral, NOT the MLX
-  variant. The voxtral4b ASR backend supplies the encoder/decoder;
-  the TTS path needs a codec decode + new sampling. Estimate ~300 LOC.
+- ~~**Voxtral-TTS**~~ — **BLOCKED, May 2026 license re-survey.**
+  Upstream `mistralai/Voxtral-4B-TTS-2603` is **CC-BY-NC 4.0**, not
+  Apache 2.0 as previously assumed. The model card states the license
+  is inherited from the voice-reference training datasets (EARS,
+  CML-TTS, IndicVoices-R, Arabic Natural Audio) which are themselves
+  NC, so the constraint is constitutional and can't be cleansed by
+  re-quantization. `TrevorJS/voxtral-tts-q4-gguf` tags itself
+  Apache-2.0 but that's incorrect. Same blocker class as F5-TTS-German
+  / Vevo1.5 below. Moved to deferred.
 - **FINAL-Bench/Darwin-TTS-1.7B-Cross** (Apache 2.0) + AWQ
   variant `AMAImedia/Qwen3-1.7B-TTS-Cross-Darwin-NOESIS-AWQ-INT4` —
   Qwen3-1.7B talker + "Darwin" codec. The 1.7B talker is a #52
@@ -933,7 +939,7 @@ adding a codec head + sampling path. Cheaper than a full new backend.
 | marduk-ra/F5-TTS-German | CC-BY-NC. F5-TTS arch is a DiT — would need new ggml ops, not worth the spend on an NC model. |
 | mlx-community/fish-audio-s2-pro-* | Fish-Audio Research license — commercial requires separate Fish Audio license. |
 | amphion/Vevo1.5 | CC-BY-NC-ND. Also voice conversion, different I/O contract. |
-| mlx-community/Voxtral-4B-TTS-2603-mlx-4bit | MLX converter slapped CC-BY-NC on top. Use Mistral upstream Apache 2.0 weights via Phase 4 instead. |
+| mistralai/Voxtral-4B-TTS-2603 + all derivatives (mlx-community 4-bit, TrevorJS Apache-2.0-tagged GGUF) | Upstream weights are CC-BY-NC 4.0 inherited from voice-ref training data (EARS / CML-TTS / IndicVoices-R / Arabic Natural Audio). Constitutional, not cleanable. The "use upstream Apache 2.0 weights" plan turned out to be based on a wrong assumption (May 2026 re-survey). |
 | KevinAHM/pocket-tts-onnx, Pendrokar/xvapitch_nvidia | ONNX-only, niche, no clear demand. |
 | NeuralAudioAI/NA_base, tokenaii/horus | Insufficient public info — re-evaluate if asked. |
 | FunAudioLLM/Fun-CosyVoice3-* + ayousanz/cosy-voice3-onnx | License unverified on v3. Earlier CosyVoice generations were Apache 2.0; needs confirmation before committing to CFM solver work for it. |
@@ -942,19 +948,19 @@ adding a codec head + sampling path. Cheaper than a full new backend.
 
 | Phase | Model | License | Status | Effort |
 |---|---|---|---|---|
-| 1 | Qwen3-TTS-CustomVoice 0.6B | Apache 2.0 | **DONE — runtime spk_id path landed; 4 ASR roundtrips passed (vivian / aiden / serena / dylan-dialect). Registry line added; HF upload pending.** | S |
-| 1 | Qwen3-TTS-CustomVoice 1.7B | Apache 2.0 | **DONE — `small_to_mtp_projection` now applied to code_pred per-step embeddings (steps 1..14), not just step 0. ASR roundtrips passed on Q8_0/ryan + F16/vivian (exact-match transcripts on long prompt). HF upload pending.** | S |
+| 1 | Qwen3-TTS-CustomVoice 0.6B | Apache 2.0 | **DONE + SHIPPED — runtime spk_id path; 4 ASR roundtrips passed (vivian / aiden / serena / dylan-dialect); registry alias `qwen3-tts-customvoice`; published as [`cstr/qwen3-tts-0.6b-customvoice-GGUF`](https://huggingface.co/cstr/qwen3-tts-0.6b-customvoice-GGUF) (Q8_0 968 MB).** | S |
+| 1 | Qwen3-TTS-CustomVoice 1.7B | Apache 2.0 | **DONE + SHIPPED — `small_to_mtp_projection` applied per-step (steps 1..14), ASR roundtrips word-exact on Q8_0/ryan + F16/vivian. Registry alias `qwen3-tts-1.7b-customvoice`; factory dispatch wired. Published as [`cstr/qwen3-tts-1.7b-customvoice-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-customvoice-GGUF) (F16 3.84 GB + Q8_0 2.04 GB).** | S |
 | 1 | Qwen3-TTS-Base 1.7B | Apache 2.0 | **DONE — runtime parameterised `spk_enc_dim` (was hardcoded 1024) so the 1.7B's 2048-d ECAPA output stops getting truncated; registry alias `qwen3-tts-1.7b-base` + HF model card landed. ASR-roundtrip word-exact on F16/Q8_0 (clone.wav English ICL). Published as [`cstr/qwen3-tts-1.7b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF) (F16 3.86 GB + Q8_0 2.07 GB).** | S |
 | 1 | Qwen3-TTS-VoiceDesign 1.7B | Apache 2.0 | **DONE (commit `bd3eb71`) — natural-language voice description via `--instruct`. New `build_voicedesign_prefill_embeds` mirrors CustomVoice but omits the speaker frame from the codec bridge and prepends an instruct block tokenised as `<\|im_start\|>user\n{instruct}<\|im_end\|>\n`. New C-ABI: `qwen3_tts_set_instruct` + `qwen3_tts_is_voice_design`. ASR-roundtrip word-exact on F16/Q8_0 (parakeet-v3 verbatim modulo terminal punctuation). Published as [`cstr/qwen3-tts-1.7b-voicedesign-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) (F16 3.84 GB + Q8_0 2.04 GB). 1.7B-only — no 0.6B-VoiceDesign weight release upstream.** | S |
-| 2 | Orpheus-3B base | llama3.2 | **DONE (commit `a0982d3`) — talker AR forward + SNAC C++ decoder shipped; ASR-roundtrip word-exact on `"Hello, my name is Tara."` (parakeet-v3 verbatim). Talker GGUF converted from `unsloth/orpheus-3b-0.1-ft` non-gated mirror; SNAC from `hubertsiuzdak/snac_24khz`. Local F16 + SNAC in `/Volumes/backups/ai/crispasr-models/`; HF upload pending. Phase 3+ gaps tracked in slice prose above.** | M |
-| 2 | Kartoffel_Orpheus DE (natural+synthetic) | llama3.2 | unblocked — checkpoint swap on Orpheus base | XS |
-| 2 | lex-au Orpheus-3B-DE-Q8 | llama3.2 | unblocked — already GGUF; needs registry alias | XS |
+| 2 | Orpheus-3B base | llama3.2 | **DONE (commits `a0982d3` + `a4f7c49` + `1f62647` + `5025150`) — talker AR forward + SNAC C++ decoder shipped; ASR-roundtrip word-exact on `"Hello, my name is Tara."` (parakeet-v3 verbatim). Published as [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) (F16 6.6 GB + Q8_0 3.5 GB) + [`cstr/snac-24khz-GGUF`](https://huggingface.co/cstr/snac-24khz-GGUF) (F32 26 MB). Unified Session API + all 6 wrappers wired (`crispasr_session_set_speaker_name`, `n_speakers`, `get_speaker_name`); orpheus default temperature now 0.6f (was 0.0f / greedy / loops). Phase 3+ gaps tracked in slice prose above.** | M |
+| 2 | Kartoffel_Orpheus DE (natural+synthetic) | llama3.2 | **WIRED — registry rows for `kartoffel-orpheus-de-{natural,synthetic}` + factory dispatch added; HF READMEs drafted at hf_readmes/. BLOCKED on user accepting click-through gate at `SebastianBodza/Kartoffel_Orpheus-3B_german_{natural,synthetic}-v0.1` before download / convert / upload can proceed.** | XS-S |
+| 2 | lex-au Orpheus-3B-DE-Q8 | llama3.2 (HF tags Apache-2.0; underlying Llama-3.2-FT) | **DONE — registry alias `lex-au-orpheus-de` added pointing at the existing `lex-au/Orpheus-3b-German-FT-Q8_0.gguf` (3.52 GB). Factory dispatch wired. SNAC companion shared with the base orpheus row.** | XS |
 | 2 | gwen-tts-0.6B | MIT | queued — needs weight inspection first | S–M |
 | 2 | tada-3b-ml | llama3.2 | queued | M |
 | 3 | Chatterbox base | MIT | queued — CFM solver gating | L |
 | 3 | Kartoffelbox_Turbo DE | CC-BY-4.0 (gated) | blocked on Chatterbox base | XS |
 | 3 | lahgtna-chatterbox-v1 AR | MIT | blocked on Chatterbox base | XS |
-| 4 | Voxtral-TTS (Mistral upstream) | Apache 2.0 | queued | M |
+| 4 | Voxtral-TTS (Mistral upstream) | CC-BY-NC 4.0 | **BLOCKED — license inherits from voice-ref training data; moved to Deferred. See Phase 4 prose.** | — |
 | 4 | Darwin-TTS-1.7B-Cross | Apache 2.0 | queued | M |
 | 5 | VoxCPM2 | Apache 2.0 | queued — large new arch | L |
 | 5 | kugelaudio-0-open | MIT | needs scoping | TBD |
@@ -1248,3 +1254,78 @@ Windows wheels with `libcrispasr.*` bundled inside via `auditwheel` /
 `delocate` / `delvewheel`. Same for Rust if we ever want
 `crispasr-sys` to vendor the native build like `tch-rs` /
 `onnxruntime-sys` do. Defer until pure-Python wheel is out and stable.
+
+
+---
+
+## 59. Cross-binding C-ABI parity
+
+The Session API surface for TTS (incl. qwen3-tts Base / CustomVoice /
+VoiceDesign variant routing) is fully wrapped across all 7 bindings as
+of commit `65e0a61` + the Dart follow-up. **The non-Session ABI (~80
+exports) is still C-ABI-only or partially-wrapped on most bindings.**
+This entry tracks closing those gaps.
+
+### Coverage matrix (May 2026)
+
+C-ABI exposes 127+ unique `crispasr_*` exports in
+`src/crispasr_c_api.cpp`. Coverage by binding:
+
+| Binding | Symbols wrapped | Approx % | TTS Session | Variant detect | Align | Diarize | LID | VAD | Streaming | Punc | Registry | Cache |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Rust (`crispasr-sys`) | 56 | ~44% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Python (`_binding.py`) | 53 | ~42% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Dart (`flutter/crispasr`) | ~25 | ~20% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Go (`bindings/go`) | 18 | ~14% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Java (JNA) | 17 | ~13% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Ruby (C ext) | 19 | ~15% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| JS (emscripten) | 18 | ~14% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+Rust + Python are the canonical / "full-coverage" wrappers. The other
+five track the high-traffic surface (transcribe + TTS) and were swept
+together in `4f476c3` (set_speaker_name) and `65e0a61` (set_instruct +
+variant detect).
+
+### Capabilities reachable only from C-ABI / Rust / Python
+
+For each, ~3-12 exports + an idiomatic result type per binding:
+
+- **Forced alignment** — `crispasr_align_words`, `align_words_abi`,
+  `align_result_*`. Word-level timestamps from a transcript + audio.
+- **Diarization** — `crispasr_diarize_segments[_abi]`. Speaker segment
+  spans.
+- **Language ID** — `crispasr_detect_language[_pcm]`,
+  `crispasr_lid_free_cache`. Pre-transcribe LID for routing.
+- **VAD** — `crispasr_vad_segments`, `crispasr_compute_vad_slices`,
+  `crispasr_stitch_vad_slices`, `crispasr_vad_remap_timestamp`,
+  `crispasr_vad_free`. Standalone VAD + slice stitching.
+- **Streaming** — `crispasr_stream_open/feed/get_text/flush/close`,
+  `crispasr_stream_run_decode`. Online ASR with a step buffer.
+- **Punctuation** — `crispasr_punc_init/process/free/free_text`.
+  FireRedPunc post-processor.
+- **Model registry** — `crispasr_registry_lookup[_abi]`,
+  `registry_lookup_by_filename[_abi]`,
+  `crispasr_detect_backend_from_gguf`. Backend / file resolution.
+- **Cache** — `crispasr_cache_dir_abi`,
+  `crispasr_cache_ensure_file_abi`. Auto-download dir + lookup.
+
+### Effort
+
+Per binding ~150-300 LOC (extern decls + idiomatic methods + result
+types + smoke test). Five trailing bindings × 9 capability surfaces ×
+~30 LOC each ≈ 1.5 kLOC total. Each capability is independent — can
+be staged.
+
+Suggested ordering once a consumer asks:
+1. Streaming (Go/Java first — common deployment shapes for ASR servers).
+2. VAD + alignment (mobile use cases via Dart).
+3. Diarization + LID + punctuation (transcription pipelines).
+4. Registry + cache (CLI-style consumers).
+
+### When to do this
+
+Not now. The qwen3-tts sweep was justified because PLAN #57 Phase 2
+unblocks needed it. Open this section when a concrete consumer shows
+up asking for, say, "Java VAD" or "Go streaming". Reference commits
+for the pattern: `4f476c3` (TTS surface sweep) and `65e0a61`
+(variant detection sweep). Same shape applies to every other capability.

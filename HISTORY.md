@@ -1076,12 +1076,17 @@ the writer first buffers tensor data to a system tempfile (honors
 `/Volumes/backups` at 100% disk usage causes silent corruption /
 slow throughput; direct write side-steps the issue.
 
-**HF release pending.** Local F16 (~6.6 GB) talker GGUF +
-SNAC codec at `/Volumes/backups/ai/crispasr-models/`. Registry
-alias `orpheus` already wired in `src/crispasr_model_registry.cpp`
-pointing at `cstr/orpheus-3b-base-GGUF` (publish pending) +
-companion `cstr/snac-24khz-GGUF`. Q8_0 / Q4_K quants + HF upload
-follow once disk pressure clears.
+**HF release.** Talker shipped to
+[`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF)
+as F16 (6.6 GB) + Q8_0 (3.5 GB). SNAC codec shipped to
+[`cstr/snac-24khz-GGUF`](https://huggingface.co/cstr/snac-24khz-GGUF)
+as a single F32 file (26 MB; the codec is small enough that
+quantising it isn't worth the audio-quality risk). Registry alias
+`orpheus` in `src/crispasr_model_registry.cpp` resolves Q8_0 + SNAC
+under `-m auto`. The full unified Session API works end-to-end:
+opening the talker through `crispasr_session_open` returns a non-null
+handle and `crispasr_session_n_speakers` returns the 8 canopylabs
+English voices (`tara`/`leah`/`jess`/`leo`/`dan`/`mia`/`zac`/`zoe`).
 
 **Phase 3+ known gaps (out of scope for slice c):** plain NEOX
 RoPE with `theta=500000` (no Llama-3 `freq_factors` scaling — fine
