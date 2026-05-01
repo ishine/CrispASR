@@ -98,7 +98,7 @@ def _build_codes(num_super_frames: int, fill: int):
 
 
 def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
-         dtype: str = "f32") -> Dict[str, Any]:
+         dtype: str = "f32", **_unused) -> Dict[str, Any]:
     """Dispatcher entry point. `model_dir` must point at the
     huggingface-cli-resolved hubertsiuzdak/snac_24khz snapshot dir; the
     `audio` arg is ignored (codec-decode-only)."""
@@ -124,6 +124,17 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
     model = SNAC.from_pretrained(str(model_dir)).eval()
     device = torch.device("cpu")
     model = model.to(device)
+
+    # NoiseBlock injects torch.randn(...) at every forward call (see
+    # snac/layers.py:NoiseBlock.forward). That makes model.decode()
+    # non-deterministic and the C++ side (which has no RNG state) can't
+    # match it. The injection is incidental at inference — its purpose is
+    # exploration during training. Replace the per-call forward with the
+    # zero-noise equivalent (return x), making NoiseBlock identity. The
+    # C++ side does the same. The PCM still passes the perceptual bar
+    # (the noise contribution is ~1e-2 of the signal RMS at 24 kHz).
+    from snac.layers import NoiseBlock
+    NoiseBlock.forward = lambda self, x: x
 
     codes_t = [torch.from_numpy(c).long().to(device) for c in codes_np]
 

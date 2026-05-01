@@ -137,6 +137,11 @@ REGISTERED_BACKENDS: Dict[str, str] = {
     # placeholder. Phonemes + voice come from KOKORO_PHONEMES / KOKORO_VOICE
     # env vars (see reference_backends/kokoro.py for the full list).
     "kokoro":     "reference_backends.kokoro",
+    # Orpheus-3B SNAC 24 kHz codec decoder only (codes → PCM).
+    # model_dir = hubertsiuzdak/snac_24khz HF snapshot; audio arg is unused.
+    # Driven by ORPHEUS_SNAC_T_SUPER (default 4) + ORPHEUS_SNAC_CODE
+    # (default 0); see reference_backends/orpheus_snac.py.
+    "orpheus":    "reference_backends.orpheus_snac",
 }
 
 DEFAULT_STAGES_BY_BACKEND: Dict[str, List[str]] = {}  # populated at import

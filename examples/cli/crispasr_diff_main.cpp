@@ -46,6 +46,7 @@
 #include "gemma4_e2b.h"
 #include "mimo_asr.h"
 #include "mimo_tokenizer.h"
+#include "orpheus_snac.h"
 
 #include "common-crispasr.h"
 
@@ -447,7 +448,7 @@ int main(int argc, char** argv) {
                 "  backend       one of: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, "
                 "granite-4.1, "
                 "granite-nle, parakeet, "
-                "canary, cohere, gemma4, mimo-tokenizer, mimo-asr\n"
+                "canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus\n"
                 "  model.gguf    crispasr-compatible model weights\n"
                 "  reference.gguf  archive produced by tools/dump_reference.py\n"
                 "  audio.wav     16 kHz mono WAV\n",
@@ -1700,11 +1701,87 @@ int main(int argc, char** argv) {
             free(mine);
         }
         kokoro_free(ctx);
+    } else if (backend_name == "orpheus") {
+        // Orpheus SNAC 24 kHz codec-decoder diff. The talker is out of
+        // scope for this slice; we drive the C++ SNAC graph directly
+        // with the same deterministic 7N-token stream the Python
+        // reference (tools/reference_backends/orpheus_snac.py) uses,
+        // de-interleaved into 3 codebook tensors per the canonical
+        // 7-slot super-frame layout.
+        //
+        // model_path is the SNAC GGUF (cstr/snac-24khz-GGUF or built
+        // locally via models/convert-snac-to-gguf.py). The audio.wav
+        // arg is unused (codec-only).
+        snac_decoder_params sp = snac_decoder_default_params();
+        sp.n_threads = 4;
+        sp.verbosity = 0;
+        sp.use_gpu = std::getenv("ORPHEUS_SNAC_GPU") != nullptr;
+        snac_decoder_ctx* ctx = snac_decoder_init_from_file(model_path.c_str(), sp);
+        if (!ctx) {
+            fprintf(stderr, "failed to load SNAC codec from '%s'\n", model_path.c_str());
+            return 4;
+        }
+
+        // Build the same deterministic codes the Python ref builds
+        // (orpheus_snac.py:_build_codes). 7 LM tokens per super-frame:
+        //   slot 0     → codes_0    (1 entry / super-frame)
+        //   slot 1, 4  → codes_1    (2 / super-frame)
+        //   slot 2,3,5,6 → codes_2  (4 / super-frame)
+        const int T_super = std::getenv("ORPHEUS_SNAC_T_SUPER")
+                                ? std::atoi(std::getenv("ORPHEUS_SNAC_T_SUPER"))
+                                : 4;
+        const int fill_code = std::getenv("ORPHEUS_SNAC_CODE")
+                                  ? std::atoi(std::getenv("ORPHEUS_SNAC_CODE"))
+                                  : 0;
+        const int code = ((fill_code % 4096) + 4096) % 4096;
+        std::vector<int32_t> c0((size_t)T_super, code);
+        std::vector<int32_t> c1((size_t)T_super * 2, code);
+        std::vector<int32_t> c2((size_t)T_super * 4, code);
+
+        printf("crispasr-diff: orpheus SNAC: T_super=%d  code=%d  → %zu+%zu+%zu codebook entries\n",
+               T_super, code, c0.size(), c1.size(), c2.size());
+
+        // Stage list matches DEFAULT_STAGES in orpheus_snac.py minus
+        // the trivially-equal codes_{0,1,2}. snac_pcm_emit is derived
+        // from snac_pcm by slicing [:, :, 2048:4096] when T_super == 4.
+        static const char* stages[] = {
+            "snac_quant_out",
+            "snac_dec_pre",
+            "snac_dec_blk0",
+            "snac_dec_blk1",
+            "snac_dec_blk2",
+            "snac_dec_blk3",
+            "snac_pcm",
+        };
+        for (const char* stage : stages) {
+            int n_stage = 0;
+            float* our_data = snac_decoder_extract_stage(ctx, c0.data(), (int)c0.size(), c1.data(), (int)c1.size(),
+                                                        c2.data(), (int)c2.size(), stage, &n_stage);
+            if (!our_data) {
+                printf("[ERR ] %-22s  extract returned null\n", stage);
+                n_fail++;
+                continue;
+            }
+            auto rep = ref.compare(stage, our_data, (size_t)n_stage);
+            print_row(stage, rep, COS_THRESHOLD);
+            record(rep);
+
+            // Streaming-window slice. Compare against snac_pcm_emit when
+            // T_super == 4 — the canonical orpheus streaming case.
+            if (std::strcmp(stage, "snac_pcm") == 0 && T_super == 4 && n_stage >= 4096) {
+                const int slice_n = 2048;
+                auto rep_emit = ref.compare("snac_pcm_emit", our_data + 2048, (size_t)slice_n);
+                print_row("snac_pcm_emit", rep_emit, COS_THRESHOLD);
+                record(rep_emit);
+            }
+            free(our_data);
+        }
+        snac_decoder_free(ctx);
     } else {
         fprintf(stderr,
                 "crispasr-diff: backend '%s' is not recognised. "
                 "Supported: voxtral, voxtral4b, qwen3, qwen3-tts, qwen3-tts-codec, kokoro, granite, granite-4.1, "
-                "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr.\n",
+                "granite-nle, parakeet, canary, cohere, gemma4, mimo-tokenizer, mimo-asr, orpheus.\n",
                 backend_name.c_str());
         return 5;
     }

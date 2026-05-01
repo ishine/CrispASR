@@ -558,7 +558,7 @@ endif()
 # ---------------------------------------------------------------------------
 # orpheus — canopylabs/orpheus-3b-0.1-ft (Llama-3.2-3B + SNAC 24 kHz codec)
 # ---------------------------------------------------------------------------
-add_library(orpheus STATIC orpheus.h orpheus.cpp)
+add_library(orpheus STATIC orpheus.h orpheus.cpp orpheus_snac.h orpheus_snac.cpp)
 set_target_properties(orpheus PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(orpheus PUBLIC .)
 target_compile_features   (orpheus PUBLIC cxx_std_17)
