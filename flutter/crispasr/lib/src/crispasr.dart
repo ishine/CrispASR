@@ -1772,11 +1772,67 @@ class CrispasrSession {
     return out;
   }
 
+  /// Set the natural-language voice description for instruct-tuned TTS
+  /// backends (qwen3-tts VoiceDesign today).
+  ///
+  /// VoiceDesign generates speech in a voice **described by a
+  /// natural-language instruction** — no reference WAV, no preset
+  /// speaker. The instruct text is wrapped as
+  /// `<|im_start|>user\n{instruct}<|im_end|>\n` and prepended to the
+  /// talker prefill; the codec bridge omits the speaker frame.
+  ///
+  /// Required for qwen3-tts VoiceDesign before [synthesize]. Detect
+  /// VoiceDesign via [isVoiceDesign].
+  void setInstruct(String instruct) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_instruct')) {
+      throw UnsupportedError('setInstruct API not available in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_instruct');
+    final p = instruct.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc == -3) {
+        throw StateError(
+            'backend $_backend is not a VoiceDesign variant; setInstruct only applies to qwen3-tts VoiceDesign');
+      }
+      if (rc != 0) throw Exception('setInstruct failed (rc=$rc) for backend $_backend');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
+  /// Whether the loaded model is a qwen3-tts CustomVoice variant
+  /// (use [setSpeakerName] for it).
+  bool isCustomVoice() {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_is_custom_voice')) return false;
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_is_custom_voice');
+    return fn(_handle) != 0;
+  }
+
+  /// Whether the loaded model is a qwen3-tts VoiceDesign variant
+  /// (use [setInstruct] for it).
+  bool isVoiceDesign() {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_is_voice_design')) return false;
+    final fn = _lib.lookupFunction<
+        Int32 Function(Pointer<Void>),
+        int Function(Pointer<Void>)>('crispasr_session_is_voice_design');
+    return fn(_handle) != 0;
+  }
+
   /// Synthesise [text] to 24 kHz mono float32 PCM.
   ///
   /// Requires a TTS-capable backend (vibevoice, qwen3-tts, kokoro, orpheus).
-  /// For vibevoice call [setVoice] before the first synthesis. For orpheus
-  /// call [setCodecPath] (SNAC GGUF) and [setSpeakerName].
+  /// For qwen3-tts call [setCodecPath] and one of: [setVoice] (Base),
+  /// [setSpeakerName] (CustomVoice), [setInstruct] (VoiceDesign). Branch
+  /// via [isVoiceDesign] / [isCustomVoice]. For orpheus call
+  /// [setCodecPath] (SNAC GGUF) and [setSpeakerName].
   Float32List synthesize(String text) {
     if (_closed) throw StateError('CrispasrSession is closed');
     if (!_lib.providesSymbol('crispasr_session_synthesize')) {

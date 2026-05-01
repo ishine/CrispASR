@@ -152,7 +152,7 @@ constexpr Entry k_registry[] = {
     // until the upload lands.
     {"qwen3-tts-1.7b-customvoice", "qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf",
      "https://huggingface.co/cstr/qwen3-tts-1.7b-customvoice-GGUF/resolve/main/qwen3-tts-12hz-1.7b-customvoice-q8_0.gguf",
-     "~2.0 GB (publish pending)",
+     "~2.0 GB",
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
     // Qwen3-TTS-VoiceDesign 1.7B: instruct-tuned variant that picks a
@@ -190,6 +190,23 @@ constexpr Entry k_registry[] = {
     {"lex-au-orpheus-de", "Orpheus-3b-German-FT-Q8_0.gguf",
      "https://huggingface.co/lex-au/Orpheus-3b-German-FT-Q8_0.gguf/resolve/main/Orpheus-3b-German-FT-Q8_0.gguf",
      "~3.5 GB",
+     "snac-24khz.gguf",
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf"},
+    // Kartoffel-Orpheus 3B German variants — drop-in checkpoint swaps on the
+    // Orpheus runtime. The natural variant is fine-tuned on natural German
+    // speech (~19 speakers); the synthetic variant adds emotion + outburst
+    // control on 4 speakers (Martin/Luca/Anne/Emma). Both are gated on the
+    // upstream HF repo (click-through accept). The cstr/ mirrors are
+    // converted via models/convert-orpheus-to-gguf.py with --variant
+    // fixed_speaker. Same SNAC codec as the base orpheus row.
+    {"kartoffel-orpheus-de-natural", "kartoffel-orpheus-de-natural-q8_0.gguf",
+     "https://huggingface.co/cstr/kartoffel-orpheus-3b-german-natural-GGUF/resolve/main/kartoffel-orpheus-de-natural-q8_0.gguf",
+     "~3.4 GB (publish pending)",
+     "snac-24khz.gguf",
+     "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf"},
+    {"kartoffel-orpheus-de-synthetic", "kartoffel-orpheus-de-synthetic-q8_0.gguf",
+     "https://huggingface.co/cstr/kartoffel-orpheus-3b-german-synthetic-GGUF/resolve/main/kartoffel-orpheus-de-synthetic-q8_0.gguf",
+     "~3.4 GB (publish pending)",
      "snac-24khz.gguf",
      "https://huggingface.co/cstr/snac-24khz-GGUF/resolve/main/snac-24khz.gguf"},
     // Kokoro-82M: official baseline + English default voice. The German
