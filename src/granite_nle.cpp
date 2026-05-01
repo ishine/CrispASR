@@ -32,6 +32,7 @@
 #include "gguf.h"
 #include "core/bpe.h"
 #include "core/cpu_ops.h"
+#include "core/ctc.h"
 #include "core/fft.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
@@ -1241,32 +1242,16 @@ extern "C" float* granite_nle_run_encoder(struct granite_nle_context* ctx, const
     ctx->last_bpe_T = 0;
     if (ctx->model.encoder.bpe_out_w && !blank_prob_mid.empty()) {
         const int pool_window = (int)hp.enc_bpe_pooling_window;
-        const int pad_len = (pool_window - T % pool_window) % pool_window;
-        const int T_pad = T + pad_len;
-        const int num_windows = T_pad / pool_window;
         const int bpe_dim = (int)hp.enc_bpe_vocab;
+        const int num_windows = core_ctc::num_windows_for(T, pool_window);
 
-        std::vector<float> pooled((size_t)num_windows * d, 0.0f);
-        for (int w = 0; w < num_windows; w++) {
-            // Sum of importance over the window (zero for padded slots).
-            float sum_imp = 0.0f;
-            for (int j = 0; j < pool_window; j++) {
-                int t = w * pool_window + j;
-                if (t < T)
-                    sum_imp += 1.0f - blank_prob_mid[t];
-            }
-            const float denom = sum_imp + 1e-8f;
-            float* dst = pooled.data() + (size_t)w * d;
-            for (int j = 0; j < pool_window; j++) {
-                int t = w * pool_window + j;
-                if (t >= T)
-                    break;
-                const float weight = (1.0f - blank_prob_mid[t]) / denom;
-                const float* src = hidden.data() + (size_t)t * d;
-                for (int i = 0; i < d; i++)
-                    dst[i] += weight * src[i];
-            }
-        }
+        std::vector<float> importance((size_t)T);
+        for (int t = 0; t < T; t++)
+            importance[t] = 1.0f - blank_prob_mid[t];
+
+        std::vector<float> pooled((size_t)num_windows * d);
+        core_ctc::posterior_weighted_pool(hidden.data(), importance.data(),
+                                          T, d, pool_window, pooled.data());
 
         ctx->last_bpe_logits.assign((size_t)bpe_dim * num_windows, 0.0f);
         nle_run_matmul(ctx, ctx->last_bpe_logits.data(), pooled.data(), d, num_windows, ctx->model.encoder.bpe_out_w,
@@ -1854,39 +1839,14 @@ extern "C" char* granite_nle_transcribe(struct granite_nle_context* ctx, const f
     }
 
     // 3+4. BPE-CTC greedy decode → LLM token IDs.
-    // argmax → unique_consecutive → drop blanks (id 0) → shift -1.
+    // Upstream _decode_bpe_ctc_greedy: argmax → unique_consecutive → drop
+    // blanks (id 0) → shift to LLM token IDs (id - 1). Lifted to
+    // core_ctc::greedy_decode_with_blank.
     std::string ctc_text;
     {
-        const float* bpe = ctx->last_bpe_logits.data();
-        const int bpe_T = ctx->last_bpe_T;
-        const int bpe_V = (int)hp.enc_bpe_vocab;
-        std::vector<int32_t> argmax(bpe_T);
-        for (int t = 0; t < bpe_T; t++) {
-            const float* row = bpe + (size_t)t * bpe_V;
-            int best = 0;
-            float bestv = row[0];
-            for (int v = 1; v < bpe_V; v++) {
-                if (row[v] > bestv) {
-                    bestv = row[v];
-                    best = v;
-                }
-            }
-            argmax[t] = best;
-        }
-        // Upstream _decode_bpe_ctc_greedy: unique_consecutive first, then
-        // drop blanks (label 0), then shift to LLM token IDs (id - 1).
-        std::vector<int32_t> collapsed;
-        for (size_t i = 0; i < argmax.size(); i++) {
-            if (i == 0 || argmax[i] != argmax[i - 1])
-                collapsed.push_back(argmax[i]);
-        }
-        std::vector<int32_t> ids;
-        ids.reserve(collapsed.size());
-        for (int32_t id : collapsed) {
-            if (id == 0)
-                continue;
-            ids.push_back(id - 1);
-        }
+        const std::vector<int32_t> ids = core_ctc::greedy_decode_with_blank(
+            ctx->last_bpe_logits.data(), ctx->last_bpe_T, (int)hp.enc_bpe_vocab,
+            /*blank_id=*/0, /*shift=*/-1);
         if (!ids.empty())
             ctc_text = core_bpe::detokenize(ctx->id_to_token, ids.data(), ids.size());
         else
