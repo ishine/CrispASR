@@ -5533,3 +5533,79 @@ crash. The qwen3-asr-style splitter lives in
 in `mimo_asr_tokenize_text`. If a third backend needs this pattern,
 factor it out to `core_bpe::tokenize_with_specials(token_to_id,
 merge_rank, text)`.
+
+# Qwen3-TTS-Base 1.7B — `spk_enc_dim` parameterization (session 2026-05-01)
+
+PLAN #57 Phase 1 closed by adding `Qwen/Qwen3-TTS-12Hz-1.7B-Base`.
+The conversion + registry entry took minutes; the synthesis-broken-
+in-a-quiet-way fix took an hour because the failure mode looked
+identical to a logits-decoding regression.
+
+## Lesson 1 — hardcoded "obviously fixed" dimensions are a foot-gun
+
+The runtime's ECAPA graph builder and speaker-embedding helpers all
+sized buffers at 1024 floats:
+
+```cpp
+// build_graph_spk_enc
+h = ggml_reshape_1d(ctx0, h, 1024);
+
+// run_spk_enc
+std::vector<float> emb(1024);
+ggml_backend_tensor_get(..., emb.data(), 0, 1024 * sizeof(float));
+```
+
+At the time it was written, every supported variant
+(`Qwen3-TTS-12Hz-0.6B-Base`) had `talker.hidden_size = 1024` and
+`speaker_encoder_config.enc_dim = 1024`, and they had to be equal:
+upstream concatenates `speaker_embed.view(1, 1, -1)` with the
+talker's codec input embeddings (which live in `talker.hidden_size`),
+so a different `enc_dim` would have asserted in PyTorch.
+
+`Qwen3-TTS-12Hz-1.7B-Base` re-pegs both at 2048. The graph still ran
+— `spk.fc_w` is 2048-row Conv1d, `mul_mat` produced a 2048-d vector,
+the reshape to 1024 lost the high half — and `run_spk_enc` then
+copied 1024 floats into a 1024-d std::vector. The 0813869 fix is
+five lines: replace `1024` with `c->hp.spk_enc_dim` (already plumbed
+from `kv_u32(g, "qwen3tts.speaker.enc_dim", ...)` at line 4332).
+
+The general rule: any literal whose value happens to equal a config
+field is a config field with a typo. If the GGUF metadata exports it,
+the runtime reads it. The trapdoor is "obvious" constants that work
+fine until a bigger / smaller variant arrives.
+
+## Lesson 2 — half-zero embeddings produce degenerate audio, not a crash
+
+Half-truncating the speaker embedding is the worst failure mode for
+debugging: the talker accepts the malformed row, the AR loop runs to
+the codec_eos, the codec decodes valid audio frames, and you get
+audibly degenerate (but well-formed) speech. None of the existing
+asserts fire. ASR roundtrip is the only gate that catches it
+cheaply.
+
+The pattern matches `feedback_tts_validation.md`: peak/RMS gates
+flag clipping or silence; ASR catches "audio is well-formed but
+content is wrong." For 1.7B-Base the F16/Q8_0 ASR roundtrips were
+word-exact within a few minutes of the fix; without the gate I'd
+have shipped a half-broken model.
+
+## Lesson 3 — `(publish pending)` is a fine intermediate state
+
+The registry entry landed in `e3dc578` with the URL string suffixed
+`(publish pending)` while the GGUFs were still on local disk. Same
+pattern Orpheus uses (`"~3.4 GB (publish pending)"`). Two reasons it
+beats the alternative of waiting:
+
+1. The registry entry is the only change that needs a code review.
+   Decoupling it from "upload finishes successfully" lets the PR
+   land when the binding decision (alias name, default quant)
+   is made, not when the upload pipe drains.
+2. If the upload is a parallel-worker handoff, the parallel worker
+   can't add the registry entry without round-tripping; landing it
+   ahead of upload removes one merge.
+
+The cleanup is one commit (`c4b458b` here) that strips the suffix
+once the URL serves a 200 (or 302 to Xet CDN). It's also a useful
+trip-wire: a "publish pending" string that lingers in main is a
+signal that someone forgot to do the upload, which is recoverable;
+a dead URL in main is a worse failure mode.

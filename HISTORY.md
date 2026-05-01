@@ -921,3 +921,46 @@ the next person doesn't lose 30 minutes diagnosing it.
 encoder model. Q2_K and the legacy `mimo-asr.gguf` are kept for
 history but were built before the vocab/merges fix and should not
 be used.
+
+### 57. Qwen3-TTS-Base 1.7B — PLAN #57 Phase 1 (May 2026)
+
+The 1.7B variant of Qwen3-TTS-Base shipped end-to-end behind the
+`qwen3-tts-1.7b-base` registry alias. Same ICL voice-clone path as
+0.6B-Base (`--voice <wav> --ref-text "..."`); the runtime now reads
+`qwen3tts.speaker.enc_dim` from the GGUF instead of assuming 1024.
+
+**The bug.** `build_graph_spk_enc` and `run_spk_enc` (plus the two
+`extern "C"` speaker-embedding helpers) hardcoded the ECAPA output at
+1024 floats. That matched the 0.6B-Base config (`talker.hidden_size =
+1024`, `enc_dim = 1024`) but the 1.7B-Base config has
+`talker.hidden_size = 2048` and `enc_dim = 2048`. The first 1024
+floats of the speaker embedding made it into the codec_input slot;
+the second 1024 floats were silently truncated, and the talker's
+prefill saw a half-zero spk row. Symptom: ICL produced degenerate
+audio.
+
+**The fix** (`0813869`). Read `c->hp.spk_enc_dim` (already plumbed
+via `kv_u32(g, "qwen3tts.speaker.enc_dim", ...)` and exported by the
+converter — just unused in the graph builders). Five sites
+parameterised; banner now logs `ECAPA-TDNN 128→1024` for 0.6B-Base
+and `128→2048` for 1.7B-Base.
+
+**Validation.** `clone.wav` ICL on `"Hello, how are you today? The
+weather is beautiful."` →
+- 1.7B-Base F16  → 57 frames / 4.56 s → "Hello? How are you today? The weather is beautiful."
+- 1.7B-Base Q8_0 → 51 frames / 4.08 s → "Hello! How are you today? The weather is beautiful."
+- 0.6B-Base Q8_0 (regression, `enc_dim=1024` path) → 75 frames / 6.00 s → "Hello? How are you today? The weather is beautiful."
+
+Word-level exact match across all three; the punctuation jitter on
+the leading single-word token is parakeet-v3 behaviour, not a
+synthesis defect.
+
+**HF release.** [`cstr/qwen3-tts-1.7b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF) ships F16 (3.86 GB)
++ Q8_0 (2.07 GB). Pair with [`cstr/qwen3-tts-tokenizer-12hz-GGUF`](https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF)
+— same 12 Hz tokenizer as 0.6B-Base.
+
+The 1.7B small_to_mtp_projection bridge from the 2048-d talker to the
+1024-d code predictor was already wired in commits `7f79d34` /
+`2cc7aeb` (originally for 1.7B-CustomVoice) and is variant-agnostic,
+so once `spk_enc_dim` was unstuck the rest of the path "just worked"
+on the existing graph builders.

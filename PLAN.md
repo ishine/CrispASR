@@ -933,7 +933,7 @@ adding a codec head + sampling path. Cheaper than a full new backend.
 |---|---|---|---|---|
 | 1 | Qwen3-TTS-CustomVoice 0.6B | Apache 2.0 | **DONE — runtime spk_id path landed; 4 ASR roundtrips passed (vivian / aiden / serena / dylan-dialect). Registry line added; HF upload pending.** | S |
 | 1 | Qwen3-TTS-CustomVoice 1.7B | Apache 2.0 | **DONE — `small_to_mtp_projection` now applied to code_pred per-step embeddings (steps 1..14), not just step 0. ASR roundtrips passed on Q8_0/ryan + F16/vivian (exact-match transcripts on long prompt). HF upload pending.** | S |
-| 1 | Qwen3-TTS-Base 1.7B | Apache 2.0 | **DONE — runtime parameterised `spk_enc_dim` (was hardcoded 1024) so the 1.7B's 2048-d ECAPA output stops getting truncated; registry alias `qwen3-tts-1.7b-base` + HF model-card stub landed. ASR-roundtrip word-exact on F16/Q8_0 (clone.wav English ICL). HF upload to `cstr/qwen3-tts-1.7b-base-GGUF` pending.** | S |
+| 1 | Qwen3-TTS-Base 1.7B | Apache 2.0 | **DONE — runtime parameterised `spk_enc_dim` (was hardcoded 1024) so the 1.7B's 2048-d ECAPA output stops getting truncated; registry alias `qwen3-tts-1.7b-base` + HF model card landed. ASR-roundtrip word-exact on F16/Q8_0 (clone.wav English ICL). Published as [`cstr/qwen3-tts-1.7b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF) (F16 3.86 GB + Q8_0 2.07 GB).** | S |
 | 2 | Orpheus-3B base | llama3.2 | queued | M |
 | 2 | Kartoffel_Orpheus DE (natural+synthetic) | llama3.2 | blocked on Orpheus base | XS |
 | 2 | lex-au Orpheus-3B-DE-Q8 | llama3.2 | blocked on Orpheus base (already GGUF) | XS |
