@@ -27,6 +27,7 @@ std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_moonshine_streaming_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_gemma4_e2b_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_omniasr_backend();
+std::unique_ptr<CrispasrBackend> crispasr_make_mimo_asr_backend();
 
 #include "ggml.h"
 #include "gguf.h"
@@ -85,6 +86,8 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_moonshine_backend();
     if (name == "omniasr" || name == "omniasr-ctc" || name == "omniasr-llm")
         return crispasr_make_omniasr_backend();
+    if (name == "mimo-asr" || name == "mimo_asr" || name == "mimoasr")
+        return crispasr_make_mimo_asr_backend();
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
@@ -119,6 +122,7 @@ std::vector<std::string> crispasr_list_backends() {
         "gemma4-e2b",
         "omniasr",
         "omniasr-llm",
+        "mimo-asr",
     };
 }
 
@@ -354,6 +358,8 @@ std::string crispasr_detect_backend_from_gguf(const std::string& model_path) {
                 result = "wav2vec2";
             else if (a == "fireredpunc")
                 result = "fireredpunc";
+            else if (a == "mimo_asr" || a == "mimo-asr")
+                result = "mimo-asr";
         }
     }
     gguf_free(gctx);

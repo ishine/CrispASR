@@ -39,6 +39,7 @@
 #include "mimo_asr.h"
 
 #include "core/attention.h"
+#include "core/bpe.h"
 #include "core/ffn.h"
 #include "core/gguf_loader.h"
 #include "ggml-alloc.h"
@@ -55,6 +56,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -167,6 +169,19 @@ struct mimo_asr_context {
     mimo_tokenizer_context* tokenizer = nullptr;
 
     std::vector<std::string> vocab;
+    std::unordered_map<std::string, int32_t> token_to_id;
+    std::unordered_map<std::string, int32_t> merge_rank;
+
+    // Special-token ids resolved at init from the vocab (or fallbacks for
+    // the stale Q4_K with a truncated vocab — step 9 fixes this).
+    int32_t id_empty = 151667;     // <|empty|>
+    int32_t id_im_start = 151644;  // <|im_start|>
+    int32_t id_im_end = 151645;    // <|im_end|>
+    int32_t id_eos = 151643;       // <|endoftext|>
+    int32_t id_sosp = 151651;      // <|sosp|>
+    int32_t id_eosp = 151652;      // <|eosp|>
+    int32_t id_eot = 151653;       // <|eot|>
+    int32_t id_eostm = 151654;     // <|eostm|>
 };
 
 static uint32_t mimo_kv_u32(gguf_context* ctx, const char* key, uint32_t def) {
@@ -222,18 +237,59 @@ extern "C" struct mimo_asr_context* mimo_asr_init_from_file(const char* path_mod
     hp.audio_head_dim = mimo_kv_u32(gctx, "mimo_asr.audio.input_head_dim", hp.audio_head_dim);
     hp.audio_intermediate = mimo_kv_u32(gctx, "mimo_asr.audio.input_intermediate", hp.audio_intermediate);
 
-    // Vocab
+    // Vocab + BPE merges + token_to_id reverse map. Step 9 reconverts the
+    // GGUF with `tokenizer.ggml.merges` populated; the encode side
+    // (`tokenize_text`) falls back to a per-byte path when merges are
+    // empty, so the loader never errors on the stale-vocab GGUF — but
+    // transcribe can't produce sane prompts without merges either.
     int tok_key = gguf_find_key(gctx, "tokenizer.ggml.tokens");
     if (tok_key >= 0) {
         int n = gguf_get_arr_n(gctx, tok_key);
         ctx->vocab.resize(n);
+        ctx->token_to_id.reserve((size_t)n);
         for (int i = 0; i < n; i++) {
             const char* s = gguf_get_arr_str(gctx, tok_key, i);
-            if (s)
+            if (s) {
                 ctx->vocab[i] = s;
+                ctx->token_to_id.emplace(s, (int32_t)i);
+            }
+        }
+    }
+    int merges_key = gguf_find_key(gctx, "tokenizer.ggml.merges");
+    if (merges_key >= 0) {
+        int n = gguf_get_arr_n(gctx, merges_key);
+        ctx->merge_rank.reserve((size_t)n);
+        for (int i = 0; i < n; i++) {
+            const char* s = gguf_get_arr_str(gctx, merges_key, i);
+            if (s)
+                ctx->merge_rank.emplace(s, (int32_t)i);
         }
     }
     gguf_free(gctx);
+
+    // Resolve special-token ids from the vocab. Defaults match MiMo's
+    // stable special-token block (151643..151667); the lookup wins when
+    // the GGUF carries the full vocab (post step 9).
+    auto find_id = [&](const char* name, int32_t fallback) {
+        auto it = ctx->token_to_id.find(name);
+        return it != ctx->token_to_id.end() ? it->second : fallback;
+    };
+    ctx->id_empty = find_id("<|empty|>", ctx->id_empty);
+    ctx->id_im_start = find_id("<|im_start|>", ctx->id_im_start);
+    ctx->id_im_end = find_id("<|im_end|>", ctx->id_im_end);
+    ctx->id_eos = find_id("<|endoftext|>", ctx->id_eos);
+    ctx->id_sosp = find_id("<|sosp|>", ctx->id_sosp);
+    ctx->id_eosp = find_id("<|eosp|>", ctx->id_eosp);
+    ctx->id_eot = find_id("<|eot|>", ctx->id_eot);
+    ctx->id_eostm = find_id("<|eostm|>", ctx->id_eostm);
+
+    if (params.verbosity >= 1) {
+        fprintf(stderr,
+                "mimo_asr: vocab=%zu merges=%zu specials: empty=%d im_start=%d im_end=%d "
+                "eos=%d sosp=%d eosp=%d\n",
+                ctx->vocab.size(), ctx->merge_rank.size(), ctx->id_empty, ctx->id_im_start,
+                ctx->id_im_end, ctx->id_eos, ctx->id_sosp, ctx->id_eosp);
+    }
 
     // Backends
     ctx->backend_cpu = ggml_backend_cpu_init();
@@ -524,7 +580,7 @@ static ggml_tensor* build_input_local_block(ggml_context* ctx0, ggml_cgraph* gf,
 //   prefill_inputs_embeds        [llm_hidden, T_groups] F32 (LM input)
 //   prefill_last_hidden          [llm_hidden, 1]        F32 (post final norm)
 //   prefill_text_logits_step0    [vocab, 1]             F32 (lm_head out)
-static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_groups) {
+static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_groups, int n_past) {
     const auto& hp = ctx->hp;
     const auto& m = ctx->model;
     const int d = (int)hp.llm_hidden;
@@ -640,17 +696,22 @@ static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_gr
     // Mark as build-target so it survives optimisation.
     ggml_build_forward_expand(gf, inputs_embeds);
 
-    // ---- 36L Qwen2 LM (KV-cached prefill) ----
+    // ---- 36L Qwen2 LM (KV-cached prefill / step decode) ----
     GGML_ASSERT(ctx->kv_k && ctx->kv_v);
-    GGML_ASSERT(T <= ctx->kv_max_ctx);
+    GGML_ASSERT(n_past + T <= ctx->kv_max_ctx);
 
+    // For step decode (T==1, n_past>0), positions are filled by the host
+    // with [n_past..n_past+T-1] and the causal mask covers the full Lk =
+    // n_past + T columns vs T queries (allowing attention to all prior KV
+    // entries). Caller fills the host-side buffers in run_lm_step.
     ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
     ggml_set_input(positions);
     ggml_set_name(positions, "lm_positions");
 
     ggml_tensor* causal_mask = nullptr;
-    if (T > 1) {
-        causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, T, T);
+    const int Lk = n_past + T;
+    if (T > 1 || n_past > 0) {
+        causal_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, Lk, T);
         ggml_set_input(causal_mask);
         ggml_set_name(causal_mask, "lm_causal_mask");
     }
@@ -681,7 +742,7 @@ static ggml_cgraph* mimo_asr_build_prefill_graph(mimo_asr_context* ctx, int T_gr
         ggml_tensor* attn = core_attn::kv_self_attn(
             ctx0, gf, h, b.attn_q_w, b.attn_k_w, b.attn_v_w, b.attn_o_w,
             /*q_norm_w*/ nullptr, /*k_norm_w*/ nullptr, positions, causal_mask, ctx->kv_k, ctx->kv_v, (int)il,
-            /*n_past*/ 0, kvp,
+            /*n_past*/ n_past, kvp,
             /*qkv_w*/ nullptr, /*fixed_kv_len*/ 0, /*kv_indices*/ nullptr, b.attn_q_b, b.attn_k_b, b.attn_v_b,
             /*o_b*/ nullptr);
         cur = ggml_add(ctx0, residual, attn);
@@ -818,7 +879,7 @@ extern "C" float* mimo_asr_extract_stage(struct mimo_asr_context* ctx, const int
 
     PrefillInputs pi = make_prefill_inputs(hp, input_ids_9xT, T_total, empty_id);
 
-    ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg);
+    ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg, /*n_past*/ 0);
     ggml_backend_sched_reset(ctx->sched);
     if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
         fprintf(stderr, "mimo_asr_extract_stage: failed to alloc graph\n");
@@ -933,27 +994,390 @@ extern "C" int mimo_asr_set_tokenizer_path(struct mimo_asr_context* ctx, const c
     return 0;
 }
 
-extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* ctx, const float* /*pcm*/, int /*n_samples*/) {
-    // PLAN #51 — full forward pass not yet implemented.
-    //
-    // Lazy-init the tokenizer context here so callers see a concrete
-    // tokenizer-load error before they hit the LLM-side stub. The
-    // tokenizer's own forward path is also unimplemented (PLAN #51
-    // step 2/3); see src/mimo_tokenizer.cpp for the remaining work.
-    if (ctx && !ctx->tokenizer && !ctx->tokenizer_path.empty()) {
+// ===========================================================================
+// PLAN #51 step 8 — full transcribe pipeline.
+//
+// Mirrors `MimoAudio.asr_sft` from ref/mimo/.../mimo_audio.py:
+//   - audio tokenize via mimo_tokenizer (8-channel codes, 25 fps).
+//   - assemble asr_sft prompt: text + audio + template + assistant header,
+//     each as a [9, T_seg] block following process_speechdata.InputSegment.
+//   - run prefill on the LM, greedy-argmax for next text token, then loop
+//     on a [9, group_size] step graph with advancing n_past.
+//   - stop on <|im_end|> / eos; skip <|empty|>/<|eot|>/<|eostm|> in output.
+// ===========================================================================
+
+// BPE encode a text fragment. Mirrors `qwen3_asr_tokenize`: split on
+// recognised <|...|> special tokens (emit their ids directly), then
+// whitespace-pre-split + bytes_to_unicode + bpe_one for the rest. Falls
+// back to the per-byte path when merge_rank is empty (stale GGUF).
+static std::vector<int32_t> mimo_asr_tokenize_text(const mimo_asr_context* ctx, const std::string& text) {
+    std::vector<int32_t> result;
+    const auto& t2i = ctx->token_to_id;
+    const auto& mr = ctx->merge_rank;
+    size_t i = 0;
+    while (i < text.size()) {
+        if (text[i] == '<' && i + 1 < text.size() && text[i + 1] == '|') {
+            size_t end = text.find("|>", i + 2);
+            if (end != std::string::npos) {
+                std::string special = text.substr(i, end + 2 - i);
+                auto it = t2i.find(special);
+                if (it != t2i.end()) {
+                    result.push_back(it->second);
+                    i = end + 2;
+                    continue;
+                }
+            }
+        }
+        size_t j = i;
+        if (text[j] == '<' && j + 1 < text.size() && text[j + 1] == '|')
+            j++;
+        while (j < text.size()) {
+            if (text[j] == '<' && j + 1 < text.size() && text[j + 1] == '|') {
+                size_t end = text.find("|>", j + 2);
+                if (end != std::string::npos && t2i.find(text.substr(j, end + 2 - j)) != t2i.end())
+                    break;
+            }
+            j++;
+        }
+        std::string chunk = text.substr(i, j - i);
+        i = j;
+        if (chunk.empty())
+            continue;
+
+        // GPT-2-style pre-split: each pre-token is "[optional single ws]
+        // + run of non-whitespace". Whitespace runs are emitted as their
+        // own pre-tokens so newlines round-trip correctly.
+        size_t k = 0;
+        while (k < chunk.size()) {
+            size_t start = k;
+            if (chunk[k] == ' ' || chunk[k] == '\t' || chunk[k] == '\n')
+                k++;
+            while (k < chunk.size() && chunk[k] != ' ' && chunk[k] != '\t' && chunk[k] != '\n')
+                k++;
+            if (k == start)
+                k++;
+            std::string pre = chunk.substr(start, k - start);
+            std::string encoded = core_bpe::bytes_to_unicode(pre.data(), pre.size());
+            core_bpe::bpe_one(t2i, mr, encoded, result);
+        }
+    }
+    return result;
+}
+
+// `insert_between` mirrors process_speechdata.InputSegment.insert_between:
+// take a [1, L] tensor and produce a [1, L*gs] tensor where original
+// values land at stride gs and `fill` (typically -100) fills the rest.
+static std::vector<int32_t> mimo_asr_insert_between(const std::vector<int32_t>& src, int gs, int32_t fill) {
+    std::vector<int32_t> out((size_t)src.size() * gs, fill);
+    for (size_t i = 0; i < src.size(); i++)
+        out[i * gs] = src[i];
+    return out;
+}
+
+// Build a [9, T_seg] block for a TEXT segment (no audio). T_seg = len(tokens)*gs.
+// Row 0 = tokens at stride gs, -100 fillers elsewhere; rows 1..8 = the
+// per-channel speech_zeroemb_idx for every position. Matches the
+// no-audio branch of InputSegment.to_input_id.
+static std::vector<int32_t> mimo_asr_build_text_segment(const mimo_asr_context* ctx, const std::vector<int32_t>& tokens) {
+    const auto& hp = ctx->hp;
+    const int gs = (int)hp.audio_group_size;
+    const int channels = (int)hp.audio_channels;
+    const int T_seg = (int)tokens.size() * gs;
+    std::vector<int32_t> block((size_t)(channels + 1) * T_seg);
+    auto row0 = mimo_asr_insert_between(tokens, gs, /*fill*/ -100);
+    std::memcpy(block.data(), row0.data(), (size_t)T_seg * sizeof(int32_t));
+    for (int c = 0; c < channels; c++) {
+        int32_t pad = (int32_t)hp.speech_zeroemb_idx[c];
+        for (int t = 0; t < T_seg; t++)
+            block[(size_t)(1 + c) * T_seg + t] = pad;
+    }
+    return block;
+}
+
+// Build a [9, T_seg] block for an AUDIO segment. T_seg = (n_frames + 2*gs).
+// Layout matches the audio branch of InputSegment.to_input_id with
+// add_sosp_eosp=True:
+//   - row 0: insert_between([sosp, empty*n_groups, eosp], gs, -100)
+//   - rows 1..8: [speech_zeroemb_pad(gs) | audio_codes(n_frames) | speech_zeroemb_pad(gs)]
+// `codes` is laid out [n_frames * channels] row-major (time-first), as
+// returned by mimo_tokenizer_encode_pcm16k.
+static std::vector<int32_t> mimo_asr_build_audio_segment(const mimo_asr_context* ctx, const int32_t* codes, int n_frames) {
+    const auto& hp = ctx->hp;
+    const int gs = (int)hp.audio_group_size;
+    const int channels = (int)hp.audio_channels;
+    const int n_groups = n_frames / gs; // must be exact
+    const int T_seg = n_frames + 2 * gs;
+    std::vector<int32_t> block((size_t)(channels + 1) * T_seg);
+
+    // Row 0
+    std::vector<int32_t> text_pre;
+    text_pre.reserve((size_t)(n_groups + 2));
+    text_pre.push_back(ctx->id_sosp);
+    for (int g = 0; g < n_groups; g++)
+        text_pre.push_back(ctx->id_empty);
+    text_pre.push_back(ctx->id_eosp);
+    auto row0 = mimo_asr_insert_between(text_pre, gs, /*fill*/ -100);
+    std::memcpy(block.data(), row0.data(), (size_t)T_seg * sizeof(int32_t));
+
+    // Rows 1..8
+    for (int c = 0; c < channels; c++) {
+        int32_t pad = (int32_t)hp.speech_zeroemb_idx[c];
+        int32_t* dst = block.data() + (size_t)(1 + c) * T_seg;
+        for (int t = 0; t < gs; t++)
+            dst[t] = pad;
+        for (int t = 0; t < n_frames; t++)
+            dst[gs + t] = codes[(size_t)t * channels + c];
+        for (int t = 0; t < gs; t++)
+            dst[gs + n_frames + t] = pad;
+    }
+    return block;
+}
+
+// Concatenate a list of [9, T_i] blocks into a single [9, sum(T_i)] tensor.
+static std::vector<int32_t> mimo_asr_concat_segments(int channels_plus_text,
+                                                     const std::vector<std::vector<int32_t>>& segments,
+                                                     std::vector<int>& seg_lens_out) {
+    int T_total = 0;
+    seg_lens_out.clear();
+    seg_lens_out.reserve(segments.size());
+    for (const auto& s : segments) {
+        int t = (int)(s.size() / channels_plus_text);
+        seg_lens_out.push_back(t);
+        T_total += t;
+    }
+    std::vector<int32_t> out((size_t)channels_plus_text * T_total);
+    int off = 0;
+    for (const auto& s : segments) {
+        int t = (int)(s.size() / channels_plus_text);
+        for (int r = 0; r < channels_plus_text; r++) {
+            std::memcpy(out.data() + (size_t)r * T_total + off, s.data() + (size_t)r * t,
+                        (size_t)t * sizeof(int32_t));
+        }
+        off += t;
+    }
+    return out;
+}
+
+// Run the prefill/step graph and return malloc'd logits for the *last*
+// position. T_total must be a multiple of group_size. n_past is the
+// number of LM groups already in the KV cache. Returns nullptr on failure.
+static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9xT, int T_total, int n_past) {
+    const auto& hp = ctx->hp;
+    const int gs = (int)hp.audio_group_size;
+    if (T_total % gs != 0)
+        return nullptr;
+    const int Tg = T_total / gs;
+
+    PrefillInputs pi = make_prefill_inputs(hp, input_ids_9xT, T_total, (uint32_t)ctx->id_empty);
+
+    ggml_cgraph* gf = mimo_asr_build_prefill_graph(ctx, Tg, n_past);
+    ggml_backend_sched_reset(ctx->sched);
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf))
+        return nullptr;
+
+    auto set_t = [&](const char* nm, const void* data, size_t bytes) {
+        ggml_tensor* t = ggml_graph_get_tensor(gf, nm);
+        if (!t)
+            return false;
+        ggml_backend_tensor_set(t, data, 0, bytes);
+        return true;
+    };
+    for (int c = 0; c < (int)hp.audio_channels; c++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "speech_codes_%d", c);
+        if (!set_t(nm, pi.speech_codes[c].data(), pi.speech_codes[c].size() * sizeof(int32_t)))
+            return nullptr;
+        snprintf(nm, sizeof(nm), "combined_mask_%d", c);
+        if (!set_t(nm, pi.combined_masks[c].data(), pi.combined_masks[c].size() * sizeof(float)))
+            return nullptr;
+    }
+    if (!set_t("speech_active_mask", pi.speech_active_mask.data(), pi.speech_active_mask.size() * sizeof(float)))
+        return nullptr;
+    if (!set_t("text_zero_mask", pi.text_zero_mask.data(), pi.text_zero_mask.size() * sizeof(float)))
+        return nullptr;
+    if (!set_t("text_input_ids", pi.text_input_ids.data(), pi.text_input_ids.size() * sizeof(int32_t)))
+        return nullptr;
+    {
+        std::vector<int32_t> p((size_t)gs);
+        for (int i = 0; i < gs; i++)
+            p[i] = i;
+        if (!set_t("ilt_positions", p.data(), p.size() * sizeof(int32_t)))
+            return nullptr;
+    }
+    {
+        std::vector<int32_t> p((size_t)Tg);
+        for (int i = 0; i < Tg; i++)
+            p[i] = n_past + i;
+        if (!set_t("lm_positions", p.data(), p.size() * sizeof(int32_t)))
+            return nullptr;
+    }
+    if (Tg > 1 || n_past > 0) {
+        const int Lk = n_past + Tg;
+        std::vector<ggml_fp16_t> mask((size_t)Tg * Lk);
+        const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        for (int q = 0; q < Tg; q++)
+            for (int k = 0; k < Lk; k++)
+                mask[(size_t)q * Lk + k] = (k <= n_past + q) ? z : ninf;
+        if (!set_t("lm_causal_mask", mask.data(), mask.size() * sizeof(ggml_fp16_t)))
+            return nullptr;
+    }
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS)
+        return nullptr;
+
+    ggml_tensor* logits_t = ggml_graph_get_tensor(gf, "prefill_text_logits_step0");
+    if (!logits_t)
+        return nullptr;
+    const size_t nlog = (size_t)ggml_nelements(logits_t);
+    float* out = (float*)malloc(nlog * sizeof(float));
+    if (!out)
+        return nullptr;
+    ggml_backend_tensor_get(logits_t, out, 0, nlog * sizeof(float));
+    return out;
+}
+
+extern "C" char* mimo_asr_transcribe(struct mimo_asr_context* ctx, const float* pcm, int n_samples) {
+    if (!ctx || !pcm || n_samples <= 0)
+        return nullptr;
+
+    // 1. Lazy-init the audio tokenizer.
+    if (!ctx->tokenizer) {
+        if (ctx->tokenizer_path.empty()) {
+            fprintf(stderr, "mimo_asr_transcribe: tokenizer path not set; call mimo_asr_set_tokenizer_path() first\n");
+            return nullptr;
+        }
         auto tp = mimo_tokenizer_context_default_params();
         tp.n_threads = ctx->n_threads;
         tp.use_gpu = ctx->params.use_gpu;
         tp.verbosity = ctx->params.verbosity;
         ctx->tokenizer = mimo_tokenizer_init_from_file(ctx->tokenizer_path.c_str(), tp);
-        if (!ctx->tokenizer && ctx->params.verbosity >= 1) {
-            fprintf(stderr, "mimo_asr: failed to lazy-load tokenizer at '%s'\n", ctx->tokenizer_path.c_str());
+        if (!ctx->tokenizer) {
+            fprintf(stderr, "mimo_asr_transcribe: failed to load tokenizer at '%s'\n", ctx->tokenizer_path.c_str());
+            return nullptr;
         }
     }
-    static const char kStub[] = "[mimo_asr: forward pass not yet implemented — PLAN #51]";
-    char* out = (char*)malloc(sizeof(kStub));
+
+    // 2. Encode PCM to 8-channel codes.
+    int n_frames = 0;
+    int32_t* codes = mimo_tokenizer_encode_pcm16k(ctx->tokenizer, pcm, n_samples, &n_frames);
+    if (!codes || n_frames <= 0) {
+        fprintf(stderr, "mimo_asr_transcribe: audio tokenization failed (n_frames=%d)\n", n_frames);
+        free(codes);
+        return nullptr;
+    }
+    const int gs = (int)ctx->hp.audio_group_size;
+    const int channels = (int)ctx->hp.audio_channels;
+    if (n_frames % gs != 0) {
+        // Trim to a multiple of group_size — upstream pads, but trimming
+        // a few frames at the end is safe for ASR (drops <0.16s).
+        n_frames -= n_frames % gs;
+    }
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "mimo_asr_transcribe: audio %d samples -> %d code frames\n", n_samples, n_frames);
+
+    // 3. Build the asr_sft prompt segments. Pinned to template[0] for
+    // determinism (matches the diff harness reference dump).
+    std::vector<std::vector<int32_t>> segments;
+    auto add_text = [&](const std::string& s) {
+        auto toks = mimo_asr_tokenize_text(ctx, s);
+        segments.push_back(mimo_asr_build_text_segment(ctx, toks));
+    };
+    add_text("<|im_start|>user\n");
+    segments.push_back(mimo_asr_build_audio_segment(ctx, codes, n_frames));
+    free(codes);
+    add_text("Please transcribe this audio file"); // asr_en_templates[0]
+    add_text("<|im_end|>\n");
+    add_text("<|im_start|>assistant\n");
+    add_text("<think>\n\n</think>\n<english>");
+
+    std::vector<int> seg_lens;
+    auto input_ids = mimo_asr_concat_segments(channels + 1, segments, seg_lens);
+    const int T_total = (int)(input_ids.size() / (channels + 1));
+    if (ctx->params.verbosity >= 1)
+        fprintf(stderr, "mimo_asr_transcribe: prompt T_total=%d (T_groups=%d)\n", T_total, T_total / gs);
+
+    // 4. KV cache budget: prompt groups + max_new_tokens (one new group
+    // per generated text token).
+    const int max_new = 256;
+    if (!mimo_asr_kv_init(ctx, T_total / gs + max_new + 16))
+        return nullptr;
+
+    // 5. Prefill.
+    float* logits = mimo_asr_run_lm(ctx, input_ids.data(), T_total, /*n_past*/ 0);
+    if (!logits) {
+        fprintf(stderr, "mimo_asr_transcribe: prefill failed\n");
+        return nullptr;
+    }
+    int vocab = (int)ctx->hp.llm_vocab;
+    auto argmax = [&](const float* L) {
+        int best = 0;
+        float bv = L[0];
+        for (int i = 1; i < vocab; i++)
+            if (L[i] > bv) { bv = L[i]; best = i; }
+        return best;
+    };
+
+    int n_past_groups = T_total / gs;
+    std::vector<int32_t> generated;
+    generated.reserve((size_t)max_new);
+    int next = argmax(logits);
+    free(logits);
+    generated.push_back(next);
+
+    // 6. Greedy decode loop. Each step runs a [9, gs] graph with the
+    //    new text token replicated across the gs positions of the new
+    //    group, and audio rows filled with speech_zeroemb_idx.
+    for (int step = 1; step < max_new; step++) {
+        if (next == ctx->id_im_end || next == ctx->id_eos)
+            break;
+        std::vector<int32_t> step_ids((size_t)(channels + 1) * gs);
+        for (int t = 0; t < gs; t++)
+            step_ids[t] = next;
+        for (int c = 0; c < channels; c++) {
+            int32_t pad = (int32_t)ctx->hp.speech_zeroemb_idx[c];
+            for (int t = 0; t < gs; t++)
+                step_ids[(size_t)(1 + c) * gs + t] = pad;
+        }
+        float* L = mimo_asr_run_lm(ctx, step_ids.data(), gs, /*n_past*/ n_past_groups);
+        if (!L)
+            return nullptr;
+        next = argmax(L);
+        free(L);
+        n_past_groups++;
+        generated.push_back(next);
+    }
+
+    // 7. Detokenize. The upstream drops the last token (typically
+    //    <|im_end|>) and string-replaces <|empty|>/<|eot|>/<|eostm|>
+    //    out of the visible transcript.
+    if (!generated.empty() &&
+        (generated.back() == ctx->id_im_end || generated.back() == ctx->id_eos))
+        generated.pop_back();
+
+    std::string detok = core_bpe::detokenize(ctx->vocab, generated.data(), generated.size());
+
+    auto strip = [&](const char* needle) {
+        std::string n = needle;
+        size_t p;
+        while ((p = detok.find(n)) != std::string::npos)
+            detok.erase(p, n.size());
+    };
+    strip("<|empty|>");
+    strip("<|eot|>");
+    strip("<|eostm|>");
+    strip("<english>");
+    strip("<chinese>");
+
+    // Trim leading whitespace
+    size_t lead = 0;
+    while (lead < detok.size() && (detok[lead] == ' ' || detok[lead] == '\t' || detok[lead] == '\n'))
+        lead++;
+    detok.erase(0, lead);
+
+    char* out = (char*)malloc(detok.size() + 1);
     if (out)
-        std::memcpy(out, kStub, sizeof(kStub));
+        std::memcpy(out, detok.c_str(), detok.size() + 1);
     return out;
 }
 

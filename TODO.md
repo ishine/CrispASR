@@ -372,9 +372,11 @@ direction; do not interleave.
   fall back to q4_0); follow-up to ship a Q5_K build, or pin those
   two tensors to F16 inside Q4_K, lives below under "open polish".
   See HISTORY.md.
-- **MiMo-V2.5-ASR** — **[IN PROGRESS]** Converters done, F16+Q4_K on HF.
-  Runtime is scaffolded (loads cleanly) but `mimo_asr_transcribe` is
-  a stub. Forward pass is PLAN #51. MIT.
+- **MiMo-V2.5-ASR** — **[WORKS, default path]** End-to-end JFK
+  transcription matches the upstream Python `MimoAudio.asr_sft`
+  reference verbatim. PLAN #51 SHIPPED. F16 + Q4_K regenerated
+  locally; HF re-upload to `cstr/mimo-asr-GGUF` is deferred (destructive
+  shared-state op, needs user OK). MIT.
 
   **PLAN #51 status (2026-05-01, late session):**
 
@@ -517,28 +519,45 @@ direction; do not interleave.
      ```
      The dumper defaults to bf16 (env `MIMO_ASR_REF_DTYPE=fp32`
      overrides — needs ~28 GB RAM for the LM half, swap-thrashes a
-     16 GB box). Re-run with F16 GGUF + fp32 ref after step 9 to
-     confirm the cos≥0.999 gate.
-  8. **Decode loop + prompt construction** (C++ side). Build the
-     asr_sft prompt input_ids in C++ (BPE encode chat template +
-     splice audio codes) and run greedy decode. Reuses the prefill
-     graph builder with T=1 and advancing n_past. Stop on `<|im_end|>`
-     or `eos_token_id`; skip `<|empty|>` / `<|eot|>` / `<|eostm|>` in
-     the output.
-     **Blocked on reconverting the GGUF with merges** — the existing
-     `mimo-asr-q4_k.gguf` has `tokenizer.ggml.tokens` but no
-     `tokenizer.ggml.merges` (the converter was fixed in commit
-     2191a70 but the GGUF wasn't regenerated). Without merges,
-     `core_bpe::tokenize_simple` can only resolve complete-token
-     vocab lookups and falls back to per-byte for sub-words, which
-     won't match the upstream tokenizer's BPE merges.
-  9. **Reconvert F16 + Q4_K** (cautious — last session ran into OOM).
-     Skip Q8_0 / Q4_K_M for now; only Q4_K is needed for the e2e test.
-     Safetensors at `/Volumes/backups/ai/huggingface-hub/models--XiaomiMiMo--MiMo-V2.5-ASR/`.
-     Re-upload to `cstr/mimo-asr-GGUF`.
-  10. **End-to-end JFK test**: `crispasr --backend mimo-asr -f
-      samples/jfk.wav` should produce roughly "And so, my fellow
-      Americans, ask not what your country can do for you...".
+     16 GB box). The strict cos≥0.999 gate would need F16 + fp32 ref;
+     the diff harness can't load the 16 GB F16 on a 16 GB Mac without
+     swap-thrashing (`core_gguf::load_weights` materialises tensors
+     into RAM rather than mmap-ing). Q4_K diff against the new GGUF
+     reproduces step 7 numbers exactly, confirming step 9 didn't
+     regress anything.
+  8. ~~**Decode loop + prompt construction**~~ **DONE.** C++ side
+     now builds the `asr_sft` prompt input_ids inline (BPE encode each
+     chat template segment, splice with the audio segment's
+     `[<|sosp|>, ...empty..., <|eosp|>]` row 0 and per-channel
+     `speech_zeroemb_idx` audio rows), runs prefill + greedy step
+     decode, and detokenizes. The shared `mimo_asr_build_prefill_graph`
+     gained an `n_past` parameter; step decode reuses it with T=gs and
+     advancing n_past. Stops on `<|im_end|>`/eos; strips
+     `<|empty|>`/`<|eot|>`/`<|eostm|>` from the output. Tokenizer is
+     the qwen3-asr-style splitter (special-token `<|...|>` greedy
+     match → bytes_to_unicode + bpe_one for the rest), needs the
+     merges from step 9.
+  9. ~~**Reconvert F16 + Q4_K**~~ **DONE.** F16
+     (`mimo-asr-f16.gguf`, 14.9 GB, 719 tensors) + Q4_K
+     (`mimo-asr-q4_k.gguf`, 4.5 GB) regenerated from the safetensors
+     snapshot. Vocab now 151680 (was 151643), merges 151291 (was 0).
+     Hit an OpenMP deadlock in `at::native::DEFAULT::copy_kernel` →
+     `__kmp_suspend_64` during the bf16→f16 cast; workaround:
+     `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+     PYTHONUNBUFFERED=1`. Total wall time ~20 min on the 16 GB Mac
+     once the env vars were set; without them the conversion hung
+     indefinitely after ~3 min. HF re-upload to `cstr/mimo-asr-GGUF`
+     deferred (destructive shared-state op — needs explicit user
+     confirmation).
+  10. ~~**End-to-end JFK test**~~ **DONE.** `crispasr --backend
+      mimo-asr -m mimo-asr-q4_k.gguf --codec-model
+      mimo-tokenizer-q4_k.gguf -f samples/jfk.wav` outputs:
+      "And so, my fellow Americans, ask not what your country can do
+      for you. Ask what you can do for your country." (matches the
+      upstream Python `MimoAudio.asr_sft` reference). 11.0 s audio in
+      ~37 s on M1 Q4_K with Metal (0.3× realtime — Q4_K dequant on
+      every step is the bottleneck; F16 + KV reuse are the obvious
+      next perf wins, but quality is correct).
 
   Upstream Python source for reference is at
   `ref/mimo/github/src/mimo_audio_tokenizer/` and
