@@ -396,6 +396,8 @@ static bool whisper_params_parse(int argc, char** argv, whisper_params& params) 
             params.tts_codec_model = ARGV_NEXT;
         } else if (arg == "--ref-text") {
             params.tts_ref_text = ARGV_NEXT;
+        } else if (arg == "--instruct") {
+            params.tts_instruct = ARGV_NEXT;
         } else if (arg == "--tts-trim-silence") {
             params.tts_trim_silence = true;
         } else if (arg == "--auto-download") {
@@ -652,6 +654,8 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             params.tts_voice.c_str());
     fprintf(stderr, "             --ref-text \"TEXT\"        reference transcription (qwen3-tts; required when --voice "
                     "is a WAV)\n");
+    fprintf(stderr, "             --instruct \"TEXT\"        natural-language voice description "
+                    "(qwen3-tts VoiceDesign only; replaces --voice)\n");
     fprintf(stderr, "             --codec-model FNAME      qwen3-tts codec GGUF (defaults to sibling of -m)\n");
     fprintf(stderr, "             --tts-steps N            [%-7d] DPM-Solver++ steps (10-20, vibevoice only)\n",
             params.tts_steps);

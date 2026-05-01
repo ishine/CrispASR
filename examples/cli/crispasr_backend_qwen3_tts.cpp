@@ -109,13 +109,34 @@ public:
         if (!ctx_ || text.empty())
             return {};
 
-        // Voice prompt: load once on first synthesise call. Three paths:
+        // Voice prompt: load once on first synthesise call. Four paths:
         //   --voice <name>       → CustomVoice fixed-speaker selection
         //                          (only when the loaded model is CustomVoice)
         //   --voice X.gguf       → baked voice pack (Base)
         //   --voice X.wav --ref-text "..." → runtime ECAPA + codec encoder (Base)
+        //   --instruct "..."     → VoiceDesign natural-language description
+        //                          (only when the loaded model is VoiceDesign)
         if (!voice_loaded_) {
-            if (qwen3_tts_is_custom_voice(ctx_)) {
+            if (qwen3_tts_is_voice_design(ctx_)) {
+                // VoiceDesign: --instruct is required, --voice has no role.
+                if (!params.tts_voice.empty() && !params.no_prints) {
+                    fprintf(stderr,
+                            "crispasr[qwen3-tts]: VoiceDesign uses --instruct, not --voice — ignoring '%s'\n",
+                            params.tts_voice.c_str());
+                }
+                if (params.tts_instruct.empty()) {
+                    fprintf(stderr,
+                            "crispasr[qwen3-tts]: VoiceDesign requires --instruct \"<voice description>\"\n");
+                    return {};
+                }
+                if (qwen3_tts_set_instruct(ctx_, params.tts_instruct.c_str()) != 0) {
+                    return {};
+                }
+                if (!params.no_prints) {
+                    fprintf(stderr, "crispasr[qwen3-tts]: VoiceDesign instruct = \"%s\"\n",
+                            params.tts_instruct.c_str());
+                }
+            } else if (qwen3_tts_is_custom_voice(ctx_)) {
                 // CustomVoice: --voice is a speaker NAME (e.g. "vivian").
                 // If absent, default to the first speaker in the table.
                 std::string spk_name = params.tts_voice;

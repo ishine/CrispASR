@@ -128,6 +128,27 @@ int qwen3_tts_set_speaker_by_name(struct qwen3_tts_context* ctx, const char* nam
 int qwen3_tts_is_custom_voice(struct qwen3_tts_context* ctx);
 
 // ---------------------------------------------------------------------------
+// VoiceDesign (instruct-tuned variants — Qwen3-TTS-VoiceDesign)
+// ---------------------------------------------------------------------------
+//
+// VoiceDesign models generate speech in a voice described by a
+// natural-language instruction (e.g. "young female with British
+// accent, energetic, fast-paced") — no reference WAV, no preset
+// speaker. The instruct text is wrapped in
+// "<|im_start|>user\n{instruct}<|im_end|>\n", embedded via the
+// talker's text_embd → text_projection, and prepended to the prefill.
+// The codec bridge omits the speaker frame entirely.
+
+// Returns true if the loaded model is a VoiceDesign variant.
+int qwen3_tts_is_voice_design(struct qwen3_tts_context* ctx);
+
+// Set the natural-language voice description used as the instruct
+// prompt. Required before qwen3_tts_synthesize / synthesize_codes when
+// the loaded model is VoiceDesign. Re-callable; latest call wins.
+// Returns 0 on success, -1 if the loaded model is not VoiceDesign.
+int qwen3_tts_set_instruct(struct qwen3_tts_context* ctx, const char* instruct);
+
+// ---------------------------------------------------------------------------
 // Diff-harness stage APIs (PLAN #52 step 4)
 //
 // These expose intermediate activations without driving the AR decode

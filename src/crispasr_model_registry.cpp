@@ -143,6 +143,17 @@ constexpr Entry k_registry[] = {
      "~1.9 GB",
      "qwen3-tts-tokenizer-12hz.gguf",
      "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
+    // Qwen3-TTS-VoiceDesign 1.7B: instruct-tuned variant that picks a
+    // voice from a natural-language description ("--instruct \"young
+    // female with British accent, energetic\"") — no reference WAV,
+    // no preset speaker. The instruct text is prepended to the prefill
+    // and the codec bridge omits the speaker frame entirely. 1.7B-only
+    // (no 0.6B-VoiceDesign upstream). Reuses the 12 Hz tokenizer.
+    {"qwen3-tts-1.7b-voicedesign", "qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF/resolve/main/qwen3-tts-12hz-1.7b-voicedesign-q8_0.gguf",
+     "~1.9 GB",
+     "qwen3-tts-tokenizer-12hz.gguf",
+     "https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF/resolve/main/qwen3-tts-tokenizer-12hz.gguf"},
     // Orpheus-3B (canopylabs/orpheus-3b-0.1-ft, llama3.2 — "Built with
     // Llama"). Talker = Llama-3.2-3B-Instruct + 7×4096 custom audio
     // tokens. Codec = hubertsiuzdak/snac_24khz (3 codebooks × 4096,

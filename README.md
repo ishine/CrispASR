@@ -100,7 +100,7 @@ quick-start commands and engine selection guidance.
 |---------|--------|-------------|-----------|---------|
 | **vibevoice-tts** | [`VibeVoice-Realtime-0.5B`](https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF) | 4L base + 20L TTS LM + DPM-Solver++ + σ-VAE decoder; pre-computed voice presets | en | MIT |
 | **vibevoice-tts** | [`VibeVoice-1.5B`](https://huggingface.co/cstr/vibevoice-1.5b-GGUF) | 28L Qwen2 LM + DPM-Solver++ + σ-VAE decoder; voice cloning from audio | en, zh | MIT |
-| **qwen3-tts** | [`Qwen3-TTS-12Hz-0.6B-Base`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF), [`Qwen3-TTS-12Hz-1.7B-Base`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF) | Qwen3 talker LM + 12 Hz RVQ speech tokenizer; baked voice pack GGUF or runtime WAV + `--ref-text`. Pick `--backend qwen3-tts-1.7b-base` for the larger talker. | multilingual, per base model | Apache-2.0 |
+| **qwen3-tts** | [`Qwen3-TTS-12Hz-0.6B-Base`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF), [`Qwen3-TTS-12Hz-1.7B-Base`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF), [`Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) | Qwen3 talker LM + 12 Hz RVQ speech tokenizer; baked voice pack GGUF or runtime WAV + `--ref-text`. Pick `--backend qwen3-tts-1.7b-base` for the larger talker, or `--backend qwen3-tts-1.7b-voicedesign` to describe the voice in natural language via `--instruct`. | multilingual, per base model | Apache-2.0 |
 | **kokoro** | [`hexgrad/Kokoro-82M`](https://huggingface.co/hexgrad/Kokoro-82M) + [`dida-80b/kokoro-german-hui-multispeaker-base`](https://huggingface.co/dida-80b/kokoro-german-hui-multispeaker-base) (German backbone) + [`kikiri-tts/kikiri-german-{victoria,martin}`](https://huggingface.co/kikiri-tts) (German voicepacks) | StyleTTS2 / iSTFTNet (BERT + ProsodyPredictor + iSTFTNet decoder, 82M params); per-voice GGUF; in-process libespeak-ng phonemizer with LRU cache; auto-routing for `-l de` swaps in the German-trained backbone + cascading voice fallback | en, es, fr, hi, it, ja, pt, zh native + de via Option 2b (PLAN §56) + others through espeak-ng with French/German voice fallback | Apache-2.0 (model + German backbone + kikiri voicepacks); HUI corpus CC0 |
 
 ### Post-processing models
@@ -601,6 +601,17 @@ default).
     --ref-text "Okay, yeah. I resent you, I love you, I respect you. But you know what - You blew it, and thanks to you." \
     --tts "Hello there" \
     --tts-output hello.wav
+
+# VoiceDesign — describe the voice in natural language. No reference WAV,
+# no preset speaker. 1.7B-only (~1.9 GB Q8_0). Pass --instruct instead of
+# --voice; the codec bridge omits the speaker frame and the description
+# is prepended to the prefill as a `<|im_start|>user\n…<|im_end|>\n`
+# block.
+./build/bin/crispasr \
+    --backend qwen3-tts-1.7b-voicedesign -m auto \
+    --instruct "A young female voice with a slight British accent, energetic, slightly fast paced" \
+    --tts "Hello, I'm an excited engineer." \
+    --tts-output hello.wav
 ```
 
 Notes:
@@ -638,6 +649,8 @@ preset; the realtime `0.5B` flow is typically driven by a voice GGUF.
 [`cstr/vibevoice-realtime-0.5b-GGUF`](https://huggingface.co/cstr/vibevoice-realtime-0.5b-GGUF) ·
 [`cstr/vibevoice-1.5b-GGUF`](https://huggingface.co/cstr/vibevoice-1.5b-GGUF) ·
 [`cstr/qwen3-tts-0.6b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-0.6b-base-GGUF) ·
+[`cstr/qwen3-tts-1.7b-base-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-base-GGUF) ·
+[`cstr/qwen3-tts-1.7b-voicedesign-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) ·
 [`cstr/qwen3-tts-tokenizer-12hz-GGUF`](https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF)
 
 ### qwen3-tts environment switches

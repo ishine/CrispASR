@@ -964,3 +964,44 @@ The 1.7B small_to_mtp_projection bridge from the 2048-d talker to the
 `2cc7aeb` (originally for 1.7B-CustomVoice) and is variant-agnostic,
 so once `spk_enc_dim` was unstuck the rest of the path "just worked"
 on the existing graph builders.
+
+### 58. Qwen3-TTS-VoiceDesign 1.7B — describe-the-voice TTS (May 2026)
+
+The instruct-tuned variant of Qwen3-TTS-12Hz-1.7B shipped behind the
+`qwen3-tts-1.7b-voicedesign` registry alias. Replaces the reference-WAV
+or fixed-speaker prompt with a natural-language voice description fed
+in via `--instruct`. No ECAPA forward, no codec encoder, no preset
+speaker table — the model picks a voice purely from the text.
+
+**Runtime contract.** When `qwen3tts.tts_model_type == "voice_design"`,
+the talker prefill is built by `build_voicedesign_prefill_embeds`
+(`src/qwen3_tts.cpp`), which mirrors `build_customvoice_prefill_embeds`
+with two changes:
+- The codec bridge omits the speaker frame: `L_codec =
+  codec_prefill.size() + 2` (just `pad,bos`), one frame shorter than
+  the CustomVoice path.
+- An instruct block — `text_proj(text_embd(instruct_ids))`, where
+  `instruct_ids` tokenises `<|im_start|>user\n{instruct}<|im_end|>\n`
+  — is prepended to the prefill. Mirrors
+  `Qwen3TTSForConditionalGeneration.generate` lines 2076–2233 of
+  `modeling_qwen3_tts.py` for the `speaker_embed=None` + `instruct_ids`
+  path.
+
+**C-ABI.** Two new entry points:
+- `qwen3_tts_is_voice_design(ctx)` — variant detection.
+- `qwen3_tts_set_instruct(ctx, instruct)` — required before synthesis
+  on a VoiceDesign model; returns -1 if the model isn't VoiceDesign.
+
+**CLI.** New `--instruct "..."` flag (parsed in `cli.cpp`). The
+`qwen3-tts` backend rejects `--voice` on VoiceDesign models with a
+helpful warning, and errors before generation if `--instruct` is
+empty.
+
+**Why 1.7B-only.** Upstream `generate_custom_voice` explicitly disables
+`instruct` for the 0.6B variant; there is no 0.6B-VoiceDesign weight
+release. The 1.7B talker forward (Q/KV/FFN, mrope, small_to_mtp
+bridge) is shared with 1.7B-Base, so the runtime side reuses the
+existing graph builders end-to-end.
+
+**HF release.** [`cstr/qwen3-tts-1.7b-voicedesign-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) ships F16 + Q8_0.
+Pair with [`cstr/qwen3-tts-tokenizer-12hz-GGUF`](https://huggingface.co/cstr/qwen3-tts-tokenizer-12hz-GGUF) — same 12 Hz tokenizer.

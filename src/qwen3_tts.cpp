@@ -728,6 +728,11 @@ struct qwen3_tts_context {
     std::vector<int32_t> runtime_ref_codes; // [T_codec * 16] set by set_voice_prompt
     std::string runtime_ref_text;           // ref text for ICL prefill
     std::vector<uint8_t> cenc_compute_meta;
+
+    // VoiceDesign: natural-language voice description, set by
+    // qwen3_tts_set_instruct. Tokenised to instruct_ids via
+    // tokenise_user_instruct on each prefill build.
+    std::string runtime_instruct;
 };
 
 // ---------------------------------------------------------------------------
@@ -1823,6 +1828,22 @@ std::vector<int32_t> tokenise_assistant_text(qwen3_tts_context* c, const std::st
     return ids;
 }
 
+// Build the VoiceDesign instruct prompt:
+//   "<|im_start|>user\n<instruct><|im_end|>\n"
+// matching `Qwen3TTSModel._build_instruct_text` in
+// qwen_tts/inference/qwen3_tts_model.py.
+std::vector<int32_t> tokenise_user_instruct(qwen3_tts_context* c, const std::string& instruct) {
+    std::vector<int32_t> ids;
+    const auto& v = c->vocab;
+    push_special(v, ids, "<|im_start|>");
+    push_text_block(v, ids, "user");
+    ids.push_back(kNewlineId);
+    push_text_block(v, ids, instruct);
+    push_special(v, ids, "<|im_end|>");
+    ids.push_back(kNewlineId);
+    return ids;
+}
+
 // Build the reference-side prompt for ICL voice cloning:
 //   "<|im_start|>assistant\n<ref_text><|im_end|>\n"
 // matching `Qwen3TTSModel._build_ref_text`.
@@ -2691,6 +2712,209 @@ bool build_customvoice_prefill_embeds(qwen3_tts_context* c, const std::string& s
                 L_bridge, L_text, T_prefill);
     }
 
+    free(tts_special_emb);
+    free(role_emb);
+    return true;
+}
+
+// VoiceDesign prefill builder. Mirrors the non_streaming_mode block of
+// `Qwen3TTSForConditionalGeneration.generate` (modeling_qwen3_tts.py
+// ~lines 2076-2233) for the speaker_embed=None + instruct_ids path: no
+// reference WAV, no fixed speaker, no ICL fusion. The voice is
+// described entirely in natural language via `instruct`.
+//
+// Differs from CustomVoice in two places:
+//   1. The codec bridge skips the speaker frame: codec_input_emb has
+//      L_codec = codec_prefill.size() + 2 (just pad+bos, no spk).
+//   2. An instruct block — `text_proj(text_embd(instruct_ids))` —
+//      is prepended to the prefill, where instruct_ids tokenise
+//      "<|im_start|>user\n{instruct}<|im_end|>\n".
+//
+// Final layout (M = len(instruct_ids), L_codec = codec_prefill+2):
+//   [instruct(M)]      text_proj(text_embd(instruct_ids))
+//   [role(3)]          text_proj(text_embd("<|im_start|>assistant\n"))
+//   [bridge(L_codec-1)]  tts_pad×(L_codec-2)+tts_bos | codec_in_emb[:-1]
+//   [text_block(N+1)]  text_proj(text_content)+tts_eos | codec_pad×(N+1)
+//   [final(1)]         tts_pad | codec_bos_emb
+bool build_voicedesign_prefill_embeds(qwen3_tts_context* c, const std::string& instruct_text,
+                                      const std::string& syn_text, std::vector<float>& prefill_embeds,
+                                      int& T_prefill, std::vector<float>& trailing_text_hidden, int& M_trailing) {
+    const auto& hp = c->hp;
+    const int d = (int)hp.d_model;
+
+    if (instruct_text.empty()) {
+        fprintf(stderr, "qwen3_tts[voicedesign]: empty instruct — call qwen3_tts_set_instruct first\n");
+        return false;
+    }
+
+    auto syn_ids = tokenise_assistant_text(c, syn_text);
+    if ((int)syn_ids.size() < 9) {
+        fprintf(stderr, "qwen3_tts[voicedesign]: prompt too short (%zu)\n", syn_ids.size());
+        return false;
+    }
+    auto instruct_ids = tokenise_user_instruct(c, instruct_text);
+    if (instruct_ids.empty()) {
+        fprintf(stderr, "qwen3_tts[voicedesign]: instruct tokenised to empty\n");
+        return false;
+    }
+
+    // ---- instruct block: text_proj(text_embd(instruct_ids)) ----
+    float* instruct_emb = run_embed_text(c, instruct_ids.data(), (int)instruct_ids.size());
+    if (!instruct_emb) {
+        return false;
+    }
+    const int M_instruct = (int)instruct_ids.size();
+
+    // ---- tts_bos / tts_eos / tts_pad embeds via text_proj ----
+    int32_t tts_special[3] = {(int32_t)hp.tts_bos_id, (int32_t)hp.tts_eos_id, (int32_t)hp.tts_pad_id};
+    float* tts_special_emb = run_embed_text(c, tts_special, 3);
+    if (!tts_special_emb) {
+        free(instruct_emb);
+        return false;
+    }
+    const float* tts_bos = tts_special_emb;                 // (d,)
+    const float* tts_eos = tts_special_emb + d;             // (d,)
+    const float* tts_pad = tts_special_emb + (size_t)2 * d; // (d,)
+
+    // ---- codec_input_emb: [codec_prefill | pad | bos] (NO speaker frame) ----
+    std::vector<int32_t> codec_prefill;
+    if (c->language_id <= 0) {
+        codec_prefill = {(int32_t)hp.codec_nothink_id, (int32_t)hp.codec_think_bos_id, (int32_t)hp.codec_think_eos_id};
+    } else {
+        codec_prefill = {(int32_t)hp.codec_think_id, (int32_t)hp.codec_think_bos_id, (int32_t)c->language_id,
+                         (int32_t)hp.codec_think_eos_id};
+    }
+    int32_t codec_pad_bos[2] = {(int32_t)hp.codec_pad_id, (int32_t)hp.codec_bos_id};
+
+    float* codec_pre_emb = lookup_rows(c, c->talker.token_embd_w, codec_prefill.data(), (int)codec_prefill.size());
+    float* codec_pb_emb = lookup_rows(c, c->talker.token_embd_w, codec_pad_bos, 2);
+    if (!codec_pre_emb || !codec_pb_emb) {
+        free(instruct_emb);
+        free(tts_special_emb);
+        free(codec_pre_emb);
+        free(codec_pb_emb);
+        return false;
+    }
+
+    const int L_codec = (int)codec_prefill.size() + 2 /*pad,bos*/; // no spk
+    std::vector<float> codec_input_emb((size_t)L_codec * d);
+    {
+        size_t pos = 0;
+        const size_t bytes_pre = (size_t)codec_prefill.size() * d * sizeof(float);
+        std::memcpy(codec_input_emb.data() + pos, codec_pre_emb, bytes_pre);
+        pos += codec_prefill.size() * d;
+        std::memcpy(codec_input_emb.data() + pos, codec_pb_emb, (size_t)2 * d * sizeof(float));
+    }
+    free(codec_pre_emb);
+    free(codec_pb_emb);
+
+    // ---- role embed: text_proj(text_embd(syn_ids[:3])) ----
+    std::vector<int32_t> role_ids(syn_ids.begin(), syn_ids.begin() + 3);
+    float* role_emb = run_embed_text(c, role_ids.data(), 3);
+    if (!role_emb) {
+        free(instruct_emb);
+        free(tts_special_emb);
+        return false;
+    }
+
+    // ---- bridge: cat(tts_pad×(L_codec-2), tts_bos) + codec_input_emb[:-1] ----
+    const int L_bridge = L_codec - 1;
+    std::vector<float> bridge((size_t)L_bridge * d);
+    for (int i = 0; i < L_bridge; i++) {
+        const float* left = (i < L_bridge - 1) ? tts_pad : tts_bos;
+        const float* right = codec_input_emb.data() + (size_t)i * d;
+        for (int j = 0; j < d; j++) {
+            bridge[(size_t)i * d + j] = left[j] + right[j];
+        }
+    }
+
+    // ---- text block: text_proj(text_content) + tts_eos | codec_pad×(N+1) ----
+    std::vector<int32_t> text_content(syn_ids.begin() + 3, syn_ids.end() - 5);
+    const int N = (int)text_content.size();
+    if (N <= 0) {
+        fprintf(stderr, "qwen3_tts[voicedesign]: empty text content\n");
+        free(instruct_emb);
+        free(tts_special_emb);
+        free(role_emb);
+        return false;
+    }
+    float* text_emb = run_embed_text(c, text_content.data(), N);
+    if (!text_emb) {
+        free(instruct_emb);
+        free(tts_special_emb);
+        free(role_emb);
+        return false;
+    }
+    int32_t codec_pad = (int32_t)hp.codec_pad_id;
+    float* codec_pad_emb = lookup_rows(c, c->talker.token_embd_w, &codec_pad, 1);
+    if (!codec_pad_emb) {
+        free(instruct_emb);
+        free(tts_special_emb);
+        free(role_emb);
+        free(text_emb);
+        return false;
+    }
+    const int L_text = N + 1; // +1 for tts_eos
+    std::vector<float> text_block((size_t)L_text * d);
+    for (int i = 0; i < L_text; i++) {
+        const float* left = (i < N) ? text_emb + (size_t)i * d : tts_eos;
+        for (int j = 0; j < d; j++) {
+            text_block[(size_t)i * d + j] = left[j] + codec_pad_emb[j];
+        }
+    }
+    free(text_emb);
+
+    // ---- final row: tts_pad + codec_bos_emb ----
+    int32_t codec_bos = (int32_t)hp.codec_bos_id;
+    float* codec_bos_emb = lookup_rows(c, c->talker.token_embd_w, &codec_bos, 1);
+    if (!codec_bos_emb) {
+        free(instruct_emb);
+        free(tts_special_emb);
+        free(role_emb);
+        free(codec_pad_emb);
+        return false;
+    }
+    std::vector<float> final_row((size_t)d);
+    for (int j = 0; j < d; j++) {
+        final_row[j] = tts_pad[j] + codec_bos_emb[j];
+    }
+    free(codec_bos_emb);
+    free(codec_pad_emb);
+
+    // ---- concat: instruct(M) + role(3) + bridge(L_bridge) + text_block(L_text) + final(1) ----
+    T_prefill = M_instruct + 3 + L_bridge + L_text + 1;
+    prefill_embeds.assign((size_t)T_prefill * d, 0.0f);
+    size_t off = 0;
+    std::memcpy(prefill_embeds.data() + off, instruct_emb, (size_t)M_instruct * d * sizeof(float));
+    off += (size_t)M_instruct * d;
+    std::memcpy(prefill_embeds.data() + off, role_emb, (size_t)3 * d * sizeof(float));
+    off += (size_t)3 * d;
+    std::memcpy(prefill_embeds.data() + off, bridge.data(), bridge.size() * sizeof(float));
+    off += bridge.size();
+    std::memcpy(prefill_embeds.data() + off, text_block.data(), text_block.size() * sizeof(float));
+    off += text_block.size();
+    std::memcpy(prefill_embeds.data() + off, final_row.data(), (size_t)d * sizeof(float));
+
+    // ---- trailing_text_hidden = tts_pad_embed (1 row) ----
+    trailing_text_hidden.assign(tts_pad, tts_pad + d);
+    M_trailing = 1;
+
+    if (const char* dd = env_str("QWEN3_TTS_DUMP_DIR")) {
+        dump_f32(dd, "vd_instruct_emb", instruct_emb, (size_t)M_instruct * d);
+        dump_f32(dd, "vd_role", role_emb, (size_t)3 * d);
+        dump_f32(dd, "vd_bridge", bridge.data(), bridge.size());
+        dump_f32(dd, "vd_text_block", text_block.data(), text_block.size());
+        dump_f32(dd, "vd_prefill", prefill_embeds.data(), prefill_embeds.size());
+        dump_i32(dd, "vd_instruct_ids", instruct_ids.data(), instruct_ids.size());
+    }
+    if (c->params.verbosity >= 1) {
+        fprintf(stderr,
+                "qwen3_tts[voicedesign]: prefill instruct=%d + role=3 + bridge=%d + text=%d + final=1 = T=%d "
+                "trailing=1\n",
+                M_instruct, L_bridge, L_text, T_prefill);
+    }
+
+    free(instruct_emb);
     free(tts_special_emb);
     free(role_emb);
     return true;
@@ -4176,10 +4400,11 @@ static ggml_cgraph* build_graph_spk_enc(qwen3_tts_context* c, int T_mel) {
 }
 
 static bool load_spk_enc(qwen3_tts_context* c) {
-    // CustomVoice variants ship with no speaker_encoder — the
-    // "speaker embedding" is just talker.token_embd[spk_id]. Skip the
-    // load (and the warnings it would emit) entirely.
-    if (c->hp.tts_model_type == "custom_voice") {
+    // CustomVoice and VoiceDesign variants ship with no speaker_encoder
+    // — for CustomVoice the speaker_embed is talker.token_embd[spk_id],
+    // for VoiceDesign the codec bridge omits the speaker frame entirely.
+    // Skip the load (and the warnings it would emit) for both.
+    if (c->hp.tts_model_type == "custom_voice" || c->hp.tts_model_type == "voice_design") {
         return true;
     }
     auto& spk = c->spk_enc;
@@ -4881,6 +5106,25 @@ extern "C" int qwen3_tts_is_custom_voice(struct qwen3_tts_context* ctx) {
     return (ctx && ctx->hp.tts_model_type == "custom_voice") ? 1 : 0;
 }
 
+extern "C" int qwen3_tts_is_voice_design(struct qwen3_tts_context* ctx) {
+    return (ctx && ctx->hp.tts_model_type == "voice_design") ? 1 : 0;
+}
+
+extern "C" int qwen3_tts_set_instruct(struct qwen3_tts_context* ctx, const char* instruct) {
+    if (!ctx) {
+        return -1;
+    }
+    if (ctx->hp.tts_model_type != "voice_design") {
+        fprintf(stderr, "qwen3_tts: model is not VoiceDesign — set_instruct not applicable\n");
+        return -1;
+    }
+    ctx->runtime_instruct = instruct ? instruct : "";
+    if (ctx->params.verbosity >= 1 && !ctx->runtime_instruct.empty()) {
+        fprintf(stderr, "qwen3_tts: VoiceDesign instruct set (%zu chars)\n", ctx->runtime_instruct.size());
+    }
+    return 0;
+}
+
 extern "C" int qwen3_tts_n_speakers(struct qwen3_tts_context* ctx) {
     if (!ctx) {
         return 0;
@@ -5074,10 +5318,17 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         return nullptr;
     }
     const bool is_custom_voice = (ctx->hp.tts_model_type == "custom_voice");
+    const bool is_voice_design = (ctx->hp.tts_model_type == "voice_design");
     if (is_custom_voice) {
         // CustomVoice: need a fixed speaker selected via set_speaker_by_name.
         if ((int)ctx->runtime_spk_emb.size() != (int)ctx->hp.d_model) {
             fprintf(stderr, "qwen3_tts: no speaker — call qwen3_tts_set_speaker_by_name\n");
+            return nullptr;
+        }
+    } else if (is_voice_design) {
+        // VoiceDesign: need a non-empty natural-language instruct.
+        if (ctx->runtime_instruct.empty()) {
+            fprintf(stderr, "qwen3_tts: VoiceDesign needs a voice description — call qwen3_tts_set_instruct\n");
             return nullptr;
         }
     } else {
@@ -5117,6 +5368,10 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         if (!build_customvoice_prefill_embeds(ctx, text, prefill, T_pre, trailing, M_trail)) {
             return nullptr;
         }
+    } else if (is_voice_design) {
+        if (!build_voicedesign_prefill_embeds(ctx, ctx->runtime_instruct, text, prefill, T_pre, trailing, M_trail)) {
+            return nullptr;
+        }
     } else {
         std::string ref_text;
         if (!ctx->runtime_ref_text.empty()) {
@@ -5134,8 +5389,8 @@ extern "C" int32_t* qwen3_tts_synthesize_codes(struct qwen3_tts_context* ctx, co
         }
     }
     if (bench) {
-        fprintf(stderr, "qwen3_tts: prefill %7.1f ms (T=%d, %s)\n", now_ms() - t0, T_pre,
-                is_custom_voice ? "customvoice" : "icl");
+        const char* label = is_custom_voice ? "customvoice" : (is_voice_design ? "voicedesign" : "icl");
+        fprintf(stderr, "qwen3_tts: prefill %7.1f ms (T=%d, %s)\n", now_ms() - t0, T_pre, label);
     }
     if (dump_dir) {
         dump_f32(dump_dir, "icl_prefill", prefill.data(), prefill.size());

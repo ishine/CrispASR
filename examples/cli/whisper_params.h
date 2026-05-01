@@ -133,5 +133,6 @@ struct whisper_params {
     int tts_steps = 20;
     std::string tts_codec_model;
     std::string tts_ref_text;
+    std::string tts_instruct; // VoiceDesign: natural-language voice description
     bool tts_trim_silence = false;
 };
