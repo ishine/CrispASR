@@ -1494,15 +1494,25 @@ The Q4_K-on-disk re-quantisation path is separate from this fuse —
 the existing 4.5 GB Q4_K stays as Q4_K, just with three Q/K/V
 tensors per layer collapsed into one `attn.qkv.weight`.
 
-**Validation (Q4_K, JFK, on this 16 GB box):**
+**Validation (Q4_K, JFK, on this 16 GB box, 4 concurrent claude
+sessions, 99%-full external disk):**
 - `crispasr-diff` cosines reproduce the §56 / 51b/b' baselines
-  within FP rounding (audio_features 0.998, text_embeds 0.996,
-  inputs_embeds 0.998, last_hidden 0.963, logits 0.981).
-- JFK transcript byte-identical to "And so, my fellow Americans,
+  bit-exactly (audio_features 0.998270, text_embeds 0.996284,
+  inputs_embeds 0.997573, last_hidden 0.963177, logits 0.981261 —
+  identical to the unfused-Q4_K reference run, character-by-character).
+- JFK transcript byte-identical: "And so, my fellow Americans,
   ask not what your country can do for you. Ask what you can do
   for your country."
-- `MIMO_ASR_BENCH=1` shows the predicted ~1.1-1.2× per-step
-  speedup on top of the 0.79 s/step 51b/b' baseline.
+- `MIMO_ASR_BENCH=1` on the same disk-thrashed box:
+  - Unfused (separate Q/K/V): prefill 10295 ms, decode 79498 ms /
+    26 steps = **3058 ms/step**, total LM 89.8 s.
+  - Fused (this PLAN #60d): prefill 4881 ms, decode 46946 ms /
+    26 steps = **1806 ms/step**, total LM 51.8 s.
+  - **1.69× per-step decode speedup** at the same disk thrash
+    level. The work order predicted 1.1-1.2× on a quiet box;
+    larger here likely because each fewer matmul also avoids one
+    page-fault round-trip on the contested disk. On uncontended
+    hardware expect closer to 1.1-1.2× pure-compute.
 
 The patched Q4_K was uploaded to `cstr/mimo-asr-GGUF` replacing
 the unfused file. The unfused F16 stays in the repo unchanged —
