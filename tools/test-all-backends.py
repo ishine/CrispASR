@@ -466,6 +466,107 @@ def test_stream(b: Backend, tier: str, ctx: dict) -> TestOutcome:
                        elapsed, extra)
 
 
+# ---- beam -----------------------------------------------------------------
+
+
+def test_beam(b: Backend, tier: str, ctx: dict) -> TestOutcome:
+    """Smoke: -bs 4 doesn't crash and produces a non-empty transcript with
+    bounded WER. Full: beam transcript matches greedy or differs by
+    at most 1 word edit (JFK is too clean to expect strict WER<).
+    """
+    crispasr, model, audio, use_gpu = (
+        ctx["crispasr"], ctx["model"], ctx["audio"], ctx["use_gpu"])
+    rc, out, err, w = _run_cli(crispasr, b, model, audio, ["-bs", "4"], use_gpu)
+    if rc < 0:
+        return TestOutcome(b.name, "beam", tier, "TIMEOUT", err, w)
+    if rc != 0:
+        return TestOutcome(b.name, "beam", tier, "CRASH",
+                           (err or "")[-300:], w)
+    transcript = parse_transcript(out)
+    if not transcript:
+        return TestOutcome(b.name, "beam", tier, "EMPTY",
+                           (err or "")[-200:], w)
+    werv = wer(JFK_REF, transcript)
+    if werv is not None and werv > 0.30:
+        return TestOutcome(b.name, "beam", tier, "FAIL",
+                           f"-bs 4 WER {werv:.1%} > 30%", w,
+                           {"transcript": transcript[:80], "wer": werv})
+    return TestOutcome(b.name, "beam", tier, "PASS",
+                       f"-bs 4 WER={werv:.1%}" if werv is not None else "-bs 4 produced output",
+                       w)
+
+
+# ---- best-of-n ------------------------------------------------------------
+
+
+def test_best_of_n(b: Backend, tier: str, ctx: dict) -> TestOutcome:
+    """Smoke: -bo 4 doesn't crash, produces transcript with bounded WER."""
+    crispasr, model, audio, use_gpu = (
+        ctx["crispasr"], ctx["model"], ctx["audio"], ctx["use_gpu"])
+    # best-of-N typically requires temperature > 0 to actually diversify
+    # candidates. Some backends accept -bo with -tp 0 as a no-op.
+    rc, out, err, w = _run_cli(crispasr, b, model, audio,
+                               ["-bo", "4", "-tp", "0.3"], use_gpu)
+    if rc < 0:
+        return TestOutcome(b.name, "best-of-n", tier, "TIMEOUT", err, w)
+    if rc != 0:
+        return TestOutcome(b.name, "best-of-n", tier, "CRASH",
+                           (err or "")[-300:], w)
+    transcript = parse_transcript(out)
+    if not transcript:
+        return TestOutcome(b.name, "best-of-n", tier, "EMPTY",
+                           (err or "")[-200:], w)
+    werv = wer(JFK_REF, transcript)
+    if werv is not None and werv > 0.30:
+        return TestOutcome(b.name, "best-of-n", tier, "FAIL",
+                           f"-bo 4 WER {werv:.1%} > 30%", w,
+                           {"transcript": transcript[:80], "wer": werv})
+    return TestOutcome(b.name, "best-of-n", tier, "PASS",
+                       f"-bo 4 WER={werv:.1%}" if werv is not None else "-bo 4 produced output",
+                       w)
+
+
+# ---- punctuation ----------------------------------------------------------
+
+
+_PUNCT_RE = re.compile(r"[,.!?]")
+
+
+def test_punctuation(b: Backend, tier: str, ctx: dict) -> TestOutcome:
+    """Run with and without --no-punctuation, verify the toggle has effect.
+    With: at least one punctuation char in transcript.
+    Without: zero punctuation chars in transcript.
+    """
+    crispasr, model, audio, use_gpu = (
+        ctx["crispasr"], ctx["model"], ctx["audio"], ctx["use_gpu"])
+    rc1, out1, err1, w1 = _run_cli(crispasr, b, model, audio, [], use_gpu)
+    if rc1 != 0:
+        return TestOutcome(b.name, "punctuation", tier, "CRASH",
+                           f"with-punct run failed: {(err1 or '')[-200:]}", w1)
+    rc2, out2, err2, w2 = _run_cli(crispasr, b, model, audio,
+                                   ["--no-punctuation"], use_gpu)
+    if rc2 != 0:
+        return TestOutcome(b.name, "punctuation", tier, "CRASH",
+                           f"--no-punctuation run failed: {(err2 or '')[-200:]}",
+                           w1 + w2)
+    t_with = parse_transcript(out1)
+    t_without = parse_transcript(out2)
+    has_with = bool(_PUNCT_RE.search(t_with))
+    has_without = bool(_PUNCT_RE.search(t_without))
+    if not has_with:
+        return TestOutcome(b.name, "punctuation", tier, "FAIL",
+                           "default run produced no punctuation chars",
+                           w1 + w2,
+                           {"with": t_with[:80], "without": t_without[:80]})
+    if has_without:
+        return TestOutcome(b.name, "punctuation", tier, "FAIL",
+                           "--no-punctuation still emitted punctuation",
+                           w1 + w2,
+                           {"with": t_with[:80], "without": t_without[:80]})
+    return TestOutcome(b.name, "punctuation", tier, "PASS",
+                       "with: punct present; without: punct absent", w1 + w2)
+
+
 # Capability → test runner. Capabilities not in this map count as
 # unimplemented (status SKIP at SMOKE/FULL tier).
 RUNNERS = {
@@ -473,7 +574,12 @@ RUNNERS = {
     "json-output":  test_json_output,
     "temperature":  test_temperature,
     "stream":       test_stream,
-    # Future: beam, best-of-n, word-timestamps, punctuation, vad, lid
+    "beam":         test_beam,
+    "best-of-n":    test_best_of_n,
+    "punctuation":  test_punctuation,
+    # Future: word-timestamps (needs aligner model + parakeet ground truth),
+    # vad (needs multi-segment clip + adjustable threshold), lid (needs
+    # non-English samples).
 }
 
 
