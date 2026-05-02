@@ -646,6 +646,21 @@ CA_EXPORT int crispasr_stream_flush(crispasr_stream* s) {
     return crispasr_stream_run_decode(s) == 0 ? 1 : -2;
 }
 
+// PLAN #7 phase 3 — voxtral4b live-captions toggle on a unified stream.
+// Forwards to voxtral4b_stream_set_live_decode if the underlying stream is
+// voxtral4b; no-op for other backends. Set BEFORE the first feed for
+// clean semantics. Idempotent.
+CA_EXPORT void crispasr_stream_set_live_decode(crispasr_stream* s, int enabled) {
+    if (!s)
+        return;
+#if __has_include("voxtral4b.h")
+    if (s->voxtral4b_stream_state) {
+        voxtral4b_stream_set_live_decode((voxtral4b_stream*)s->voxtral4b_stream_state, enabled);
+    }
+#endif
+    (void)enabled; // silence unused-warning when no streaming-capable backend is built in
+}
+
 // =========================================================================
 // Parakeet (nvidia/parakeet-tdt-0.6b-v3) — C-ABI wrappers for Dart
 // =========================================================================

@@ -1511,15 +1511,24 @@ class Session:
     # ------------------------------------------------------------------
 
     def stream_open(self, *, step_ms: int = 3000, length_ms: int = 10000, keep_ms: int = 200,
-                    language: str = "", translate: bool = False) -> "Session._Stream":
+                    language: str = "", translate: bool = False, live: bool = False) -> "Session._Stream":
         """Open a rolling-window streaming decoder for this session.
 
-        Currently whisper-only at the C-ABI level (PLAN #62b). Other
-        backends raise :class:`RuntimeError`.
+        Backends with native streaming today: whisper, kyutai-stt,
+        moonshine-streaming, voxtral4b. Other backends raise
+        :class:`RuntimeError`.
 
         ``step_ms``: how often to commit a partial transcript (default 3s).
         ``length_ms``: rolling-window size (default 10s).
         ``keep_ms``: trailing audio carried over between windows (200ms).
+
+        ``live``: voxtral4b-only — when True, decode runs during ``feed()``
+        so ``get_text()`` returns progressive transcript as audio arrives.
+        Default False (PTT semantics: decode happens in ``flush()``).
+        Sequential live decode is ~1.5× realtime on M1 Q4_K voxtral4b;
+        falls behind realtime audio without parallel encoder/decoder
+        threads. Useful for: faster-than-realtime offline streaming,
+        post-utterance live captions, manual stop-and-resume capture.
 
         Returns a :class:`_Stream` handle. Feed PCM with
         :meth:`_Stream.feed` and pull text with :meth:`_Stream.get_text`.
@@ -1535,7 +1544,12 @@ class Session:
             language.encode("utf-8") if language else b"", 1 if translate else 0,
         )
         if not h:
-            raise RuntimeError(f"stream_open failed for backend {self.backend!r} (whisper-only today)")
+            raise RuntimeError(f"stream_open failed for backend {self.backend!r}")
+        # Voxtral4b live-decode toggle. No-op on other backends. Idempotent.
+        if live and hasattr(self._lib, "crispasr_stream_set_live_decode"):
+            self._lib.crispasr_stream_set_live_decode.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            self._lib.crispasr_stream_set_live_decode.restype = None
+            self._lib.crispasr_stream_set_live_decode(h, 1)
         return Session._Stream(self._lib, h)
 
     class _Stream:

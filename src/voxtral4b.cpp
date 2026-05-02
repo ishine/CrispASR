@@ -2471,6 +2471,12 @@ extern "C" int voxtral4b_stream_get_text(struct voxtral4b_stream* s, char* out, 
     return copy_n;
 }
 
+extern "C" void voxtral4b_stream_set_live_decode(struct voxtral4b_stream* s, int enabled) {
+    if (!s)
+        return;
+    s->live_decode_enabled = (enabled != 0);
+}
+
 extern "C" void voxtral4b_stream_close(struct voxtral4b_stream* s) {
     if (!s)
         return;

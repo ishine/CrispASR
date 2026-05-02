@@ -89,6 +89,13 @@ int voxtral4b_stream_get_text(struct voxtral4b_stream* s, char* out, int cap, do
 // on success (even if no new text), <0 on error.
 int voxtral4b_stream_flush(struct voxtral4b_stream* s);
 
+// Toggle live-captions decode-during-feed (PLAN #7 phase 3). When enabled,
+// each new audio_embed produced during `feed` triggers one greedy decode
+// step; tokens commit immediately to out_text and `get_text` returns
+// progressive transcript. When disabled (default), decode is deferred to
+// `flush`. Set BEFORE the first feed for clean semantics. Idempotent.
+void voxtral4b_stream_set_live_decode(struct voxtral4b_stream* s, int enabled);
+
 void voxtral4b_stream_close(struct voxtral4b_stream* s);
 
 #ifdef __cplusplus
