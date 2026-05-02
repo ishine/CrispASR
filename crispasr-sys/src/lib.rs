@@ -114,6 +114,12 @@ pub struct CrispasrSession(c_void);
 #[repr(C)]
 pub struct CrispasrSessionResult(c_void);
 
+/// Opaque streaming-decoder handle returned by
+/// `crispasr_session_stream_open`. Must be freed with
+/// `crispasr_stream_close`. (PLAN #62)
+#[repr(C)]
+pub struct CrispasrStream(c_void);
+
 /// Opaque result handle for `crispasr_align_words_abi`. Must be freed
 /// with `crispasr_align_result_free`.
 #[repr(C)]
@@ -324,6 +330,28 @@ extern "C" {
 
     /// Shared known-model registry lookup by filename (exact then fuzzy).
     pub fn crispasr_registry_list_backends_abi(out_csv: *mut c_char, out_cap: c_int) -> c_int;
+
+    // --- Streaming (PLAN #62) — rolling-window decoder for whisper today ---
+    pub fn crispasr_session_stream_open(
+        s: *mut CrispasrSession,
+        n_threads: c_int,
+        step_ms: c_int,
+        length_ms: c_int,
+        keep_ms: c_int,
+        language: *const c_char,
+        translate: c_int,
+    ) -> *mut CrispasrStream;
+    pub fn crispasr_stream_feed(s: *mut CrispasrStream, pcm: *const c_float, n_samples: c_int) -> c_int;
+    pub fn crispasr_stream_get_text(
+        s: *mut CrispasrStream,
+        out_text: *mut c_char,
+        out_cap: c_int,
+        out_t0_s: *mut f64,
+        out_t1_s: *mut f64,
+        out_counter: *mut i64,
+    ) -> c_int;
+    pub fn crispasr_stream_flush(s: *mut CrispasrStream) -> c_int;
+    pub fn crispasr_stream_close(s: *mut CrispasrStream);
     pub fn crispasr_registry_lookup_by_filename_abi(
         filename: *const c_char,
         out_filename: *mut c_char,

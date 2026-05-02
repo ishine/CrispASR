@@ -886,6 +886,7 @@ class Session:
             )
         be = self._lib.crispasr_session_backend(self._handle)
         self.backend = be.decode("utf-8") if be else ""
+        self._n_threads = int(n_threads)
 
     def _setup_session_signatures(self):
         lib = self._lib
@@ -1388,6 +1389,111 @@ class Session:
         if rc != 0:
             raise RuntimeError(f"detect_language failed (rc={rc})")
         return out_buf.value.decode("utf-8"), float(out_prob.value)
+
+    # ------------------------------------------------------------------
+    # Streaming API (PLAN #62a — Python wrapper for crispasr_stream_*).
+    # ------------------------------------------------------------------
+
+    def stream_open(self, *, step_ms: int = 3000, length_ms: int = 10000, keep_ms: int = 200,
+                    language: str = "", translate: bool = False) -> "Session._Stream":
+        """Open a rolling-window streaming decoder for this session.
+
+        Currently whisper-only at the C-ABI level (PLAN #62b). Other
+        backends raise :class:`RuntimeError`.
+
+        ``step_ms``: how often to commit a partial transcript (default 3s).
+        ``length_ms``: rolling-window size (default 10s).
+        ``keep_ms``: trailing audio carried over between windows (200ms).
+
+        Returns a :class:`_Stream` handle. Feed PCM with
+        :meth:`_Stream.feed` and pull text with :meth:`_Stream.get_text`.
+        """
+        if not hasattr(self._lib, "crispasr_session_stream_open"):
+            raise RuntimeError("streaming API not present in this libcrispasr build")
+        self._lib.crispasr_session_stream_open.argtypes = [
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_char_p, ctypes.c_int,
+        ]
+        self._lib.crispasr_session_stream_open.restype = ctypes.c_void_p
+        h = self._lib.crispasr_session_stream_open(
+            self._handle, self._n_threads, step_ms, length_ms, keep_ms,
+            language.encode("utf-8") if language else b"", 1 if translate else 0,
+        )
+        if not h:
+            raise RuntimeError(f"stream_open failed for backend {self.backend!r} (whisper-only today)")
+        return Session._Stream(self._lib, h)
+
+    class _Stream:
+        """Rolling-window streaming decoder handle returned by
+        :meth:`Session.stream_open`. Feed PCM, pull text."""
+
+        def __init__(self, lib, handle):
+            self._lib = lib
+            self._handle = handle
+            self._closed = False
+
+        def feed(self, pcm) -> int:
+            """Push 16 kHz mono float32 PCM. Returns 0 if still buffering,
+            1 if a new partial transcript is ready (call :meth:`get_text`).
+            Raises on error."""
+            import numpy as np
+            arr = np.ascontiguousarray(pcm, dtype=np.float32)
+            self._lib.crispasr_stream_feed.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_int]
+            self._lib.crispasr_stream_feed.restype = ctypes.c_int
+            rc = self._lib.crispasr_stream_feed(
+                self._handle, arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), int(arr.size),
+            )
+            if rc < 0:
+                raise RuntimeError(f"stream_feed failed (rc={rc})")
+            return rc
+
+        def get_text(self) -> dict:
+            """Return latest committed transcript as
+            ``{"text": str, "t0": float, "t1": float, "counter": int}``.
+            ``counter`` increments per commit; same value means no new text."""
+            self._lib.crispasr_stream_get_text.argtypes = [
+                ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int,
+                ctypes.POINTER(ctypes.c_double), ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_int64),
+            ]
+            self._lib.crispasr_stream_get_text.restype = ctypes.c_int
+            buf = ctypes.create_string_buffer(8192)
+            t0 = ctypes.c_double(0.0)
+            t1 = ctypes.c_double(0.0)
+            counter = ctypes.c_int64(0)
+            rc = self._lib.crispasr_stream_get_text(
+                self._handle, buf, 8192, ctypes.byref(t0), ctypes.byref(t1), ctypes.byref(counter),
+            )
+            if rc < 0:
+                raise RuntimeError(f"stream_get_text failed (rc={rc})")
+            return {"text": buf.value.decode("utf-8"), "t0": t0.value, "t1": t1.value, "counter": counter.value}
+
+        def flush(self) -> None:
+            """Finalise any remaining buffered audio."""
+            self._lib.crispasr_stream_flush.argtypes = [ctypes.c_void_p]
+            self._lib.crispasr_stream_flush.restype = ctypes.c_int
+            rc = self._lib.crispasr_stream_flush(self._handle)
+            if rc < 0:
+                raise RuntimeError(f"stream_flush failed (rc={rc})")
+
+        def close(self) -> None:
+            if self._closed or not self._handle:
+                return
+            self._lib.crispasr_stream_close.argtypes = [ctypes.c_void_p]
+            self._lib.crispasr_stream_close.restype = None
+            self._lib.crispasr_stream_close(self._handle)
+            self._closed = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.close()
+
+        def __del__(self):
+            try:
+                self.close()
+            except Exception:
+                pass
 
     def is_voice_design(self) -> bool:
         """Return True iff the loaded model is a qwen3-tts VoiceDesign variant.

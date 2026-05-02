@@ -249,6 +249,7 @@ pub struct SessionSegment {
 /// A loaded session over a CrispASR model of any backend.
 pub struct Session {
     handle: *mut crispasr_sys::CrispasrSession,
+    n_threads: c_int,
 }
 
 // Not `Sync` — do not share between threads without external sync.
@@ -281,7 +282,7 @@ impl Session {
                 "Failed to open {model_path:?}. Library was built with: [{avail}]"
             ));
         }
-        Ok(Self { handle })
+        Ok(Self { handle, n_threads })
     }
 
     /// List of backend names the loaded CrispASR library was compiled with.
@@ -683,6 +684,42 @@ impl Session {
         Ok(())
     }
 
+    /// Open a rolling-window streaming decoder for this session
+    /// (PLAN #62). Currently whisper-only at the C-ABI level; other
+    /// backends return an error. `step_ms` is how often to commit a
+    /// partial transcript (default 3000); `length_ms` is the rolling
+    /// window size (default 10000); `keep_ms` is the trailing audio
+    /// carried over (default 200). `language` empty = auto-detect;
+    /// `translate` enables EN-target speech translation (whisper).
+    pub fn stream_open(
+        &self,
+        step_ms: i32,
+        length_ms: i32,
+        keep_ms: i32,
+        language: &str,
+        translate: bool,
+    ) -> Result<Stream, String> {
+        let lang_c = CString::new(language).map_err(|e| e.to_string())?;
+        let h = unsafe {
+            crispasr_sys::crispasr_session_stream_open(
+                self.handle,
+                self.n_threads,
+                step_ms,
+                length_ms,
+                keep_ms,
+                lang_c.as_ptr(),
+                if translate { 1 } else { 0 },
+            )
+        };
+        if h.is_null() {
+            return Err(format!(
+                "stream_open failed for backend {:?} (whisper-only today)",
+                self.backend()
+            ));
+        }
+        Ok(Stream { handle: h })
+    }
+
     /// Set decoder temperature on backends that support runtime control
     /// (canary, cohere, parakeet, moonshine). Other backends silently
     /// no-op. `seed` is the RNG seed; pass 0 for time-based.
@@ -848,6 +885,82 @@ impl VadOptions {
 impl Drop for Session {
     fn drop(&mut self) {
         unsafe { crispasr_sys::crispasr_session_close(self.handle) }
+    }
+}
+
+// =========================================================================
+// Streaming (PLAN #62) — rolling-window decoder for whisper today.
+// =========================================================================
+
+/// One commit from a streaming session — the latest concatenated text
+/// plus its absolute audio-time bounds.
+#[derive(Debug, Clone)]
+pub struct StreamingUpdate {
+    pub text: String,
+    pub t0: f64,
+    pub t1: f64,
+    pub counter: i64,
+}
+
+/// Streaming-decoder handle returned by [`Session::stream_open`]. Feed
+/// PCM with [`Stream::feed`], pull text with [`Stream::get_text`],
+/// finalize with [`Stream::flush`]. Auto-closes on drop.
+pub struct Stream {
+    handle: *mut crispasr_sys::CrispasrStream,
+}
+
+unsafe impl Send for Stream {}
+
+impl Stream {
+    /// Push 16 kHz mono float32 PCM. Returns 0 if still buffering, 1
+    /// if a new partial transcript is ready (call [`get_text`](Stream::get_text)).
+    pub fn feed(&self, pcm: &[f32]) -> Result<i32, String> {
+        let rc = unsafe { crispasr_sys::crispasr_stream_feed(self.handle, pcm.as_ptr(), pcm.len() as c_int) };
+        if rc < 0 {
+            return Err(format!("stream_feed failed (rc={})", rc));
+        }
+        Ok(rc)
+    }
+
+    /// Return the latest committed transcript + absolute audio-time
+    /// bounds. `counter` increments per commit; same value = no new text.
+    pub fn get_text(&self) -> Result<StreamingUpdate, String> {
+        let mut buf = vec![0u8; 8192];
+        let mut t0: f64 = 0.0;
+        let mut t1: f64 = 0.0;
+        let mut counter: i64 = 0;
+        let rc = unsafe {
+            crispasr_sys::crispasr_stream_get_text(
+                self.handle,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as c_int,
+                &mut t0,
+                &mut t1,
+                &mut counter,
+            )
+        };
+        if rc < 0 {
+            return Err(format!("stream_get_text failed (rc={})", rc));
+        }
+        let text = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) }
+            .to_string_lossy()
+            .into_owned();
+        Ok(StreamingUpdate { text, t0, t1, counter })
+    }
+
+    /// Finalize any remaining buffered audio.
+    pub fn flush(&self) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_stream_flush(self.handle) };
+        if rc < 0 {
+            return Err(format!("stream_flush failed (rc={})", rc));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        unsafe { crispasr_sys::crispasr_stream_close(self.handle) }
     }
 }
 
