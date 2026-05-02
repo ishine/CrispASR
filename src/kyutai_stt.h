@@ -22,6 +22,7 @@ struct kyutai_stt_context_params {
     int verbosity;     // 0=silent 1=normal 2=verbose
     bool use_gpu;      // false => force CPU backend
     float temperature; // 0 = greedy argmax, >0 = softmax sampling
+    int beam_size; // 1 = greedy/sampled (default); >1 = deterministic beam search over text-token decisions per frame
 };
 
 struct kyutai_stt_context_params kyutai_stt_context_default_params(void);
@@ -55,6 +56,12 @@ const char* kyutai_stt_token_text(struct kyutai_stt_context* ctx, int id);
 // state alone; non-zero = `srand(seed)`. Process-global; serialize best-of-N
 // at the adapter level.
 void kyutai_stt_set_seed(struct kyutai_stt_context* ctx, unsigned int seed);
+
+// Sticky beam size for the per-frame text-token decode. 1 = greedy/sampled
+// (default). >1 = deterministic beam search; mutually exclusive with
+// temperature sampling. Beam path snapshots the LM KV per beam each frame
+// and picks by cumulative log-prob across all T_frames.
+void kyutai_stt_set_beam_size(struct kyutai_stt_context* ctx, int beam_size);
 
 // ---- Per-token + word-level timing (PLAN #61c) ----
 //

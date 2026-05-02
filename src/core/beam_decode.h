@@ -328,9 +328,7 @@ inline Result run_with_probs_branched(Ctx* ctx, const float* prefill_logits, Sav
         Holder(const Holder&) = delete;
         Holder& operator=(const Holder&) = delete;
     };
-    auto wrap = [&snap_free_fn](Snap s) {
-        return std::shared_ptr<Holder>(new Holder(s, &snap_free_fn));
-    };
+    auto wrap = [&snap_free_fn](Snap s) { return std::shared_ptr<Holder>(new Holder(s, &snap_free_fn)); };
 
     struct BeamS {
         std::vector<int32_t> tokens;

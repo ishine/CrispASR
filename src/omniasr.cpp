@@ -1421,8 +1421,8 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const std::vector<floa
         if (cfg.vocab_size <= 0) {
             fprintf(stderr, "omniasr-llm: beam path requires prefill to capture logits\n");
         } else {
-            auto r = core_beam_decode::run_with_probs_branched(ctx, step_logits.data(), save, restore, snap_free, step,
-                                                               cfg);
+            auto r =
+                core_beam_decode::run_with_probs_branched(ctx, step_logits.data(), save, restore, snap_free, step, cfg);
             for (size_t i = 0; i < r.tokens.size(); i++) {
                 if (r.tokens[i] == hp.eos_id)
                     break;

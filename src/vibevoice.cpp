@@ -4210,8 +4210,8 @@ extern "C" char* vibevoice_transcribe(struct vibevoice_context* ctx, const float
     return vibevoice_transcribe_impl(ctx, samples, n_samples, nullptr, nullptr);
 }
 
-extern "C" struct vibevoice_result* vibevoice_transcribe_with_probs(struct vibevoice_context* ctx,
-                                                                    const float* samples, int n_samples) {
+extern "C" struct vibevoice_result* vibevoice_transcribe_with_probs(struct vibevoice_context* ctx, const float* samples,
+                                                                    int n_samples) {
     std::vector<int32_t> ids;
     std::vector<float> probs;
     char* text = vibevoice_transcribe_impl(ctx, samples, n_samples, &ids, &probs);

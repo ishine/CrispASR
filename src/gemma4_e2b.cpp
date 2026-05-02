@@ -2117,8 +2117,8 @@ static char* gemma4_e2b_transcribe_impl(struct gemma4_e2b_context* ctx, const fl
     // per token (cheap at gemma4-e2b's vocab) and keeps the public greedy
     // entry pristine for non-prob callers.
     const bool capture_probs = (out_token_ids && out_token_probs);
-    auto dec = core_greedy_decode::run_with_probs(ctx, first_token, first_p, T_total, g4e_embed_tokens,
-                                                  g4e_run_llm_kv, cfg);
+    auto dec =
+        core_greedy_decode::run_with_probs(ctx, first_token, first_p, T_total, g4e_embed_tokens, g4e_run_llm_kv, cfg);
 
     if (verbose)
         fprintf(stderr, "gemma4_e2b: decoded %d tokens (%.1f ms total)\n", (int)dec.tokens.size(),

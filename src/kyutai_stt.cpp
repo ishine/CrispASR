@@ -15,6 +15,7 @@
 
 #include "kyutai_stt.h"
 
+#include "core/beam_decode.h"
 #include "core/gguf_loader.h"
 
 #include "ggml-backend.h"
@@ -228,7 +229,7 @@ struct kyutai_stt_context {
 // ===========================================================================
 
 extern "C" struct kyutai_stt_context_params kyutai_stt_context_default_params(void) {
-    return {/*n_threads=*/4, /*verbosity=*/1, /*use_gpu=*/true, /*temperature=*/0.0f};
+    return {/*n_threads=*/4, /*verbosity=*/1, /*use_gpu=*/true, /*temperature=*/0.0f, /*beam_size=*/1};
 }
 
 // --- Helpers ---
@@ -1001,6 +1002,84 @@ static void resample_16k_to_24k(const float* in, int n_in, std::vector<float>& o
 // High-level transcribe
 // ===========================================================================
 
+// Per-frame LM step: build graph for a single frame, run forward at slot
+// n_past, and read text-token logits into `out_logits` (resized to text_card).
+// Used by both the greedy loop and the beam-search path. Returns true on
+// success, false on graph alloc/compute failure.
+static bool kyutai_lm_step(struct kyutai_stt_context* ctx, int32_t text_token,
+                           const std::vector<std::vector<int32_t>>& codes, int frame_idx, int n_past,
+                           std::vector<float>& out_logits) {
+    auto& m = ctx->model;
+    auto& hp = m.hp;
+
+    struct ggml_init_params gp = {
+        /*.mem_size   =*/ctx->compute_meta.size(),
+        /*.mem_buffer =*/ctx->compute_meta.data(),
+        /*.no_alloc   =*/true,
+    };
+    ggml_context* ctx0 = ggml_init(gp);
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
+
+    ggml_tensor* text_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(text_tok, "text_token");
+    ggml_set_input(text_tok);
+
+    std::vector<ggml_tensor*> audio_toks(hp.n_q);
+    for (int q = 0; q < hp.n_q; q++) {
+        char name[32];
+        snprintf(name, sizeof(name), "audio_tok_%d", q);
+        audio_toks[q] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+        ggml_set_name(audio_toks[q], name);
+        ggml_set_input(audio_toks[q]);
+    }
+
+    ggml_tensor* emb = ggml_get_rows(ctx0, m.text_emb, text_tok);
+    for (int q = 0; q < hp.n_q; q++) {
+        ggml_tensor* a_emb = ggml_get_rows(ctx0, m.audio_emb[q], audio_toks[q]);
+        emb = ggml_add(ctx0, emb, a_emb);
+    }
+
+    ggml_tensor* logits = build_lm_step(ctx0, gf, ctx, emb, n_past);
+    ggml_set_name(logits, "logits");
+    ggml_set_output(logits);
+    ggml_build_forward_expand(gf, logits);
+
+    ggml_backend_sched_reset(ctx->sched);
+    if (ctx->kv_k)
+        ggml_backend_sched_set_tensor_backend(ctx->sched, ctx->kv_k, ctx->backend);
+    if (ctx->kv_v)
+        ggml_backend_sched_set_tensor_backend(ctx->sched, ctx->kv_v, ctx->backend);
+
+    if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+        ggml_free(ctx0);
+        return false;
+    }
+
+    int32_t text_id = text_token;
+    ggml_backend_tensor_set(text_tok, &text_id, 0, sizeof(int32_t));
+    for (int q = 0; q < hp.n_q; q++) {
+        // Frame 0 uses the codec's initial sentinel (hp.card = 2048); later
+        // frames use the actual encoded code at this frame index.
+        int32_t audio_id = (frame_idx == 0) ? hp.card : codes[q][frame_idx];
+        ggml_backend_tensor_set(audio_toks[q], &audio_id, 0, sizeof(int32_t));
+    }
+    int32_t pos = n_past;
+    ggml_tensor* pos_tensor = ggml_get_tensor(ctx0, "lm_pos");
+    if (pos_tensor)
+        ggml_backend_tensor_set(pos_tensor, &pos, 0, sizeof(int32_t));
+
+    if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+        ggml_free(ctx0);
+        return false;
+    }
+
+    out_logits.resize((size_t)hp.text_card);
+    ggml_backend_tensor_get(logits, out_logits.data(), 0, (size_t)hp.text_card * sizeof(float));
+
+    ggml_free(ctx0);
+    return true;
+}
+
 // Internal: transcribe and (optionally) capture per-token ids + softmax probs.
 // The decoded text fragment per emitted text token (excluding pad/special) is
 // appended to `result`; ids/probs are appended in lock-step when out vectors
@@ -1050,104 +1129,12 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
     std::string result;
     // Initial token: text_card (8000) NOT padding_id (3) — this is the start-of-sequence token
     int text_token = hp.text_card;
-    int n_past = 0;
 
-    for (int t = 0; t < T_frames; t++) {
-        // Build input embedding: sum of n_q audio embeddings + text embedding
-        // This needs a small graph each step.
-
-        struct ggml_init_params gp = {
-            /*.mem_size   =*/ctx->compute_meta.size(),
-            /*.mem_buffer =*/ctx->compute_meta.data(),
-            /*.no_alloc   =*/true,
-        };
-        ggml_context* ctx0 = ggml_init(gp);
-        ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
-
-        // Create input token indices
-        ggml_tensor* text_tok = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
-        ggml_set_name(text_tok, "text_token");
-        ggml_set_input(text_tok);
-
-        // Audio token indices (one per codebook)
-        std::vector<ggml_tensor*> audio_toks(hp.n_q);
-        for (int q = 0; q < hp.n_q; q++) {
-            char name[32];
-            snprintf(name, sizeof(name), "audio_tok_%d", q);
-            audio_toks[q] = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
-            ggml_set_name(audio_toks[q], name);
-            ggml_set_input(audio_toks[q]);
-        }
-
-        // Look up and sum embeddings
-        ggml_tensor* emb = ggml_get_rows(ctx0, m.text_emb, text_tok);
-        for (int q = 0; q < hp.n_q; q++) {
-            ggml_tensor* a_emb = ggml_get_rows(ctx0, m.audio_emb[q], audio_toks[q]);
-            emb = ggml_add(ctx0, emb, a_emb);
-        }
-        // emb: [dim, 1]
-
-        // LM forward
-        ggml_tensor* logits = build_lm_step(ctx0, gf, ctx, emb, n_past);
-        ggml_set_name(logits, "logits");
-        ggml_set_output(logits);
-
-        ggml_build_forward_expand(gf, logits);
-
-        // Allocate and compute
-        ggml_backend_sched_reset(ctx->sched);
-
-        // Tell scheduler which backend owns the KV cache tensors
-        if (ctx->kv_k)
-            ggml_backend_sched_set_tensor_backend(ctx->sched, ctx->kv_k, ctx->backend);
-        if (ctx->kv_v)
-            ggml_backend_sched_set_tensor_backend(ctx->sched, ctx->kv_v, ctx->backend);
-
-        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
-            fprintf(stderr, "kyutai_stt: failed to alloc LM graph at step %d\n", t);
-            ggml_free(ctx0);
-            break;
-        }
-
-        // Set input data
-        int32_t text_id = text_token;
-        ggml_backend_tensor_set(text_tok, &text_id, 0, sizeof(int32_t));
-
-        for (int q = 0; q < hp.n_q; q++) {
-            // First step uses initial audio token (card=2048), rest use actual codes
-            int32_t audio_id = (t == 0) ? hp.card : codes[q][t];
-            ggml_backend_tensor_set(audio_toks[q], &audio_id, 0, sizeof(int32_t));
-        }
-
-        // Set position
-        int32_t pos = n_past;
-        ggml_tensor* pos_tensor = ggml_get_tensor(ctx0, "lm_pos");
-        if (pos_tensor) {
-            ggml_backend_tensor_set(pos_tensor, &pos, 0, sizeof(int32_t));
-        }
-
-        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
-            fprintf(stderr, "kyutai_stt: LM compute failed at step %d\n", t);
-            ggml_free(ctx0);
-            break;
-        }
-
-        // Read logits and pick (greedy or sampled per ctx->params.temperature)
-        std::vector<float> logits_data(hp.text_card);
-        ggml_backend_tensor_get(logits, logits_data.data(), 0, hp.text_card * sizeof(float));
-
-        float picked_prob = 0.0f;
-        text_token = sample_token(logits_data.data(), hp.text_card, ctx->params.temperature, &picked_prob);
-        n_past++;
-
-        if (ctx->params.verbosity >= 2 && (t < 5 || t % 20 == 0)) {
-            fprintf(stderr, "  [frame %d] text_token=%d logit=%.4f\n", t, text_token, logits_data[text_token]);
-        }
-
-        // Decode token to text
-        if (text_token != 0 && text_token != hp.existing_text_padding_id && text_token < (int)m.vocab.size()) {
-            std::string piece = m.vocab[text_token];
-            // SentencePiece: ▁ (U+2581, 3 bytes: E2 96 81) = space
+    // Helper: append decoded piece for a non-pad text token, plus capture
+    // its id/prob/frame in the optional output vectors.
+    auto emit_token = [&](int tok, float prob, int frame_idx) {
+        if (tok != 0 && tok != hp.existing_text_padding_id && tok < (int)m.vocab.size()) {
+            std::string piece = m.vocab[tok];
             std::string decoded;
             for (size_t ci = 0; ci < piece.size(); ci++) {
                 if ((unsigned char)piece[ci] == 0xE2 && ci + 2 < piece.size() && (unsigned char)piece[ci + 1] == 0x96 &&
@@ -1160,19 +1147,98 @@ static char* kyutai_stt_transcribe_impl(struct kyutai_stt_context* ctx, const fl
             }
             result += decoded;
             if (out_token_ids && out_token_probs) {
-                out_token_ids->push_back(text_token);
-                out_token_probs->push_back(picked_prob);
+                out_token_ids->push_back(tok);
+                out_token_probs->push_back(prob);
             }
-            if (out_frame_indices) {
-                out_frame_indices->push_back(t);
-            }
+            if (out_frame_indices)
+                out_frame_indices->push_back(frame_idx);
+        }
+    };
 
-            if (ctx->params.verbosity >= 2) {
-                fprintf(stderr, "  [%d] token=%d piece='%s'\n", t, text_token, decoded.c_str());
+    if (ctx->params.beam_size > 1) {
+        // Beam-search path. Per-frame branching over text-token decisions;
+        // audio codes for this frame are shared across all beams.
+        // Run frame 0 once to seed prefill_logits + populate KV slot 0,
+        // then hand off to core_beam_decode::run_with_probs_branched for
+        // frames 1..T_frames-1.
+        std::vector<float> initial_logits;
+        if (!kyutai_lm_step(ctx, hp.text_card, codes, /*frame_idx=*/0, /*n_past=*/0, initial_logits)) {
+            fprintf(stderr, "kyutai_stt: beam prefill (frame 0) failed\n");
+            if (ctx->kv_buf) {
+                ggml_backend_buffer_free(ctx->kv_buf);
+                ctx->kv_buf = nullptr;
             }
+            if (ctx->kv_ctx) {
+                ggml_free(ctx->kv_ctx);
+                ctx->kv_ctx = nullptr;
+            }
+            return nullptr;
         }
 
-        ggml_free(ctx0);
+        struct kyutai_kv_snap {
+            std::vector<uint8_t> k_data;
+            std::vector<uint8_t> v_data;
+        };
+        auto save = [](kyutai_stt_context* c) -> kyutai_kv_snap* {
+            auto* s = new kyutai_kv_snap();
+            const size_t kb = ggml_nbytes(c->kv_k);
+            const size_t vb = ggml_nbytes(c->kv_v);
+            s->k_data.resize(kb);
+            s->v_data.resize(vb);
+            ggml_backend_tensor_get(c->kv_k, s->k_data.data(), 0, kb);
+            ggml_backend_tensor_get(c->kv_v, s->v_data.data(), 0, vb);
+            return s;
+        };
+        auto restore = [](kyutai_stt_context* c, kyutai_kv_snap* s) {
+            ggml_backend_tensor_set(c->kv_k, s->k_data.data(), 0, s->k_data.size());
+            ggml_backend_tensor_set(c->kv_v, s->v_data.data(), 0, s->v_data.size());
+        };
+        auto snap_free = [](kyutai_kv_snap* s) { delete s; };
+        std::vector<float> step_buf;
+        // step_fn: feed (text_tok, codes[*][n_past]) at slot n_past, return
+        // logits over text_card. n_past doubles as the frame index since
+        // the per-frame loop advances both 1:1.
+        auto step = [&codes, &step_buf](kyutai_stt_context* c, int32_t text_tok, int n_past) -> float* {
+            if (!kyutai_lm_step(c, text_tok, codes, /*frame_idx=*/n_past, n_past, step_buf))
+                return nullptr;
+            const int V = (int)step_buf.size();
+            float* out = (float*)std::malloc((size_t)V * sizeof(float));
+            std::memcpy(out, step_buf.data(), (size_t)V * sizeof(float));
+            return out;
+        };
+
+        core_beam_decode::Config cfg;
+        cfg.max_new_tokens = T_frames; // one pick per frame, including frame 0
+        cfg.eos_id = -1;               // no EOS; loop runs to T_frames
+        cfg.vocab_size = hp.text_card;
+        cfg.beam_size = ctx->params.beam_size;
+        cfg.prompt_len = 1; // slot 0 already populated by the frame-0 step above
+
+        auto r =
+            core_beam_decode::run_with_probs_branched(ctx, initial_logits.data(), save, restore, snap_free, step, cfg);
+
+        // r.tokens has up to T_frames picks (one per frame). Walk in order
+        // and emit non-pad tokens with their frame index.
+        for (size_t i = 0; i < r.tokens.size(); i++) {
+            emit_token(r.tokens[i], r.probs[i], (int)i);
+        }
+    } else {
+        int n_past = 0;
+        for (int t = 0; t < T_frames; t++) {
+            std::vector<float> logits_data;
+            if (!kyutai_lm_step(ctx, text_token, codes, /*frame_idx=*/t, n_past, logits_data)) {
+                fprintf(stderr, "kyutai_stt: LM step failed at frame %d\n", t);
+                break;
+            }
+            float picked_prob = 0.0f;
+            text_token = sample_token(logits_data.data(), hp.text_card, ctx->params.temperature, &picked_prob);
+            n_past++;
+
+            if (ctx->params.verbosity >= 2 && (t < 5 || t % 20 == 0))
+                fprintf(stderr, "  [frame %d] text_token=%d logit=%.4f\n", t, text_token, logits_data[text_token]);
+
+            emit_token(text_token, picked_prob, t);
+        }
     }
 
     // Clean up KV cache
@@ -1223,6 +1289,11 @@ extern "C" void kyutai_stt_set_seed(struct kyutai_stt_context* ctx, unsigned int
     (void)ctx;
     if (seed != 0)
         srand(seed);
+}
+
+extern "C" void kyutai_stt_set_beam_size(struct kyutai_stt_context* ctx, int beam_size) {
+    if (ctx)
+        ctx->params.beam_size = (beam_size > 0) ? beam_size : 1;
 }
 
 extern "C" void kyutai_stt_result_free(struct kyutai_stt_result* r) {
@@ -1416,7 +1487,7 @@ static int kyutai_stt_stream_run_decode(kyutai_stt_stream* s) {
     if (s->rolling.empty())
         return 0;
     const int64_t window_start_samples = s->total_fed_samples - (int64_t)s->rolling.size();
-    const int64_t window_start_cs      = window_start_samples * 100 / 16000;
+    const int64_t window_start_cs = window_start_samples * 100 / 16000;
 
     kyutai_stt_result_ex* r =
         kyutai_stt_transcribe_ex(s->ctx, s->rolling.data(), (int)s->rolling.size(), window_start_cs);
@@ -1428,26 +1499,27 @@ static int kyutai_stt_stream_run_decode(kyutai_stt_stream* s) {
     } else {
         s->out_text.clear();
     }
-    s->out_t0_s      = (double)window_start_samples / 16000.0;
-    s->out_t1_s      = (double)s->total_fed_samples / 16000.0;
-    s->has_output    = true;
+    s->out_t0_s = (double)window_start_samples / 16000.0;
+    s->out_t1_s = (double)s->total_fed_samples / 16000.0;
+    s->has_output = true;
     s->decode_counter += 1;
     return 0;
 }
 
-extern "C" struct kyutai_stt_stream* kyutai_stt_stream_open(struct kyutai_stt_context* ctx, int step_ms, int length_ms) {
+extern "C" struct kyutai_stt_stream* kyutai_stt_stream_open(struct kyutai_stt_context* ctx, int step_ms,
+                                                            int length_ms) {
     if (!ctx)
         return nullptr;
     auto* s = new kyutai_stt_stream();
-    s->ctx                       = ctx;
-    s->step_samples_16k          = (step_ms > 0 ? step_ms : 3000) * 16;
-    s->length_samples_16k        = (length_ms > 0 ? length_ms : 10000) * 16;
-    s->total_fed_samples         = 0;
+    s->ctx = ctx;
+    s->step_samples_16k = (step_ms > 0 ? step_ms : 3000) * 16;
+    s->length_samples_16k = (length_ms > 0 ? length_ms : 10000) * 16;
+    s->total_fed_samples = 0;
     s->samples_since_last_decode = 0;
-    s->out_t0_s                  = 0.0;
-    s->out_t1_s                  = 0.0;
-    s->has_output                = false;
-    s->decode_counter            = 0;
+    s->out_t0_s = 0.0;
+    s->out_t1_s = 0.0;
+    s->has_output = false;
+    s->decode_counter = 0;
     return s;
 }
 

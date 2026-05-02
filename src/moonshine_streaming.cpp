@@ -1138,9 +1138,9 @@ static int moonshine_streaming_stream_run_decode(moonshine_streaming_stream* s) 
     s->out_text = text ? text : "";
     free(text);
     const int64_t window_start_samples = s->total_fed_samples - (int64_t)s->rolling.size();
-    s->out_t0_s      = (double)window_start_samples / 16000.0;
-    s->out_t1_s      = (double)s->total_fed_samples / 16000.0;
-    s->has_output    = true;
+    s->out_t0_s = (double)window_start_samples / 16000.0;
+    s->out_t1_s = (double)s->total_fed_samples / 16000.0;
+    s->has_output = true;
     s->decode_counter += 1;
     return 0;
 }
@@ -1150,15 +1150,15 @@ extern "C" struct moonshine_streaming_stream* moonshine_streaming_stream_open(st
     if (!ctx)
         return nullptr;
     auto* s = new moonshine_streaming_stream();
-    s->ctx                       = ctx;
-    s->step_samples_16k          = (step_ms > 0 ? step_ms : 3000) * 16;
-    s->length_samples_16k        = (length_ms > 0 ? length_ms : 10000) * 16;
-    s->total_fed_samples         = 0;
+    s->ctx = ctx;
+    s->step_samples_16k = (step_ms > 0 ? step_ms : 3000) * 16;
+    s->length_samples_16k = (length_ms > 0 ? length_ms : 10000) * 16;
+    s->total_fed_samples = 0;
     s->samples_since_last_decode = 0;
-    s->out_t0_s                  = 0.0;
-    s->out_t1_s                  = 0.0;
-    s->has_output                = false;
-    s->decode_counter            = 0;
+    s->out_t0_s = 0.0;
+    s->out_t1_s = 0.0;
+    s->has_output = false;
+    s->decode_counter = 0;
     return s;
 }
 

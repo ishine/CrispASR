@@ -33,8 +33,8 @@ struct moonshine_streaming_result {
     int n_tokens;
 };
 
-struct moonshine_streaming_result* moonshine_streaming_transcribe_with_probs(
-    struct moonshine_streaming_context* ctx, const float* pcm, int n_samples);
+struct moonshine_streaming_result* moonshine_streaming_transcribe_with_probs(struct moonshine_streaming_context* ctx,
+                                                                             const float* pcm, int n_samples);
 void moonshine_streaming_result_free(struct moonshine_streaming_result* r);
 
 // Single-id detokenize. Returns a thread-local buffer valid until the next
@@ -61,10 +61,10 @@ struct moonshine_streaming_stream;
 struct moonshine_streaming_stream* moonshine_streaming_stream_open(struct moonshine_streaming_context* ctx, int step_ms,
                                                                    int length_ms);
 
-int  moonshine_streaming_stream_feed(struct moonshine_streaming_stream* s, const float* pcm_16k, int n_samples);
-int  moonshine_streaming_stream_get_text(struct moonshine_streaming_stream* s, char* out, int cap, double* t0_s,
-                                         double* t1_s, int64_t* counter);
-int  moonshine_streaming_stream_flush(struct moonshine_streaming_stream* s);
+int moonshine_streaming_stream_feed(struct moonshine_streaming_stream* s, const float* pcm_16k, int n_samples);
+int moonshine_streaming_stream_get_text(struct moonshine_streaming_stream* s, char* out, int cap, double* t0_s,
+                                        double* t1_s, int64_t* counter);
+int moonshine_streaming_stream_flush(struct moonshine_streaming_stream* s);
 void moonshine_streaming_stream_close(struct moonshine_streaming_stream* s);
 
 #ifdef __cplusplus

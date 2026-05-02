@@ -1512,9 +1512,9 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
     // `[/INST]lang:<X>[TRANSCRIBE]` template that asks for a verbatim
     // transcript in the target language.
     const char* prefix = "<s>[INST][BEGIN_AUDIO]";
-    const std::string suffix = !ask.empty()
-        ? std::string("[/INST]") + ask
-        : std::string("[/INST]lang:") + (language.empty() ? "en" : language) + "[TRANSCRIBE]";
+    const std::string suffix =
+        !ask.empty() ? std::string("[/INST]") + ask
+                     : std::string("[/INST]lang:") + (language.empty() ? "en" : language) + "[TRANSCRIBE]";
 
     int n_pref = 0;
     int32_t* pref_ids = ops.tokenize(ctx, prefix, &n_pref);
@@ -2243,8 +2243,7 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         };
 
         const std::vector<float> pcm24 = resample_16k_to_24k(pcm, n_samples);
-        vibevoice_result* vr =
-            vibevoice_transcribe_with_probs(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size());
+        vibevoice_result* vr = vibevoice_transcribe_with_probs(s->vibevoice_ctx, pcm24.data(), (int)pcm24.size());
         if (!vr || !vr->text) {
             if (vr)
                 vibevoice_result_free(vr);
@@ -2580,8 +2579,8 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
                         // Gemma uses SentencePiece-style ▁ markers (U+2581).
                         std::string p = piece;
                         for (size_t ci = 0; ci < p.size(); ci++) {
-                            if ((unsigned char)p[ci] == 0xE2 && ci + 2 < p.size() &&
-                                (unsigned char)p[ci + 1] == 0x96 && (unsigned char)p[ci + 2] == 0x81) {
+                            if ((unsigned char)p[ci] == 0xE2 && ci + 2 < p.size() && (unsigned char)p[ci + 1] == 0x96 &&
+                                (unsigned char)p[ci + 2] == 0x81) {
                                 tk.text += ' ';
                                 ci += 2;
                             } else {
@@ -3359,7 +3358,7 @@ CA_EXPORT crispasr_stream* crispasr_session_stream_open(crispasr_session* s, int
         kyutai_stt_stream* ks = kyutai_stt_stream_open((kyutai_stt_context*)s->kyutai_ctx, step_ms, length_ms);
         if (!ks)
             return nullptr;
-        auto* w               = new crispasr_stream();
+        auto* w = new crispasr_stream();
         w->kyutai_stream_state = ks;
         return w;
     }
@@ -3377,7 +3376,7 @@ CA_EXPORT crispasr_stream* crispasr_session_stream_open(crispasr_session* s, int
             (moonshine_streaming_context*)s->moonshine_streaming_ctx, step_ms, length_ms);
         if (!ms)
             return nullptr;
-        auto* w                       = new crispasr_stream();
+        auto* w = new crispasr_stream();
         w->moonshine_streaming_state = ms;
         return w;
     }
