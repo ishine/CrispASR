@@ -7118,6 +7118,23 @@ original author's caution, not a real correctness boundary for
 Q-formats. Verify by checking that `ggml_new_tensor_2d` accepts the
 quantized type at the fused output shape, then drop the gate.
 
+**Cross-backend portability (May 2026).** The same overly conservative
+gate exists at `qwen3_asr.cpp:1433` and `qwen3_tts.cpp:4986` — Q4_K /
+Q8_0 users of those two backends are silently missing the ~7-8 %
+decode speedup. Dropping the gate is a 1-line change per file.
+Voxtral (3B) has separate q/k/v weights with no runtime fuse at all;
+adding the voxtral4b pattern (~80 LOC) ports the same speedup.
+PLAN #60d's open follow-up tracks this work.
+
+**One subtle gotcha** when porting the qwen3_asr pattern: the
+existing implementation allocates the fused buffer on the CPU
+backend (`ggml_backend_cpu_buffer_type()`) — fine for F16/F32 since
+the matmul kernel handles cross-backend transfer cheaply, but
+catastrophic for Q-formats because every matmul would pay a
+Metal→CPU transfer cost. Switch to
+`ggml_backend_get_default_buffer_type(ctx->backend)` when extending
+the gate. (voxtral4b's implementation already does this.)
+
 ## Lesson — not every matmul fusion is a win on Metal Q4_K — measure ROI in saved kernel launches, not saved input reads
 
 Same phase 2 pass, FFN gate+up fuse: combine the per-layer

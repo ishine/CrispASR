@@ -1306,9 +1306,34 @@ hand-off prompt at the end of the May 2026 perf-wave session.
 
 ---
 
-### 60d. Fused QKV per LM layer — **DONE (mimo-asr Q4_K) → [HISTORY §64](HISTORY.md)**
+### 60d. Fused QKV per LM layer — **DONE (mimo-asr Q4_K, voxtral4b Q4_K) → [HISTORY §64, §71](HISTORY.md)**
 
-Open follow-up: F16 re-upload (deferred behind PLAN #51c disk-thrash blocker), and port to qwen3-asr / voxtral4b for quantised variants (their F16/F32 paths already runtime-fuse via `qwen3_asr.cpp:1428` / `qwen3_tts.cpp:4978`).
+mimo-asr Q4_K runtime fuse (May 2026, HISTORY §64). voxtral4b Q4_K
+runtime fuse (May 2026, HISTORY §71, ~7-8 % decode speedup on M1).
+
+**Open follow-up (well-scoped, low-risk):** the runtime fuse pattern
+in `qwen3_asr.cpp:1433` and `qwen3_tts.cpp:4986` gates on
+`attn_q_w->type == GGML_TYPE_F32 || GGML_TYPE_F16`. That gate is
+overly conservative — row-wise quantized formats (Q4_K, Q4_0, Q5_K,
+Q8_0) concatenate cleanly along the output axis via byte-concat (each
+output row is a self-contained block group; no requantization
+needed). The voxtral4b implementation (~80 LOC) demonstrated that
+this works on Q4_K. Dropping the gate on qwen3_asr and qwen3_tts
+extends the same ~7-8 % decode speedup to Q4_K / Q8_0 users — which
+is most production users since Q4_K is the typical default for
+memory efficiency.
+
+Voxtral (3B) — like voxtral4b — has separate q/k/v LLM weights with
+no runtime fuse at all. Adding the same pattern (~80 LOC, mirror of
+voxtral4b's `voxtral4b_init_from_file` fuse block) would land the
+same ~7-8 % decode speedup.
+
+Targets:
+- `qwen3_asr.cpp:1433` — drop the F16/F32 type-gate, switch fused-buf
+  allocation from CPU buffer to default-backend buffer (otherwise Q
+  weights pay a backend-transfer cost per matmul).
+- `qwen3_tts.cpp:4986` — same.
+- `voxtral.cpp` — add full runtime fuse like voxtral4b.
 
 ---
 
