@@ -89,6 +89,11 @@ class Backend:
     voice_file: str | None = None     # e.g. kokoro-voice-af_heart.gguf
     codec_model: str | None = None    # e.g. qwen3-tts-tokenizer-12hz-q8_0.gguf
     tts_extra_args: tuple[str, ...] = ()
+    # Reference / shared models — never auto-deleted in --cache-mode=ephemeral.
+    # Used by other backends as ground truth (parakeet for TTS roundtrip;
+    # whisper-tiny for LID; silero for VAD). Set True for any backend whose
+    # download is reused across capability tests of OTHER backends.
+    is_reference: bool = False
 
 
 # Capability → ALL backends that advertise it, populated below.
@@ -103,11 +108,15 @@ REGISTRY: tuple[Backend, ...] = (
     Backend("whisper",    "Whisper (tiny)",      "ggml-tiny.bin",
             "ggerganov/crispasr", "ggml-tiny.bin",
             timeout_s=60, approx_size_mb=80,
-            capabilities=("transcribe", "json-output", "stream", "lid", "vad")),
+            capabilities=("transcribe", "json-output", "stream", "lid", "vad"),
+            # Pinned: every other backend triggers LID via this model.
+            is_reference=True),
     Backend("parakeet",   "Parakeet TDT 0.6B",   "parakeet-tdt-0.6b-v3-q4_k.gguf",
             "cstr/parakeet-tdt-0.6b-v3-GGUF", "parakeet-tdt-0.6b-v3-q4_k.gguf",
             timeout_s=60, approx_size_mb=420,
-            capabilities=("transcribe", "json-output", "word-timestamps")),
+            capabilities=("transcribe", "json-output", "word-timestamps"),
+            # Pinned: TTS-roundtrip uses parakeet ASR as ground truth.
+            is_reference=True),
     Backend("moonshine",  "Moonshine Tiny",      "moonshine-tiny-q4_k.gguf",
             "cstr/moonshine-tiny-GGUF", "moonshine-tiny-q4_k.gguf",
             timeout_s=30, approx_size_mb=30,
@@ -268,12 +277,35 @@ def make_multi_segment_probe(src: Path, n_repeats: int = 4,
     return out
 
 
+@dataclass
+class FetchedModel:
+    """Result of fetch_model — tracks which files we downloaded *this run*
+    vs which were already on disk. Only "downloaded this run" files are
+    eligible for ephemeral cleanup."""
+    path: Path
+    downloaded_files: list[Path] = field(default_factory=list)
+
+
 def fetch_model(b: Backend, models_dir: Path, skip_missing: bool,
-                space_margin_mb: int = 2048) -> Path | None:
+                space_margin_mb: int = 2048) -> FetchedModel | None:
+    # Locate the main model — disk first, fall through to download.
     for cand in (b.local_file, b.hf_file):
         p = models_dir / cand
         if p.is_file():
-            return p
+            # Pre-existing main file. Still try to fetch missing extras
+            # (tokenizer.bin, voice file, etc.) — they may be needed and
+            # the cleanup logic only deletes what we ourselves downloaded.
+            downloaded: list[Path] = []
+            for ex_local, ex_repo, ex_file in b.extra_files:
+                if not (models_dir / ex_local).is_file() and not skip_missing:
+                    try:
+                        from huggingface_hub import hf_hub_download
+                        ep = Path(hf_hub_download(ex_repo, ex_file, local_dir=str(models_dir)))
+                        downloaded.append(ep)
+                    except Exception as e:
+                        print(f"    extra file {ex_file} failed: {e} (continuing)")
+            return FetchedModel(p, downloaded)
+
     if skip_missing:
         return None
     needed_mb = (b.approx_size_mb or 0) + space_margin_mb
@@ -289,19 +321,42 @@ def fetch_model(b: Backend, models_dir: Path, skip_missing: bool,
     print(f"    downloading {b.hf_file} from {b.hf_repo}…", flush=True)
     t0 = time.time()
     try:
-        downloaded = hf_hub_download(b.hf_repo, b.hf_file, local_dir=str(models_dir))
+        downloaded_main = hf_hub_download(b.hf_repo, b.hf_file, local_dir=str(models_dir))
     except Exception as e:
         print(f"    download failed: {e}")
         return None
-    sz_mb = os.path.getsize(downloaded) / 1024 / 1024
+    sz_mb = os.path.getsize(downloaded_main) / 1024 / 1024
     print(f"    ✓ {sz_mb:.0f} MB in {time.time()-t0:.1f}s")
+    fetched = FetchedModel(Path(downloaded_main), [Path(downloaded_main)])
     for ex_local, ex_repo, ex_file in b.extra_files:
         if not (models_dir / ex_local).is_file():
             try:
-                hf_hub_download(ex_repo, ex_file, local_dir=str(models_dir))
+                ep = Path(hf_hub_download(ex_repo, ex_file, local_dir=str(models_dir)))
+                fetched.downloaded_files.append(ep)
             except Exception as e:
                 print(f"    extra file {ex_file} failed: {e} (continuing)")
-    return Path(downloaded)
+    return fetched
+
+
+def cleanup_downloaded(b: Backend, fetched: FetchedModel | None) -> None:
+    """Delete files we downloaded for this backend in this run.
+    Reference models (whisper/parakeet/etc., is_reference=True) are
+    skipped — other backends rely on them as ground truth or for LID."""
+    if fetched is None or b.is_reference:
+        if fetched is not None and b.is_reference:
+            print(f"    keep (reference model — used by other backends)")
+        return
+    freed = 0
+    for p in fetched.downloaded_files:
+        if p.is_file():
+            sz = p.stat().st_size
+            try:
+                p.unlink()
+                freed += sz
+            except OSError as e:
+                print(f"    cleanup failed for {p.name}: {e}")
+    if freed:
+        print(f"    cleaned up {freed/1024/1024:.0f} MB ({len(fetched.downloaded_files)} file(s))")
 
 
 # ---------------------------------------------------------------------------
@@ -1033,6 +1088,18 @@ def main() -> int:
                     help="WER above this fails 'transcribe' at full tier (default: 0.10)")
     ap.add_argument("--skip-missing", action="store_true",
                     help="Don't download missing models — skip the backend instead")
+    ap.add_argument("--cache-mode", choices=("keep", "ephemeral"), default="keep",
+                    help=("keep (default): preserve downloaded models on disk for "
+                          "reuse across runs (good for local dev where bandwidth "
+                          "is the bottleneck). "
+                          "ephemeral: after each backend's tier tests complete, "
+                          "delete files we downloaded this run (for tight-disk "
+                          "boxes like Kaggle where bandwidth is cheap and disk "
+                          "is the bottleneck). Reference models (whisper-tiny "
+                          "for LID, parakeet for TTS-roundtrip ground truth) "
+                          "are pinned and never auto-deleted. Pre-existing "
+                          "files that we didn't download this run are also "
+                          "kept untouched."))
     ap.add_argument("--cpu", action="store_true",
                     help="Run with -ng (CPU only)")
     # Per-capability tier overrides
@@ -1076,18 +1143,22 @@ def main() -> int:
           + (" (others=ignore)" if len(active_caps) < len(tiers) else ""))
     print(f"backends:     {len(backends)} selected")
     print(f"download:     {'OFF (--skip-missing)' if args.skip_missing else 'ON'}")
+    print(f"cache-mode:   {args.cache_mode}"
+          + ("  (will free downloads after each backend; "
+             "reference models pinned)" if args.cache_mode == "ephemeral" else ""))
     print(f"backend mode: {'CPU' if args.cpu else 'GPU'}")
 
     outcomes: list[TestOutcome] = []
     for b in backends:
         print(f"\n[{b.name}] {b.display}")
-        model = fetch_model(b, models_dir, args.skip_missing)
-        if not model:
+        fetched = fetch_model(b, models_dir, args.skip_missing)
+        if fetched is None:
             print("    SKIP — no model on disk"
                   + (" and --skip-missing set" if args.skip_missing else ""))
             outcomes.append(TestOutcome(b.name, "transcribe", tiers["transcribe"],
                                         "NO_MODEL", "model not on disk"))
             continue
+        model = fetched.path
         print(f"    model: {model.name} ({os.path.getsize(model)/1024/1024:.0f} MB)",
               flush=True)
         ctx = {
@@ -1096,23 +1167,30 @@ def main() -> int:
             "use_gpu": not args.cpu, "wer_threshold": args.wer_threshold,
             "skip_missing": args.skip_missing,
         }
-        # Run each advertised capability whose tier != ignore.
-        for cap in b.capabilities:
-            tier = tiers.get(cap, "ignore")
-            if tier == "ignore":
-                continue
-            runner = RUNNERS.get(cap)
-            if runner is None:
-                outcomes.append(TestOutcome(b.name, cap, tier, "SKIP",
-                                            "no runner implemented yet"))
-                print(f"    {cap:18} SKIP   (runner not yet implemented)")
-                continue
-            o = runner(b, tier, ctx)
-            outcomes.append(o)
-            mark = {"PASS": "✓", "FAIL": "✗", "SKIP": "·", "NO_MODEL": "·"}\
-                .get(o.status, "?")
-            print(f"    {cap:18} {mark} {o.status:8} ({o.tier:5}) "
-                  f"{o.detail[:70]}")
+        try:
+            # Run each advertised capability whose tier != ignore.
+            for cap in b.capabilities:
+                tier = tiers.get(cap, "ignore")
+                if tier == "ignore":
+                    continue
+                runner = RUNNERS.get(cap)
+                if runner is None:
+                    outcomes.append(TestOutcome(b.name, cap, tier, "SKIP",
+                                                "no runner implemented yet"))
+                    print(f"    {cap:18} SKIP   (runner not yet implemented)")
+                    continue
+                o = runner(b, tier, ctx)
+                outcomes.append(o)
+                mark = {"PASS": "✓", "FAIL": "✗", "SKIP": "·", "NO_MODEL": "·"}\
+                    .get(o.status, "?")
+                print(f"    {cap:18} {mark} {o.status:8} ({o.tier:5}) "
+                      f"{o.detail[:70]}")
+        finally:
+            # Ephemeral cleanup runs even if a runner raises — Kaggle disk
+            # is too tight to leak a multi-GB blob on a partial failure.
+            if args.cache_mode == "ephemeral":
+                cleanup_downloaded(b, fetched)
+                print(f"    free disk now: {free_mb(models_dir)} MB")
 
     # Summary
     print("\n" + "=" * 60)
