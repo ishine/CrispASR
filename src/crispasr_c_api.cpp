@@ -26,6 +26,7 @@
 #include "crispasr_aligner.h"        // CTC / forced-aligner word timings (shared with CLI)
 #include "crispasr_cache.h"          // HF download + filesystem cache (shared with CLI)
 #include "crispasr_model_registry.h" // Known-model lookup (shared with CLI)
+#include "core/greedy_decode.h"      // Shared autoregressive greedy decode helper
 // Non-Whisper backend headers. Each of these lives in `src/` and is built as
 // its own shared library — we link them into libwhisper privately so Dart
 // only has to open one library to reach every backend. Any missing header
@@ -834,6 +835,129 @@ struct crispasr_session_result {
     std::string backend;
 };
 
+// Per-token data fed into emit_words_from_tokens. Backends with their own
+// token-prob APIs project into this shape so the word-grouping logic stays
+// in one place.
+struct ca_token_record {
+    std::string text;
+    int64_t t0;
+    int64_t t1;
+    float p;
+};
+
+// GPT-2 byte-level BPE decoder. Mirrors HF's bytes_to_unicode reverse map.
+// Used by qwen3 / granite tokenizers and any GPT-2 / Llama-3 family.
+static const std::vector<int>& gpt2_byte_decoder() {
+    static std::vector<int> dec;
+    static bool initialized = false;
+    if (initialized)
+        return dec;
+    dec.assign(0x200, -1);
+    std::vector<int> bs, cs;
+    for (int b = 0x21; b <= 0x7e; b++) { bs.push_back(b); cs.push_back(b); }
+    for (int b = 0xa1; b <= 0xac; b++) { bs.push_back(b); cs.push_back(b); }
+    for (int b = 0xae; b <= 0xff; b++) { bs.push_back(b); cs.push_back(b); }
+    int n = 0;
+    for (int b = 0; b < 256; b++) {
+        bool present = false;
+        for (int x : bs) if (x == b) { present = true; break; }
+        if (!present) { bs.push_back(b); cs.push_back(256 + n); n++; }
+    }
+    for (size_t i = 0; i < bs.size(); i++)
+        if ((size_t)cs[i] < dec.size())
+            dec[cs[i]] = bs[i];
+    initialized = true;
+    return dec;
+}
+
+static std::string gpt2_byte_decode(const std::string& s) {
+    const auto& dec = gpt2_byte_decoder();
+    std::string out;
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = (unsigned char)s[i];
+        int cp = 0, len = 1;
+        if (c < 0x80) { cp = c; len = 1; }
+        else if ((c & 0xE0) == 0xC0) { cp = c & 0x1F; len = 2; }
+        else if ((c & 0xF0) == 0xE0) { cp = c & 0x0F; len = 3; }
+        else if ((c & 0xF8) == 0xF0) { cp = c & 0x07; len = 4; }
+        else { i++; continue; }
+        if (i + len > s.size()) break;
+        for (int k = 1; k < len; k++) cp = (cp << 6) | (s[i + k] & 0x3F);
+        i += len;
+        if (cp >= 0 && cp < (int)dec.size() && dec[cp] >= 0)
+            out.push_back((char)dec[cp]);
+    }
+    return out;
+}
+
+// SentencePiece-style word grouping. Each token's `text` either starts with a
+// leading space (Latin convention: token is the start of a new word) or
+// continues the previous word. Punctuation-only tokens attach to the previous
+// word. Per-word probability is the arithmetic mean of contributing tokens'
+// softmax probs — matches parakeet's word grouping convention.
+static std::vector<crispasr_session_seg::word> emit_words_from_tokens(const std::vector<ca_token_record>& toks) {
+    auto is_punct_only = [](const std::string& s) {
+        if (s.empty())
+            return false;
+        for (char c : s) {
+            unsigned char u = (unsigned char)c;
+            if ((u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') || (u >= '0' && u <= '9') || u >= 0x80)
+                return false;
+        }
+        return true;
+    };
+
+    std::vector<crispasr_session_seg::word> out;
+    crispasr_session_seg::word cur;
+    bool have_cur = false;
+    float cur_p_sum = 0.0f;
+    int cur_p_cnt = 0;
+
+    auto flush = [&]() {
+        if (cur_p_cnt > 0)
+            cur.p = cur_p_sum / (float)cur_p_cnt;
+        else
+            cur.p = 1.0f;
+        out.push_back(std::move(cur));
+        cur = {};
+        cur_p_sum = 0.0f;
+        cur_p_cnt = 0;
+        have_cur = false;
+    };
+
+    for (const auto& tk : toks) {
+        if (tk.text.empty())
+            continue;
+        if (tk.text == " ") {
+            // Standalone space (CTC-style ▁ → ' ' emission) marks a word
+            // boundary. Flush the current accumulating word but don't add
+            // anything else.
+            if (have_cur)
+                flush();
+            continue;
+        }
+
+        const bool has_leading_space = (tk.text[0] == ' ');
+        const bool punct = is_punct_only(tk.text);
+
+        if (has_leading_space && !punct && have_cur)
+            flush();
+
+        if (!have_cur) {
+            cur.t0 = tk.t0;
+            have_cur = true;
+        }
+        cur.t1 = tk.t1;
+        cur_p_sum += tk.p;
+        cur_p_cnt += 1;
+        cur.text += has_leading_space ? tk.text.substr(1) : tk.text;
+    }
+    if (have_cur)
+        flush();
+    return out;
+}
+
 CA_EXPORT crispasr_session* crispasr_session_open_explicit(const char* model_path, const char* backend_name,
                                                            int n_threads) {
     if (!model_path || !backend_name)
@@ -1354,11 +1478,15 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
         return nullptr;
     }
 
-    // 8. Greedy generation loop. Pick argmax at each step, embed the new
-    //    token, feed it through run_llm_kv with n_past=total_tokens+step,
-    //    stop on EOS or kMaxNewTokens.
+    // 8. Greedy generation loop. Pick argmax at each step, capture the
+    //    softmax probability of the picked token (stable softmax over the
+    //    last position's logits), embed the new token, feed it through
+    //    run_llm_kv with n_past=total_tokens+step, stop on EOS or
+    //    kMaxNewTokens.
     std::string generated;
     generated.reserve(512);
+    std::vector<ca_token_record> toks;
+    toks.reserve(64);
     int n_past = total_tokens;
     for (int step = 0; step < kMaxNewTokens; ++step) {
         // argmax over the last position's logits.
@@ -1371,6 +1499,11 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
                 best = i;
             }
         }
+        // Numerically stable softmax: 1 / sum(exp(last[i] - best_score)).
+        float sum_exp = 0.f;
+        for (int i = 0; i < out_vocab; ++i)
+            sum_exp += expf(last[i] - best_score);
+        const float picked_p = (sum_exp > 0.f) ? (1.0f / sum_exp) : 0.0f;
         std::free(logits);
         logits = nullptr;
 
@@ -1379,9 +1512,32 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
 
         int tok_len = 0;
         const uint8_t* tok_bytes = ops.token_text(ctx, best, &tok_len);
+        std::string piece;
         if (tok_bytes && tok_len > 0) {
-            generated.append(reinterpret_cast<const char*>(tok_bytes), (size_t)tok_len);
+            piece.assign(reinterpret_cast<const char*>(tok_bytes), (size_t)tok_len);
         }
+        // Mistral / Tekken tokenizers emit ▁ (U+2581) as the word-leading
+        // marker. Convert to a normal ASCII space so emit_words_from_tokens
+        // sees the same convention as the other backends.
+        std::string decoded;
+        decoded.reserve(piece.size());
+        for (size_t ci = 0; ci < piece.size(); ci++) {
+            if ((unsigned char)piece[ci] == 0xE2 && ci + 2 < piece.size() &&
+                (unsigned char)piece[ci + 1] == 0x96 && (unsigned char)piece[ci + 2] == 0x81) {
+                decoded += ' ';
+                ci += 2;
+            } else {
+                decoded += piece[ci];
+            }
+        }
+        generated += decoded;
+
+        ca_token_record tk;
+        tk.text = decoded;
+        tk.t0 = -1;
+        tk.t1 = -1;
+        tk.p = picked_p;
+        toks.push_back(std::move(tk));
 
         // Embed the newly-chosen token and step the KV cache.
         int32_t next_id = best;
@@ -1401,6 +1557,7 @@ static crispasr_session_result* run_voxtral_family(Ctx* ctx, const VoxtralFamily
     seg.text = std::move(generated);
     seg.t0 = 0;
     seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+    seg.words = emit_words_from_tokens(toks);
     r->segments.push_back(std::move(seg));
     return r;
 }
@@ -1517,29 +1674,375 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         // Resolution order (most specific wins): per-call `language` arg
         // → sticky `s->source_language` / `s->target_language` → historical
         // default of en→en. Same for punctuation: sticky `s->punctuation`
-        // (default true). (PLAN #59 unblock — was hardcoded en→en/true.)
+        // (default true).
         const std::string src = lang_set ? lang : (!s->source_language.empty() ? s->source_language : "en");
         const std::string tgt = !s->target_language.empty() ? s->target_language : src;
-        return run_char_transcribe(
-            canary_transcribe(s->canary_ctx, pcm, n_samples, src.c_str(), tgt.c_str(), s->punctuation));
+        canary_result* cr =
+            canary_transcribe_ex(s->canary_ctx, pcm, n_samples, src.c_str(), tgt.c_str(), s->punctuation, 0);
+        if (!cr) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = cr->text ? cr->text : "";
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+
+        std::vector<ca_token_record> toks;
+        toks.reserve((size_t)cr->n_tokens);
+        for (int i = 0; i < cr->n_tokens; i++) {
+            ca_token_record tk;
+            tk.text = cr->tokens[i].text; // already ▁→' ' decoded
+            tk.t0 = cr->tokens[i].t0;
+            tk.t1 = cr->tokens[i].t1;
+            tk.p = cr->tokens[i].p;
+            toks.push_back(std::move(tk));
+        }
+        seg.words = emit_words_from_tokens(toks);
+        canary_result_free(cr);
+        r->segments.push_back(std::move(seg));
+        return r;
     }
 #endif
 #ifdef CA_HAVE_QWEN3
     if (s->backend == "qwen3" && s->qwen3_ctx) {
-        return run_char_transcribe(qwen3_asr_transcribe(s->qwen3_ctx, pcm, n_samples));
+        // qwen3-asr's runtime _transcribe() is a stub. Drive the building
+        // blocks the CLI adapter uses (compute_mel → run_encoder → tokenize
+        // → embed+splice → kv_init → run_llm_kv prefill → greedy decode).
+        // Capture per-step softmax probability via core_greedy_decode.
+        int n_mels = 0, T_mel = 0;
+        float* mel = qwen3_asr_compute_mel(s->qwen3_ctx, pcm, n_samples, &n_mels, &T_mel);
+        if (!mel) {
+            delete r;
+            return nullptr;
+        }
+        int N_enc = 0, pdim = 0;
+        float* audio_embeds = qwen3_asr_run_encoder(s->qwen3_ctx, mel, n_mels, T_mel, &N_enc, &pdim);
+        std::free(mel);
+        if (!audio_embeds) {
+            delete r;
+            return nullptr;
+        }
+
+        // ChatML prompt: <|im_start|>system\n<|im_end|>\n<|im_start|>user\n
+        // <|audio_start|><|audio_pad|>×N<|audio_end|><|im_end|>\n<|im_start|>assistant\n
+        std::string text = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio_start|>";
+        text.reserve(text.size() + (size_t)N_enc * 13 + 64);
+        for (int i = 0; i < N_enc; i++)
+            text += "<|audio_pad|>";
+        text += "<|audio_end|><|im_end|>\n<|im_start|>assistant\n";
+
+        int n_prompt = 0;
+        int32_t* raw_ids = qwen3_asr_tokenize(s->qwen3_ctx, text.c_str(), &n_prompt);
+        if (!raw_ids) {
+            std::free(audio_embeds);
+            delete r;
+            return nullptr;
+        }
+        std::vector<int32_t> ids(raw_ids, raw_ids + n_prompt);
+        std::free(raw_ids);
+
+        int n_pad_id = 0;
+        int32_t* pad_id_arr = qwen3_asr_tokenize(s->qwen3_ctx, "<|audio_pad|>", &n_pad_id);
+        const int audio_pad_id = (pad_id_arr && n_pad_id >= 1) ? pad_id_arr[0] : -1;
+        std::free(pad_id_arr);
+        if (audio_pad_id < 0) {
+            std::free(audio_embeds);
+            delete r;
+            return nullptr;
+        }
+
+        float* text_embeds = qwen3_asr_embed_tokens(s->qwen3_ctx, ids.data(), (int)ids.size());
+        if (!text_embeds) {
+            std::free(audio_embeds);
+            delete r;
+            return nullptr;
+        }
+        int spliced = 0;
+        for (size_t i = 0; i < ids.size() && spliced < N_enc; i++) {
+            if (ids[i] == audio_pad_id) {
+                std::memcpy(text_embeds + i * pdim, audio_embeds + (size_t)spliced * pdim,
+                            pdim * sizeof(float));
+                spliced++;
+            }
+        }
+        std::free(audio_embeds);
+
+        if (!qwen3_asr_kv_init(s->qwen3_ctx, 4096)) {
+            std::free(text_embeds);
+            delete r;
+            return nullptr;
+        }
+        qwen3_asr_kv_reset(s->qwen3_ctx);
+
+        int n_t = 0, vocab = 0;
+        float* logits = qwen3_asr_run_llm_kv(s->qwen3_ctx, text_embeds, (int)ids.size(), 0, &n_t, &vocab);
+        std::free(text_embeds);
+        if (!logits) {
+            delete r;
+            return nullptr;
+        }
+
+        int eos_id = -1;
+        int n_eos = 0;
+        int32_t* eos_arr = qwen3_asr_tokenize(s->qwen3_ctx, "<|im_end|>", &n_eos);
+        if (eos_arr && n_eos >= 1)
+            eos_id = eos_arr[0];
+        std::free(eos_arr);
+
+        const int last_off = (n_t - 1) * vocab;
+        const int first_tok = core_greedy_decode::argmax(logits + last_off, vocab);
+        const float first_p =
+            core_greedy_decode::softmax_of(logits + last_off, vocab, first_tok, logits[last_off + first_tok]);
+        std::free(logits);
+
+        core_greedy_decode::Config dec_cfg;
+        dec_cfg.max_new_tokens = 256;
+        dec_cfg.eos_id = eos_id;
+        dec_cfg.vocab_size = vocab;
+        auto dec = core_greedy_decode::run_with_probs(s->qwen3_ctx, first_tok, first_p, (int)ids.size(),
+                                                       qwen3_asr_embed_tokens, qwen3_asr_run_llm_kv, dec_cfg);
+
+        // Detokenize, filtering out qwen3's metadata wrapper tokens
+        // (<|im_start|>, <asr_text>, "language <name>", etc.) the same
+        // way the CLI adapter does, and project surviving tokens into
+        // ca_token_record for word grouping.
+        std::string transcript;
+        std::vector<ca_token_record> toks;
+        toks.reserve(dec.tokens.size());
+        bool capture_language = false;
+        for (size_t i = 0; i < dec.tokens.size(); i++) {
+            const int32_t id = dec.tokens[i];
+            if (id == eos_id)
+                break;
+            const char* raw_piece = qwen3_asr_token_text(s->qwen3_ctx, id);
+            if (!raw_piece || !*raw_piece)
+                continue;
+            std::string raw = raw_piece;
+            // Skip qwen3 special tokens and structured tags.
+            if (raw.size() >= 2 && raw[0] == '<' && raw[1] == '|')
+                continue;
+            if (raw.size() >= 2 && raw[0] == '<' && raw.back() == '>')
+                continue;
+            if (raw.size() >= 5 && raw[0] == '[' && raw[1] == 'P' && raw[2] == 'A' && raw[3] == 'D')
+                continue;
+            std::string piece = gpt2_byte_decode(raw);
+            if (piece == "language") {
+                capture_language = true;
+                continue;
+            }
+            if (capture_language) {
+                capture_language = false; // language name eaten, no transcript contribution
+                continue;
+            }
+            transcript += piece;
+            ca_token_record tk;
+            tk.text = piece;
+            tk.t0 = -1;
+            tk.t1 = -1;
+            tk.p = (i < dec.probs.size()) ? dec.probs[i] : -1.0f;
+            toks.push_back(std::move(tk));
+        }
+        while (!transcript.empty() && (transcript.front() == ' ' || transcript.front() == '\n'))
+            transcript.erase(transcript.begin());
+
+        crispasr_session_seg seg;
+        seg.text = transcript;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        seg.words = emit_words_from_tokens(toks);
+        r->segments.push_back(std::move(seg));
+        return r;
     }
 #endif
 #ifdef CA_HAVE_COHERE
     if (s->backend == "cohere" && s->cohere_ctx) {
         // Cohere takes a single `lang` (source); per-call wins, sticky next.
         const std::string src = lang_set ? lang : (!s->source_language.empty() ? s->source_language : "en");
-        return run_char_transcribe(cohere_transcribe(s->cohere_ctx, pcm, n_samples, src.c_str()));
+        cohere_result* cr = cohere_transcribe_ex(s->cohere_ctx, pcm, n_samples, src.c_str(), 0);
+        if (!cr) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = cr->text ? cr->text : "";
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+
+        std::vector<ca_token_record> toks;
+        toks.reserve((size_t)cr->n_tokens);
+        for (int i = 0; i < cr->n_tokens; i++) {
+            ca_token_record tk;
+            tk.text = cr->tokens[i].text; // already ▁→' ' decoded
+            tk.t0 = cr->tokens[i].t0;
+            tk.t1 = cr->tokens[i].t1;
+            tk.p = cr->tokens[i].p;
+            toks.push_back(std::move(tk));
+        }
+        seg.words = emit_words_from_tokens(toks);
+        cohere_result_free(cr);
+        r->segments.push_back(std::move(seg));
+        return r;
     }
 #endif
 #ifdef CA_HAVE_GRANITE
     if ((s->backend == "granite" || s->backend == "granite-4.1" || s->backend == "granite-4.1-plus") &&
         s->granite_ctx) {
-        return run_char_transcribe(granite_speech_transcribe(s->granite_ctx, pcm, n_samples));
+        // granite_speech_transcribe is a stub. Drive the building blocks:
+        // mel → encoder → projector → tokenize prompt → splice projector
+        // output into the audio-pad slots → kv prefill → greedy decode.
+        int n_mels = 0, T_mel = 0;
+        float* mel = granite_speech_compute_mel(s->granite_ctx, pcm, n_samples, &n_mels, &T_mel);
+        if (!mel) {
+            delete r;
+            return nullptr;
+        }
+        int N_enc = 0, enc_dim = 0;
+        float* enc = granite_speech_run_encoder(s->granite_ctx, mel, n_mels, T_mel, &N_enc, &enc_dim);
+        std::free(mel);
+        if (!enc) {
+            delete r;
+            return nullptr;
+        }
+        int N_proj = 0, proj_dim = 0;
+        float* proj = granite_speech_run_projector(s->granite_ctx, enc, N_enc, enc_dim, &N_proj, &proj_dim);
+        std::free(enc);
+        if (!proj) {
+            delete r;
+            return nullptr;
+        }
+
+        int audio_tok = granite_speech_audio_token_id(s->granite_ctx);
+        int eos_tok = granite_speech_eos_token_id(s->granite_ctx);
+        // Legacy granite-4.0 fallbacks (mirrors crispasr_backend_granite.cpp).
+        if (audio_tok < 0)
+            audio_tok = 100352;
+        if (eos_tok < 0)
+            eos_tok = 100257;
+
+        // granite-3.x uses control-token chat template; granite-4.0 uses
+        // "USER: …\n ASSISTANT:". Discriminator: audio_token < 50000 ⇒ v3.
+        const bool use_v3_template = (audio_tok < 50000);
+        std::vector<int32_t> prefix_ids, suffix_ids;
+        if (use_v3_template) {
+            const std::string prefix_str = "<|start_of_role|>user<|end_of_role|>";
+            const std::string suffix_str = "can you transcribe the speech into a written format?"
+                                           "<|end_of_text|>\n"
+                                           "<|start_of_role|>assistant<|end_of_role|>";
+            int n = 0;
+            int32_t* a = granite_speech_tokenize(s->granite_ctx, prefix_str.c_str(), &n);
+            if (a && n > 0) {
+                prefix_ids.assign(a, a + n);
+                std::free(a);
+            } else if (a)
+                std::free(a);
+            a = granite_speech_tokenize(s->granite_ctx, suffix_str.c_str(), &n);
+            if (a && n > 0) {
+                suffix_ids.assign(a, a + n);
+                std::free(a);
+            } else if (a)
+                std::free(a);
+        } else {
+            // granite-4.0-1b legacy hardcoded ids: "USER: " + transcription request.
+            static const int32_t kPrefix4[] = {6584, 25, 220};
+            static const int32_t kSuffix4[] = {4919, 499, 1380, 3191, 279, 8982, 1139, 264,
+                                                5439, 3645, 30, 198, 36660, 3931, 2891, 25};
+            prefix_ids.assign(kPrefix4, kPrefix4 + (sizeof(kPrefix4) / sizeof(kPrefix4[0])));
+            suffix_ids.assign(kSuffix4, kSuffix4 + (sizeof(kSuffix4) / sizeof(kSuffix4[0])));
+        }
+        if (prefix_ids.empty() || suffix_ids.empty()) {
+            std::free(proj);
+            delete r;
+            return nullptr;
+        }
+
+        const int n_prefix = (int)prefix_ids.size();
+        const int n_suffix = (int)suffix_ids.size();
+        const int total_prompt = n_prefix + N_proj + n_suffix;
+        std::vector<int32_t> prompt_ids;
+        prompt_ids.reserve(total_prompt);
+        for (int id : prefix_ids)
+            prompt_ids.push_back(id);
+        for (int i = 0; i < N_proj; i++)
+            prompt_ids.push_back(audio_tok);
+        for (int id : suffix_ids)
+            prompt_ids.push_back(id);
+
+        float* all_embeds = granite_speech_embed_tokens(s->granite_ctx, prompt_ids.data(), total_prompt);
+        if (!all_embeds) {
+            std::free(proj);
+            delete r;
+            return nullptr;
+        }
+        for (int i = 0; i < N_proj; i++)
+            std::memcpy(all_embeds + (size_t)(n_prefix + i) * proj_dim, proj + (size_t)i * proj_dim,
+                        proj_dim * sizeof(float));
+        std::free(proj);
+
+        if (!granite_speech_kv_init(s->granite_ctx, 4096)) {
+            std::free(all_embeds);
+            delete r;
+            return nullptr;
+        }
+        granite_speech_kv_reset(s->granite_ctx);
+
+        int vocab = 0;
+        float* logits = granite_speech_run_llm_kv(s->granite_ctx, all_embeds, total_prompt, 0, nullptr, &vocab);
+        std::free(all_embeds);
+        if (!logits) {
+            delete r;
+            return nullptr;
+        }
+        const int first_tok = core_greedy_decode::argmax(logits, vocab);
+        const float first_p = core_greedy_decode::softmax_of(logits, vocab, first_tok, logits[first_tok]);
+        std::free(logits);
+
+        core_greedy_decode::Config dec_cfg;
+        dec_cfg.max_new_tokens = 200;
+        dec_cfg.eos_id = eos_tok;
+        dec_cfg.vocab_size = vocab;
+        auto dec = core_greedy_decode::run_with_probs(s->granite_ctx, first_tok, first_p, total_prompt,
+                                                       granite_speech_embed_tokens, granite_speech_run_llm_kv,
+                                                       dec_cfg);
+
+        // Detokenize batch via granite's own merge logic for the segment
+        // text. Per-token text comes from gpt2_byte_decode of single ids
+        // for the word-grouping pass.
+        std::vector<int32_t> text_ids;
+        text_ids.reserve(dec.tokens.size());
+        for (int32_t id : dec.tokens)
+            if (id != eos_tok)
+                text_ids.push_back(id);
+        char* batch_text = granite_speech_decode_tokens(s->granite_ctx, text_ids.data(), (int)text_ids.size());
+        std::string transcript = batch_text ? batch_text : "";
+        if (batch_text)
+            std::free(batch_text);
+        while (!transcript.empty() && (transcript.front() == ' ' || transcript.front() == '\n'))
+            transcript.erase(transcript.begin());
+
+        std::vector<ca_token_record> toks;
+        toks.reserve(dec.tokens.size());
+        for (size_t i = 0; i < dec.tokens.size(); i++) {
+            const int32_t id = dec.tokens[i];
+            if (id == eos_tok)
+                break;
+            const char* raw = granite_speech_token_text(s->granite_ctx, id);
+            std::string piece = raw ? gpt2_byte_decode(raw) : "";
+            ca_token_record tk;
+            tk.text = piece;
+            tk.t0 = -1;
+            tk.t1 = -1;
+            tk.p = (i < dec.probs.size()) ? dec.probs[i] : -1.0f;
+            toks.push_back(std::move(tk));
+        }
+
+        crispasr_session_seg seg;
+        seg.text = transcript;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        seg.words = emit_words_from_tokens(toks);
+        r->segments.push_back(std::move(seg));
+        return r;
     }
 #endif
 #ifdef CA_HAVE_VOXTRAL
@@ -1578,8 +2081,9 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
 #endif
 #ifdef CA_HAVE_WAV2VEC2
     if (s->backend == "wav2vec2" && s->wav2vec2_ctx) {
-        // Encoder + CTC head → logits → greedy decode, same pipeline
-        // wav2vec2-ggml.h advertises.
+        // Encoder + CTC head → logits → greedy decode with per-emission
+        // probabilities. Each non-blank emission is a CTC frame; we group
+        // them into words on the SentencePiece "|" (= space) boundary.
         auto logits = wav2vec2_compute_logits(*s->wav2vec2_ctx, pcm, n_samples, s->n_threads);
         if (logits.empty()) {
             delete r;
@@ -1587,12 +2091,33 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         }
         const int V = (int)s->wav2vec2_ctx->hparams.vocab_size;
         const int T = (int)(logits.size() / (size_t)V);
-        const std::string text = wav2vec2_greedy_decode(*s->wav2vec2_ctx, logits.data(), T);
+        auto emits = wav2vec2_greedy_decode_with_probs(*s->wav2vec2_ctx, logits.data(), T);
+        const float frame_dur_s = wav2vec2_frame_dur(*s->wav2vec2_ctx);
+
+        // Build the transcript text and project emissions into the
+        // ca_token_record shape that emit_words_from_tokens consumes.
+        std::vector<ca_token_record> toks;
+        toks.reserve(emits.size());
+        std::string text;
+        for (const auto& e : emits) {
+            text += e.text;
+            ca_token_record tk;
+            tk.text = e.text;
+            tk.t0 = (int64_t)(e.frame_start * frame_dur_s * 100.0);
+            tk.t1 = (int64_t)((e.frame_end + 1) * frame_dur_s * 100.0);
+            tk.p = e.prob;
+            toks.push_back(std::move(tk));
+        }
+        // Trim leading/trailing spaces from the assembled transcript.
+        auto lo = text.find_first_not_of(' ');
+        auto hi = text.find_last_not_of(' ');
+        text = (lo == std::string::npos) ? "" : text.substr(lo, hi - lo + 1);
 
         crispasr_session_seg seg;
         seg.text = text;
         seg.t0 = 0;
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        seg.words = emit_words_from_tokens(toks);
         r->segments.push_back(std::move(seg));
         return r;
     }
@@ -1632,8 +2157,40 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
             delete r;
             return nullptr;
         }
-        char* text = canary_ctc_greedy_decode(s->ctc_ctx, logits, T_enc, V);
+        canary_ctc_decode_result* dr = canary_ctc_greedy_decode_with_probs(s->ctc_ctx, logits, T_enc, V);
         std::free(logits);
+        if (!dr || !dr->text) {
+            if (dr)
+                canary_ctc_decode_result_free(dr);
+            delete r;
+            return nullptr;
+        }
+        const int frame_dur_cs = canary_ctc_frame_dur_cs(s->ctc_ctx);
+        crispasr_session_seg seg;
+        seg.text = dr->text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+
+        std::vector<ca_token_record> toks;
+        toks.reserve((size_t)dr->n_tokens);
+        for (int i = 0; i < dr->n_tokens; i++) {
+            ca_token_record tk;
+            if (dr->text_lengths[i] > 0)
+                tk.text.assign(dr->text + dr->text_offsets[i], (size_t)dr->text_lengths[i]);
+            tk.t0 = (int64_t)dr->frame_starts[i] * frame_dur_cs;
+            tk.t1 = (int64_t)(dr->frame_ends[i] + 1) * frame_dur_cs;
+            tk.p = dr->token_probs[i];
+            toks.push_back(std::move(tk));
+        }
+        seg.words = emit_words_from_tokens(toks);
+        canary_ctc_decode_result_free(dr);
+        r->segments.push_back(std::move(seg));
+        return r;
+    }
+#endif
+
+    // Helper: package a text-only result with the standard segment span.
+    auto package_text_only = [&](char* text, bool need_free) -> crispasr_session_result* {
         if (!text) {
             delete r;
             return nullptr;
@@ -1643,36 +2200,217 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         seg.t0 = 0;
         seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
         r->segments.push_back(std::move(seg));
-        std::free(text);
+        if (need_free)
+            std::free(text);
         return r;
+    };
+
+    // Helper: package a text + per-token result. Constructs ca_token_record
+    // entries from typed token arrays and runs the SentencePiece word grouping.
+    auto package_with_tokens = [&](char* text, std::vector<ca_token_record>&& toks) -> crispasr_session_result* {
+        if (!text) {
+            delete r;
+            return nullptr;
+        }
+        crispasr_session_seg seg;
+        seg.text = text;
+        seg.t0 = 0;
+        seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
+        seg.words = emit_words_from_tokens(toks);
+        r->segments.push_back(std::move(seg));
+        return r;
+    };
+
+#ifdef CA_HAVE_GLMASR
+    if ((s->backend == "glm-asr" || s->backend == "glmasr" || s->backend == "glm" || s->backend == "glm_asr") &&
+        s->glmasr_ctx) {
+        glm_asr_result* gr = glm_asr_transcribe_with_probs((glm_asr_context*)s->glmasr_ctx, pcm, n_samples);
+        if (!gr || !gr->text) {
+            if (gr)
+                glm_asr_result_free(gr);
+            delete r;
+            return nullptr;
+        }
+        std::vector<ca_token_record> toks;
+        toks.reserve((size_t)gr->n_tokens);
+        for (int i = 0; i < gr->n_tokens; i++) {
+            ca_token_record tk;
+            // GLM uses GPT-2 byte-level BPE: Ġ→space, Ċ→newline.
+            const char* raw = glm_asr_token_text((glm_asr_context*)s->glmasr_ctx, gr->token_ids[i]);
+            if (raw) {
+                for (size_t ci = 0; raw[ci] != '\0';) {
+                    unsigned char c = (unsigned char)raw[ci];
+                    if (c == 0xC4 && raw[ci + 1] != '\0') {
+                        unsigned char c2 = (unsigned char)raw[ci + 1];
+                        if (c2 == 0xA0) {
+                            tk.text += ' ';
+                            ci += 2;
+                            continue;
+                        }
+                        if (c2 == 0x8A) {
+                            tk.text += '\n';
+                            ci += 2;
+                            continue;
+                        }
+                    }
+                    tk.text += (char)c;
+                    ci++;
+                }
+            }
+            tk.t0 = -1;
+            tk.t1 = -1;
+            tk.p = gr->token_probs[i];
+            toks.push_back(std::move(tk));
+        }
+        char* text = strdup(gr->text);
+        glm_asr_result_free(gr);
+        return package_with_tokens(text, std::move(toks));
+    }
+#endif
+#ifdef CA_HAVE_KYUTAI
+    if ((s->backend == "kyutai-stt" || s->backend == "kyutai" || s->backend == "moshi-stt") && s->kyutai_ctx) {
+        kyutai_stt_result* kr =
+            kyutai_stt_transcribe_with_probs((kyutai_stt_context*)s->kyutai_ctx, pcm, n_samples);
+        if (!kr || !kr->text) {
+            if (kr)
+                kyutai_stt_result_free(kr);
+            delete r;
+            return nullptr;
+        }
+        std::vector<ca_token_record> toks;
+        toks.reserve((size_t)kr->n_tokens);
+        for (int i = 0; i < kr->n_tokens; i++) {
+            ca_token_record tk;
+            const char* piece = kyutai_stt_token_text((kyutai_stt_context*)s->kyutai_ctx, kr->token_ids[i]);
+            if (piece) {
+                std::string p = piece;
+                for (size_t ci = 0; ci < p.size(); ci++) {
+                    if ((unsigned char)p[ci] == 0xE2 && ci + 2 < p.size() && (unsigned char)p[ci + 1] == 0x96 &&
+                        (unsigned char)p[ci + 2] == 0x81) {
+                        tk.text += ' ';
+                        ci += 2;
+                    } else {
+                        tk.text += p[ci];
+                    }
+                }
+            }
+            tk.t0 = -1;
+            tk.t1 = -1;
+            tk.p = kr->token_probs[i];
+            toks.push_back(std::move(tk));
+        }
+        char* text = strdup(kr->text);
+        kyutai_stt_result_free(kr);
+        return package_with_tokens(text, std::move(toks));
+    }
+#endif
+#ifdef CA_HAVE_FIRERED
+    if ((s->backend == "firered-asr" || s->backend == "firered") && s->firered_ctx) {
+        firered_asr_result* fr =
+            firered_asr_transcribe_with_probs((firered_asr_context*)s->firered_ctx, pcm, n_samples);
+        if (!fr || !fr->text) {
+            if (fr)
+                firered_asr_result_free(fr);
+            delete r;
+            return nullptr;
+        }
+        std::vector<ca_token_record> toks;
+        toks.reserve((size_t)fr->n_tokens);
+        for (int i = 0; i < fr->n_tokens; i++) {
+            ca_token_record tk;
+            const char* piece = firered_asr_token_text((firered_asr_context*)s->firered_ctx, fr->token_ids[i]);
+            if (piece) {
+                std::string p = piece;
+                for (size_t ci = 0; ci < p.size(); ci++) {
+                    if ((unsigned char)p[ci] == 0xE2 && ci + 2 < p.size() && (unsigned char)p[ci + 1] == 0x96 &&
+                        (unsigned char)p[ci + 2] == 0x81) {
+                        tk.text += ' ';
+                        ci += 2;
+                    } else {
+                        tk.text += p[ci];
+                    }
+                }
+            }
+            tk.t0 = -1;
+            tk.t1 = -1;
+            tk.p = fr->token_probs[i];
+            toks.push_back(std::move(tk));
+        }
+        char* text = strdup(fr->text);
+        firered_asr_result_free(fr);
+        return package_with_tokens(text, std::move(toks));
+    }
+#endif
+#ifdef CA_HAVE_MOONSHINE
+    if (s->backend == "moonshine" && s->moonshine_ctx) {
+        moonshine_result* mr = moonshine_transcribe_with_probs((moonshine_context*)s->moonshine_ctx, pcm, n_samples);
+        if (!mr || !mr->text) {
+            if (mr)
+                moonshine_result_free(mr);
+            delete r;
+            return nullptr;
+        }
+        std::vector<ca_token_record> toks;
+        toks.reserve((size_t)mr->n_tokens);
+        for (int i = 0; i < mr->n_tokens; i++) {
+            ca_token_record tk;
+            const char* piece = moonshine_token_text((moonshine_context*)s->moonshine_ctx, mr->token_ids[i]);
+            if (piece && piece[0])
+                tk.text = piece;
+            tk.t0 = -1;
+            tk.t1 = -1;
+            tk.p = mr->token_probs[i];
+            toks.push_back(std::move(tk));
+        }
+        char* text = strdup(mr->text);
+        moonshine_result_free(mr);
+        return package_with_tokens(text, std::move(toks));
+    }
+#endif
+#ifdef CA_HAVE_OMNIASR
+    if ((s->backend == "omniasr" || s->backend == "omniasr-ctc" || s->backend == "omniasr-llm") && s->omniasr_ctx) {
+        // LLM variant produces per-token probs; CTC variant returns nullptr
+        // here — fall through to the plain-text path below.
+        omniasr_result* oar =
+            omniasr_transcribe_with_probs((omniasr_context*)s->omniasr_ctx, pcm, n_samples);
+        if (oar && oar->text) {
+            std::vector<ca_token_record> toks;
+            toks.reserve((size_t)oar->n_tokens);
+            for (int i = 0; i < oar->n_tokens; i++) {
+                ca_token_record tk;
+                const char* piece = omniasr_token_text((omniasr_context*)s->omniasr_ctx, oar->token_ids[i]);
+                if (piece) {
+                    std::string p = piece;
+                    for (size_t ci = 0; ci < p.size(); ci++) {
+                        if ((unsigned char)p[ci] == 0xE2 && ci + 2 < p.size() && (unsigned char)p[ci + 1] == 0x96 &&
+                            (unsigned char)p[ci + 2] == 0x81) {
+                            tk.text += ' ';
+                            ci += 2;
+                        } else {
+                            tk.text += p[ci];
+                        }
+                    }
+                }
+                tk.t0 = -1;
+                tk.t1 = -1;
+                tk.p = oar->token_probs[i];
+                toks.push_back(std::move(tk));
+            }
+            char* text = strdup(oar->text);
+            omniasr_result_free(oar);
+            return package_with_tokens(text, std::move(toks));
+        }
+        if (oar)
+            omniasr_result_free(oar);
+        // CTC variant: text only.
+        return package_text_only(omniasr_transcribe((omniasr_context*)s->omniasr_ctx, pcm, n_samples), true);
     }
 #endif
 
-    // Generic text-returning backends: glm-asr, kyutai-stt, firered-asr,
-    // moonshine, omniasr — all return a malloc'd/static string from transcribe().
+    // Backends without a token-prob API yet: text-only segment.
     {
         char* text = nullptr;
         bool need_free = true;
-#ifdef CA_HAVE_GLMASR
-        if ((s->backend == "glm-asr" || s->backend == "glmasr" || s->backend == "glm" || s->backend == "glm_asr") &&
-            s->glmasr_ctx)
-            text = glm_asr_transcribe((glm_asr_context*)s->glmasr_ctx, pcm, n_samples);
-#endif
-#ifdef CA_HAVE_KYUTAI
-        if (!text && (s->backend == "kyutai-stt" || s->backend == "kyutai" || s->backend == "moshi-stt") &&
-            s->kyutai_ctx)
-            text = kyutai_stt_transcribe((kyutai_stt_context*)s->kyutai_ctx, pcm, n_samples);
-#endif
-#ifdef CA_HAVE_FIRERED
-        if (!text && (s->backend == "firered-asr" || s->backend == "firered") && s->firered_ctx)
-            text = firered_asr_transcribe((firered_asr_context*)s->firered_ctx, pcm, n_samples);
-#endif
-#ifdef CA_HAVE_MOONSHINE
-        if (!text && s->backend == "moonshine" && s->moonshine_ctx) {
-            text = (char*)moonshine_transcribe((moonshine_context*)s->moonshine_ctx, pcm, n_samples);
-            need_free = false; // moonshine returns internal pointer
-        }
-#endif
 #ifdef CA_HAVE_MOONSHINE_STREAMING
         if (!text && s->backend == "moonshine-streaming" && s->moonshine_streaming_ctx)
             text = moonshine_streaming_transcribe((moonshine_streaming_context*)s->moonshine_streaming_ctx, pcm,
@@ -1682,29 +2420,56 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         if (!text && s->backend == "gemma4-e2b" && s->gemma4_e2b_ctx)
             text = gemma4_e2b_transcribe((gemma4_e2b_context*)s->gemma4_e2b_ctx, pcm, n_samples);
 #endif
-#ifdef CA_HAVE_OMNIASR
-        if (!text && (s->backend == "omniasr" || s->backend == "omniasr-ctc" || s->backend == "omniasr-llm") &&
-            s->omniasr_ctx)
-            text = omniasr_transcribe((omniasr_context*)s->omniasr_ctx, pcm, n_samples);
-#endif
 #ifdef CA_HAVE_MIMO_ASR
-        // mimo_asr_transcribe returns null + logs to stderr if the
-        // tokenizer companion wasn't set via crispasr_session_set_codec_path.
-        // The if (text) check below skips silently in that case so we
-        // surface a clean "no transcription" error rather than hanging.
-        if (!text && s->backend == "mimo-asr" && s->mimo_asr_ctx)
-            text = mimo_asr_transcribe(s->mimo_asr_ctx, pcm, n_samples);
-#endif
-        if (text) {
-            crispasr_session_seg seg;
-            seg.text = text;
-            seg.t0 = 0;
-            seg.t1 = (int64_t)((double)n_samples * 100.0 / 16000.0);
-            r->segments.push_back(std::move(seg));
-            if (need_free)
-                std::free(text);
-            return r;
+        if (!text && s->backend == "mimo-asr" && s->mimo_asr_ctx) {
+            // mimo_asr returns null + logs to stderr if the tokenizer companion
+            // wasn't set via crispasr_session_set_codec_path. We surface a clean
+            // "no transcription" rather than hanging.
+            mimo_asr_result* mr = mimo_asr_transcribe_with_probs(s->mimo_asr_ctx, pcm, n_samples);
+            if (mr && mr->text) {
+                std::vector<ca_token_record> toks;
+                toks.reserve((size_t)mr->n_tokens);
+                for (int i = 0; i < mr->n_tokens; i++) {
+                    ca_token_record tk;
+                    const char* piece = mimo_asr_token_text(s->mimo_asr_ctx, mr->token_ids[i]);
+                    if (piece) {
+                        std::string p = piece;
+                        // Mimo uses Qwen2 tokenizer (GPT-2 byte-level BPE):
+                        // Ġ (0xC4 0xA0) → space, Ċ (0xC4 0x8A) → newline.
+                        for (size_t ci = 0; ci < p.size();) {
+                            unsigned char c = (unsigned char)p[ci];
+                            if (c == 0xC4 && ci + 1 < p.size()) {
+                                unsigned char c2 = (unsigned char)p[ci + 1];
+                                if (c2 == 0xA0) {
+                                    tk.text += ' ';
+                                    ci += 2;
+                                    continue;
+                                }
+                                if (c2 == 0x8A) {
+                                    tk.text += '\n';
+                                    ci += 2;
+                                    continue;
+                                }
+                            }
+                            tk.text += (char)c;
+                            ci++;
+                        }
+                    }
+                    tk.t0 = -1;
+                    tk.t1 = -1;
+                    tk.p = mr->token_probs[i];
+                    toks.push_back(std::move(tk));
+                }
+                char* dup = strdup(mr->text);
+                mimo_asr_result_free(mr);
+                return package_with_tokens(dup, std::move(toks));
+            }
+            if (mr)
+                mimo_asr_result_free(mr);
         }
+#endif
+        if (text)
+            return package_text_only(text, need_free);
     }
 
     delete r;

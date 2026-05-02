@@ -1605,3 +1605,207 @@ diagnostic signature as PLAN #51c thrash mode. The patcher script
 exists specifically to side-step this on this hardware; the
 converter itself is correct (and what would run on an uncontested
 machine).
+
+### 65. Session-API word-confidence parity + 61a/b feature-matrix uplift (May 2026)
+
+**Problem.** Every session-API caller (Rust crispasr crate, Python
+wrapper, Flutter, Ruby, …) saw `word.confidence = 1.0` for parakeet
+(hardcoded) and no per-word data at all for every other backend
+(canary, qwen3, cohere, granite, voxtral, voxtral4b, mimo-asr,
+wav2vec2, firered-asr, glm-asr, kyutai-stt, moonshine, omniasr,
+fastconformer-ctc). Plus the C-side accessor
+`crispasr_session_result_word_p` existed in the .cpp but wasn't
+declared in any binding's FFI, so callers couldn't even read it.
+
+**Resolution — three batches of work, all runtime-side, no GGUF
+changes:**
+
+**1. Per-token confidence runtime APIs (PLAN #61b).** Each ASR
+backend that produces text via greedy / beam decode now exposes a
+`*_transcribe_with_probs` C-API (or, for backends with token data
+already, a refactor that surfaces the `.p` field through the
+adapter):
+
+- **wav2vec2** — new `wav2vec2_greedy_decode_with_probs` does CTC
+  frame argmax + numerically-stable softmax of the picked logit;
+  emits one `wav2vec2_token_prob{id, prob, frame_start, frame_end}`
+  per non-blank emission. Adapter populates
+  `crispasr_segment::tokens` with frame-aligned t0/t1.
+- **firered-asr** — beam-search loop in `firered_asr_transcribe_impl`
+  refactored: `beam_hyp` gained `token_logprobs` parallel to
+  `tokens`; `candidate` gained `token_logprob` (= `top_score[k]` at
+  push time). `firered_asr_transcribe_with_probs` returns a
+  `firered_asr_result*` with id / `expf(logprob)` arrays in
+  lock-step with the winning beam's token sequence. Old plain
+  `firered_asr_transcribe` is now a 1-line wrapper.
+- **fastconformer-ctc / canary-ctc** — new
+  `canary_ctc_greedy_decode_with_probs` returns a
+  `canary_ctc_decode_result*` with token ids, softmax probs,
+  CTC-frame ranges, AND text-offset/length into the assembled
+  transcript (so callers can substring-quote each emission without
+  redoing the ▁→' ' / special-token logic). Frame timestamps
+  computed via `canary_ctc_frame_dur_cs`.
+- **moonshine** — refactored `moonshine_transcribe` into
+  `moonshine_transcribe_impl` that optionally captures probs;
+  added `moonshine_set_temperature` (sticky context flag) so the
+  same loop also handles `> 0` multinomial sampling. New
+  `moonshine_token_text(ctx, id)` uses a new
+  `moonshine_tokenizer::token_to_piece` that decodes a single id
+  without trim/special-strip.
+- **glm-asr** — extended `sample_token` with optional `out_prob`;
+  refactored `glm_asr_transcribe` → `_impl` with optional out
+  vectors, only emitting tokens for non-special pieces; new
+  `glm_asr_transcribe_with_probs`. Adapter does GPT-2 byte-level
+  BPE Ġ→space / Ċ→newline decode for per-token text.
+- **kyutai-stt** — extended `sample_token` with `out_prob`; refactored
+  `kyutai_stt_transcribe` → `_impl`; new
+  `kyutai_stt_transcribe_with_probs`. SentencePiece ▁→' ' done in
+  the adapter.
+- **omniasr (LLM variant)** — extended `omniasr_run_prefill` and
+  `omniasr_run_dec_token` with optional `out_logits` parameters;
+  when set, the build switches from `output_token_id=true` (argmax
+  baked into graph) to `output_token_id=false` and reads back the
+  full `[V, 1]` logits tensor for CPU-side argmax+softmax.
+  Per-step capture into `cur_prob` + writeback to context-owned
+  `capture_token_ids` / `capture_token_probs` pointers. New
+  `omniasr_transcribe_with_probs` orchestrates. CTC variant returns
+  null and falls back to text-only path.
+
+Adapter capability flags updated: every CTC trio + decoder quartet
+now reports `tok-conf Y` in `crispasr --list-backends`. README
+"Feature matrix" `Per-token confidence` row went from 8 ✔ to 15 ✔.
+
+**2. Auto-download (PLAN #61a).** Both fc-ctc and wav2vec2 already
+had registry entries — only needed `CAP_AUTO_DOWNLOAD` on each
+adapter. 2 README cells gained.
+
+**3. Session-API word emission (PLAN #65).** Every modified
+backend's session path now produces a `crispasr_session_seg::words`
+array with real per-word probs:
+
+- **parakeet** — `parakeet_word_data` gained a `float p` field;
+  `parakeet_transcribe_ex` accumulates `cur_p_sum / cur_p_cnt` mean
+  alongside the existing word grouping. Session adapter reads
+  `pr->words[i].p` instead of hardcoding 1.0. *(Landed in commit
+  `bc67d12` mid-session after CI surfaced the missing struct
+  field.)*
+- **wav2vec2** — session path switched from `wav2vec2_greedy_decode`
+  to `wav2vec2_greedy_decode_with_probs`, projecting CTC emissions
+  into a new `ca_token_record` shape, then through a shared
+  `emit_words_from_tokens` helper that does SentencePiece-style
+  word grouping (▁ / leading-space / standalone " " / punctuation
+  attachment).
+- **canary** — session path switched to `canary_transcribe_ex`
+  (existing API), tokens already have `.p`.
+- **cohere** — same with `cohere_transcribe_ex`.
+- **firered-asr / glm-asr / kyutai-stt / moonshine / omniasr (LLM)** —
+  switched to each backend's new `_transcribe_with_probs`. Per
+  backend a small ▁→space / Ġ→space decode loop in the adapter.
+- **fastconformer-ctc / canary-ctc** — switched to
+  `canary_ctc_greedy_decode_with_probs`.
+- **voxtral / voxtral4b** — `run_voxtral_family` (the templated
+  decode loop both backends share in `c_api.cpp`) gained per-step
+  numerically-stable softmax over the picked logit. Decoded piece
+  goes through a ▁→space pass in the loop, so `emit_words_from_tokens`
+  sees the same convention as the other backends.
+- **mimo-asr** — `mimo_asr_transcribe` refactored into
+  `mimo_asr_transcribe_impl` with optional `out_token_ids` /
+  `out_token_probs`. The greedy `argmax` lambda became
+  `pick(L, float* out_p)`, and the impl passes
+  `capture_probs ? &prob : nullptr` so the legacy text-only entry
+  pays no softmax cost (mimo's vocab is 151,680 — softmax on every
+  step would add ~150k `expf` calls per token, measurable). New
+  `mimo_asr_transcribe_with_probs` + `mimo_asr_token_text`.
+- **qwen3 + granite** — both runtime `*_transcribe` functions are
+  stubs that return empty/null. The CLI worked because its adapter
+  drives the building blocks (`*_compute_mel`, `*_run_encoder`,
+  `*_tokenize`, `*_embed_tokens`, `*_kv_init`, `*_run_llm_kv`,
+  `*_token_text`) directly. Ported the same flow into the session
+  path in `c_api.cpp`:
+  - **qwen3** — chatml prompt with audio-pad splice; greedy decode
+    via `core_greedy_decode::run_with_probs`; metadata-token filter
+    (`<|im_start|>`, `<asr_text>`, `[PAD…]`, "language <name>"
+    capture) mirrors the CLI adapter; GPT-2 byte-level decode via a
+    new shared `gpt2_byte_decode` helper.
+  - **granite** — chat-template selection (`audio_token < 50000` ⇒
+    granite-3.x control tokens, else legacy 4.0 hardcoded `kPrefix4`/
+    `kSuffix4`); projector-output splice into the audio-pad
+    positions; `granite_speech_decode_tokens` for batch transcript;
+    `granite_speech_token_text` + `gpt2_byte_decode` for per-token
+    pieces.
+
+**Public-API additions:**
+
+- `crispasr_session_result_word_p(r, i_seg, i_word)` returns the
+  per-word probability in `[0, 1]`, or `-1.0f` for "no data".
+- Rust `crispasr-sys::crispasr_session_result_word_p` FFI
+  declaration added.
+- Rust `crispasr` crate's `SessionWord` gained `confidence: f32`,
+  populated through the new accessor (folds C-side `-1.0` to `1.0`
+  so consumers can render uniformly).
+- Python `SessionWord` gained `confidence: float = 1.0`; ctypes
+  binding probed via `hasattr(lib,
+  "crispasr_session_result_word_p")` so old dylibs stay loadable.
+- Flutter was already wired (`wordPFn` lookup with
+  `providesSymbol` probe; `Word.p` field).
+
+**Cross-backend smoke-test results** (JFK clip via the Python
+session API, real probabilities, no longer 1.0):
+
+```
+parakeet     | 22 | And=0.9993 so,=0.9146 my=0.9998 fellow=0.9989
+canary       | 22 | And=0.9722 so,=0.9605 my=0.9925 fellow=0.9969
+cohere       | 22 | And=0.9810 so,=0.9966 my=0.9998 fellow=1.0000
+voxtral      | 22 | And=0.9992 so,=0.8858 my=1.0000 fellow=1.0000
+wav2vec2     | 22 | and=0.9999  so=0.9998  my=0.9999 fellow=0.9991
+firered-asr  | 22 | AND=0.9825  SO=0.9834  MY=0.9975 FELLOW=0.9974
+mimo-asr     | 22 | And=0.9999998… so,=0.9999964… my=1.0 fellow=1.0
+qwen3        | 22 | And=1.0000 so,=0.9135 my=1.0000 fellow=0.9997
+granite-4.1  | 22 | and=0.9516  so=0.9984  my=0.8053 fellow=0.9986
+```
+
+(mimo's 1.0s are softmax-saturated to fp32 precision on a clean
+recording — `repr` shows the actual values are like
+`0.9999998807907104`. Not a hardcoded 1.0.)
+
+**Side-quest: Metal `GGML_OP_PAD` left-pad audit.** While testing
+wav2vec2 the binary aborted with `unsupported op 'PAD'`. Root cause
+in `ggml/src/ggml-metal/ggml-metal-device.m:131-138`: Metal supports
+`GGML_OP_PAD` only when all left-side pads (params 0/2/4/6) are
+zero. wav2vec2's `ggml_grouped_conv1d_same` used
+`ggml_pad_ext(ctx, x, pad_l, pad_r, …)` with `pad_l = (K-1)/2 ≈ 63`
+inside a `ggml_backend_graph_compute(metal, gf)` call (no scheduler
+fallback) — instant crash on Apple Silicon.
+
+Fix: replace the in-graph pad with a host-side zero-fill into a
+wider input buffer, set the input tensor at the pre-padded shape,
+skip the `ggml_pad_ext` op entirely. Per-call cost is one
+`vector<float>` zero-fill + memcpy of `T_pad * C * 4` bytes (≈2.8
+MB for wav2vec2-large) — under 1 ms on M1, well below the noise
+floor. 3× consecutive JFK runs at 0.69 s ± 0 ms.
+
+Audit of the rest of the tree: 24 `ggml_pad_ext` call sites total.
+Every other left-pad (kyutai_stt:238, firered_asr:1404+1513,
+qwen3_tts:3299+3321+3998, marblenet_vad:302, gemma4_e2b:320, 761,
+762, vibevoice:322+343, core/conv.h:72) runs through
+`ggml_backend_sched_graph_compute` which queries `supports_op` and
+falls unsupported ops back to a CPU sub-backend transparently —
+safe by construction. The only landmine remaining is the dead
+`build_pos_conv_graph` in `wav2vec2-ggml.cpp:615` (gated off via
+`include_pos_conv=false`); if anyone re-enables it they'd need to
+port the same CPU-pad fix. Documented in LEARNINGS.md "Metal
+`GGML_OP_PAD` only supports right-side pads".
+
+**No GGUF regeneration required for any of this work.** All
+changes are runtime-side, calling already-existing model C-APIs
+that read from the existing GGUF layout. Both old (e.g.
+granite-4.0 with no `audio_token_index` key) and new GGUFs work
+unchanged — that's why the granite path falls back to
+`kPrefix4`/`kSuffix4` legacy ids when
+`granite_speech_audio_token_id()` returns `-1`.
+
+**Still open** (text-only in the session API; tracked in PLAN
+#65a): vibevoice, gemma4-e2b, moonshine-streaming. Each needs a
+`*_transcribe_with_probs` runtime addition mirroring the
+moonshine / omniasr pattern. Plus other-binding word-p exposure
+for Go / Java / Ruby / JS (PLAN #65b — pure FFI plumbing).

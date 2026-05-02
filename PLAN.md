@@ -1293,3 +1293,120 @@ source + per-platform builds in CI).
 Doesn't apply to Metal. If we ever ship a CUDA backend (not
 currently a target — we use ggml-cuda for build-time only),
 revisit.
+
+---
+
+## 65. Session-API word-confidence parity — DONE (May 2026 → HISTORY §65)
+
+**Status:** mostly DONE. Three text-only backends remain.
+
+User-listed gap: every session-API word came back with
+`confidence: 1.0` (parakeet hardcoded; everyone else emitted no
+words at all). Now every ASR backend wired through
+`crispasr_session_transcribe_lang` returns real per-word softmax
+probabilities. Specifics in [HISTORY.md §65](HISTORY.md).
+
+| Backend | Status | Source of word p |
+|---|:-:|---|
+| parakeet | DONE | `parakeet_word_data.p` (mean of subword token probs) |
+| wav2vec2 | DONE | `wav2vec2_greedy_decode_with_probs` |
+| canary | DONE | `canary_transcribe_ex` (existing API) |
+| cohere | DONE | `cohere_transcribe_ex` (existing API) |
+| firered-asr | DONE | new `firered_asr_transcribe_with_probs` |
+| glm-asr | DONE | new `glm_asr_transcribe_with_probs` |
+| kyutai-stt | DONE | new `kyutai_stt_transcribe_with_probs` |
+| moonshine | DONE | new `moonshine_transcribe_with_probs` |
+| omniasr-llm | DONE | new `omniasr_transcribe_with_probs` |
+| omniasr-ctc | DONE | text-only fallback (CTC argmax) |
+| fastconformer-ctc / canary-ctc | DONE | new `canary_ctc_greedy_decode_with_probs` |
+| voxtral / voxtral4b | DONE | `run_voxtral_family` instrumented |
+| mimo-asr | DONE | new `mimo_asr_transcribe_with_probs` (gated softmax) |
+| qwen3 | DONE | session path drives building blocks + `core_greedy_decode` |
+| granite (3.x / 4.0 / 4.1 / 4.1-plus) | DONE | session path drives building blocks + chat-template selection |
+| **vibevoice** | OPEN | runtime exposes `char*` only; no token-prob API |
+| **gemma4-e2b** | OPEN | same |
+| **moonshine-streaming** | OPEN | same |
+
+**Bindings updated:** Rust `crispasr-sys` FFI, Rust `crispasr` crate's
+`SessionWord.confidence`, Python `_binding.py` (with `hasattr` probe
+for backward compat), Flutter `Word.p` (was already wired). Go,
+Java, Ruby, JS bindings don't expose word-level access yet — see
+PLAN #59 for the cross-binding parity tracker.
+
+**No GGUF regeneration required.** All work runtime-side, calling
+already-existing model C-APIs.
+
+### 65a. Remaining backends (vibevoice / gemma4-e2b / moonshine-streaming)
+
+**Status:** OPEN. **Tier 2.** **Effort:** ~80 LOC each.
+
+For each, add `*_transcribe_with_probs` to the runtime mirroring the
+moonshine / omniasr pattern: refactor the greedy loop into an `_impl`
+that optionally captures softmax probs, expose a result struct.
+Then wire into the `c_api.cpp` session path's `package_with_tokens`
+helper.
+
+### 65b. Other-binding word-p exposure
+
+**Status:** OPEN. **Tier 1.** **Effort:** ~10 LOC per binding.
+
+Go / Java / Ruby / JS bindings currently expose only segment-level
+text in the session API. Add the four word accessors
+(`_word_text`, `_word_t0`, `_word_t1`, `_word_p`) to each — pure FFI
+plumbing, no logic.
+
+---
+
+## 61. Feature matrix uplift — landed batches
+
+The README "Feature matrix" table (`README.md` §"Feature matrix")
+was missing checkmarks for many cells where the underlying model
+already supported the feature. This plan covers the runtime +
+adapter work to surface those features.
+
+### 61a. Auto-download for fc-ctc + wav2vec2 — DONE
+
+Registry entries already existed; only needed `CAP_AUTO_DOWNLOAD`
+flag flip on each adapter and README cell. 2 cells gained.
+
+### 61b. Per-token confidence — DONE for all 7 candidates
+
+| Backend | Path |
+|---|---|
+| wav2vec2 | new `wav2vec2_greedy_decode_with_probs` (CTC frame argmax + softmax) |
+| firered-asr | beam-search instrumented (`beam_hyp.token_logprobs`) + new `firered_asr_transcribe_with_probs` |
+| fastconformer-ctc / canary-ctc | new `canary_ctc_greedy_decode_with_probs` + frame-aligned text offsets |
+| moonshine | new `moonshine_transcribe_with_probs` + sticky `moonshine_set_temperature` |
+| glm-asr | extended `sample_token` to optionally emit prob; new `glm_asr_transcribe_with_probs` |
+| kyutai-stt | extended `sample_token`; new `kyutai_stt_transcribe_with_probs` |
+| omniasr (LLM) | added `out_logits` capture to `omniasr_run_prefill` + `omniasr_run_dec_token`; new `omniasr_transcribe_with_probs` |
+
+7 cells gained in `Per-token confidence` row. README matrix updated
+to all-✔ across 15 backends.
+
+### 61c. Native + word timestamps for kyutai-stt — IN PROGRESS (parallel worker)
+
+User added `kyutai_stt_transcribe_ex` declaration with
+`kyutai_stt_token_data` / `kyutai_stt_word_data` structs that align
+each emitted text token to its source audio frame (Kyutai's
+delayed-streams architecture has this for free). Implementation
+queued; once it lands, kyutai-stt gains both `Native timestamps` and
+`Word-level timing` in the matrix.
+
+### 61d-k. Per the original PLAN #61 audit
+
+Best-of-N + temperature for the LLM-style decoder quartet (61d/e),
+flash attention for fc-ctc (61i), translate for voxtral4b (61j),
+GBNF (61k) all queued with detailed effort estimates. Original
+audit lived in PLAN.md but was collapsed during a parallel-worker
+pass; this stub keeps the section numbers stable for future readers.
+
+### Validation gate (every step)
+
+1. `crispasr --backend <X> -m auto -f samples/jfk.wav` — golden
+   transcript matches HISTORY-tracked baseline.
+2. `crispasr --list-backends` — new ✔ shows up in the printed
+   matrix.
+3. README matrix line for that backend updated to match
+   `--list-backends`.
+4. `warn_unsupported` no longer fires for the corresponding flag.
