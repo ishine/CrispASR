@@ -1434,10 +1434,13 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
     // for Q-format weights on Metal the CPU-buffer path would pay a
     // backend-transfer cost per matmul. See LEARNINGS § "runtime
     // QKV/MLP fusion on row-wise quantized weights is just byte-concat".
+    // Opt-out: CRISPASR_QWEN3_ASR_FUSED_QKV=0.
     {
+        const char* fuse_env = getenv("CRISPASR_QWEN3_ASR_FUSED_QKV");
+        const bool fuse_enabled = (fuse_env == nullptr) || (atoi(fuse_env) != 0);
         auto& hp = ctx->model.hparams;
         auto& blocks = ctx->model.llm.blocks;
-        bool can_fuse = !blocks.empty() && blocks[0].attn_q_w && blocks[0].attn_k_w && blocks[0].attn_v_w;
+        bool can_fuse = fuse_enabled && !blocks.empty() && blocks[0].attn_q_w && blocks[0].attn_k_w && blocks[0].attn_v_w;
         if (can_fuse) {
             const ggml_type t0 = blocks[0].attn_q_w->type;
             for (auto& b : blocks) {
