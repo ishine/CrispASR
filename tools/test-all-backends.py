@@ -199,6 +199,51 @@ def free_mb(path: Path) -> int:
     return shutil.disk_usage(p).free // (1024 * 1024)
 
 
+# ---------------------------------------------------------------------------
+# VAD / streaming probe — multi-segment clip stitched at runtime from a
+# single-segment source audio. Caches into build/test-fixtures/. Used by
+# vad-full and stream-long tiers as deterministic ground truth without
+# committing a binary fixture to the repo.
+# ---------------------------------------------------------------------------
+
+
+def make_multi_segment_probe(src: Path, n_repeats: int = 4,
+                             silence_ms: int = 800,
+                             unit_ms: int = 2200) -> Path:
+    """Stitch `n_repeats` copies of `src` truncated to `unit_ms` (must
+    be 16k mono PCM WAV) separated by `silence_ms` of silence each.
+
+    `unit_ms` should match a single silero speech segment in the source
+    so the resulting probe has exactly `n_repeats` detectable segments.
+    For samples/jfk.wav the first silero segment is ~0.3-2.2s, so
+    unit_ms=2200 captures it cleanly without crossing into segment 2.
+
+    Cached so repeated calls don't redo the work.
+    """
+    cache_dir = REPO_ROOT / "build" / "test-fixtures"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = cache_dir / f"{src.stem}_unit{unit_ms}_x{n_repeats}_gap{silence_ms}.wav"
+    if out.is_file():
+        return out
+    with wave.open(str(src), "rb") as wf:
+        if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
+            raise RuntimeError(
+                f"probe source {src} must be 16-bit 16kHz mono PCM "
+                f"(got {wf.getnchannels()}ch / {wf.getsampwidth()*8}-bit / "
+                f"{wf.getframerate()}Hz)"
+            )
+        unit_frames = (unit_ms * 16000) // 1000
+        pcm = wf.readframes(min(unit_frames, wf.getnframes()))
+    silence_bytes = bytes(silence_ms * 16 * 2)  # 16k, 16-bit mono
+    payload = (pcm + silence_bytes) * (n_repeats - 1) + pcm
+    with wave.open(str(out), "wb") as ow:
+        ow.setnchannels(1)
+        ow.setsampwidth(2)
+        ow.setframerate(16000)
+        ow.writeframes(payload)
+    return out
+
+
 def fetch_model(b: Backend, models_dir: Path, skip_missing: bool,
                 space_margin_mb: int = 2048) -> Path | None:
     for cand in (b.local_file, b.hf_file):
@@ -684,9 +729,16 @@ def _find_silero(models_dir: Path) -> Path | None:
 
 
 def test_vad(b: Backend, tier: str, ctx: dict) -> TestOutcome:
-    """Smoke: --vad on JFK produces N speech segments where 1 <= N <= 8.
-    Counts the 'Final speech segments after filtering: N' log line.
-    Full: same range, plus the resulting transcript still has WER <= 0.20.
+    """Smoke: --vad on JFK produces 1-8 speech segments. (JFK is one
+    sentence with internal pauses; silero typically slices at 5.)
+
+    Full: switches to a stitched multi-segment probe (4 copies of the
+    source audio separated by 800ms silence) and asserts the segment
+    count is 4 ± 1. Tightens the gate from "any reasonable count" to
+    "the count the probe was constructed for."
+
+    Counts come from silero's 'Final speech segments after filtering:
+    N' log line.
     """
     crispasr, model, audio, use_gpu, models_dir = (
         ctx["crispasr"], ctx["model"], ctx["audio"], ctx["use_gpu"],
@@ -697,6 +749,15 @@ def test_vad(b: Backend, tier: str, ctx: dict) -> TestOutcome:
                            "silero VAD model not found in --models or "
                            "~/.cache/crispasr/ — download "
                            "ggml-silero-v5.1.2.bin from ggml-org/whisper-vad")
+    if tier == "full":
+        try:
+            audio = make_multi_segment_probe(audio, n_repeats=4, silence_ms=800)
+        except Exception as e:
+            return TestOutcome(b.name, "vad", tier, "SKIP",
+                               f"couldn't build multi-segment probe: {e}")
+        expected_lo, expected_hi = 3, 5  # 4 ± 1 tolerance
+    else:
+        expected_lo, expected_hi = 1, 8
     rc, out, err, w = _run_cli(crispasr, b, model, audio,
                                ["--vad", "-vm", str(silero)], use_gpu)
     if rc != 0:
@@ -707,19 +768,14 @@ def test_vad(b: Backend, tier: str, ctx: dict) -> TestOutcome:
         return TestOutcome(b.name, "vad", tier, "FAIL",
                            "no VAD segment-count log line", w)
     n_segs = int(m.group(1))
-    if n_segs < 1 or n_segs > 8:
+    if n_segs < expected_lo or n_segs > expected_hi:
         return TestOutcome(b.name, "vad", tier, "FAIL",
-                           f"VAD produced {n_segs} segments (expected 1-8)",
+                           f"VAD produced {n_segs} segments "
+                           f"(expected {expected_lo}-{expected_hi})",
                            w, {"n_segments": n_segs})
-    if tier == "full":
-        transcript = parse_transcript(out)
-        werv = wer(JFK_REF, transcript)
-        if werv is not None and werv > 0.20:
-            return TestOutcome(b.name, "vad", tier, "FAIL",
-                               f"VAD-sliced transcript WER {werv:.1%} > 20%",
-                               w, {"n_segments": n_segs, "wer": werv})
     return TestOutcome(b.name, "vad", tier, "PASS",
-                       f"{n_segs} segments", w, {"n_segments": n_segs})
+                       f"{n_segs} segments (range {expected_lo}-{expected_hi})",
+                       w, {"n_segments": n_segs})
 
 
 # ---- lid -------------------------------------------------------------------
