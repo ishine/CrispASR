@@ -699,6 +699,23 @@ impl Session {
         language: &str,
         translate: bool,
     ) -> Result<Stream, String> {
+        self.stream_open_ex(step_ms, length_ms, keep_ms, language, translate, false)
+    }
+
+    /// Like [`stream_open`](Session::stream_open) but with the voxtral4b
+    /// live-captions toggle. When `live` is true, decode runs during
+    /// `feed()` so `get_text()` returns progressive transcript as audio
+    /// arrives (PLAN #7 phase 3). No-op for backends without audio-injection
+    /// prompt decode.
+    pub fn stream_open_ex(
+        &self,
+        step_ms: i32,
+        length_ms: i32,
+        keep_ms: i32,
+        language: &str,
+        translate: bool,
+        live: bool,
+    ) -> Result<Stream, String> {
         let lang_c = CString::new(language).map_err(|e| e.to_string())?;
         let h = unsafe {
             crispasr_sys::crispasr_session_stream_open(
@@ -713,9 +730,12 @@ impl Session {
         };
         if h.is_null() {
             return Err(format!(
-                "stream_open failed for backend {:?} (whisper-only today)",
+                "stream_open failed for backend {:?}",
                 self.backend()
             ));
+        }
+        if live {
+            unsafe { crispasr_sys::crispasr_stream_set_live_decode(h, 1) };
         }
         Ok(Stream { handle: h })
     }
@@ -912,6 +932,16 @@ pub struct Stream {
 unsafe impl Send for Stream {}
 
 impl Stream {
+    /// Toggle voxtral4b live-captions decode-during-feed (PLAN #7
+    /// phase 3). When enabled, each new audio_embed produced during
+    /// `feed` triggers one greedy decode step; tokens commit
+    /// immediately to `out_text` and `get_text` returns progressive
+    /// transcript. Set BEFORE the first feed for clean semantics.
+    /// No-op on backends without audio-injection prompt decode.
+    pub fn set_live_decode(&self, enabled: bool) {
+        unsafe { crispasr_sys::crispasr_stream_set_live_decode(self.handle, if enabled { 1 } else { 0 }) };
+    }
+
     /// Push 16 kHz mono float32 PCM. Returns 0 if still buffering, 1
     /// if a new partial transcript is ready (call [`get_text`](Stream::get_text)).
     pub fn feed(&self, pcm: &[f32]) -> Result<i32, String> {

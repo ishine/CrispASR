@@ -358,6 +358,11 @@ extern "C" {
     pub fn crispasr_stream_flush(s: *mut CrispasrStream) -> c_int;
     pub fn crispasr_stream_close(s: *mut CrispasrStream);
 
+    /// Toggle voxtral4b live-captions decode-during-feed (PLAN #7 phase 3).
+    /// No-op for backends that don't have audio-injection prompt decode.
+    /// Set BEFORE the first feed for clean semantics.
+    pub fn crispasr_stream_set_live_decode(s: *mut CrispasrStream, enabled: c_int);
+
     // --- Mic capture (PLAN #62d) — miniaudio ma_device wrapper ---
     pub fn crispasr_mic_open(
         sample_rate: c_int,
