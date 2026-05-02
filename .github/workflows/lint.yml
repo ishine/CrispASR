@@ -20,6 +20,9 @@ on:
       - '.github/workflows/lint.yml'
       - 'CMakeLists.txt'
       - 'CMakePresets.json'
+      # README language drift check (issue #50)
+      - 'README.md'
+      - 'tools/check-readme-langs.py'
   pull_request:
     branches: [main, master]
     paths:
@@ -31,6 +34,9 @@ on:
       - '.github/workflows/lint.yml'
       - 'CMakeLists.txt'
       - 'CMakePresets.json'
+      # README language drift check (issue #50)
+      - 'README.md'
+      - 'tools/check-readme-langs.py'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -162,3 +168,35 @@ jobs:
             --suppress=invalidFunctionArg \
             --quiet \
             src/ examples/cli/ crisp_audio/
+
+  # ---------------------------------------------------------------------------
+  # README language metadata vs upstream model cards (regression catcher
+  # for issue #50: granite-4.1-plus / -nar / -3.3-2b copy-pasted `ja` into
+  # the language column from a base row that DID support Japanese, and
+  # nothing in lint or test caught the drift). Fetches each HF model link
+  # in the README's model table and asserts our language column matches
+  # the upstream card's `language:` frontmatter.
+  # ---------------------------------------------------------------------------
+  readme-langs:
+    name: README language metadata
+    runs-on: ubuntu-latest
+    # Soft-fire on schedule + push to main so a flaky HF API doesn't
+    # block PRs. The job is best-effort: missing upstream metadata or
+    # network errors degrade to "skip" without failing the lint.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install huggingface_hub
+        run: pip install --quiet 'huggingface_hub>=0.20'
+
+      - name: Check README language columns vs HF cards
+        env:
+          # Authenticated requests get higher rate limits; the secret is
+          # optional — anonymous hits work for public repos.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python tools/check-readme-langs.py
