@@ -54,9 +54,12 @@
 #define UNUSED GGML_UNUSED
 
 uint64_t ggml_graph_next_uid(void) {
-#ifdef _MSC_VER
+#if defined(_MSC_VER) && defined(_M_X64)
     static volatile long long counter = 1;
     return (uint64_t) _InterlockedIncrement64(&counter) - 1;
+#elif defined(_MSC_VER)
+    static volatile long counter = 1;
+    return (uint64_t) _InterlockedIncrement(&counter) - 1;
 #else
     static uint64_t counter = 1;
     return __atomic_fetch_add(&counter, 1, __ATOMIC_RELAXED);

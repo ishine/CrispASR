@@ -397,7 +397,7 @@ std::string generate_temp_filename(const std::string& path, const std::string& p
     std::uniform_int_distribution<long long> dist(0, 1e9);
 
     std::stringstream ss;
-    ss << path << std::filesystem::path::preferred_separator << prefix << "-"
+    ss << path << static_cast<char>(std::filesystem::path::preferred_separator) << prefix << "-"
        << std::put_time(std::localtime(&now_time_t), "%Y%m%d-%H%M%S") << "-" << dist(rng) << extension;
 
     return ss.str();

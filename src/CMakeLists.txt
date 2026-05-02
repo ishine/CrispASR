@@ -905,16 +905,14 @@ if (BUILD_SHARED_LIBS)
         add_custom_command(TARGET crispasr POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E create_symlink
                 $<TARGET_FILE_NAME:crispasr>
-                libwhisper.dylib
-            WORKING_DIRECTORY $<TARGET_FILE_DIR:crispasr>
+                $<TARGET_FILE_DIR:crispasr>/libwhisper.dylib
             COMMENT "Creating libwhisper.dylib -> $<TARGET_FILE_NAME:crispasr> alias"
         )
     elseif (UNIX)
         add_custom_command(TARGET crispasr POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E create_symlink
                 $<TARGET_FILE_NAME:crispasr>
-                libwhisper.so
-            WORKING_DIRECTORY $<TARGET_FILE_DIR:crispasr>
+                $<TARGET_FILE_DIR:crispasr>/libwhisper.so
             COMMENT "Creating libwhisper.so -> $<TARGET_FILE_NAME:crispasr> alias"
         )
     elseif (WIN32)
