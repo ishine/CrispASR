@@ -714,6 +714,122 @@ def align_words(
         lib.crispasr_align_result_free(res)
 
 
+# ===========================================================================
+# Microphone capture (PLAN #62d) — cross-platform live PCM via miniaudio.
+# ===========================================================================
+
+class Mic:
+    """Library-level microphone capture handle.
+
+    Wraps the C-ABI ``crispasr_mic_*`` functions which delegate to
+    miniaudio's ``ma_device`` (Core Audio on macOS, ALSA/PulseAudio on
+    Linux, WASAPI on Windows). The callback runs on miniaudio's audio
+    thread — keep it short and non-blocking. To do streaming ASR,
+    open a :meth:`Session.stream_open` handle and call
+    ``stream.feed(pcm)`` from inside the callback (or queue and feed
+    from another thread to avoid blocking the audio thread).
+
+    Use as a context manager::
+
+        with Mic(sample_rate=16000, callback=my_callback) as mic:
+            mic.start()
+            time.sleep(10)
+            mic.stop()
+
+    The :meth:`start_dictation` helper combines mic + stream + per-call
+    feed for the common dictation use case.
+    """
+
+    # Holds the ctypes callback wrapper so it isn't garbage-collected
+    # while the device is running. miniaudio's data callback is fired
+    # from the audio thread; if the wrapper goes away we crash.
+    _CB_TYPE = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_float), ctypes.c_int, ctypes.c_void_p)
+
+    def __init__(self, *, sample_rate: int = 16000, channels: int = 1,
+                 callback=None, lib_path: Optional[str] = None):
+        if callback is None:
+            raise ValueError("callback is required")
+        self._lib = ctypes.CDLL(lib_path or _find_lib())
+        if not hasattr(self._lib, "crispasr_mic_open"):
+            raise RuntimeError("mic API not present in this libcrispasr build")
+        self._py_callback = callback
+
+        def _trampoline(pcm_ptr, n_samples, _userdata):
+            # Copy the audio thread's buffer into a numpy view; the
+            # original miniaudio buffer is reused after we return.
+            import numpy as np
+            arr = np.ctypeslib.as_array(pcm_ptr, shape=(n_samples,)).copy()
+            try:
+                callback(arr)
+            except Exception as e:
+                import sys
+                sys.stderr.write(f"crispasr.Mic callback raised: {e}\n")
+
+        self._cb_holder = Mic._CB_TYPE(_trampoline)
+
+        self._lib.crispasr_mic_open.argtypes = [
+            ctypes.c_int, ctypes.c_int, Mic._CB_TYPE, ctypes.c_void_p,
+        ]
+        self._lib.crispasr_mic_open.restype = ctypes.c_void_p
+        self._handle = self._lib.crispasr_mic_open(
+            int(sample_rate), int(channels), self._cb_holder, None,
+        )
+        if not self._handle:
+            raise RuntimeError("crispasr_mic_open failed")
+        self._started = False
+
+    def start(self) -> None:
+        self._lib.crispasr_mic_start.argtypes = [ctypes.c_void_p]
+        self._lib.crispasr_mic_start.restype = ctypes.c_int
+        rc = self._lib.crispasr_mic_start(self._handle)
+        if rc != 0:
+            raise RuntimeError(f"mic_start failed (rc={rc})")
+        self._started = True
+
+    def stop(self) -> None:
+        if not self._started:
+            return
+        self._lib.crispasr_mic_stop.argtypes = [ctypes.c_void_p]
+        self._lib.crispasr_mic_stop.restype = ctypes.c_int
+        self._lib.crispasr_mic_stop(self._handle)
+        self._started = False
+
+    def close(self) -> None:
+        if not self._handle:
+            return
+        self.stop()
+        self._lib.crispasr_mic_close.argtypes = [ctypes.c_void_p]
+        self._lib.crispasr_mic_close.restype = None
+        self._lib.crispasr_mic_close(self._handle)
+        self._handle = None
+        self._cb_holder = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def mic_default_device_name(*, lib_path: Optional[str] = None) -> str:
+    """Return the human-readable name of the default capture device,
+    or empty string if no input device is available."""
+    lib = ctypes.CDLL(lib_path or _find_lib())
+    if not hasattr(lib, "crispasr_mic_default_device_name"):
+        return ""
+    fn = lib.crispasr_mic_default_device_name
+    fn.argtypes = []
+    fn.restype = ctypes.c_char_p
+    s = fn()
+    return s.decode("utf-8") if s else ""
+
+
 def detect_language_pcm(
     pcm: np.ndarray,
     *,

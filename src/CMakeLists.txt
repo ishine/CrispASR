@@ -115,6 +115,10 @@ add_library(crispasr
             # Lets language wrappers feed `crispasr_session_transcribe`
             # any audio format without bundling an external ffmpeg.
             crispasr_audio.cpp
+            # Library-level mic capture (PLAN #62d) — wraps miniaudio
+            # ma_device for cross-platform live PCM. Symbols share the
+            # MINIAUDIO_IMPLEMENTATION already linked from crispasr_audio.cpp.
+            crispasr_mic.cpp
             # Silero-VAD-driven segmentation + crispasr.cpp-style stitching.
             # Consumed by the CLI and by the C-ABI `crispasr_session_transcribe_vad`
             # wrapper so every language binding benefits without re-implementing.

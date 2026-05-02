@@ -219,6 +219,29 @@ class TestKokoroPhonemeCacheClear(unittest.TestCase):
 
 
 @unittest.skipUnless(LIB_PATH, "libwhisper not built")
+class TestMicAPI(unittest.TestCase):
+    """PLAN #62d: mic capture API exists, default device probe works."""
+
+    def test_symbols_exported(self):
+        import ctypes
+        lib = ctypes.CDLL(LIB_PATH)
+        for name in (
+            "crispasr_mic_open",
+            "crispasr_mic_start",
+            "crispasr_mic_stop",
+            "crispasr_mic_close",
+            "crispasr_mic_default_device_name",
+        ):
+            self.assertTrue(hasattr(lib, name), f"missing symbol: {name}")
+
+    def test_default_device_name_callable(self):
+        from crispasr import mic_default_device_name
+        # On CI/headless the device list may be empty; not asserting non-empty.
+        name = mic_default_device_name(lib_path=LIB_PATH)
+        self.assertIsInstance(name, str)
+
+
+@unittest.skipUnless(LIB_PATH, "libwhisper not built")
 class TestStreamingAPI(unittest.TestCase):
     """PLAN #62a/b: session-level streaming API symbols are exported and
     null-handle paths return cleanly."""

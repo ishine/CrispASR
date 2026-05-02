@@ -302,6 +302,95 @@ RegistryEntry? _registryCall(String sym, String key, DynamicLibrary? lib) {
   return out;
 }
 
+// ===========================================================================
+// Microphone capture (PLAN #62d) — cross-platform live PCM via miniaudio.
+// ===========================================================================
+
+typedef _MicCallbackNative = Void Function(Pointer<Float> pcm, Int32 nSamples, Pointer<Void> userdata);
+
+/// Library-level microphone handle. The user-supplied callback is
+/// invoked from miniaudio's audio thread with mono float32 PCM in
+/// [-1, 1]. Keep the callback short and non-blocking.
+class Mic {
+  final DynamicLibrary _lib;
+  Pointer<Void> _handle;
+  // Hold the ctypes-style native callback alive for the lifetime of
+  // the Mic; if it's GC'd, miniaudio will crash.
+  late final NativeCallable<_MicCallbackNative> _trampoline;
+  bool _started = false;
+
+  Mic._(this._lib, this._handle, this._trampoline);
+
+  /// Open the default capture device. `sampleRate=16000` matches every
+  /// ASR backend. `channels=1` for mono (recommended).
+  static Mic open({
+    required void Function(Float32List pcm) callback,
+    int sampleRate = 16000,
+    int channels = 1,
+    DynamicLibrary? lib,
+  }) {
+    lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+    if (!lib.providesSymbol('crispasr_mic_open')) {
+      throw UnsupportedError('mic API not present in this libcrispasr build');
+    }
+    final trampoline = NativeCallable<_MicCallbackNative>.listener((Pointer<Float> pcm, int n, Pointer<Void> _) {
+      // Audio thread → main isolate via NativeCallable.listener.
+      final view = pcm.asTypedList(n);
+      final copy = Float32List.fromList(view); // detach from miniaudio's buffer
+      try {
+        callback(copy);
+      } catch (e) {
+        // ignore — audio thread mustn't propagate exceptions
+      }
+    });
+    final fn = lib.lookupFunction<
+        Pointer<Void> Function(Int32, Int32, Pointer<NativeFunction<_MicCallbackNative>>, Pointer<Void>),
+        Pointer<Void> Function(int, int, Pointer<NativeFunction<_MicCallbackNative>>,
+            Pointer<Void>)>('crispasr_mic_open');
+    final h = fn(sampleRate, channels, trampoline.nativeFunction, nullptr);
+    if (h == nullptr) {
+      trampoline.close();
+      throw Exception('crispasr_mic_open failed');
+    }
+    return Mic._(lib, h, trampoline);
+  }
+
+  void start() {
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>('crispasr_mic_start');
+    final rc = fn(_handle);
+    if (rc != 0) throw Exception('mic_start failed (rc=$rc)');
+    _started = true;
+  }
+
+  void stop() {
+    if (!_started) return;
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>), int Function(Pointer<Void>)>('crispasr_mic_stop');
+    fn(_handle);
+    _started = false;
+  }
+
+  void close() {
+    if (_handle == nullptr) return;
+    stop();
+    final fn = _lib.lookupFunction<Void Function(Pointer<Void>), void Function(Pointer<Void>)>('crispasr_mic_close');
+    fn(_handle);
+    _handle = nullptr;
+    _trampoline.close();
+  }
+}
+
+/// Human-readable name of the default capture device, or empty string
+/// if no input device is available.
+String micDefaultDeviceName({DynamicLibrary? lib}) {
+  lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_mic_default_device_name')) return '';
+  final fn = lib.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(
+      'crispasr_mic_default_device_name');
+  final p = fn();
+  if (p == nullptr) return '';
+  return p.toDartString();
+}
+
 /// Download [filename] from [url] into the CrispASR cache (or return
 /// the cached path if it's already present). Returns the absolute path
 /// or null on failure.

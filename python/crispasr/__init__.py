@@ -8,6 +8,7 @@ from ._binding import (
     KokoroResolved,
     LidMethod,
     LidResult,
+    Mic,
     RegistryEntry,
     Segment,
     Session,
@@ -20,6 +21,7 @@ from ._binding import (
     diarize_segments,
     kokoro_resolve_for_lang,
     list_known_models,
+    mic_default_device_name,
     registry_lookup,
     registry_lookup_by_filename,
 )
@@ -32,6 +34,7 @@ __all__ = [
     "KokoroResolved",
     "LidMethod",
     "LidResult",
+    "Mic",
     "RegistryEntry",
     "Segment",
     "Session",
@@ -44,6 +47,7 @@ __all__ = [
     "diarize_segments",
     "kokoro_resolve_for_lang",
     "list_known_models",
+    "mic_default_device_name",
     "registry_lookup",
     "registry_lookup_by_filename",
 ]

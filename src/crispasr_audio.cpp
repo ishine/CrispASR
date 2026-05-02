@@ -15,9 +15,11 @@
 #include "../examples/stb_vorbis.c"
 
 #define MINIAUDIO_IMPLEMENTATION
-#define MA_NO_DEVICE_IO  // we don't need playback/capture devices
-#define MA_NO_THREADING  // avoid pthreads coupling in the dylib
-#define MA_NO_GENERATION // skip synth helpers
+// Device IO (capture mode) is needed for `crispasr_mic_*` (PLAN #62d);
+// MA_NO_DEVICE_IO would strip the ma_device_* symbols. Threading
+// follows from device IO. MA_NO_GENERATION (no oscillators / synth
+// helpers) is still safe to keep.
+#define MA_NO_GENERATION
 
 #include "miniaudio.h"
 

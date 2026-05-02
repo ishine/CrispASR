@@ -120,6 +120,11 @@ pub struct CrispasrSessionResult(c_void);
 #[repr(C)]
 pub struct CrispasrStream(c_void);
 
+/// Opaque microphone handle returned by `crispasr_mic_open`.
+/// Must be freed with `crispasr_mic_close`. (PLAN #62d)
+#[repr(C)]
+pub struct CrispasrMic(c_void);
+
 /// Opaque result handle for `crispasr_align_words_abi`. Must be freed
 /// with `crispasr_align_result_free`.
 #[repr(C)]
@@ -352,6 +357,18 @@ extern "C" {
     ) -> c_int;
     pub fn crispasr_stream_flush(s: *mut CrispasrStream) -> c_int;
     pub fn crispasr_stream_close(s: *mut CrispasrStream);
+
+    // --- Mic capture (PLAN #62d) — miniaudio ma_device wrapper ---
+    pub fn crispasr_mic_open(
+        sample_rate: c_int,
+        channels: c_int,
+        cb: extern "C" fn(pcm: *const c_float, n_samples: c_int, userdata: *mut c_void),
+        userdata: *mut c_void,
+    ) -> *mut CrispasrMic;
+    pub fn crispasr_mic_start(m: *mut CrispasrMic) -> c_int;
+    pub fn crispasr_mic_stop(m: *mut CrispasrMic) -> c_int;
+    pub fn crispasr_mic_close(m: *mut CrispasrMic);
+    pub fn crispasr_mic_default_device_name() -> *const c_char;
     pub fn crispasr_registry_lookup_by_filename_abi(
         filename: *const c_char,
         out_filename: *mut c_char,

@@ -965,6 +965,97 @@ impl Drop for Stream {
 }
 
 // =========================================================================
+// Microphone capture (PLAN #62d) — cross-platform via miniaudio.
+// =========================================================================
+
+use std::os::raw::c_void;
+use std::sync::Mutex;
+
+/// Library-level microphone handle. The user-supplied callback is
+/// invoked from miniaudio's audio thread with mono float32 PCM in
+/// [-1, 1]. Keep the callback short and non-blocking — for ASR, queue
+/// the audio and feed [`Stream::feed`] from another thread.
+///
+/// Auto-stops + closes on drop.
+pub struct Mic {
+    handle: *mut crispasr_sys::CrispasrMic,
+    _trampoline: Box<TrampolineState>,
+}
+
+unsafe impl Send for Mic {}
+
+struct TrampolineState {
+    cb: Mutex<Box<dyn FnMut(&[f32]) + Send + 'static>>,
+}
+
+extern "C" fn mic_trampoline(pcm: *const c_float, n_samples: c_int, userdata: *mut c_void) {
+    if userdata.is_null() || pcm.is_null() || n_samples <= 0 {
+        return;
+    }
+    unsafe {
+        let state = &*(userdata as *const TrampolineState);
+        let slice = std::slice::from_raw_parts(pcm, n_samples as usize);
+        if let Ok(mut cb) = state.cb.lock() {
+            (cb)(slice);
+        }
+    }
+}
+
+impl Mic {
+    /// Open the default capture device. `sample_rate=16000` matches
+    /// every ASR backend. Pass `channels=1` for mono (recommended);
+    /// channels=2 hands the callback interleaved stereo.
+    pub fn open<F>(sample_rate: i32, channels: i32, callback: F) -> Result<Mic, String>
+    where
+        F: FnMut(&[f32]) + Send + 'static,
+    {
+        let trampoline = Box::new(TrampolineState {
+            cb: Mutex::new(Box::new(callback)),
+        });
+        let userdata_ptr = trampoline.as_ref() as *const TrampolineState as *mut c_void;
+        let handle = unsafe {
+            crispasr_sys::crispasr_mic_open(sample_rate, channels, mic_trampoline, userdata_ptr)
+        };
+        if handle.is_null() {
+            return Err("crispasr_mic_open failed".to_string());
+        }
+        Ok(Mic { handle, _trampoline: trampoline })
+    }
+
+    pub fn start(&self) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_mic_start(self.handle) };
+        if rc != 0 {
+            return Err(format!("mic_start failed (rc={})", rc));
+        }
+        Ok(())
+    }
+
+    pub fn stop(&self) -> Result<(), String> {
+        let rc = unsafe { crispasr_sys::crispasr_mic_stop(self.handle) };
+        if rc != 0 {
+            return Err(format!("mic_stop failed (rc={})", rc));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Mic {
+    fn drop(&mut self) {
+        unsafe { crispasr_sys::crispasr_mic_close(self.handle) }
+    }
+}
+
+/// Human-readable name of the default capture device, or empty string
+/// if no input device is available.
+pub fn mic_default_device_name() -> String {
+    let p = unsafe { crispasr_sys::crispasr_mic_default_device_name() };
+    if p.is_null() {
+        return String::new();
+    }
+    unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+}
+
+// =========================================================================
 // HF download + cache + model registry (shared C-ABI, 0.4.8+)
 // =========================================================================
 
