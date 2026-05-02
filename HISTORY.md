@@ -1526,19 +1526,44 @@ re-conversion).
 `mimo_asr_kv_init`. Default stays F16, so this is bit-identical to
 existing behaviour.
 
-The shared `core_attn::kv_self_attn` read path adapts via
-`ggml_is_quantized(kv_k->type)`: F16/F32 still uses `ggml_cont` to
-materialise the strided per-layer view; quantised types use
-`ggml_cast(...,F16)` because Metal's CPY kernel doesn't support
-`Q*→Q*` (only `Q*→F16/F32`). So the cache *storage* is half-bytes
-(Q8_0) or quarter-bytes (Q4_0) — the hour-long-podcast use case
-where `max_ctx > 10k` would otherwise need ~1.5 GB F16 KV — but
-each step's read pays one dequant pass per layer.
+The shared `core_attn::kv_self_attn` adapts both write and read
+paths for quantised cache:
+
+- **Write:** the original `ggml_cpy(F32, slice-of-cache)` path
+  requires the destination to be contiguous when the source/dst
+  types differ, but a per-token slice into a max_ctx-strided 4D
+  cache is never contiguous. CPU's `dup_to_q<float>` aborts; Metal
+  also skips non-contig quant dst. Fix: when the cache is
+  quantised, always go through the `ggml_set_rows` scatter path
+  (which both backends accept for F32→Q* directly), even when no
+  `kv_indices` is supplied. The `positions` tensor — already
+  populated with [n_past..n_past+T) for RoPE — is exactly the
+  row-id list set_rows wants, so we re-use it as the synthetic
+  kv_indices.
+- **Read:** `ggml_is_quantized(kv_k->type)` switches from `ggml_cont`
+  to `ggml_cast(view_q*, GGML_TYPE_F32)`. Both backends support
+  `Q*→F32` CPY; the CPU backend's `compute_forward_dup` only
+  implements `Q*→F32` (not `Q*→F16`), so F32 is the only safe
+  dequant target if the scheduler splits the op. Cache *storage*
+  still uses ~half the bytes (Q8_0) — the hour-long-podcast use
+  case where `max_ctx > 10k` would otherwise need ~1.5 GB F16 KV —
+  but reads pay one dequant pass per layer.
+
+**Validation (Q8_0 KV cache, fused Q4_K, JFK):**
+- F16 KV baseline (above) had last_hidden cos_min 0.963177, logits
+  cos_min 0.981261.
+- Q8_0 KV: last_hidden cos_min 0.963031 (Δ -0.000146), logits
+  cos_min 0.981454 (Δ +0.000193). Both stay well above the work
+  order's ≥0.98 gate. Pre-attn stages (audio_features,
+  text_embeds, inputs_embeds) don't go through the KV cache and
+  reproduce the F16 cosines exactly.
 
 Per-backend rollout (mirroring the env lookup into `qwen3_asr`,
 `voxtral4b`, `granite_speech`, `granite_nle`, `gemma4_e2b`, etc.) is
 deferred to a follow-up — see PLAN #60e for the rollout list and
-diff-harness gate.
+diff-harness gate. The shared-code surgery is already done; each
+backend just needs the same 3-line `CRISPASR_KV_QUANT` lookup
+mirrored from `mimo_asr_kv_init`.
 
 **Side-quest:** the converter run itself was killed mid-flight after
 22 min / 0.8 MB/min sustained on the contested disk — same
