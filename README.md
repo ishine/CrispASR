@@ -216,7 +216,7 @@ crispasr --backend parakeet -m parakeet.gguf --vad --flush-after 1 -osrt -f long
 | **Speech translation** (X→en or en→X) | **canary**, **voxtral**, **qwen3** |
 | **30 languages + Chinese dialects** | **qwen3** |
 | **1600+ languages** | **omniasr** (CTC or LLM) |
-| **Realtime streaming ASR** (<500 ms latency) | **voxtral4b** |
+| **Realtime streaming ASR** (native incremental encoder, ~2× RT feed; sub-second-token target deferred to phase 2) | **voxtral4b** |
 | Highest-quality offline speech-LLM | **voxtral** |
 | Apache-licensed speech-LLM | **granite**, **voxtral**, **qwen3**, **omniasr-llm** |
 | **Lightweight CTC-only** (fast, no decoder) | **wav2vec2**, **fc-ctc**, **data2vec**, **omniasr** |
