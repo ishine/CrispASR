@@ -16,11 +16,8 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | Priority | Item | Effort | Status |
 |---|---|---|---|
 | **MEDIUM** | [#52 Qwen3-TTS](#52-qwen3-tts) — perf pass | Medium | talker + code_predictor + codec + ECAPA + codec_encoder all done; only step-4 perf pass open (~137 ms/frame → real-time) |
-| **DONE** | [#51 MiMo-V2.5-ASR runtime](#51-mimo-v25-asr-runtime--done-may-2026) | Large | end-to-end JFK matches reference; F16+Q4_K on HF; 51b/b' shipped (step-only + cached step graph, 1.46× decode); 51a mmap loader landed behind `CRISPASR_GGUF_MMAP=1` (default-flip + 51c F16 step pending) |
-| **DONE** | [#54 granite-speech-4.1 plus / nar](#54-granite-speech-41-plus--nar-variants) | Small | base + plus + nar runtimes all DONE; F16 + 3 Q4_K variants shipped to [`cstr/granite-speech-4.1-2b-nar-GGUF`](https://huggingface.co/cstr/granite-speech-4.1-2b-nar-GGUF); registry wired |
-| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phase 1 (Qwen3-TTS-{CustomVoice 0.6B/1.7B, Base 1.7B, VoiceDesign 1.7B}) DONE; Phase 2 Orpheus-3B base + lex-au-orpheus-de + Kartoffel_Orpheus DE natural DONE; Kartoffel synthetic converted locally, HF upload pending; phases 3-5 queued |
-| **DONE** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet / cohere / canary all DONE — see [HISTORY §63](HISTORY.md) |
-| **DONE** | [#53 Two narrow extractions](#53-two-narrow-extractions-for-shared-tts-codec-patterns) | Small | snake_beta + convt1d_crop landed across qwen3-tts + SNAC — see [HISTORY §63](HISTORY.md) |
+| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phases 1-2 DONE (Qwen3-TTS variants + Orpheus-3B base + lex-au-orpheus-de + Kartoffel natural); Kartoffel synthetic HF upload pending; phases 3-5 queued |
+| **MEDIUM** | [#51c MiMo-V2.5-ASR F16 step decode](#51c-f16-step-decode) | Small | F16 step-decode validation blocked behind ≥32 GB box (see PLAN #51c); base runtime + Q4_K shipped → HISTORY §56 |
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
 | **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | TTS surface (incl. qwen3-tts variants) at full parity across all 7 wrappers; align/diarize/VAD/streaming/punctuation/LID/registry still C-ABI-only on Go/Java/Ruby/JS/Dart |
@@ -31,6 +28,8 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | **LOW** | [#11 WebSocket server](#11-websocket-streaming-server) | High | |
 | **BLOCKED** | [#42 VibeVoice-ASR 7B](#42-vibevoice-asr-7b) | High | Needs ≥16 GB RAM |
 | **BLOCKED** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | License unclear |
+
+**Recently completed** (full write-ups in HISTORY.md): #5 reference backends → §63, #16 Shaw RPE → §55, #51 MiMo-V2.5-ASR runtime → §56, #51b step-decode KV cache reuse → §60, #53 narrow core helper extractions → §63, #54 granite-speech-4.1 plus/nar → §61, #55 granite-family DRY refactor → §54, #56 Kokoro phonemizer-step diff harness + cache_clear ABI → §63, #60d Fused QKV mimo-asr Q4_K → §64.
 
 ---
 
@@ -65,13 +64,7 @@ NOT audio→phoneme. Runs on transcription output.
 
 ---
 
-## ~~5. Reference backends for parakeet/canary/cohere~~ — **DONE (May 2026)**
-
-All three reference dumpers shipped: `parakeet.py` (April 2026, used to
-diagnose the JA xscaling bug), `cohere.py` (encoder-decoder NeMo), and
-`canary.py` (May 2026, commit `63f708e` — patterned on parakeet, with
-TimeMels-layout transpose and 32 per-layer encoder hooks for diagnostic).
-See [HISTORY §63](HISTORY.md) for the canary writeup.
+## ~~5. Reference backends for parakeet/canary/cohere~~ — **DONE → [HISTORY §63](HISTORY.md)**
 
 ---
 
@@ -103,19 +96,9 @@ support WebSocket — need custom protocol or library.
 ---
 
 
-## ~~16. Shaw RPE for granite graph~~ — **DONE (May 2026)**
+## ~~16. Shaw RPE for granite graph~~ — **DONE → [HISTORY §55](HISTORY.md)**
 
-Per-block subgraph attention with Shaw RPE landed and is now the
-default encoder path for **all three** granite variants —
-granite-speech base, PLUS (in-graph cat_layers concat), and NAR
-(`granite_nle.cpp` mirror with self-cond residual + snapshot concat
-+ final CTC logits + blank-prob softmax tap). Per-layer RPE bug
-(layer 0 reused for all 16 blocks) fixed. End-to-end realtime on
-M1 + Q4_K: base 2.3× → 4.8×, plus 1.2× → 2.9×, nar 0.6× → 1.7×.
-All three transcribe JFK byte-for-byte identical to the CPU loop.
 `GRANITE_DISABLE_ENCODER_GRAPH=1` is the unified escape hatch.
-Full write-up in [HISTORY.md §55](HISTORY.md). Lesson recorded in
-LEARNINGS.
 
 ---
 
@@ -140,44 +123,15 @@ No response. HF model card has no license field.
 
 ---
 
-## ~~51. MiMo-V2.5-ASR runtime~~ — **DONE (May 2026)**
+## ~~51. MiMo-V2.5-ASR runtime~~ — **DONE → [HISTORY §56](HISTORY.md) + [§64](HISTORY.md)**
 
-End-to-end JFK transcription matches the upstream Python
-`MimoAudio.asr_sft` reference verbatim. F16 + Q4_K shipped to
-[`cstr/mimo-asr-GGUF`](https://huggingface.co/cstr/mimo-asr-GGUF)
-with corrected vocab (151680) + merges (151291). See HISTORY entry
-56 for the full bug post-mortem. Remaining (low-priority) follow-ups:
+Base runtime + Q4_K + fused-QKV layout shipped. Remaining follow-ups:
 
-### 51a. mmap-style GGUF loader for large F16 models — env-flag SHIPPED
+### 51a. mmap-style GGUF loader for large F16 models — env-flag SHIPPED → [HISTORY §62](HISTORY.md)
 
-Zero-copy CPU path landed in commit `9710f80` behind
-`CRISPASR_GGUF_MMAP=1`: a custom `ggml_backend_buffer_t` wraps the
-mmap'd file region, tensors bind directly into mmap offsets via
-`ggml_backend_tensor_alloc`, and the buffer's `free_buffer` callback
-munmaps when the model is freed. Mmap is `MAP_PRIVATE +
-PROT_READ|PROT_WRITE` (Win32 `FILE_MAP_COPY`) so backends that mutate
-weights post-load (parakeet's BN-into-conv fold, etc.) get COW pages
-instead of SIGBUS. See HISTORY §62 for the implementation walkthrough.
+`CRISPASR_GGUF_MMAP=1` lands the zero-copy CPU + Metal mmap path; default-flip queued behind F16 RSS measurement on a 32+ GB box.
 
-Validated on parakeet Q4_K (Metal default + CPU default + CPU+mmap, all
-correct JFK transcripts) and mimo-asr Q4_K (5.5 GB peak RSS baseline →
-761 MB working set with mmap, zero-copy mechanism confirmed). Default
-remains the legacy copy path; flip is queued for after the F16
-motivating case is timed end-to-end and the diff harness on F16 GGUFs
-has been exercised. Metal path is untouched (Metal's
-`MTLBuffer-newBufferWithBytesNoCopy` plumbing is a separate, larger
-follow-up that's not needed for the diff-harness blocker).
-
-**Pending follow-up:** F16 mimo-asr RSS measurement, default-flip
-commit, then PLAN #51c can land.
-
-### ~~51b. Step-decode KV cache reuse~~ — **DONE (May 2026)**
-
-Step-only graph variant + cached step graph + diag-capture gate
-shipped — JFK transcript still gold byte-for-byte; per-step
-decode 1.46× faster (1.15 s → 0.79 s on M1+Metal+Q4_K). Full
-write-up in [HISTORY.md §60](HISTORY.md). `MIMO_ASR_BENCH=1`
-env exposes prefill/decode timing.
+### ~~51b. Step-decode KV cache reuse~~ — **DONE → [HISTORY §60](HISTORY.md)**
 
 ### 51c. F16 step decode
 
@@ -275,146 +229,20 @@ share enough that landing one substantially de-risks the other.
 
 ---
 
-## ~~54. granite-speech-4.1 plus / nar variants~~ — **DONE (May 2026)**
+## ~~54. granite-speech-4.1 plus / nar variants~~ — **DONE → [HISTORY §61](HISTORY.md)**
 
-All three variants (`granite-4.1`, `granite-4.1-plus`, `granite-4.1-nar`)
-shipped with bit-exact JFK transcription; full pipeline writeup +
-quant table + HF URLs in [HISTORY.md §61](HISTORY.md). Speaker labels
-+ word-level timestamps for the `plus` variant remain queued as a
-~50 LOC chat-template follow-up.
-
-<details>
-<summary>Old per-variant breakdown (kept for reference)</summary>
-
-The `ibm-granite/granite-speech-4.1-2b` family ships three variants
-with significantly different decoders despite the shared "4.1-2b"
-naming. All three runtimes are now fully supported and bit-exact on
-JFK; HF upload landed.
-
-| Variant | Decoder | Encoder change | Outputs | Status |
-|---|---|---|---|---|
-| `granite-speech-4.1-2b` (base) | Granite-1B AR | none | text | DONE — 4 GGUFs on HF, encoder cos 0.999908, transcribes JFK at 2.1× realtime on M1 Q4K |
-| `granite-speech-4.1-2b-plus` | Granite-1B AR | `cat_hidden_layers: [3]` | text + speaker labels + word-level timestamps | DONE — f16 GGUF on HF, transcribes JFK with punctuation/capitalisation by default; speaker labels + word timestamps in template work pending |
-| `granite-speech-4.1-2b-nar` | non-autoregressive (`NLENARDecoder`) | self-conditioning at L8 + BPE aux head + 4-layer hidden capture | text | DONE — full pipeline bit-exact on JFK (mel `cos_min=0.999997`, encoder_output `cos_min=0.999852`, encoder_logits `cos_min=0.999675`, projector_output `cos_min=0.999999`, editing_logits `cos_min=0.999999` 47/47 top-1; transcribe matches reference `final_text` exactly) |
-
-### Base 4.1-2b (DONE)
-
-- `granite-4.1` backend alias of `granite`
-- 4 GGUF variants on `cstr/granite-speech-4.1-2b-GGUF`: F16 (5.58 GB),
-  Q4K with F32 encoder (2.94 GB, recommended), Q4K with F16 encoder
-  (2.07 GB, sweet spot), Q4K everywhere (1.7 GB, mini)
-- 3.7× total speedup from norm + QKV graph fusion (commit `796824f`)
-- `GRANITE_BENCH=1` per-stage timer
-- New GGUF keys: `enc.context_size`, `enc.max_pos_emb`,
-  `proj.encoder_hidden_size`, `proj.cat_layers`. Old values default
-  in for legacy GGUFs.
-
-### Plus variant — DONE for ASR transcription
-
-The PLUS GGUF (5.6 GB f16) is converted and the runtime concatenates
-encoder layer 3 with the final layer output (`il + 1 == cat_index`,
-matching HF's `output_hidden_states` convention). End-to-end JFK
-transcription with the new `--backend granite-4.1-plus` alias produces:
-
-```
-And so my fellow Americans, ask not what your country can do for you,
-ask what you can do for your country.
-```
-
-Punctuation and capitalisation come for free — the PLUS variant's
-training default is structured output. Speaker labels and word-level
-timestamps are not yet in the output; investigating the upstream
-`chat_template.jinja` is the next step (~50 LOC, template-only).
-
-Commits: `f298818` (cat_layer + tokenizer fix), `ed0e5ac` (backend
-alias + registry), `a3147b6` (HF README).
-
-### NAR variant — DONE
-
-1. **Encoder forward** (`granite_nle_run_encoder`). DONE. Same
-   Conformer block as base; self-conditioning at layer 8 (the running
-   char-level CTC logits feed back through `out_mid`); 4-layer hidden
-   state capture at the indices listed in `proj.encoder_layer_indices`
-   (default `[4, 8, 12, -1]`). The capture obeys HF tuple semantics:
-   `-1` resolves to `n_layers`, and the snapshot at the
-   self-conditioning layer is taken AFTER the residual is added.
-   Validated against PyTorch on JFK at cos_min ≥ 0.999. The BPE
-   auxiliary head (`enc.bpe_out`) is intentionally not wired through
-   `run_encoder` — it's only needed by the LLM editing pass's text-init
-   step, where it's faster to run on the posterior-pooled features.
-2. **Windowed Q-Former projector**
-   (`granite_nle_run_projector`). DONE. Two-pass implementation: (A)
-   one ggml graph for the per-encoder-layer LayerNorms + concat +
-   `layer_proj` (4096 → 2048) + GELU; (B) one Q-Former graph per
-   block (`block_size=15`, `downsample_rate=5`, `query_length=3`)
-   with mean-pool over downsample groups, additive `query` and
-   `window_positions`, two 32-head SDPA cross-attention + SiLU-MLP
-   layers, and a final `out_norm`+`out_linear`. Output rate: 3 audio
-   tokens per 15 encoder frames. Validated against PyTorch on JFK at
-   `projector_output cos_min=0.999999` (T_out=111 × llm_dim=2048).
-3. **Non-causal LLM editing pass** (`granite_nle_run_llm_editing`).
-   DONE. Single graph over the flat `[audio_embs, text_embs_with_slots]`
-   sequence with µP scaling (embedding_multiplier=12,
-   attention_multiplier=1/128, residual_multiplier=0.22). 40 layers of
-   RMSNorm + non-causal `flash_attn_ext` (mask=nullptr, GQA 16/4
-   native) + SwiGLU. Tied LM head (matmul against the same
-   `token_embd_w` used for embed lookup). The caller passes audio_embs
-   pre-divided by `embedding_multiplier` so the uniform downstream
-   scale-up recovers the original projector output for audio while
-   still scaling text by 12× — mirrors `_build_flat_llm_inputs`.
-   Validated bit-exact: `editing_logits cos_min=0.999999` and 47/47
-   top-1 match on JFK.
-
-   Reference dump pitfall: `GraniteModel.forward` unconditionally
-   builds an upper-triangular causal mask and passes it to SDPA, which
-   then enforces causality regardless of `self_attn.is_causal=False`.
-   The upstream "flash_attention_2 required" assertion is real — only
-   FA2 reads `is_causal` directly without using the mask. The
-   `tools/reference_backends/granite_nle.py` dumper monkey-patches
-   `transformers.models.granite.modeling_granite.create_causal_mask`
-   to return None to get true non-causal attention via SDPA.
-
-4. **Transcribe orchestration** (`granite_nle_transcribe`). DONE.
-   Wires together: encoder (with BPE auxiliary head:
-   `posterior_weighted_pool` window=4 driven by `1 - blank_prob_mid`
-   from the L8 self-conditioning softmax, populating `last_bpe_logits`)
-   → BPE-CTC greedy decode (`unique_consecutive` → drop blank label 0
-   → shift to LLM IDs by -1) → `core_bpe::detokenize` (GPT-2 byte-level
-   reverse, now shared with `granite_speech` and lifted into
-   `core_bpe::token_bytes_to_utf8`) → strip + lowercase + " "-fallback
-   → re-tokenize via `core_bpe::tokenize_simple` → `add_insertion_slots`
-   (`max(2n+1, 8)`, EOS-padded) → `run_projector` divided by
-   `embedding_multiplier=12` and sliced to `enc_T // downsample_rate=5`
-   audio frames → `run_llm_editing` → per-row argmax + unique_consecutive
-   + drop EOS + detokenize. JFK end-to-end output matches reference
-   `final_text` exactly.
-
-**Effort remaining:** none — encoder, projector, LLM editing, and
-transcribe are all bit-exact end-to-end on JFK.
-
-</details>
+All three variants (`granite-4.1`, `granite-4.1-plus`, `granite-4.1-nar`) shipped bit-exact on JFK; HF GGUFs published. Open follow-up: speaker labels + word-level timestamps for the `plus` variant via chat_template (~50 LOC, template-only).
 
 ---
 
-## ~~53. Two narrow extractions for shared TTS-codec patterns~~ — **DONE (May 2026)**
+## ~~53. Two narrow extractions for shared TTS-codec patterns~~ — **DONE → [HISTORY §63](HISTORY.md)**
 
-`core_act::snake_beta` + `core_convt::convt1d_crop` shipped, qwen3-tts
-codec and SNAC both delegate. Bit-equivalent: SNAC `crispasr-diff`
-8/8 PASS (cos_min 0.999941 unchanged). Original ambition of a
-`core/audio_decoder.h` super-helper rejected because the convergence
-across our four TTS decoders (vibevoice σ-VAE, qwen3-tts codec, mimo
-encoder-only, SNAC, kokoro istftnet) wasn't there once the code was
-read end-to-end. See [HISTORY §63](HISTORY.md) for the full writeup.
+`core_act::snake_beta` + `core_convt::convt1d_crop` shipped (qwen3-tts codec + SNAC both delegate).
 
 ---
 
 
-## ~~55. granite-family DRY refactor~~ — **DONE (May 2026)**
-
-All five steps landed. See `HISTORY.md` §54 for the full table of commits,
-LOC moved, and the step-5 plan correction (the speech / NAR Q-Formers
-turned out to be structurally different — `core/qformer.h` shipped as a
-NAR-only co-location rather than a both-TUs unification).
+## ~~55. granite-family DRY refactor~~ — **DONE → [HISTORY §54](HISTORY.md)**
 
 ---
 
@@ -1288,118 +1116,25 @@ hand-off prompt at the end of the May 2026 perf-wave session.
 
 ---
 
-### 60a. `posix_madvise(WILLNEED)` on mmap'd weights — **DONE (May 2026)**
+### 60a. `posix_madvise(WILLNEED)` on mmap'd weights — **DONE → [HISTORY §63](HISTORY.md)**
 
-**Status:** DONE. Commit `f1f4bce`.
-
-When `CRISPASR_GGUF_MMAP=1` is set, both the CPU and Metal mmap
-branches now call `posix_madvise(POSIX_MADV_WILLNEED)` on the entire
-mmap'd weight region. Hints the kernel to start async readahead so
-the first access during prefill doesn't synchronously page-fault
-(~5-10 ms each on a 99%-full external disk we hit during PLAN #51c
-F16 testing). Mirrors llama.cpp's `llama_mmap` populate path.
-
-**Files touched:** `src/core/gguf_loader.cpp` (16 LOC, both mmap branches).
-**Open follow-up:** Windows `PrefetchVirtualMemory` (Win8+) — see 60c.
+`CRISPASR_GGUF_MMAP=1` triggers `POSIX_MADV_WILLNEED` on both CPU + Metal mmap branches. Open follow-up: Windows `PrefetchVirtualMemory` (Win8+).
 
 ---
 
-### 60b. wrap_iface forward-compat: `set_tensor_2d` / `get_tensor_2d` / `reset` — **DONE (May 2026)**
-
-**Status:** DONE.
-
-Added three delegating shims to `mmap_wrap_iface` in
-`src/core/gguf_loader.cpp` so any future ggml dispatch through
-`set_tensor_2d` / `get_tensor_2d` / `reset` on a wrapped Metal mmap
-buffer routes to the inner buffer's optimized path instead of
-silently falling back. Each shim guards on the inner iface method
-being non-null (all three are optional in the buffer-iface
-contract).
+### 60b. wrap_iface forward-compat: `set_tensor_2d` / `get_tensor_2d` / `reset` — **DONE → [HISTORY §63](HISTORY.md)**
 
 ---
 
-### 60c. Pre-touch / `--preload` flag — **DONE (May 2026)**
+### 60c. Pre-touch / `--preload` flag — **DONE → [HISTORY §63](HISTORY.md)**
 
-**Status:** DONE (env-gated; no CLI flag yet).
-
-`CRISPASR_GGUF_PRELOAD=1` triggers a page-walk loop right after
-the WILLNEED hint in both mmap branches. Each page is touched
-through a `volatile` byte read so the kernel faults it in
-synchronously; by the time `load_weights` returns, every weight
-page is resident.
-
-Trade-off acknowledged: on a 16 GB box loading a 16 GB F16,
-preload just *moves* the wait from compute time to load time and
-may evict everything else from cache. Useful for benchmarking and
-for users with comfortable RAM headroom — see 60f for the
-stronger pin form.
-
-**CLI flag deferred.** Add `--preload` to
-`examples/cli/whisper_params.h` later if a user actually asks; for
-now the env var is the surface.
-
-Linux `MADV_POPULATE_READ` (single-syscall kernel-walk) would be a
-tighter implementation than the per-page volatile read; queued as
-a tiny follow-up if anyone runs this path on Linux.
+`CRISPASR_GGUF_PRELOAD=1` page-walks all mmap'd weights synchronously. Open follow-up: `--preload` CLI flag in `whisper_params.h` if a user asks; Linux `MADV_POPULATE_READ` for a single-syscall kernel-walk.
 
 ---
 
-### 60d. Fused QKV per LM layer — **DONE (mimo-asr Q4_K, May 2026)**
+### 60d. Fused QKV per LM layer — **DONE (mimo-asr Q4_K) → [HISTORY §64](HISTORY.md)**
 
-**Status:** DONE for mimo-asr Q4_K. F16 re-upload deferred behind
-the same disk-thrash blocker as PLAN #51c (uncontended-disk
-re-conversion).
-
-Save 2 matmuls per layer × 36 layers × N steps by emitting one
-`attn.qkv.weight = concat(Q,K,V)` of shape
-`[d, (n_q + 2*n_kv) * hd]` and a fused `attn.qkv.bias` of length
-`(n_q + 2*n_kv) * hd`, feeding both to `core_attn::kv_self_attn`
-via the existing `qkv_w` plus a new `qkv_b` parameter.
-
-**What landed:**
-- `src/core/attention.h` — `core_attn::kv_self_attn` gained an
-  optional trailing `qkv_b` parameter. When `qkv_w` and `qkv_b`
-  are both non-null the helper does `qkv = qkv_w·x + qkv_b` in one
-  fused mul_mat + ggml_add (instead of three separate matmuls +
-  three bias adds). Algebraically identical; one ggml_add op
-  replaces three.
-- `src/mimo_asr.cpp` — `mimo_asr_qwen2_block` gained
-  `attn_qkv_w` / `attn_qkv_b` slots. `bind_qwen2_block` prefers the
-  fused tensors via `try_t`; falls back to the separate Q/K/V path
-  when fused tensors are absent (legacy GGUFs and the audio
-  `audio.blk.*` blocks, which use bidirectional attention outside
-  `core_attn`). Both LM call sites pass through `qkv_w` / `qkv_b`.
-- `models/convert-mimo-asr-to-gguf.py` — at HF→GGUF convert time,
-  per-LM-layer Q/K/V tensors (and biases) are concatenated along
-  the output-dim and emitted as
-  `model.layers.{i}.attn.qkv.{weight,bias}`. The audio path is
-  intentionally untouched.
-- `tools/patch_mimo_asr_fuse_qkv.py` — patches an existing GGUF
-  in place by byte-concat'ing the per-row Q/K/V data. Works for
-  F16/F32 (element concat) and Q4_K/Q8_0/etc. (byte concat — each
-  row is independently quantised, so this is bit-identical to
-  re-quantising a fresh fused F16). Used to ship the new Q4_K
-  without re-running the BF16→F16 converter (which thrashes on a
-  99%-full external disk per LEARNINGS / PLAN #51c).
-- Re-uploaded the patched Q4_K to `cstr/mimo-asr-GGUF`. The
-  in-runtime fallback keeps the existing unfused F16 GGUF working
-  as-is — F16 re-upload is queued behind PLAN #51c.
-
-**Validation:**
-- `crispasr-diff mimo-asr <fused.q4_k.gguf> mimo-asr-ref.gguf jfk.wav`
-  reproduces the §56 cosines within FP rounding of the unfused
-  baseline (audio_features 0.998, text_embeds 0.996,
-  inputs_embeds 0.998, last_hidden 0.963, logits 0.981).
-- JFK transcript byte-identical to "And so, my fellow Americans,
-  ask not what your country can do for you. Ask what you can do
-  for your country."
-- `MIMO_ASR_BENCH=1` shows the expected ~1.1-1.2× per-step
-  speedup on top of the 0.79 s/step 51b/b' baseline.
-
-**Port pattern to:** qwen3-asr / voxtral4b already have runtime
-fusion paths for F16/F32 (`qwen3_asr.cpp:1428`,
-`qwen3_tts.cpp:4978`). Quantized variants would follow this
-section's converter-side fuse approach.
+Open follow-up: F16 re-upload (deferred behind PLAN #51c disk-thrash blocker), and port to qwen3-asr / voxtral4b for quantised variants (their F16/F32 paths already runtime-fuse via `qwen3_asr.cpp:1428` / `qwen3_tts.cpp:4978`).
 
 ---
 
@@ -1447,51 +1182,15 @@ stay ≥0.98. Default stays F16 until each backend passes.
 
 ---
 
-### 60f. `--mlock` flag — **DONE (May 2026)**
+### 60f. `--mlock` flag — **DONE → [HISTORY §63](HISTORY.md)**
 
-**Status:** DONE (env-gated; no CLI flag yet).
-
-`CRISPASR_MLOCK=1` runs `mlock()` on the mmap region right after
-the WILLNEED hint (and after preload, when both are set) in both
-mmap branches. Failure (typically `RLIMIT_MEMLOCK` exceeded)
-prints an actionable warning and continues — pages are still
-mapped, just unpinned.
-
-Risky on RAM-tight hosts — pinning a 16 GB model on a 16 GB box
-would starve the rest of the system. The opt-in env makes the
-sharp edge explicit.
-
-**CLI flag deferred.** Same shape as 60c — add `--mlock` to
-`examples/cli/whisper_params.h` if a user actually asks.
+`CRISPASR_MLOCK=1` runs `mlock()` after WILLNEED + preload in both mmap branches. Open follow-up: `--mlock` CLI flag in `whisper_params.h` if a user asks.
 
 ---
 
-### 60g. `MADV_RANDOM` post-prefill — **DONE (May 2026)**
+### 60g. `MADV_RANDOM` post-prefill — **DONE → [HISTORY §63](HISTORY.md)**
 
-**Status:** DONE (helper exposed; per-backend wiring follow-up).
-
-`core_gguf::mmap_advise_random(ggml_backend_buffer_t)` is now
-public in `src/core/gguf_loader.h`. It detects whether the buffer
-came from either of our mmap branches (CPU `mmap_buffer_iface` or
-Metal `mmap_wrap_iface`) by comparing iface function pointers,
-extracts the mmap region, and calls
-`posix_madvise(MADV_RANDOM)`. No-op on non-mmap buffers and on
-Windows.
-
-**Per-backend wiring deferred.** Backends that want the hint can
-add a single call between prefill and the decode loop:
-
-```cpp
-core_gguf::mmap_advise_random(ctx->buf_w);
-```
-
-mimo-asr would call it from `mimo_asr_transcribe` between
-prefill and the decode loop; same shape applies to qwen3-asr,
-voxtral, voxtral4b, granite-speech, etc. Skipped from this batch
-because the perf delta is marginal on Q4_K (weights fit; readahead
-cost is small) and impossible to measure on F16 in the current
-RAM-tight environment (see PLAN #51c). Land per-backend when a
-benchmark on a larger box demonstrates measurable benefit.
+`core_gguf::mmap_advise_random(ggml_backend_buffer_t)` exposed. Open follow-up: per-backend wiring (1-line call between prefill and decode loop) — defer until a 32+ GB-box benchmark shows measurable benefit; on Q4_K the perf delta is marginal.
 
 ---
 
