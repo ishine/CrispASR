@@ -520,10 +520,10 @@ static inline ggml_tensor* kv_self_attn(ggml_context* ctx0, ggml_cgraph* gf, ggm
         ggml_view_3d(ctx0, kv_k, hd, Lk, n_kv, kv_k->nb[1], kv_k->nb[2], (size_t)il * kv_k->nb[3]);
     ggml_tensor* v_layer_view =
         ggml_view_3d(ctx0, kv_v, hd, Lk, n_kv, kv_v->nb[1], kv_v->nb[2], (size_t)il * kv_v->nb[3]);
-    ggml_tensor* Kfull = ggml_is_quantized(kv_k->type) ? ggml_cast(ctx0, k_layer_view, GGML_TYPE_F32)
-                                                       : ggml_cont(ctx0, k_layer_view);
-    ggml_tensor* Vfull = ggml_is_quantized(kv_v->type) ? ggml_cast(ctx0, v_layer_view, GGML_TYPE_F32)
-                                                       : ggml_cont(ctx0, v_layer_view);
+    ggml_tensor* Kfull =
+        ggml_is_quantized(kv_k->type) ? ggml_cast(ctx0, k_layer_view, GGML_TYPE_F32) : ggml_cont(ctx0, k_layer_view);
+    ggml_tensor* Vfull =
+        ggml_is_quantized(kv_v->type) ? ggml_cast(ctx0, v_layer_view, GGML_TYPE_F32) : ggml_cont(ctx0, v_layer_view);
 
     // ---- GQA expansion ----
     if (p.gqa_mode != GQA_NATIVE && grp > 1) {

@@ -1316,8 +1316,7 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const std::vector<floa
         }
 
         int n_past = prefix_len + step;
-        if (!omniasr_run_dec_token(ctx, cur_token, n_past, cur_token, perf,
-                                   want_probs ? &step_logits : nullptr)) {
+        if (!omniasr_run_dec_token(ctx, cur_token, n_past, cur_token, perf, want_probs ? &step_logits : nullptr)) {
             fprintf(stderr, "omniasr-llm: decode step %d failed\n", step);
             break;
         }
