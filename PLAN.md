@@ -24,6 +24,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
 | **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | TTS surface (incl. qwen3-tts variants) at full parity across all 7 wrappers; align/diarize/VAD/streaming/punctuation/LID/registry still C-ABI-only on Go/Java/Ruby/JS/Dart |
+| **MEDIUM** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | Phased | T1 madvise WILLNEED DONE; T2 Fused QKV + KV quantization next; T3 mlock/spec-decode/GBNF parked |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
 | **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | |
 | **LOW** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | |
@@ -1236,3 +1237,152 @@ unblocks needed it. Open this section when a concrete consumer shows
 up asking for, say, "Java VAD" or "Go streaming". Reference commits
 for the pattern: `4f476c3` (TTS surface sweep) and `65e0a61`
 (variant detection sweep). Same shape applies to every other capability.
+
+---
+
+## 60. Cross-backend perf tricks (llama.cpp / llamafile ports)
+
+Catalogue of optimizations from upstream llama.cpp + Justine Tunney's
+llamafile that we could pull into our fork. Prioritized by ROI for our
+specific shape: Apple Silicon M1, 16 GB RAM, 7B-class speech-LLMs
+(MiMo-ASR, qwen3-asr, voxtral4b), often-contested external disk.
+
+### Tier 1 — directly attacks the cold-start page-fault wall
+
+#### ~~`posix_madvise(POSIX_MADV_WILLNEED)` after mmap~~ — **DONE (May 2026)**
+
+When `CRISPASR_GGUF_MMAP=1` is set, we now hint the kernel to start
+async readahead of the entire mmap'd weight region in both the CPU
+and Metal mmap branches. Without this, every first access during
+prefill triggered a synchronous page fault (~5-10 ms each on a
+99%-full external disk hit during PLAN #51c F16 testing). Mirrors
+llama.cpp's `llama_mmap` populate path. Windows-skip (`PrefetchVirtualMemory`
+is a Win8+ shim we can add later). Both branches in
+`src/core/gguf_loader.cpp::load_weights`.
+
+#### Optional pre-touch / `--mlock`-style flag
+
+The next step beyond `WILLNEED`: an opt-in mode that *forces* every
+page resident before `load_weights` returns. Two implementation
+options:
+
+- **Linux `MADV_POPULATE_READ`** — single syscall, kernel walks the
+  region for us. Doesn't exist on macOS.
+- **Page-walk read loop** — `for (off = 0; off < size; off += pagesize) { volatile char x = base[off]; }`. Portable but blocks the
+  loader until everything is paged in. On a 16 GB box loading a
+  16 GB F16 weight, this just *moves* the wait from compute time to
+  load time and may evict everything else; useful for benchmarking
+  or for users with enough RAM to mlock comfortably.
+
+Effort: ~10 LOC in `core_gguf::load_weights` mmap branches, gated
+on `CRISPASR_GGUF_PRELOAD=1`. Add `--preload` and `--mlock` CLI
+flags later if usage justifies them.
+
+### Tier 2 — decode-time speedup, work-order calls out
+
+#### Fused QKV per LM layer (mimo-asr first, then qwen3-asr, voxtral4b)
+
+The work order's "small wins to consider opportunistically" for
+PLAN #51 already lists this. Save 2 matmuls per layer × 36 layers
+× N steps by writing one `attn_qkv.weight = concat(Q,K,V)` of
+shape `[d, (n_q + 2*n_kv) * hd]` and feeding it to
+`core_attn::kv_self_attn` via the existing `qkv_w` parameter
+(qwen3-tts already uses this path). Probably another **1.1-1.2×
+per-step decode** on top of 51b/b'.
+
+Files to touch:
+- `models/convert-mimo-asr-to-gguf.py` — fuse Q/K/V tensors per
+  LM layer at convert time (write one combined tensor per layer
+  instead of three). Old GGUFs would still work via a fallback
+  path at load time that re-fuses on the fly (or runtime detects
+  whichever is present). Re-upload `cstr/mimo-asr-GGUF` with the
+  new layout.
+- `src/mimo_asr.cpp` — load `attn_qkv.weight` per LM layer if
+  present; pass through to `core_attn::kv_self_attn(..., qkv_w=fused, ...)`.
+
+Effort: ~50 LOC runtime + 30 LOC converter + GGUF re-upload.
+Same shape applies to qwen3-asr (28L Qwen3) and voxtral4b (26L
+Mistral) — port the pattern once it's validated on mimo-asr.
+
+#### KV cache quantization (F16 → Q8_0 or Q4_0)
+
+llama.cpp ships `--kv-quant-type k Q8_0` etc. Halves (Q8_0) or
+quarters (Q4_0) KV memory with near-zero quality loss for ASR.
+Currently our `kv_max_ctx` for mimo-asr is capped by the
+`mimo_asr_kv_init(prompt_groups + max_new + 16)` budget — with
+F16 KV at 36 layers × 8 KV heads × 128 head_dim × 369 ctx ≈
+**~57 MB**. Q8_0 would drop that to ~28 MB. Not load-bearing for
+JFK (11s) but essential for hour-long podcast ASR where
+`max_ctx` would balloon past 10k groups (~1.5 GB F16 KV).
+
+Files to touch (substantially):
+- `src/core/attention.h` — `core_attn::kv_self_attn` currently
+  hardcodes `GGML_TYPE_F16` for the K/V views. Add a `kv_dtype`
+  parameter; the read path needs `ggml_dequantize_row` shims for
+  Q8_0/Q4_0.
+- Each backend that allocates KV (`mimo_asr_kv_init`,
+  `qwen3_asr_kv_init`, `voxtral4b_kv_init`, etc.) — opt into
+  the smaller dtype via env (`CRISPASR_KV_QUANT=q8_0`) or per-backend.
+
+Effort: **Medium** (~200 LOC, touches `core_attn` shared by ~10
+backends). Land behind env flag; flip default per backend after
+validation.
+
+### Tier 3 — distribution / quality / future
+
+#### `--mlock` flag (proper)
+
+Not just "preload pages" — actually call `mlock()` to pin them
+in physical RAM, preventing eviction under memory pressure.
+Risky on 16 GB with a 16 GB model (would starve the rest of the
+system); useful as opt-in for users with 32+ GB. Add `--mlock`
+CLI flag mapped to a `CRISPASR_MLOCK=1` env. ~15 LOC.
+
+#### Speculative decoding (target + draft)
+
+llama.cpp's main throughput trick for autoregressive generation:
+small "draft" model proposes 4-8 tokens, large "target" model
+verifies in one prefill. Typical 2-3× decode speedup with no
+quality loss when draft acceptance rate is high.
+
+For our family, no obvious draft model exists for mimo-asr
+(7.5B, 36L Qwen2). Could investigate using qwen3-asr-0.6B as a
+drafter — but it's a different tokenizer, vocab, and audio
+preprocessing stack. Not worth the complexity unless someone
+specifically asks for it.
+
+#### Grammar-constrained decoding (GBNF)
+
+Useful for structured outputs (JSON, fixed-format timestamps,
+PII redaction templates). Not for raw transcription. Park this
+until a consumer asks.
+
+#### tinyBLAS (llamafile-specific)
+
+Justine Tunney's bespoke x86 quantized matmul kernels. Faster
+than llama.cpp's reference quants on certain CPUs. **Not relevant
+for us** — Apple Silicon Metal kernels are already fast, and our
+x86 paths are CI-only (no production users on x86 yet).
+
+#### APE multi-arch single-file binary (llamafile-specific)
+
+Cosmopolitan libc trick — one binary runs on Linux/macOS/Windows.
+Distribution win, not perf. Skip until we ship a packaged binary
+to end users.
+
+#### CUDA graphs / CUDA-specific
+
+Doesn't apply to Metal. If we ever ship a CUDA backend (not
+currently a target — we use ggml-cuda for build-time only),
+revisit.
+
+### Suggested order
+
+If asked to ship "the next batch of perf wins":
+1. Tier 2 Fused QKV — concrete, work order calls it out, ~80 LOC.
+2. Tier 1 pre-touch flag — ~10 LOC, helpful for benchmarking.
+3. Tier 2 KV quantization — bigger surgery, only urgent for long-form.
+4. Tier 3 `--mlock` — small but only useful for users with headroom.
+
+Skip: tinyBLAS, APE, speculative decoding, GBNF — until concrete
+demand.

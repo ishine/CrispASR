@@ -437,6 +437,14 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
             mctx->mmap_size = mmap_size;
             mctx->tensor_base = tensor_base;
             mf.release();
+            // Hint kernel to start async readahead of the entire weight
+            // region. Without this we hit a synchronous page fault on every
+            // first access during prefill (~5-10 ms each on the 99%-full
+            // external disk we hit during PLAN #51c F16 testing). Mirrors
+            // llama.cpp's `llama_mmap` populate path.
+#if !defined(_WIN32)
+            ::posix_madvise(mctx->mmap_base, mctx->mmap_size, POSIX_MADV_WILLNEED);
+#endif
 
             out.buf = ggml_backend_buffer_init(ggml_backend_cpu_buffer_type(), mmap_buffer_iface, mctx, buf_size);
             if (!out.buf) {
@@ -502,6 +510,14 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
                     w->mmap_base = mf.base;
                     w->mmap_size = mf.size;
                     mf.release();
+                    // Hint kernel async readahead — same rationale as the
+                    // CPU branch above. On Apple Silicon the unified-memory
+                    // shared-storage MTLBuffer reads the same physical
+                    // pages, so this readahead benefits both CPU and GPU
+                    // accesses with one call.
+#if !defined(_WIN32)
+                    ::posix_madvise(w->mmap_base, w->mmap_size, POSIX_MADV_WILLNEED);
+#endif
 
                     // Reuse the inner buffer's buft so usage/alignment/etc.
                     // stay consistent with the device's expectations. The
