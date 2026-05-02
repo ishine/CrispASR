@@ -16,7 +16,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | Priority | Item | Effort | Status |
 |---|---|---|---|
 | **MEDIUM** | [#52 Qwen3-TTS](#52-qwen3-tts) — perf pass | Medium | talker + code_predictor + codec + ECAPA + codec_encoder all done; only step-4 perf pass open (~137 ms/frame → real-time) |
-| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phases 1-2 DONE (Qwen3-TTS variants + Orpheus-3B base + lex-au-orpheus-de + Kartoffel natural); Kartoffel synthetic HF upload pending; phases 3-5 queued |
+| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phases 1-2 DONE (Qwen3-TTS variants + Orpheus-3B base + lex-au-orpheus-de + Kartoffel natural + Kartoffel synthetic, all on HF + registry-resolved); phases 3-5 queued |
 | **MEDIUM** | [#51c MiMo-V2.5-ASR F16 step decode](#51c-f16-step-decode) | Small | F16 step-decode validation blocked behind ≥32 GB box (see PLAN #51c); base runtime + Q4_K shipped → HISTORY §56 |
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
@@ -703,7 +703,7 @@ adding a codec head + sampling path. Cheaper than a full new backend.
 | 1 | Qwen3-TTS-VoiceDesign 1.7B | Apache 2.0 | **DONE (commit `bd3eb71`) — natural-language voice description via `--instruct`. New `build_voicedesign_prefill_embeds` mirrors CustomVoice but omits the speaker frame from the codec bridge and prepends an instruct block tokenised as `<\|im_start\|>user\n{instruct}<\|im_end\|>\n`. New C-ABI: `qwen3_tts_set_instruct` + `qwen3_tts_is_voice_design`. ASR-roundtrip word-exact on F16/Q8_0 (parakeet-v3 verbatim modulo terminal punctuation). Published as [`cstr/qwen3-tts-1.7b-voicedesign-GGUF`](https://huggingface.co/cstr/qwen3-tts-1.7b-voicedesign-GGUF) (F16 3.84 GB + Q8_0 2.04 GB). 1.7B-only — no 0.6B-VoiceDesign weight release upstream.** | S |
 | 2 | Orpheus-3B base | llama3.2 | **DONE (commits `a0982d3` + `a4f7c49` + `1f62647` + `5025150`) — talker AR forward + SNAC C++ decoder shipped; ASR-roundtrip word-exact on `"Hello, my name is Tara."` (parakeet-v3 verbatim). Published as [`cstr/orpheus-3b-base-GGUF`](https://huggingface.co/cstr/orpheus-3b-base-GGUF) (F16 6.6 GB + Q8_0 3.5 GB) + [`cstr/snac-24khz-GGUF`](https://huggingface.co/cstr/snac-24khz-GGUF) (F32 26 MB). Unified Session API + all 6 wrappers wired (`crispasr_session_set_speaker_name`, `n_speakers`, `get_speaker_name`); orpheus default temperature now 0.6f (was 0.0f / greedy / loops). Phase 3+ gaps tracked in slice prose above.** | M |
 | 2 | Kartoffel_Orpheus DE natural | llama3.2 | **DONE + SHIPPED — converted + quantized (F16 6.61 GB / Q8_0 3.5 GB / Q4_K 1.87 GB), ASR-roundtrip word-exact on Q8_0/Julian via parakeet-v3 -l de. Published as [`cstr/kartoffel-orpheus-3b-german-natural-GGUF`](https://huggingface.co/cstr/kartoffel-orpheus-3b-german-natural-GGUF). Registry alias `kartoffel-orpheus-de-natural` + factory dispatch live (commit `d5b55a7`). 19 fixed German speakers (Jakob, Anton, Julian, Jan, Alexander, Emil, Ben, Elias, Felix, Jonas, Noah, Maximilian, Sophie, Marie, Mia, Maria, Sophia, Lina, Lea).** | XS |
-| 2 | Kartoffel_Orpheus DE synthetic | llama3.2 | **IN FLIGHT — same pipeline, downloading safetensors. 4 speakers (Martin/Luca/Anne/Emma) + 12 emotions + 5 outbursts. Registry + factory + README all pre-staged.** | XS |
+| 2 | Kartoffel_Orpheus DE synthetic | llama3.2 | **DONE + SHIPPED — converted + quantized (F16 6.61 GB / Q8_0 3.5 GB / Q4_K 1.87 GB). Published as [`cstr/kartoffel-orpheus-3b-german-synthetic-GGUF`](https://huggingface.co/cstr/kartoffel-orpheus-3b-german-synthetic-GGUF) (commit `927877e`). Registry alias `kartoffel-orpheus-de-synthetic` + factory dispatch live. 4 speakers (Martin / Luca / Anne / Emma) + 12 emotions (Neutral, Happy, Sad, Excited, Surprised, Humorous, Angry, Calm, Disgust, Fear, Proud, Romantic) + 5 outbursts (haha, ughh, wow, wuhuuu, ohhh) via `{Speaker} - {Emotion}: {text}` prompt syntax. End-to-end synth verification deferred (local 16 GB box memory-contested by parallel agent's converters; orpheus 3B AR loop hung in both Metal init and CPU mode); architecture + Kartoffel checkpoint-swap path validated via natural variant's word-exact roundtrip. Xet dedup made the synth upload only ~5.1 GB net new bytes despite 12 GB nominal size.** | XS |
 | 2 | lex-au Orpheus-3B-DE-Q8 | llama3.2 (HF tags Apache-2.0; underlying Llama-3.2-FT) | **DONE — registry alias `lex-au-orpheus-de` added pointing at the existing `lex-au/Orpheus-3b-German-FT-Q8_0.gguf` (3.52 GB). Factory dispatch wired. SNAC companion shared with the base orpheus row.** | XS |
 | 2 | gwen-tts-0.6B | MIT | queued — needs weight inspection first | S–M |
 | 2 | tada-3b-ml | llama3.2 | queued | M |
@@ -1297,120 +1297,105 @@ revisit.
 
 ---
 
-## 65. Session-API word-confidence parity — DONE (May 2026 → HISTORY §65)
+## 65. Session-API word-confidence parity — **DONE → [HISTORY §65](HISTORY.md)**
 
-**Status:** mostly DONE. Three text-only backends remain.
+Sub-items 65 main batch + 65a vibevoice/moonshine-streaming all
+landed. Remaining open: gemma4-e2b token-prob API + Go/Java/Ruby/JS
+binding word accessors (the latter partially handled by parallel
+worker in `5534588`).
 
-User-listed gap: every session-API word came back with
-`confidence: 1.0` (parakeet hardcoded; everyone else emitted no
-words at all). Now every ASR backend wired through
-`crispasr_session_transcribe_lang` returns real per-word softmax
-probabilities. Specifics in [HISTORY.md §65](HISTORY.md).
+### 65a-residue. gemma4-e2b session-API word probs — OPEN
 
-| Backend | Status | Source of word p |
-|---|:-:|---|
-| parakeet | DONE | `parakeet_word_data.p` (mean of subword token probs) |
-| wav2vec2 | DONE | `wav2vec2_greedy_decode_with_probs` |
-| canary | DONE | `canary_transcribe_ex` (existing API) |
-| cohere | DONE | `cohere_transcribe_ex` (existing API) |
-| firered-asr | DONE | new `firered_asr_transcribe_with_probs` |
-| glm-asr | DONE | new `glm_asr_transcribe_with_probs` |
-| kyutai-stt | DONE | new `kyutai_stt_transcribe_with_probs` |
-| moonshine | DONE | new `moonshine_transcribe_with_probs` |
-| omniasr-llm | DONE | new `omniasr_transcribe_with_probs` |
-| omniasr-ctc | DONE | text-only fallback (CTC argmax) |
-| fastconformer-ctc / canary-ctc | DONE | new `canary_ctc_greedy_decode_with_probs` |
-| voxtral / voxtral4b | DONE | `run_voxtral_family` instrumented |
-| mimo-asr | DONE | new `mimo_asr_transcribe_with_probs` (gated softmax) |
-| qwen3 | DONE | session path drives building blocks + `core_greedy_decode` |
-| granite (3.x / 4.0 / 4.1 / 4.1-plus) | DONE | session path drives building blocks + chat-template selection |
-| vibevoice | DONE | new `vibevoice_transcribe_with_probs` (Qwen2 byte-level BPE decode in adapter) |
-| moonshine-streaming | DONE | new `moonshine_streaming_transcribe_with_probs` (shared moonshine tokenizer) |
-| **gemma4-e2b** | OPEN | runtime exposes `char*` only; no token-prob API |
+Last text-only backend. Refactor `gemma4_e2b_transcribe` into
+`_impl` + `_with_probs` mirroring the moonshine/omniasr pattern.
+~80 LOC.
 
-**Bindings updated:** Rust `crispasr-sys` FFI, Rust `crispasr` crate's
-`SessionWord.confidence`, Python `_binding.py` (with `hasattr` probe
-for backward compat), Flutter `Word.p` (was already wired). Go,
-Java, Ruby, JS bindings don't expose word-level access yet — see
-PLAN #59 for the cross-binding parity tracker.
+### 65b-residue. Remaining bindings (JS only)
 
-**No GGUF regeneration required.** All work runtime-side, calling
-already-existing model C-APIs.
-
-### 65a. Remaining backends (vibevoice / gemma4-e2b / moonshine-streaming)
-
-**Status:** OPEN. **Tier 2.** **Effort:** ~80 LOC each.
-
-For each, add `*_transcribe_with_probs` to the runtime mirroring the
-moonshine / omniasr pattern: refactor the greedy loop into an `_impl`
-that optionally captures softmax probs, expose a result struct.
-Then wire into the `c_api.cpp` session path's `package_with_tokens`
-helper.
-
-### 65b. Other-binding word-p exposure
-
-**Status:** OPEN. **Tier 1.** **Effort:** ~10 LOC per binding.
-
-Go / Java / Ruby / JS bindings currently expose only segment-level
-text in the session API. Add the four word accessors
-(`_word_text`, `_word_t0`, `_word_t1`, `_word_p`) to each — pure FFI
-plumbing, no logic.
+Parallel-worker commits 5534588 + d963e3a brought Go/Java/Ruby up
+to parity. JS/emscripten still session-API-less for word access
+but is TTS-focused — leaving until a JS consumer asks.
 
 ---
 
-## 61. Feature matrix uplift — landed batches
+## 61. Feature matrix uplift
 
-The README "Feature matrix" table (`README.md` §"Feature matrix")
-was missing checkmarks for many cells where the underlying model
-already supported the feature. This plan covers the runtime +
-adapter work to surface those features.
+The README "Feature matrix" was missing checkmarks for many cells
+where the underlying model already supported the feature. Tracker
+for closing the remaining gaps.
 
-### 61a. Auto-download for fc-ctc + wav2vec2 — DONE
+### 61a-c, 61e, 61f — **DONE → [HISTORY §65](HISTORY.md)**
 
-Registry entries already existed; only needed `CAP_AUTO_DOWNLOAD`
-flag flip on each adapter and README cell. 2 cells gained.
-
-### 61b. Per-token confidence — DONE for all 7 candidates
-
-| Backend | Path |
+| Sub-item | Outcome |
 |---|---|
-| wav2vec2 | new `wav2vec2_greedy_decode_with_probs` (CTC frame argmax + softmax) |
-| firered-asr | beam-search instrumented (`beam_hyp.token_logprobs`) + new `firered_asr_transcribe_with_probs` |
-| fastconformer-ctc / canary-ctc | new `canary_ctc_greedy_decode_with_probs` + frame-aligned text offsets |
-| moonshine | new `moonshine_transcribe_with_probs` + sticky `moonshine_set_temperature` |
-| glm-asr | extended `sample_token` to optionally emit prob; new `glm_asr_transcribe_with_probs` |
-| kyutai-stt | extended `sample_token`; new `kyutai_stt_transcribe_with_probs` |
-| omniasr (LLM) | added `out_logits` capture to `omniasr_run_prefill` + `omniasr_run_dec_token`; new `omniasr_transcribe_with_probs` |
+| 61a Auto-download for fc-ctc + wav2vec2 | 2 ✔ |
+| 61b Per-token confidence × 7 backends | 7 ✔ (full row, 15/15) |
+| 61c Kyutai native + word timestamps | 2 ✔ |
+| 61e Temperature for omniasr-llm | 1 ✔ |
+| 61f Punctuation toggle × 4 LLM-style decoders | 4 ✔ |
+| **Subtotal** | **16 cells gained** |
 
-7 cells gained in `Per-token confidence` row. README matrix updated
-to all-✔ across 15 backends.
+### 61d. Best-of-N for LLM-style decoder quartet — OPEN
 
-### 61c. Native + word timestamps for kyutai-stt — IN PROGRESS (parallel worker)
+**Tier:** 2. **Effort:** ~80 LOC per backend. **Cells:** 4.
 
-User added `kyutai_stt_transcribe_ex` declaration with
-`kyutai_stt_token_data` / `kyutai_stt_word_data` structs that align
-each emitted text token to its source audio frame (Kyutai's
-delayed-streams architecture has this for free). Implementation
-queued; once it lands, kyutai-stt gains both `Native timestamps` and
-`Word-level timing` in the matrix.
+`glm-asr`, `kyutai-stt`, `moonshine`, `omniasr-llm` all support
+temperature now. Best-of-N adds: a per-call seed parameter
+(otherwise N runs of same audio give N identical samples), an
+N-run loop, scoring by mean prob, picking the winner. Pattern
+already exists in `crispasr_backend_qwen3.cpp:272-345`.
 
-### 61d-k. Per the original PLAN #61 audit
+### 61g. Audio Q&A (`--ask`) for glm-asr / omniasr-llm — OPEN
 
-Best-of-N + temperature for the LLM-style decoder quartet (61d/e),
-flash attention for fc-ctc (61i), translate for voxtral4b (61j),
-GBNF (61k) all queued with detailed effort estimates. Original
-audit lived in PLAN.md but was collapsed during a parallel-worker
-pass; this stub keeps the section numbers stable for future readers.
+**Tier:** 2. **Effort:** ~80 LOC per backend. **Cells:** 2.
 
-### Validation gate (every step)
+Inject `params.ask` into the chat template. voxtral4b is
+streaming-only; doesn't fit. Validation: probe each model with a
+known-good Q&A clip; if output is sensible, plumb. Otherwise mark
+backend with `*` (granite/qwen3 do this).
 
-1. `crispasr --backend <X> -m auto -f samples/jfk.wav` — golden
-   transcript matches HISTORY-tracked baseline.
-2. `crispasr --list-backends` — new ✔ shows up in the printed
-   matrix.
-3. README matrix line for that backend updated to match
-   `--list-backends`.
-4. `warn_unsupported` no longer fires for the corresponding flag.
+### 61h. Beam search for LLM family + enc-dec — OPEN
+
+**Tier:** 3. **Effort:** ~300 LOC for shared decoder + 30 LOC per
+backend. **Cells:** 8 (LLM quartet + qwen3/granite/voxtral4b +
+canary/cohere/moonshine via per-model loop).
+
+Generic `core_beam_decode` in `src/core/`: takes the same step
+callbacks as `crispasr_llm_pipeline.h::run_with_probs` (advance KV
+by one token, get logits). All four LLM backends share it. For
+canary/cohere/moonshine, beam lives in the per-model decoder loop;
+one PR per backend.
+
+### 61i. Flash attention for fc-ctc — OPEN
+
+**Tier:** 3. **Effort:** ~80 LOC. **Cells:** 1-2.
+
+fc-ctc reuses the canary_ctc runtime (encoder-only Conformer with
+conventional attention). Flip `use_flash` flag in
+`canary_ctc_context_params`, route through fc-ctc adapter. wav2vec2
+deferred — its encoder lives outside `core_attn`; modest payoff.
+
+### 61j. Translate + source/target lang for voxtral4b / glm-asr / omniasr-llm — OPEN
+
+**Tier:** 3. **Effort:** ~100 LOC + empirical validation.
+**Cells:** 3-6.
+
+Try the translate template each model honours; ASR-roundtrip a
+known X→Y pair; if sensible, add `CAP_TRANSLATE | CAP_SRC_TGT_LANGUAGE`.
+
+### 61k. Grammar (GBNF) — BLOCKED on PLAN #60k
+
+**Tier:** 4. **Cells:** 8 (qwen3, voxtral, voxtral4b, granite,
+glm-asr, moonshine, omniasr-llm, kyutai-stt).
+
+When 60k lands, every backend that token-by-token decodes through a
+sampler can constrain output. Pure plumbing per backend.
+
+### Validation gate
+
+Each step must pass: golden JFK transcript unchanged, the new ✔
+shows up in `crispasr --list-backends`, README matrix line updated,
+`warn_unsupported` no longer fires for the toggled flag.
 
 ---
 

@@ -1805,10 +1805,92 @@ unchanged — that's why the granite path falls back to
 `granite_speech_audio_token_id()` returns `-1`.
 
 **Still open** (text-only in the session API; tracked in PLAN
-#65a): vibevoice, gemma4-e2b, moonshine-streaming. Each needs a
-`*_transcribe_with_probs` runtime addition mirroring the
-moonshine / omniasr pattern. Plus other-binding word-p exposure
-for Go / Java / Ruby / JS (PLAN #65b — pure FFI plumbing).
+#65a): gemma4-e2b. (vibevoice + moonshine-streaming were added in
+the same session, see below.) Plus other-binding word-p exposure
+for Go / Java / Ruby (parallel-worker `5534588`) and JS (still
+TTS-only, deferred).
+
+**61c kyutai native + word timestamps (parallel worker).**
+`kyutai_stt_transcribe_ex` returns per-token + per-word data with
+audio-frame-aligned timestamps via Kyutai's "delayed-streams"
+architecture: every emitted text token is associated with its
+source audio frame, so word boundaries fall out for free at the
+LM frame rate (12.5 Hz, with `audio_delay_seconds` lookahead
+subtraction). The adapter switched to this entry point and now
+declares `CAP_TIMESTAMPS_NATIVE | CAP_WORD_TIMESTAMPS`, lighting
+up two README cells.
+
+**61e omniasr-llm temperature.** The per-token-confidence work in
+this same batch had already added an `out_logits` capture path to
+`omniasr_run_prefill` + `omniasr_run_dec_token` (logits-mode graph
+instead of graph-baked argmax). Adding sampling on top was a thin
+extension: `omniasr_transcribe_llm` now takes a `pick_from_logits`
+lambda that does CPU argmax (when `temperature == 0`) or
+multinomial sampling from `softmax(logits / T)` with a
+deterministic per-call xorshift64 seed (when `temperature > 0`),
+overriding the helper's argmax pick. The captured probability is
+the softmax-with-temperature of whichever token we picked.
+Adapter wires `cp.temperature = params.temperature` and adds
+`CAP_TEMPERATURE`. Smoke test confirms `-tp 0.7` produces a
+different sample than greedy on a clean recording while keeping
+the transcript sensible.
+
+**61f punctuation toggle.** glm-asr / kyutai-stt / moonshine /
+omniasr-llm gained `--no-punctuation` via two new shared helpers
+in `examples/cli/crispasr_backend_utils.h`:
+
+- `crispasr_strip_ascii_punctuation(s)` — keeps ASCII letters /
+  digits / whitespace / any byte ≥ 0x80 (so multi-byte UTF-8
+  sequences pass through untouched). Collapses runs of multiple
+  spaces left behind by stripped punctuation. Trims leading /
+  trailing whitespace.
+- `crispasr_lowercase_ascii(s)` — ASCII-only `tolower`. Multi-byte
+  UTF-8 bytes pass through unchanged so non-Latin scripts aren't
+  corrupted.
+
+Each adapter applies both to `seg.text`, every `seg.tokens[i].text`,
+and (kyutai only) every `seg.words[i].text` when
+`!params.punctuation`. Capability bits gain `CAP_PUNCTUATION_TOGGLE`.
+4 cells in the README "Punctuation toggle" row.
+
+Smoke (moonshine):
+```
+default      → "And so my fellow-american asked not what your country can do for you, ask what you can do for your country."
+--no-punc    → "and so my fellowamerican asked not what your country can do for you ask what you can do for your country"
+```
+
+**65a vibevoice + moonshine-streaming.** Closes 2 of the 3 last
+text-only session-API backends. Pattern mirrors the previous batch:
+
+- `vibevoice` — refactored `vibevoice_transcribe` into
+  `vibevoice_transcribe_impl` with optional `out_token_ids` /
+  `out_token_probs`. `argmax` lambda became `pick(lg, out_p)` with
+  softmax gated on `capture_probs`. Vocab is ~152k Qwen2 — gating
+  is necessary so legacy text-only callers don't pay the
+  per-token softmax cost (matches the same pattern from mimo-asr).
+  Public C-API: `vibevoice_transcribe_with_probs`,
+  `vibevoice_result_free`, `vibevoice_token_text`. Session adapter
+  routes raw vocab pieces through `gpt2_byte_decode` (Qwen2
+  byte-level BPE Ġ→space, Ċ→newline) and the shared
+  `emit_words_from_tokens` helper, dropping `<|...|>` special
+  tokens.
+- `moonshine-streaming` — same refactor. New
+  `moonshine_streaming_transcribe_with_probs`, `_result_free`,
+  `_token_text`. The `_token_text` accessor reuses the shared
+  `moonshine_tokenizer::token_to_piece` (added during moonshine
+  proper's batch).
+
+Cleanup: the historical `run_char_transcribe` lambda in
+`crispasr_session_transcribe_lang` was removed. After this batch
+every backend either has a token-prob path or routes through the
+explicit text-only fallback block — the lambda was unreachable
+dead code.
+
+PLAN.md updated: §65 main batch + §65a vibevoice + moonshine-
+streaming marked DONE; gemma4-e2b alone remains as the last
+text-only session-API holdout. §61 audit updated with current
+DONE / OPEN status for each sub-item (61a-c/e/f DONE; 61d/g/h/i/j
+queued; 61k blocked on 60k).
 
 ### 66. Feature-matrix closure pass — sticky setters + streaming + mic + Go/Java/Ruby parity (May 2026)
 
