@@ -17,7 +17,7 @@ public:
     const char* name() const override { return "moonshine"; }
 
     uint32_t capabilities() const override {
-        return CAP_AUTO_DOWNLOAD | CAP_TOKEN_CONFIDENCE | CAP_TEMPERATURE | CAP_PUNCTUATION_TOGGLE;
+        return CAP_AUTO_DOWNLOAD | CAP_TOKEN_CONFIDENCE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_PUNCTUATION_TOGGLE;
         // Best-of-N is implemented in transcribe() as a sequential loop over
         // _transcribe_with_probs with a sticky seed. There's no CAP_BEST_OF_N
         // bit today; the matrix tracks it via README + adapter behaviour.
@@ -39,6 +39,7 @@ public:
             return out;
 
         moonshine_set_temperature(ctx_, params.temperature);
+        moonshine_set_beam_size(ctx_, params.beam_size > 0 ? params.beam_size : 1);
 
         // Best-of-N: when temperature > 0 and best_of > 1, run N seeded
         // decodes and keep the one with highest mean per-token softmax prob.

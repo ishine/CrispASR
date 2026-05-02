@@ -2,6 +2,8 @@
 #include "moonshine-impl.h"
 #include "moonshine-tokenizer.h"
 
+#include "core/beam_decode.h"
+
 #include "ggml.h"
 #include "gguf.h"
 #include "ggml-alloc.h"
@@ -31,6 +33,7 @@ struct moonshine_context {
 
     int n_threads = 4;
     float temperature = 0.0f; // 0 = greedy argmax; > 0 = multinomial sampling
+    int beam_size = 1;        // 1 = greedy/sampled; >1 = beam search (deterministic)
     // Sticky per-call seed override for best-of-N. 0 = derive deterministically
     // from the input audio buffer (the historical default — repeated calls
     // with the same input give identical samples). Non-zero values let the
@@ -993,7 +996,97 @@ static int moonshine_transcribe_impl(struct moonshine_context* ctx, const float*
     }
 
     // 5. Decode loop. Picks via argmax when temperature == 0, otherwise
-    // softmax(logits/T) + multinomial sample.
+    // softmax(logits/T) + multinomial sample. Beam search (beam_size > 1)
+    // takes a separate path below — it ignores temperature and always
+    // returns the highest cumulative-log-prob hypothesis.
+    if (ctx->beam_size > 1) {
+        // 5a. Prefill BOS to populate slot 0 + capture initial logits.
+        std::vector<float> bos_logits;
+        ret = moonshine_decode_step(ctx, (int32_t)hp.bos_token_id, bos_logits, gallocr);
+        if (ret != 0) {
+            ggml_gallocr_free(gallocr);
+            ctx->kv_self.reset();
+            ctx->kv_cross.reset();
+            return ret;
+        }
+
+        // 5b. KV snapshot helpers — branched beam needs each beam to fork
+        // its own KV state. moonshine's kv_self.k[il] / v[il] are per-layer
+        // tensors of shape [head_dim, max_len, n_kv_heads]; we snapshot the
+        // full tensor (small — single-MB total for the 8L Tiny model). The
+        // self-attention KV is the only state that diverges between beams;
+        // kv_cross is precomputed once and shared across beams via ctx.
+        struct moonshine_kv_snap {
+            int n;
+            std::vector<std::vector<uint8_t>> k_data;
+            std::vector<std::vector<uint8_t>> v_data;
+        };
+        auto save = [](moonshine_context* c) -> moonshine_kv_snap* {
+            auto* s = new moonshine_kv_snap();
+            s->n = c->kv_self.n;
+            const int L = (int)c->kv_self.k.size();
+            s->k_data.resize((size_t)L);
+            s->v_data.resize((size_t)L);
+            for (int il = 0; il < L; il++) {
+                size_t kb = ggml_nbytes(c->kv_self.k[il]);
+                size_t vb = ggml_nbytes(c->kv_self.v[il]);
+                s->k_data[(size_t)il].resize(kb);
+                s->v_data[(size_t)il].resize(vb);
+                ggml_backend_tensor_get(c->kv_self.k[il], s->k_data[(size_t)il].data(), 0, kb);
+                ggml_backend_tensor_get(c->kv_self.v[il], s->v_data[(size_t)il].data(), 0, vb);
+            }
+            return s;
+        };
+        auto restore = [](moonshine_context* c, moonshine_kv_snap* s) {
+            c->kv_self.n = s->n;
+            const int L = (int)c->kv_self.k.size();
+            for (int il = 0; il < L; il++) {
+                ggml_backend_tensor_set(c->kv_self.k[il], s->k_data[(size_t)il].data(), 0,
+                                        s->k_data[(size_t)il].size());
+                ggml_backend_tensor_set(c->kv_self.v[il], s->v_data[(size_t)il].data(), 0,
+                                        s->v_data[(size_t)il].size());
+            }
+        };
+        auto snap_free = [](moonshine_kv_snap* s) { delete s; };
+        std::vector<float> step_logits_buf;
+        auto step = [&step_logits_buf, gallocr](moonshine_context* c, int32_t tok, int /*n_past*/) -> float* {
+            // n_past is implicit in c->kv_self.n (set by restore_fn just
+            // before this call). decode_step uses it directly.
+            if (moonshine_decode_step(c, tok, step_logits_buf, gallocr) != 0)
+                return nullptr;
+            const int V = (int)c->model.hparams.vocab_size;
+            float* out = (float*)std::malloc((size_t)V * sizeof(float));
+            std::memcpy(out, step_logits_buf.data(), (size_t)V * sizeof(float));
+            return out;
+        };
+
+        core_beam_decode::Config cfg;
+        cfg.max_new_tokens = max_len - 1;
+        cfg.eos_id = (int)hp.eos_token_id;
+        cfg.vocab_size = (int)hp.vocab_size;
+        cfg.beam_size = ctx->beam_size;
+        cfg.prompt_len = 1; // BOS occupies slot 0
+
+        auto r = core_beam_decode::run_with_probs_branched(ctx, bos_logits.data(), save, restore, snap_free, step, cfg);
+
+        for (size_t i = 0; i < r.tokens.size(); i++) {
+            if (r.tokens[i] == (int32_t)hp.eos_token_id)
+                break;
+            out_tokens.push_back(r.tokens[i]);
+            if (out_token_probs)
+                out_token_probs->push_back(r.probs[i]);
+        }
+
+        auto t_decode_done = std::chrono::high_resolution_clock::now();
+        ctx->timing.decode_ms = std::chrono::duration<double, std::milli>(t_decode_done - t_encode_done).count();
+        ctx->timing.n_tokens = (int)out_tokens.size();
+
+        ggml_gallocr_free(gallocr);
+        ctx->kv_self.reset();
+        ctx->kv_cross.reset();
+        return 0;
+    }
+
     int32_t token = (int32_t)hp.bos_token_id;
     std::vector<float> logits((size_t)hp.vocab_size);
     const float T = ctx->temperature;
@@ -1151,6 +1244,11 @@ extern "C" void moonshine_set_temperature(struct moonshine_context* ctx, float t
 extern "C" void moonshine_set_seed(struct moonshine_context* ctx, uint64_t seed) {
     if (ctx)
         ctx->seed_override = seed;
+}
+
+extern "C" void moonshine_set_beam_size(struct moonshine_context* ctx, int beam_size) {
+    if (ctx)
+        ctx->beam_size = (beam_size > 0) ? beam_size : 1;
 }
 
 extern "C" const char* moonshine_token_text(struct moonshine_context* ctx, int token_id) {

@@ -39,6 +39,12 @@ void moonshine_set_temperature(struct moonshine_context* ctx, float temperature)
 // from the same audio by injecting a run-index salt.
 void moonshine_set_seed(struct moonshine_context* ctx, uint64_t seed);
 
+// Sticky beam size for the decoder. 1 = greedy/sampled (default). >1 = beam
+// search via per-beam KV snapshot/restore (O(B × T) single-token forwards).
+// Beam search is mutually exclusive with temperature sampling — the beam
+// path always picks deterministically by cumulative log-prob.
+void moonshine_set_beam_size(struct moonshine_context* ctx, int beam_size);
+
 // Single-token piece lookup. The returned pointer is owned by the context
 // and stable until the next call to this function. Returns empty string
 // for special tokens / out-of-range ids.
