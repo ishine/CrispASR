@@ -24,7 +24,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
 | **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | TTS surface (incl. qwen3-tts variants) at full parity across all 7 wrappers; align/diarize/VAD/streaming/punctuation/LID/registry still C-ABI-only on Go/Java/Ruby/JS/Dart |
-| **MEDIUM** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | Phased | T1 madvise WILLNEED DONE; T2 Fused QKV + KV quantization next; T3 mlock/spec-decode/GBNF parked |
+| **MEDIUM** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | 14 items | 60a madvise WILLNEED DONE; 60b/c/d/e/f/g OPEN; 60h-n parked/skip — see sub-table |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
 | **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | |
 | **LOW** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | |
@@ -1242,147 +1242,281 @@ for the pattern: `4f476c3` (TTS surface sweep) and `65e0a61`
 
 ## 60. Cross-backend perf tricks (llama.cpp / llamafile ports)
 
-Catalogue of optimizations from upstream llama.cpp + Justine Tunney's
-llamafile that we could pull into our fork. Prioritized by ROI for our
-specific shape: Apple Silicon M1, 16 GB RAM, 7B-class speech-LLMs
-(MiMo-ASR, qwen3-asr, voxtral4b), often-contested external disk.
+Catalogue of optimizations worth porting from upstream llama.cpp +
+Justine Tunney's llamafile, broken into discrete actionable items
+(60a, 60b, …). Prioritized for our specific shape: Apple Silicon M1,
+16 GB RAM, 7B-class speech-LLMs (MiMo-ASR, qwen3-asr, voxtral4b),
+often-contested external disk.
 
-### Tier 1 — directly attacks the cold-start page-fault wall
+| Item | Status | Tier | Effort | Notes |
+|---|---|---|---|---|
+| [60a — madvise WILLNEED](#60a-posix_madvisewillneed-on-mmapd-weights) | **DONE** | T1 | done | Async kernel readahead, both mmap branches |
+| [60b — wrap_iface forward-compat](#60b-wrap_iface-forward-compat-set_tensor_2d--get_tensor_2d--reset) | **OPEN** | T1 | XS | 3 missing iface delegations |
+| [60c — pre-touch / `--preload` flag](#60c-pre-touch--preload-flag) | **OPEN** | T1 | S | Force pages resident at load |
+| [60d — Fused QKV per LM layer](#60d-fused-qkv-per-lm-layer) | **OPEN** | T2 | M | mimo-asr first; qwen3-asr / voxtral4b later |
+| [60e — KV cache quantization](#60e-kv-cache-quantization-f16--q8_0--q4_0) | **OPEN** | T2 | M | Long-form ASR enabler |
+| [60f — `--mlock` flag](#60f---mlock-flag) | **OPEN** | T3 | XS | Opt-in for users with headroom |
+| [60g — `MADV_RANDOM` post-prefill](#60g-madv_random-post-prefill) | **OPEN** | T3 | XS | Disable readahead during decode |
+| [60h — Linux huge pages](#60h-linux-huge-pages-map_hugetlb) | PARKED | T3 | S | Linux-only; we don't have Linux production targets |
+| [60i — Read-only mmap mode](#60i-read-only-mmap-mode) | PARKED | T3 | XS | Per-backend; safety net not yet needed |
+| [60j — Speculative decoding](#60j-speculative-decoding) | PARKED | T3 | L | No obvious draft model in our family |
+| [60k — GBNF grammar-constrained decode](#60k-gbnf-grammar-constrained-decoding) | PARKED | T3 | M | No structured-output consumer yet |
+| [60l — tinyBLAS x86 kernels](#60l-tinyblas-llamafile-specific) | SKIP | T3 | — | Not relevant on Apple Silicon |
+| [60m — APE multi-arch binary](#60m-ape-multi-arch-binary-llamafile-specific) | SKIP | T3 | — | Distribution, not perf |
+| [60n — CUDA graphs](#60n-cuda-graphs--cuda-specific) | SKIP | T3 | — | We don't ship a CUDA backend |
 
-#### ~~`posix_madvise(POSIX_MADV_WILLNEED)` after mmap~~ — **DONE (May 2026)**
+**Tiers:** T1 = directly attacks cold-start / loader. T2 = decode-time
+speedup, work-order calls out. T3 = situational / parked / skip.
 
-When `CRISPASR_GGUF_MMAP=1` is set, we now hint the kernel to start
-async readahead of the entire mmap'd weight region in both the CPU
-and Metal mmap branches. Without this, every first access during
-prefill triggered a synchronous page fault (~5-10 ms each on a
-99%-full external disk hit during PLAN #51c F16 testing). Mirrors
-llama.cpp's `llama_mmap` populate path. Windows-skip (`PrefetchVirtualMemory`
-is a Win8+ shim we can add later). Both branches in
-`src/core/gguf_loader.cpp::load_weights`.
+**Suggested order if asked to ship "the next batch":**
+60d (Fused QKV) → 60b (iface forward-compat) → 60e (KV quant) →
+60c (preload flag) → 60f (--mlock) → 60g (MADV_RANDOM).
 
-#### Optional pre-touch / `--mlock`-style flag
+---
 
-The next step beyond `WILLNEED`: an opt-in mode that *forces* every
-page resident before `load_weights` returns. Two implementation
-options:
+### 60a. `posix_madvise(WILLNEED)` on mmap'd weights — **DONE (May 2026)**
 
-- **Linux `MADV_POPULATE_READ`** — single syscall, kernel walks the
-  region for us. Doesn't exist on macOS.
-- **Page-walk read loop** — `for (off = 0; off < size; off += pagesize) { volatile char x = base[off]; }`. Portable but blocks the
-  loader until everything is paged in. On a 16 GB box loading a
-  16 GB F16 weight, this just *moves* the wait from compute time to
-  load time and may evict everything else; useful for benchmarking
-  or for users with enough RAM to mlock comfortably.
+**Status:** DONE. Commit `f1f4bce`.
 
-Effort: ~10 LOC in `core_gguf::load_weights` mmap branches, gated
-on `CRISPASR_GGUF_PRELOAD=1`. Add `--preload` and `--mlock` CLI
-flags later if usage justifies them.
+When `CRISPASR_GGUF_MMAP=1` is set, both the CPU and Metal mmap
+branches now call `posix_madvise(POSIX_MADV_WILLNEED)` on the entire
+mmap'd weight region. Hints the kernel to start async readahead so
+the first access during prefill doesn't synchronously page-fault
+(~5-10 ms each on a 99%-full external disk we hit during PLAN #51c
+F16 testing). Mirrors llama.cpp's `llama_mmap` populate path.
 
-### Tier 2 — decode-time speedup, work-order calls out
+**Files touched:** `src/core/gguf_loader.cpp` (16 LOC, both mmap branches).
+**Open follow-up:** Windows `PrefetchVirtualMemory` (Win8+) — see 60c.
 
-#### Fused QKV per LM layer (mimo-asr first, then qwen3-asr, voxtral4b)
+---
+
+### 60b. wrap_iface forward-compat: `set_tensor_2d` / `get_tensor_2d` / `reset`
+
+**Status:** OPEN. **Effort: XS (~15 LOC).** **Tier 1.**
+
+The Metal mmap path's `mmap_wrap_iface` in `src/core/gguf_loader.cpp`
+delegates `free_buffer` / `get_base` / `init_tensor` / `memset_tensor`
+/ `set_tensor` / `get_tensor` / `cpy_tensor` / `clear` to the inner
+Metal buffer, but leaves three optional iface methods as `nullptr`:
+
+- `set_tensor_2d`
+- `get_tensor_2d`
+- `reset`
+
+If ggml ever dispatches these on a wrapped buffer (e.g., a future
+Metal kernel that batches strided 2D uploads more efficiently), the
+scheduler silently falls back to N×`set_tensor` calls instead of
+the optimized inner path. Forward-compat fix: add three delegating
+shims in the same shape as the existing wrappers.
+
+**Files to touch:** `src/core/gguf_loader.cpp` (one new function each
++ wire into `mmap_wrap_iface` struct).
+
+---
+
+### 60c. Pre-touch / `--preload` flag
+
+**Status:** OPEN. **Effort: S (~10 LOC + CLI plumbing).** **Tier 1.**
+
+The next step beyond 60a's `WILLNEED` hint: an opt-in mode that
+*forces* every page resident before `load_weights` returns, so
+prefill never blocks on a page fault.
+
+Two implementation paths:
+
+- **Linux `MADV_POPULATE_READ`** — single syscall, kernel walks
+  the region for us. Doesn't exist on macOS.
+- **Page-walk read loop** (portable) — `for (off = 0; off < size; off += pagesize) { volatile char x = base[off]; }`. Blocks the
+  loader until everything is paged in.
+
+Trade-off: on a 16 GB box loading a 16 GB F16, preloading just
+*moves* the wait from compute time to load time and may evict
+everything else from cache. Useful for benchmarking and for users
+with comfortable headroom (mlock — see 60f — is the stronger
+version).
+
+**Files to touch:** `src/core/gguf_loader.cpp` (mmap branches),
+gated on `CRISPASR_GGUF_PRELOAD=1`. Add CLI `--preload` flag in
+`examples/cli/whisper_params.h` later if usage justifies it.
+
+---
+
+### 60d. Fused QKV per LM layer
+
+**Status:** OPEN. **Effort: M (~80 LOC + converter + GGUF re-upload).** **Tier 2.**
 
 The work order's "small wins to consider opportunistically" for
 PLAN #51 already lists this. Save 2 matmuls per layer × 36 layers
 × N steps by writing one `attn_qkv.weight = concat(Q,K,V)` of
 shape `[d, (n_q + 2*n_kv) * hd]` and feeding it to
 `core_attn::kv_self_attn` via the existing `qkv_w` parameter
-(qwen3-tts already uses this path). Probably another **1.1-1.2×
-per-step decode** on top of 51b/b'.
+(qwen3-tts already uses this path).
 
-Files to touch:
+Probably another **1.1-1.2× per-step decode** on top of 51b/b'.
+
+**Files to touch (mimo-asr first):**
 - `models/convert-mimo-asr-to-gguf.py` — fuse Q/K/V tensors per
   LM layer at convert time (write one combined tensor per layer
-  instead of three). Old GGUFs would still work via a fallback
-  path at load time that re-fuses on the fly (or runtime detects
-  whichever is present). Re-upload `cstr/mimo-asr-GGUF` with the
-  new layout.
+  instead of three).
 - `src/mimo_asr.cpp` — load `attn_qkv.weight` per LM layer if
-  present; pass through to `core_attn::kv_self_attn(..., qkv_w=fused, ...)`.
+  present; pass through to
+  `core_attn::kv_self_attn(..., qkv_w=fused, ...)`.
+- Re-upload `cstr/mimo-asr-GGUF` with the new layout. Keep a
+  fallback in `mimo_asr_init_from_file` that detects unfused Q/K/V
+  in old GGUFs and runs the slow path so existing downloads keep
+  working.
 
-Effort: ~50 LOC runtime + 30 LOC converter + GGUF re-upload.
-Same shape applies to qwen3-asr (28L Qwen3) and voxtral4b (26L
-Mistral) — port the pattern once it's validated on mimo-asr.
+**Port pattern to:** qwen3-asr (28L Qwen3), voxtral4b (26L Mistral)
+once validated on mimo-asr. Same shape; ~30 LOC each.
 
-#### KV cache quantization (F16 → Q8_0 or Q4_0)
+---
+
+### 60e. KV cache quantization (F16 → Q8_0 / Q4_0)
+
+**Status:** OPEN. **Effort: M (~200 LOC, shared-code surgery).** **Tier 2.**
 
 llama.cpp ships `--kv-quant-type k Q8_0` etc. Halves (Q8_0) or
 quarters (Q4_0) KV memory with near-zero quality loss for ASR.
 Currently our `kv_max_ctx` for mimo-asr is capped by the
-`mimo_asr_kv_init(prompt_groups + max_new + 16)` budget — with
-F16 KV at 36 layers × 8 KV heads × 128 head_dim × 369 ctx ≈
-**~57 MB**. Q8_0 would drop that to ~28 MB. Not load-bearing for
-JFK (11s) but essential for hour-long podcast ASR where
-`max_ctx` would balloon past 10k groups (~1.5 GB F16 KV).
+`mimo_asr_kv_init(prompt_groups + max_new + 16)` budget — with F16
+KV at 36 layers × 8 KV heads × 128 head_dim × 369 ctx ≈ **~57 MB**.
+Q8_0 would drop that to ~28 MB.
 
-Files to touch (substantially):
+Not load-bearing for JFK (11 s). **Essential for hour-long podcast
+ASR** where `max_ctx` balloons past 10k groups (~1.5 GB F16 KV).
+
+**Files to touch:**
 - `src/core/attention.h` — `core_attn::kv_self_attn` currently
   hardcodes `GGML_TYPE_F16` for the K/V views. Add a `kv_dtype`
   parameter; the read path needs `ggml_dequantize_row` shims for
-  Q8_0/Q4_0.
+  Q8_0 / Q4_0.
 - Each backend that allocates KV (`mimo_asr_kv_init`,
-  `qwen3_asr_kv_init`, `voxtral4b_kv_init`, etc.) — opt into
-  the smaller dtype via env (`CRISPASR_KV_QUANT=q8_0`) or per-backend.
+  `qwen3_asr_kv_init`, `voxtral4b_kv_init`, etc.) — opt into the
+  smaller dtype via env (`CRISPASR_KV_QUANT=q8_0`) or per-backend.
 
-Effort: **Medium** (~200 LOC, touches `core_attn` shared by ~10
-backends). Land behind env flag; flip default per backend after
-validation.
+Land behind env flag; flip default per backend after diff-harness
+cosine validation. Touches ~10 backends shared via `core_attn` —
+needs the same broad-backend gauntlet as PLAN #51a.
 
-### Tier 3 — distribution / quality / future
+---
 
-#### `--mlock` flag (proper)
+### 60f. `--mlock` flag
 
-Not just "preload pages" — actually call `mlock()` to pin them
-in physical RAM, preventing eviction under memory pressure.
-Risky on 16 GB with a 16 GB model (would starve the rest of the
-system); useful as opt-in for users with 32+ GB. Add `--mlock`
-CLI flag mapped to a `CRISPASR_MLOCK=1` env. ~15 LOC.
+**Status:** OPEN. **Effort: XS (~15 LOC).** **Tier 3.**
 
-#### Speculative decoding (target + draft)
+Not just "preload pages" (60c) — actually call `mlock()` to pin
+weights in physical RAM, preventing eviction under memory pressure.
+The strongest form of the cold-start mitigation chain
+(WILLNEED → preload → mlock).
+
+Risky on 16 GB with a 16 GB model — would starve the rest of the
+system. Useful as opt-in for users with 32+ GB. Add `--mlock` CLI
+flag mapped to `CRISPASR_MLOCK=1` env.
+
+**Files to touch:** `src/core/gguf_loader.cpp` (mmap branches, after
+WILLNEED), `examples/cli/whisper_params.h` (`--mlock` flag).
+
+---
+
+### 60g. `MADV_RANDOM` post-prefill
+
+**Status:** OPEN. **Effort: XS (~5 LOC + plumbing for the hook).** **Tier 3.**
+
+`WILLNEED` (60a) hints "I'll need this soon" — good for prefill which
+walks weights layer-by-layer. After prefill, decode is small (T=1)
+but revisits all 36 layers per step in a non-sequential access
+pattern. `MADV_RANDOM` would tell the kernel to disable readahead,
+so it doesn't waste IO speculatively prefetching pages we won't
+sequentially access.
+
+Diminishing returns: if all weights are already resident after
+prefill (for models that fit in RAM), readahead doesn't matter.
+If they're not (16 GB model on 16 GB box), pages get evicted
+between layer accesses anyway, and `MADV_RANDOM` hints the kernel
+toward a different (possibly worse) eviction policy. Worth
+benchmarking before enabling by default.
+
+**Files to touch:** new method on `mmap_buffer_ctx` /
+`mmap_wrap_ctx` that callers can invoke after prefill completes.
+Mimo-asr would call it from `mimo_asr_transcribe` between prefill
+and the decode loop.
+
+---
+
+### 60h. Linux huge pages (`MAP_HUGETLB`)
+
+**Status:** PARKED. **Tier 3.**
+
+mmap with `MAP_HUGETLB` reduces TLB misses ~10% on big models.
+Doesn't exist on macOS. Not currently a Linux production target —
+revisit if/when we ship a Linux-first packaging target.
+
+---
+
+### 60i. Read-only mmap mode
+
+**Status:** PARKED. **Tier 3.**
+
+Currently `MappedFile` opens with `MAP_PRIVATE + PROT_READ|PROT_WRITE`
+(copy-on-write writable). Some backends (parakeet's BN-into-conv
+fold) need the writable path. For backends that don't mutate
+weights, `PROT_READ` would catch accidental mutation as a SIGSEGV
+instead of silent CoW. Could gate per-backend in
+`core_gguf::load_weights` later. Safety net, not perf.
+
+---
+
+### 60j. Speculative decoding
+
+**Status:** PARKED. **Tier 3.** **Reason:** no obvious draft model.
 
 llama.cpp's main throughput trick for autoregressive generation:
 small "draft" model proposes 4-8 tokens, large "target" model
 verifies in one prefill. Typical 2-3× decode speedup with no
 quality loss when draft acceptance rate is high.
 
-For our family, no obvious draft model exists for mimo-asr
-(7.5B, 36L Qwen2). Could investigate using qwen3-asr-0.6B as a
-drafter — but it's a different tokenizer, vocab, and audio
-preprocessing stack. Not worth the complexity unless someone
-specifically asks for it.
+For our family, no obvious draft model exists for mimo-asr (7.5B,
+36L Qwen2). Could investigate using qwen3-asr-0.6B as a drafter,
+but it's a different tokenizer / vocab / audio preprocessing
+stack. Not worth the complexity unless someone specifically asks.
 
-#### Grammar-constrained decoding (GBNF)
+---
 
-Useful for structured outputs (JSON, fixed-format timestamps,
-PII redaction templates). Not for raw transcription. Park this
-until a consumer asks.
+### 60k. GBNF grammar-constrained decoding
 
-#### tinyBLAS (llamafile-specific)
+**Status:** PARKED. **Tier 3.** **Reason:** no consumer.
+
+Useful for structured ASR outputs (JSON, fixed-format timestamps,
+PII redaction templates). Not for raw transcription. Park until a
+consumer asks.
+
+---
+
+### 60l. tinyBLAS (llamafile-specific)
+
+**Status:** SKIP. **Tier 3.** **Reason:** wrong target architecture.
 
 Justine Tunney's bespoke x86 quantized matmul kernels. Faster
-than llama.cpp's reference quants on certain CPUs. **Not relevant
-for us** — Apple Silicon Metal kernels are already fast, and our
-x86 paths are CI-only (no production users on x86 yet).
+than llama.cpp's reference quants on certain CPUs. Apple Silicon
+Metal kernels are already fast, and our x86 paths are CI-only
+(no production users on x86 yet). Skip.
 
-#### APE multi-arch single-file binary (llamafile-specific)
+---
 
-Cosmopolitan libc trick — one binary runs on Linux/macOS/Windows.
-Distribution win, not perf. Skip until we ship a packaged binary
-to end users.
+### 60m. APE multi-arch binary (llamafile-specific)
 
-#### CUDA graphs / CUDA-specific
+**Status:** SKIP. **Tier 3.** **Reason:** distribution trick, not perf.
+
+Cosmopolitan libc — one binary runs on Linux/macOS/Windows. Skip
+until we ship a packaged binary to end users (currently we ship
+source + per-platform builds in CI).
+
+---
+
+### 60n. CUDA graphs / CUDA-specific
+
+**Status:** SKIP. **Tier 3.** **Reason:** wrong backend.
 
 Doesn't apply to Metal. If we ever ship a CUDA backend (not
 currently a target — we use ggml-cuda for build-time only),
 revisit.
-
-### Suggested order
-
-If asked to ship "the next batch of perf wins":
-1. Tier 2 Fused QKV — concrete, work order calls it out, ~80 LOC.
-2. Tier 1 pre-touch flag — ~10 LOC, helpful for benchmarking.
-3. Tier 2 KV quantization — bigger surgery, only urgent for long-form.
-4. Tier 3 `--mlock` — small but only useful for users with headroom.
-
-Skip: tinyBLAS, APE, speculative decoding, GBNF — until concrete
-demand.
