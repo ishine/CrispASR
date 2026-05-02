@@ -28,7 +28,7 @@ jobs:
       - name: Build
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_OPENBLAS=ON
-          cmake --build build --target crispasr crispasr-quantize -j $(nproc)
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(nproc)
 
       - name: Package
         run: |
@@ -118,7 +118,7 @@ jobs:
       - name: Build
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_METAL=ON
-          cmake --build build --target crispasr crispasr-quantize -j $(sysctl -n hw.logicalcpu)
+          cmake --build build --target crispasr-cli crispasr-quantize -j $(sysctl -n hw.logicalcpu)
 
       - name: Package
         run: |
@@ -148,7 +148,7 @@ jobs:
             -DBUILD_SHARED_LIBS=OFF `
             -DGGML_NATIVE=OFF `
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
-          cmake --build build --config Release --target crispasr crispasr-quantize -j $env:NUMBER_OF_PROCESSORS
+          cmake --build build --config Release --target crispasr-cli crispasr-quantize -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
         run: |
@@ -182,7 +182,7 @@ jobs:
             -DGGML_NATIVE=OFF `
             -DGGML_AVX2=OFF -DGGML_FMA=OFF -DGGML_F16C=OFF `
             -DGGML_AVX=ON
-          cmake --build build --config Release --target crispasr crispasr-quantize -j $env:NUMBER_OF_PROCESSORS
+          cmake --build build --config Release --target crispasr-cli crispasr-quantize -j $env:NUMBER_OF_PROCESSORS
 
       - name: Package
         run: |
@@ -230,7 +230,7 @@ jobs:
             -DCMAKE_CUDA_ARCHITECTURES="75-real;86-real;89-real;120-real;120-virtual" ^
             -DGGML_NATIVE=OFF ^
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
-          cmake --build build --target crispasr crispasr-quantize -j %NUMBER_OF_PROCESSORS%
+          cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
       - name: Package (binary + DLLs + CUDA runtime)
         shell: pwsh
@@ -280,7 +280,7 @@ jobs:
             -DGGML_CUDA=OFF ^
             -DGGML_NATIVE=OFF ^
             -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON
-          cmake --build build --target crispasr crispasr-quantize -j %NUMBER_OF_PROCESSORS%
+          cmake --build build --target crispasr-cli crispasr-quantize -j %NUMBER_OF_PROCESSORS%
 
       - name: Package (binary + DLLs)
         shell: pwsh
