@@ -7182,6 +7182,56 @@ model where matmul time dwarfs launch overhead, or a smaller-quant
 weight where the input re-read becomes proportionally significant
 might still benefit.
 
+## Lesson — Metal's single GPU queue makes "decoder thread" mostly an API affordance, not a perf win, on Apple-Silicon
+
+PLAN #7 phase 4 added a decoder worker thread to voxtral4b streaming.
+The naïve hope: encoder runs on main thread, decoder runs on worker
+thread, total wall-clock = max(encoder, decoder) instead of sum.
+**Measured on M1: zero wall-clock improvement.** PTT/LIVE-single-
+thread/LIVE+decoder-thread all land within ±100 ms on JFK 11 s.
+
+Why: Metal exposes one GPU command queue per device. ggml's Metal
+backend submits compute kernels into that queue via command buffers.
+Two threads submitting via separate `ggml_backend_sched_compute`
+calls still funnel into the same queue, which executes them in
+submission order. There's no kernel-level parallelism on M1's
+8-core GPU — concurrent compute submissions serialize.
+
+**The architecture is still worth shipping** because:
+
+1. **Mic-driven workloads.** When the audio source is paced (a real
+   microphone delivering ~80 ms chunks at audio rate), the decoder
+   thread drains decode during the natural gaps between feeds. The
+   main thread can return from feed() without waiting for the entire
+   decode loop, keeping the audio queue from backing up.
+
+2. **Faster GPUs.** M3 Ultra (76-core GPU), NVIDIA, AMD — these have
+   real kernel-level parallelism. Two compute submissions to
+   different command buffers actually run concurrently across SIMD-
+   groups. The same code that's a no-op on M1 becomes a
+   30-40 % wall-clock win on M3 Ultra (estimated).
+
+3. **API ergonomics.** Even on M1, callers get a non-blocking feed:
+   `stream.feed(pcm); return` instead of `stream.feed(pcm); wait
+   for decode; return`. For UI-driven applications (display
+   progressive captions in a TextField), this matters even when
+   the underlying compute is serialized.
+
+**Generalisable rule.** Threading a compute pipeline only delivers
+parallel-execution wins when the underlying device exposes that
+parallelism. On a single-queue GPU, threads buy you API smoothness
+(non-blocking returns, separate concerns) but not throughput. Don't
+expect throughput wins until you've measured the device's
+multi-stream capacity.
+
+For dual-sched true parallelism on devices that support it: PLAN #7
+phase 5 (deferred). Two `ggml_backend_sched` instances on the same
+backend, each with its own graph allocation buffer. Each submits to
+the Metal queue independently; on a multi-stream GPU they overlap.
+~150 LOC + per-call routing in voxtral4b_run_llm_kv. Defer until a
+consumer measures actual M3 Ultra (or NVIDIA) gain that justifies
+the LOC.
+
 ## Lesson — audio-injection prompt models give live captions for free; encoder-decoder models don't
 
 PLAN #7 phase 3 shipped voxtral4b live captions in ~150 LOC with no

@@ -24,7 +24,7 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | **HIGH** | [#62 Streaming + mic library API](#62-streaming--mic-library-api) | M-L | crispasr_stream_* whisper-only; needs Python/Rust wrappers (Dart has), generalize to session handle, library-level mic via miniaudio, native streaming for moonshine-streaming + kyutai-stt + voxtral4b |
 | **MEDIUM** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | 14 items | 60a/b/c/d/f/g DONE; 60e env-flag wired across 9 backends (mimo-asr validated, others awaiting per-backend cosine pass); 60h-n parked/skip |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
-| **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | phase 1 + 1.5 + 2 + 3 SHIPPED (incremental encoder, bit-exact-batch, 240ms chunks, fused QKV LLM, combined-chunk flush, speculative prefill, **live captions during speech** with progressive get_text); phase 4 (decoder thread) deferred |
+| **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | phase 1 + 1.5 + 2 + 3 + 4 SHIPPED (incremental encoder, bit-exact-batch, 240ms chunks, fused QKV LLM, combined-chunk flush, speculative prefill, **live captions during speech**, **decoder thread**) |
 | **LOW** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | |
 | **LOW** | [#11 WebSocket server](#11-websocket-streaming-server) | High | |
 | **BLOCKED** | [#42 VibeVoice-ASR 7B](#42-vibevoice-asr-7b) | High | Needs ≥16 GB RAM |
@@ -271,18 +271,51 @@ to encoder) would fix this. Today's path is useful for:
 faster-than-realtime offline streaming, post-utterance live
 caption rendering, and as the substrate for phase 4.
 
-### Phase 4 (deferred) — decoder thread for true realtime live captions
+### Phase 4 — SHIPPED — decoder thread (May 2026)
 
-- **Decoder thread overlapping audio injection.** Encoder runs on
-  one thread; decoder consumes audio_embeds from a queue on another.
-  Total per-100ms-chunk wall-clock = max(100ms encoder, 50ms decode)
-  = 100ms = 1.0× realtime. Enables live captions on live mic input.
-  ~200 LOC of cross-thread sync (audio-thread → encode-thread →
-  decode-thread → main-thread for get_text).
+**Optional worker thread** that drains decode steps in the background
+while feed() handles encoder + projector on the main thread. Enable
+via `CRISPASR_VOXTRAL4B_STREAM_DECODER_THREAD=1` (implies live mode).
+
+**Architecture:**
+- `worker_thread` sleeps on `cond_var` until shutdown OR
+  audio_embeds grow past decode_adapter_pos
+- feed() acquires `sched_mutex` around encoder/projector/prefill,
+  then notifies cond_var so worker picks up new audio_embeds
+- worker drains under sched_mutex + decode_state_mutex
+- flush() signals + waits until worker is idle + caught up to
+  N_audio (busy-wait with 1ms sleeps + cond_var re-notifies)
+- close() requests shutdown + joins the worker
+
+**Performance characterisation on M1 (JFK 11 s):**
+- PTT: feed 9.3 s, flush 7.3 s — bit-exact-batch
+- LIVE single-thread: feed 15.6 s, flush 1.0 s — bit-exact-batch
+- LIVE + decoder thread: feed 15.7 s, flush 1.0 s — bit-exact-batch
+
+The thread doesn't reduce total wall-clock on M1 because Metal's
+single GPU queue serializes encoder and decoder regardless of how
+many CPU threads submit work. **The architectural win is for:**
+1. **Mic-driven workloads** with audio-rate gaps between feeds: the
+   worker drains decode during user-typed/spoken pauses; feed()
+   returns between encoder chunks without waiting for the entire
+   decode loop.
+2. **Faster GPUs** with kernel-level parallelism (M3 Ultra, NVIDIA):
+   Metal/CUDA can overlap concurrent compute kernels submitted by
+   different ggml_backend_sched_compute calls, giving real
+   encoder+decoder overlap.
+
+### Phase 5 (deferred) — dual-sched for true on-Metal parallelism
+
+- **Two ggml_backend_sched on the same backend.** Encoder uses one,
+  LLM uses the other. They submit independently to the Metal
+  command queue. On a GPU with kernel-level parallelism, encoder
+  and LLM kernels overlap on different SIMDgroups. Estimated 30-40 %
+  total wall-clock reduction on M3 Ultra. ~150 LOC of sched
+  duplication + per-call routing in voxtral4b_run_llm_kv.
 - **Right-pad encoder pipelining (full speculative).** Pre-encode
   right-pad zeros during user idle time with state save/restore.
   Could shave another ~290 ms off first-text-token but interacts
-  with phase 4's queue.
+  with phase 5's two-sched architecture.
 
 ---
 

@@ -1748,6 +1748,8 @@ reference (see [Debug a new backend against PyTorch ground truth](#debug-a-new-b
 | `CRISPASR_VOXTRAL4B_STREAM_CHUNK_MS=N` | Override the internal encoder chunk size (default 240 ms). Must be a multiple of 80 ms. Larger = faster feed (kernel-launch amortisation), longer live-caption latency floor. |
 | `CRISPASR_VOXTRAL4B_STREAM_BATCH_ENCODER=1` | Regression-debug: ignore the streaming encoder's audio_embeds and re-run the whole batch encoder at flush. |
 | `CRISPASR_VOXTRAL4B_STREAM_DEBUG=1` / `CRISPASR_VOXTRAL4B_STREAM_DIFF=1` | Per-step decode prints / side-by-side encoder cosine vs the batch encoder. |
+| `CRISPASR_VOXTRAL4B_STREAM_LIVE=1` | Live-captions decode-during-feed (PLAN #7 phase 3). `get_text()` polled during feed returns progressive transcript. Default OFF (PTT semantics). Wrappers: Python `Session.stream_open(live=True)`, Rust `stream_open_ex(.., live: true)`. |
+| `CRISPASR_VOXTRAL4B_STREAM_DECODER_THREAD=1` | Decoder worker thread (PLAN #7 phase 4, implies live mode). Lets `feed()` return between encoder chunks without waiting for the decode loop — useful for mic-driven workloads. On M1 the Metal queue serializes encoder and decoder so total wall-clock is unchanged; faster GPUs with kernel-level parallelism see real overlap. |
 | `CRISPASR_VOXTRAL4B_FUSED_QKV=0` | Opt out of the runtime fused-QKV LLM path (default-on, ~7-8 % decode speedup on M1 Q4_K, ~500 MB extra memory). |
 | `CRISPASR_QWEN3_ASR_FUSED_QKV=0` | Opt out of the runtime fused-QKV LLM path for qwen3-asr (default-on; works on F16/F32/Q4_K/Q8_0/...). |
 | `CRISPASR_VOXTRAL_FUSED_QKV=1` | Opt **in** to the runtime fused-QKV LLM path for voxtral 3B. Off by default (no measurable speedup on JFK-shape decodes; useful for long-form workloads where decode dominates). |

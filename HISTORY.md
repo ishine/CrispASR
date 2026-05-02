@@ -2535,8 +2535,36 @@ Limitation: sequential live decode is ~1.5× realtime on M1 Q4_K
 realtime audio when fed from a live mic. Phase 4 (decoder thread
 parallel to encoder) would fix this.
 
-**PLAN #7 closed at phase 3.** Phase 4 deferred to when a consumer
-actually needs realtime-mic live captions on M1 Q4_K voxtral4b.
+**Phase 4 — decoder thread (May 2026).** Optional worker thread that
+drains decode steps in the background while feed() handles encoder +
+projector on the main thread. Enable via
+`CRISPASR_VOXTRAL4B_STREAM_DECODER_THREAD=1` (implies live mode).
+
+Architecture: `worker_thread` sleeps on `cond_var` until shutdown OR
+audio_embeds grow past `decode_adapter_pos`. feed() acquires
+`sched_mutex` around encoder/projector/prefill, notifies cond_var,
+returns. Worker drains under sched_mutex + decode_state_mutex.
+flush() signals + busy-waits with 1 ms sleeps until worker is idle
+and caught up to N_audio. close() requests shutdown + joins.
+
+Performance on M1 (JFK 11 s, all three modes pass bit-exact-batch):
+- PTT: feed 9.3 s, flush 7.3 s
+- LIVE single-thread: feed 15.6 s, flush 1.0 s
+- LIVE + decoder thread: feed 15.7 s, flush 1.0 s
+
+The thread doesn't reduce total wall-clock on M1 because Metal's
+single GPU queue serializes encoder + decoder regardless of how
+many CPU threads submit work. **Wins materialise when:**
+1. Mic-driven feed has audio-rate gaps between calls — worker
+   drains decode during the gaps, feed returns between encoder
+   chunks without waiting for the entire decode loop.
+2. Faster GPUs (M3 Ultra, NVIDIA) with kernel-level parallelism —
+   Metal/CUDA can overlap concurrent compute kernels submitted by
+   different ggml_backend_sched_compute calls.
+
+**PLAN #7 closed at phase 4.** Phase 5 (dual-sched for true on-Metal
+parallelism via independent backend schedulers, ~150 LOC) deferred
+to when a consumer measures gain on faster hardware.
 
 **Architectural floor for first-text-token latency** (revealed by
 the timing pass on M1 Q4_K JFK 11 s):
