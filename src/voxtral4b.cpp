@@ -1601,6 +1601,32 @@ struct voxtral4b_stream {
     int prefill_n_past;
     int prefill_out_vocab;
 
+    // ── Live decode state (PLAN #7 phase 3 — live captions) ────────────────
+    // After speculative prefill, every new audio_embed enables one more
+    // greedy decode step. With live_decode_enabled, those steps run during
+    // feed() and tokens get appended to out_text / out_text_unread as they
+    // commit; get_text() then returns progressive transcript.
+    // Off by default (PTT semantics: decode happens at flush). Set
+    // CRISPASR_VOXTRAL4B_STREAM_LIVE=1 at stream_open to opt in.
+    //
+    // No stable-prefix heuristic needed: voxtral4b's audio-injection
+    // pre_hook makes each decoded token a deterministic function of the
+    // audio context up to that point. Tokens commit immediately — no
+    // retraction. (This is the key architectural property that distinguishes
+    // injection-prompt audio-LLMs from encoder-decoder ASR where stable-
+    // prefix heuristics matter.)
+    bool live_decode_enabled;
+    bool decode_started;          // first decode step ran (logits/state initialised)
+    bool decode_finished;         // EOS emitted
+    bool decode_logits_committed; // true if decode_logits's argmax has already been emitted
+                                  // (prevents double-emission across multiple drain calls)
+    int decode_n_past;            // current LLM position cursor (advances per step)
+    int decode_adapter_pos;       // current audio_embed cursor (advances per step)
+    int decode_out_vocab;         // cached for the current logits buffer
+    int decode_last_argmax_id;    // most-recent argmax id (committed but not yet forwarded)
+    std::vector<float> decode_logits; // last-position logits for next argmax
+    int decode_steps_done;        // total decode steps run (for timing telemetry)
+
     // ── Output ────────────────────────────────────────────────────────────
     std::string out_text;
     std::string out_text_unread;
@@ -1913,8 +1939,121 @@ static int vox_stream_maybe_prefill(voxtral4b_stream* s) {
     s->prefill_n_past = kStreamingPromptLen;
     s->prefill_out_vocab = out_vocab;
     s->prefill_done = true;
+
+    // Initialise the live-decode state from prefill — same data, decoupled
+    // so the decode loop can mutate independently.
+    s->decode_logits = s->prefill_logits;
+    s->decode_n_past = kStreamingPromptLen;
+    s->decode_adapter_pos = kStreamingPromptLen;
+    s->decode_out_vocab = out_vocab;
+    s->decode_started = true;
     return 0;
 }
+
+// PLAN #7 phase 3: shared decode-drain. Runs greedy decode steps from the
+// stream's current state, emitting text into `out_text` / `out_text_unread`.
+// Stops when one of: (a) EOS hit, (b) audio_embeds[adapter_pos] not yet
+// available (live mode — caller will resume on next feed), (c) max
+// new-tokens limit. Idempotent across feed/flush calls — flush just
+// calls it after the encoder/projector are drained, with the same state.
+//
+// Returns 0 on success (incl. "no progress because no audio yet"), <0 on error.
+static int vox_stream_drain_decode(voxtral4b_stream* s) {
+    if (!s->decode_started || s->decode_finished)
+        return 0;
+    const auto& hp = s->ctx->model.hparams;
+    const int proj_out = (int)hp.proj_out_dim;
+    const int N_audio = (int)(s->audio_embeds.size() / proj_out);
+    constexpr int kMaxNewTokens = 512;
+    constexpr int eos_id = 2;
+    if (s->decode_logits.empty() || s->decode_out_vocab <= 0)
+        return -1;
+
+    // Per-step state machine to avoid double-emission across multiple
+    // drain calls (live mode invokes drain once per feed):
+    //
+    // 1. If decode_logits is uncommitted: argmax → emit → set committed=true.
+    //    `last_argmax_id` is stashed on the stream so step 3 can use it.
+    // 2. Check stop conditions (EOS, audio exhausted) — break out of loop.
+    // 3. Embed `last_argmax_id` + inject audio_embeds[adapter_pos] → forward.
+    //    The forward updates decode_logits and clears committed=false.
+    //
+    // Cross-drain-call invariant: when drain returns, decode_logits is
+    // ALWAYS committed (its argmax has been emitted). The next drain call
+    // skips step 1 on its first iteration and goes straight to step 2.
+    while (s->decode_steps_done < kMaxNewTokens) {
+        if (!s->decode_logits_committed) {
+            // Step 1: argmax + emit.
+            const float* last = s->decode_logits.data();
+            int best = 0;
+            float best_score = last[0];
+            for (int i = 1; i < s->decode_out_vocab; ++i) {
+                if (last[i] > best_score) {
+                    best_score = last[i];
+                    best = i;
+                }
+            }
+            s->decode_last_argmax_id = best;
+            if (best == eos_id) {
+                s->decode_finished = true;
+                s->decode_logits_committed = true;
+                break;
+            }
+            // Filter streaming control tokens (id < 1000) from emitted text.
+            if (best >= 1000) {
+                int tok_len = 0;
+                const uint8_t* tok_bytes = voxtral4b_token_text(s->ctx, best, &tok_len);
+                std::string piece;
+                if (tok_bytes && tok_len > 0)
+                    piece.assign(reinterpret_cast<const char*>(tok_bytes), (size_t)tok_len);
+                std::string decoded;
+                decoded.reserve(piece.size());
+                for (size_t ci = 0; ci < piece.size(); ci++) {
+                    if ((unsigned char)piece[ci] == 0xE2 && ci + 2 < piece.size() &&
+                        (unsigned char)piece[ci + 1] == 0x96 && (unsigned char)piece[ci + 2] == 0x81) {
+                        decoded += ' ';
+                        ci += 2;
+                    } else {
+                        decoded += piece[ci];
+                    }
+                }
+                s->out_text += decoded;
+                s->out_text_unread += decoded;
+            }
+            s->decode_logits_committed = true;
+        }
+
+        // Step 2: stop if EOS or no audio left to inject.
+        if (s->decode_finished)
+            break;
+        if (s->decode_adapter_pos >= N_audio)
+            break;
+        // Step 3: embed the just-committed argmax + inject audio + forward.
+        int32_t next_id = s->decode_last_argmax_id;
+        float* next_emb = voxtral4b_embed_tokens(s->ctx, &next_id, 1);
+        if (!next_emb)
+            return -2;
+        const float* aud = s->audio_embeds.data() + (size_t)s->decode_adapter_pos * proj_out;
+        for (int j = 0; j < proj_out; j++)
+            next_emb[j] += aud[j];
+        s->decode_adapter_pos++;
+
+        int out_n_tok = 0, out_vocab = 0;
+        float* logits =
+            voxtral4b_run_llm_kv(s->ctx, next_emb, 1, s->decode_n_past, &out_n_tok, &out_vocab);
+        std::free(next_emb);
+        if (!logits)
+            return -3;
+        s->decode_logits.assign(logits, logits + out_vocab);
+        s->decode_out_vocab = out_vocab;
+        std::free(logits);
+        s->decode_n_past++;
+        s->decode_steps_done++;
+        s->decode_logits_committed = false; // new logits, need to argmax+emit on next iter
+    }
+    return 0;
+}
+
 } // namespace
 
 extern "C" struct voxtral4b_stream* voxtral4b_stream_open(struct voxtral4b_context* ctx, int /*step_ms*/,
@@ -1950,6 +2089,15 @@ extern "C" struct voxtral4b_stream* voxtral4b_stream_open(struct voxtral4b_conte
     s->prefill_done = false;
     s->prefill_n_past = 0;
     s->prefill_out_vocab = 0;
+    s->live_decode_enabled = (getenv("CRISPASR_VOXTRAL4B_STREAM_LIVE") != nullptr);
+    s->decode_started = false;
+    s->decode_finished = false;
+    s->decode_logits_committed = false;
+    s->decode_n_past = 0;
+    s->decode_adapter_pos = 0;
+    s->decode_out_vocab = 0;
+    s->decode_last_argmax_id = 0;
+    s->decode_steps_done = 0;
     s->out_t0_s = 0.0;
     s->out_t1_s = 0.0;
     s->has_output = false;
@@ -2021,6 +2169,14 @@ extern "C" int voxtral4b_stream_feed(struct voxtral4b_stream* s, const float* pc
     // Skipped here on negative return to avoid masking errors.
     if (vox_stream_maybe_prefill(s) < 0)
         return -4;
+
+    // PLAN #7 phase 3 — live decode (CRISPASR_VOXTRAL4B_STREAM_LIVE=1):
+    // run as many decode steps as new audio_embeds allow, appending text
+    // to out_text / out_text_unread as it commits.
+    if (s->live_decode_enabled && s->decode_started && !s->decode_finished) {
+        if (vox_stream_drain_decode(s) < 0)
+            return -5;
+    }
     return 0;
 }
 
@@ -2193,31 +2349,25 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
     if (timing)
         fprintf(stderr, "voxtral4b_stream timing: encoder+projector drain @ %.1f ms\n", elapsed_ms());
 
-    // PLAN #7 phase 3: prefer the speculative prefill stashed during feed.
-    // Falls back to running prefill here if (a) we're in batch-encoder mode,
-    // (b) feed never reached kStreamingPromptLen audio_embeds (very short
-    // utterance), or (c) batch path produced different audio embeds than the
-    // streaming path so the stashed prefill is stale.
-    int out_n_tok = 0, out_vocab = 0;
-    int n_past;
-    float* logits = nullptr;
-    constexpr int kMaxNewTokens = 512;
+    // For the batch (regression-debug) path: overwrite s->audio_embeds
+    // with the batch encoder's result so vox_stream_drain_decode reads
+    // from the same buffer either way. Discards the streaming-encoder's
+    // (probably stale) audio_embeds in the process — fine, we're in the
+    // explicit fall-back path.
+    if (!use_incremental && !batch_audio_embeds.empty()) {
+        s->audio_embeds = std::move(batch_audio_embeds);
+        // Drop any speculative-prefill state — it was based on the streaming
+        // encoder's audio_embeds and is now stale.
+        s->prefill_done = false;
+        s->decode_started = false;
+        s->decode_logits.clear();
+    }
 
-    if (s->prefill_done && use_incremental) {
-        // Reuse stashed prefill: avoids re-running the 39-token forward
-        // (~250 ms wall-clock).
-        out_n_tok = 1;
-        out_vocab = s->prefill_out_vocab;
-        logits = (float*)std::malloc((size_t)out_vocab * sizeof(float));
-        if (!logits)
-            return -7;
-        std::memcpy(logits, s->prefill_logits.data(), (size_t)out_vocab * sizeof(float));
-        n_past = s->prefill_n_past;
-        if (timing)
-            fprintf(stderr, "voxtral4b_stream timing: prefill REUSED (saved ~250 ms); total @ %.1f ms\n",
-                    elapsed_ms());
-    } else {
-        // Build streaming-prompt + run prefill now.
+    // Run the streaming-prompt prefill if it didn't happen during feed
+    // (very short utterances, or batch path). Sets up s->prefill_logits
+    // + decode_n_past + decode_adapter_pos for vox_stream_drain_decode.
+    constexpr int kMaxNewTokens = 512;
+    if (!s->prefill_done) {
         std::vector<int32_t> prompt_ids((size_t)kStreamingPromptLen);
         prompt_ids[0] = 1;
         for (int i = 1; i < kStreamingPromptLen; i++)
@@ -2226,7 +2376,7 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
         if (!prompt_emb)
             return -6;
         for (int i = 0; i < kStreamingPromptLen && i < N_audio; i++) {
-            const float* src = audio_src + (size_t)i * proj_out;
+            const float* src = s->audio_embeds.data() + (size_t)i * proj_out;
             float* dst = prompt_emb + (size_t)i * proj_out;
             for (int j = 0; j < proj_out; j++)
                 dst[j] += src[j];
@@ -2240,7 +2390,9 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
         }
         voxtral4b_kv_reset(s->ctx);
         auto t_pre = std::chrono::steady_clock::now();
-        logits = voxtral4b_run_llm_kv(s->ctx, prompt_emb, kStreamingPromptLen, 0, &out_n_tok, &out_vocab);
+        int out_n_tok = 0, out_vocab = 0;
+        float* logits =
+            voxtral4b_run_llm_kv(s->ctx, prompt_emb, kStreamingPromptLen, 0, &out_n_tok, &out_vocab);
         std::free(prompt_emb);
         if (!logits || out_vocab <= 0)
             return -8;
@@ -2248,108 +2400,49 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
             fprintf(stderr, "voxtral4b_stream timing: prefill (39 tokens) %.1f ms; total @ %.1f ms\n",
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pre).count(),
                     elapsed_ms());
-        n_past = kStreamingPromptLen;
-    }
-
-    const int eos_id = 2;
-    int adapter_pos = kStreamingPromptLen; // next audio embed to inject
-    std::string generated;
-    generated.reserve(512);
-    std::vector<double> step_ms_log;
-    bool first_text_emitted = false;
-
-    for (int step = 0; step < kMaxNewTokens; ++step) {
-        auto t_step = std::chrono::steady_clock::now();
         const float* last = logits + (size_t)(out_n_tok - 1) * (size_t)out_vocab;
-        int best = 0;
-        float best_score = last[0];
-        for (int i = 1; i < out_vocab; ++i) {
-            if (last[i] > best_score) {
-                best_score = last[i];
-                best = i;
-            }
-        }
+        s->prefill_logits.assign(last, last + out_vocab);
         std::free(logits);
-        logits = nullptr;
-        if (best == eos_id)
-            break;
-
-        // Filter: streaming control tokens (id < 1000) don't contribute to text.
-        if (best >= 1000) {
-            int tok_len = 0;
-            const uint8_t* tok_bytes = voxtral4b_token_text(s->ctx, best, &tok_len);
-            std::string piece;
-            if (tok_bytes && tok_len > 0)
-                piece.assign(reinterpret_cast<const char*>(tok_bytes), (size_t)tok_len);
-            // SP `▁ → space` normalization.
-            std::string decoded;
-            decoded.reserve(piece.size());
-            for (size_t ci = 0; ci < piece.size(); ci++) {
-                if ((unsigned char)piece[ci] == 0xE2 && ci + 2 < piece.size() &&
-                    (unsigned char)piece[ci + 1] == 0x96 && (unsigned char)piece[ci + 2] == 0x81) {
-                    decoded += ' ';
-                    ci += 2;
-                } else {
-                    decoded += piece[ci];
-                }
-            }
-            generated += decoded;
-            s->out_text_unread += decoded;
-            if (timing && !first_text_emitted) {
-                fprintf(stderr,
-                        "voxtral4b_stream timing: first text token at @ %.1f ms (step %d, id=%d)\n",
-                        elapsed_ms(), step, best);
-                first_text_emitted = true;
-            }
-        }
-
-        // Stop when audio is exhausted — matches the CLI pre_hook returning
-        // false. Continuing decode without audio injection lets the model
-        // emit trailing garbage.
-        if (adapter_pos >= N_audio)
-            break;
-
-        // Embed the token; inject the next audio embed into the embedding before the LLM step.
-        int32_t next_id = best;
-        float* next_emb = voxtral4b_embed_tokens(s->ctx, &next_id, 1);
-        if (!next_emb)
-            break;
-        const float* aud = audio_src + (size_t)adapter_pos * proj_out;
-        for (int j = 0; j < proj_out; j++)
-            next_emb[j] += aud[j];
-        adapter_pos++;
-        logits = voxtral4b_run_llm_kv(s->ctx, next_emb, 1, n_past, &out_n_tok, &out_vocab);
-        std::free(next_emb);
-        if (!logits)
-            break;
-        n_past += 1;
-        if (timing)
-            step_ms_log.push_back(
-                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_step).count());
+        s->prefill_n_past = kStreamingPromptLen;
+        s->prefill_out_vocab = out_vocab;
+        s->prefill_done = true;
+        s->decode_logits = s->prefill_logits;
+        s->decode_n_past = kStreamingPromptLen;
+        s->decode_adapter_pos = kStreamingPromptLen;
+        s->decode_out_vocab = out_vocab;
+        s->decode_started = true;
+    } else if (timing) {
+        fprintf(stderr, "voxtral4b_stream timing: prefill REUSED (saved ~250 ms); total @ %.1f ms\n",
+                elapsed_ms());
     }
-    if (logits)
-        std::free(logits);
 
-    if (timing && !step_ms_log.empty()) {
-        std::vector<double> sorted = step_ms_log;
-        std::sort(sorted.begin(), sorted.end());
-        const double p50 = sorted[sorted.size() / 2];
-        const double p95 = sorted[(sorted.size() * 95) / 100];
-        const double avg =
-            std::accumulate(sorted.begin(), sorted.end(), 0.0) / (double)sorted.size();
+    // Drain decode — runs all remaining tokens until EOS or audio exhausted.
+    // In live mode many will already be drained from feed; in PTT mode this
+    // does the entire decode loop.
+    auto t_decode_start = std::chrono::steady_clock::now();
+    const int decode_steps_before = s->decode_steps_done;
+    const std::string out_text_before = s->out_text;
+    const int decode_first_text = s->out_text.empty() ? 0 : 1;
+    if (vox_stream_drain_decode(s) < 0)
+        return -9;
+    const int new_decode_steps = s->decode_steps_done - decode_steps_before;
+    if (timing && new_decode_steps > 0) {
+        const double decode_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t_decode_start)
+                                     .count();
         fprintf(stderr,
-                "voxtral4b_stream timing: %zu decode steps, avg %.1f ms p50 %.1f ms p95 %.1f ms; flush total %.1f ms\n",
-                step_ms_log.size(), avg, p50, p95, elapsed_ms());
+                "voxtral4b_stream timing: drain %d decode steps in %.1f ms (avg %.1f ms/step); flush total %.1f ms\n",
+                new_decode_steps, decode_ms, decode_ms / std::max(1, new_decode_steps), elapsed_ms());
     }
+    (void)decode_first_text;
+    (void)out_text_before;
 
-    // Trim leading/trailing whitespace.
-    while (!generated.empty() && (generated.front() == ' ' || generated.front() == '\t'))
-        generated.erase(generated.begin());
-    while (!generated.empty() && (generated.back() == ' ' || generated.back() == '\t'))
-        generated.pop_back();
-
-    s->out_text = generated; // Replace, don't append — flush gives the full transcript.
-    s->out_text_unread = generated;
+    // Trim leading/trailing whitespace from out_text (live mode may have
+    // committed leading spaces from `▁` SP-marker tokens).
+    while (!s->out_text.empty() && (s->out_text.front() == ' ' || s->out_text.front() == '\t'))
+        s->out_text.erase(s->out_text.begin());
+    while (!s->out_text.empty() && (s->out_text.back() == ' ' || s->out_text.back() == '\t'))
+        s->out_text.pop_back();
     s->out_t0_s = 0.0;
     s->out_t1_s = (double)s->total_samples_fed / 16000.0;
     s->has_output = true;
