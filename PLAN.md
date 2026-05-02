@@ -18,9 +18,9 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | **MEDIUM** | [#52 Qwen3-TTS](#52-qwen3-tts) — perf pass | Medium | talker + code_predictor + codec + ECAPA + codec_encoder all done; only step-4 perf pass open (~137 ms/frame → real-time) |
 | **DONE** | [#51 MiMo-V2.5-ASR runtime](#51-mimo-v25-asr-runtime--done-may-2026) | Large | end-to-end JFK matches reference; F16+Q4_K on HF; 51b/b' shipped (step-only + cached step graph, 1.46× decode); 51a mmap loader landed behind `CRISPASR_GGUF_MMAP=1` (default-flip + 51c F16 step pending) |
 | **DONE** | [#54 granite-speech-4.1 plus / nar](#54-granite-speech-41-plus--nar-variants) | Small | base + plus + nar runtimes all DONE; F16 + 3 Q4_K variants shipped to [`cstr/granite-speech-4.1-2b-nar-GGUF`](https://huggingface.co/cstr/granite-speech-4.1-2b-nar-GGUF); registry wired |
-| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phase 1 (Qwen3-TTS-{CustomVoice 0.6B/1.7B, Base 1.7B, VoiceDesign 1.7B}) DONE; Phase 2 Orpheus-3B base + lex-au-orpheus-de DONE; Kartoffel_Orpheus DE checkpoint swap pending (safetensors → GGUF conversion); phases 3-5 queued |
-| **MEDIUM** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet/cohere DONE; canary remaining |
-| **LOW** | [#53 Two narrow extractions](#53-two-narrow-extractions-for-shared-tts-codec-patterns) | Small | Snake activations + causal tconv1d wrapper across qwen3-tts + SNAC |
+| **HIGH** | [#57 Commercial-friendly TTS expansion](#57-commercial-friendly-tts-backend-expansion) | Phased | Phase 1 (Qwen3-TTS-{CustomVoice 0.6B/1.7B, Base 1.7B, VoiceDesign 1.7B}) DONE; Phase 2 Orpheus-3B base + lex-au-orpheus-de + Kartoffel_Orpheus DE natural DONE; Kartoffel synthetic converted locally, HF upload pending; phases 3-5 queued |
+| **DONE** | [#5 Reference backends](#5-reference-backends-for-parakeetcanarycohere) | Medium | parakeet / cohere / canary all DONE — see [HISTORY §63](HISTORY.md) |
+| **DONE** | [#53 Two narrow extractions](#53-two-narrow-extractions-for-shared-tts-codec-patterns) | Small | snake_beta + convt1d_crop landed across qwen3-tts + SNAC — see [HISTORY §63](HISTORY.md) |
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
 | **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | TTS surface (incl. qwen3-tts variants) at full parity across all 7 wrappers; align/diarize/VAD/streaming/punctuation/LID/registry still C-ABI-only on Go/Java/Ruby/JS/Dart |
@@ -65,16 +65,13 @@ NOT audio→phoneme. Runs on transcription output.
 
 ---
 
-## 5. Reference backends for parakeet/canary/cohere
+## ~~5. Reference backends for parakeet/canary/cohere~~ — **DONE (May 2026)**
 
-Write `tools/reference_backends/{parakeet,canary,cohere}.py` for
-`crispasr-diff` reference activation comparison.
-
-**Effort:** ~100-150 LOC per backend.
-
-**Status (April 2026):** `parakeet` reference backend done — used to
-diagnose the JA xscaling bug. Cohere already has one
-(`reference_backends/cohere.py`). Canary is the only one still missing.
+All three reference dumpers shipped: `parakeet.py` (April 2026, used to
+diagnose the JA xscaling bug), `cohere.py` (encoder-decoder NeMo), and
+`canary.py` (May 2026, commit `63f708e` — patterned on parakeet, with
+TimeMels-layout transpose and 32 per-layer encoder hooks for diagnostic).
+See [HISTORY §63](HISTORY.md) for the canary writeup.
 
 ---
 
@@ -399,54 +396,15 @@ transcribe are all bit-exact end-to-end on JFK.
 
 ---
 
-## 53. Two narrow extractions for shared TTS-codec patterns
+## ~~53. Two narrow extractions for shared TTS-codec patterns~~ — **DONE (May 2026)**
 
-Originally scoped (April 2026) as a broad `core/audio_decoder.h` that
-would unify VibeVoice (σ-VAE), Qwen3-TTS (RVQ codec) and MiMo's
-audio-tokeniser decode path. After Orpheus / SNAC and the qwen3-tts
-codec both shipped (May 2026), a re-read of all four backends shows
-the convergence isn't there:
-
-- **VibeVoice σ-VAE** is continuous (no RVQ); upsampling is
-  ConvNeXt-style (depthwise conv + LN + FFN). 0 % overlap with the
-  RVQ backends.
-- **MiMo-Tokenizer** in our tree is encoder-only (`core_rvq::
-  encode_euclidean`). No decoder code lives here — not a third
-  client.
-- **Kokoro** is istftnet (style-conditioned, F0/noise-driven); 0 %
-  overlap.
-- **Only Qwen3-TTS codec + SNAC actually share shape** — and even
-  there qwen3-tts splits codebook-0 from rest-15 and runs an 8-layer
-  transformer on the latent, while SNAC sums all codebooks equally
-  and has no transformer. Stride patterns differ ([8,5,4,3] vs
-  [8,8,4,2]). RVQ-decode lookup is `ggml_get_rows` + sum, not the
-  Euclidean nearest-neighbour pattern that already lives in
-  `core/rvq.h` (encoder-only).
-
-A full audio-decoder helper would force divergent shapes through a
-generic interface for ~110 LOC saved across just two clients. Not
-worth it. Two narrow extractions are worth doing — both pure utility,
-both reusable by the upcoming Phase-3 (Chatterbox) / Phase-5
-(VoxCPM2 / Darwin-TTS) backends:
-
-1. **Snake activations** → `core/activation.h`.
-   `codec_snake_beta` (qwen3-tts) and `snake1d` (orpheus_snac) are
-   nearly the same math. Pure, reusable, ~30 LOC saved.
-2. **Causal transposed-conv-1D wrapper** → `core/conv.h`.
-   Both qwen3-tts and SNAC repeat the same stride-aware padding /
-   cropping dance around `ggml_conv_transpose_1d`. ~50 LOC saved,
-   used by both clients.
-
-Explicitly **not** extracting:
-- RVQ decode lookup — the codebook-0-vs-rest split in qwen3-tts vs
-  the equal-sum in SNAC makes a generic helper more complex than
-  inline code; `core/rvq.h` stays encoder-only.
-- Residual units — short (~40 LOC each) and tied to per-backend
-  dilation patterns.
-- Any cross-cut with VibeVoice / MiMo / Kokoro decoders.
-
-**Effort:** Small. Two files, ~80 LOC of new helpers, replace at most
-~80 LOC of inline duplication.
+`core_act::snake_beta` + `core_convt::convt1d_crop` shipped, qwen3-tts
+codec and SNAC both delegate. Bit-equivalent: SNAC `crispasr-diff`
+8/8 PASS (cos_min 0.999941 unchanged). Original ambition of a
+`core/audio_decoder.h` super-helper rejected because the convergence
+across our four TTS decoders (vibevoice σ-VAE, qwen3-tts codec, mimo
+encoder-only, SNAC, kokoro istftnet) wasn't there once the code was
+read end-to-end. See [HISTORY §63](HISTORY.md) for the full writeup.
 
 ---
 

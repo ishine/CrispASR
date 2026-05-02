@@ -1353,3 +1353,93 @@ trade-off `ggml_conv_1d` already makes upstream.
 **Out of scope, queued for follow-up:** measuring the F16 mimo-asr
 RSS win end-to-end; flipping the env-flag default; PLAN #51c (F16
 step decode) which the HANDOFF flagged as "trivial" once #51a lands.
+
+### 63. Session 2026-05-02 — canary ref dumper + DRY helpers + cache-clear ABI sweep
+
+Three small landings collected here because none warrants its own
+section:
+
+**PLAN #5 — Canary reference dumper** (commit `63f708e`). The C++
+`crispasr-diff canary` branch was already wired (mel + encoder taps)
+but the matching Python ref dumper was missing. Added
+`tools/reference_backends/canary.py`, modeled on `parakeet.py`: NeMo
+`ASRModel.from_pretrained("nvidia/canary-1b-v2")`, preprocessor +
+encoder forward, per-layer hooks for 32 encoder layers of diagnostic
+captures, transposed to TimeMels layout for the C++ side. Diff
+against the existing Q4_K GGUF on JFK shows expected quantisation
+noise (encoder cos_mean 0.972, cos_min 0.35 on low-magnitude frames)
+but the runtime still transcribes byte-exact:
+`"And so, my fellow Americans, ask not what your country can do for
+you, ask what you can do for your country."` Strict cos≥0.999 PASS
+would need an F16 GGUF — deferred until disk headroom allows the
+converter to run without thrashing (98% full external + slow
+`shutil.copyfileobj` per CLAUDE.md note).
+
+**PLAN #53 — Two narrow core helpers** (commit `d393a43`). After the
+qwen3-tts codec and SNAC decoders both shipped, a re-read across all
+four of our TTS decoders (vibevoice σ-VAE, qwen3-tts codec, mimo
+tokenizer encoder-only, SNAC, kokoro istftnet) showed the convergence
+the original PLAN #53 ("`core/audio_decoder.h`") imagined wasn't
+there: VibeVoice is continuous-VAE with ConvNeXt, MiMo has no
+decoder, Kokoro is istftnet, and only qwen3-tts codec + SNAC share
+shape — and even there the codebook-handling diverges (qwen3-tts
+splits codebook-0 from rest-15 vs SNAC sums all codebooks equally).
+Rewrote the PLAN entry to scope down, then extracted exactly two
+helpers:
+
+- `core_act::snake_beta` in `core/activation.h` — the BigVGAN
+  `y = x + exp(-β)·sin²(x·exp(α))` activation. qwen3-tts now
+  delegates via a 1-line alias. ~10 LOC saved net.
+- `core_convt::convt1d_crop` in `core/conv.h` — generic
+  channels-first `ggml_conv_transpose_1d` wrapper with
+  caller-controlled `crop_left`/`crop_right`. qwen3-tts (causal,
+  `crop_right=K-stride`) and SNAC (symmetric,
+  `crop_left=crop_right=pad`) both delegate. ~30 LOC saved net.
+
+SNAC `crispasr-diff` 8/8 PASS (cos_min 0.999941 unchanged) confirmed
+the wrapper is bit-equivalent. PLAN #53 priority moved MEDIUM →
+LOW since the `core/audio_decoder.h` super-helper is no longer the
+intent.
+
+**PLAN #56 #5 — Kokoro phoneme cache clear ABI** (commits `9bffb0f`,
+`6cabefa`, `d022bff`, `603f47e`). The `kokoro_phoneme_cache` LRU
+already existed in `kokoro_context`; what was missing was a way for
+long-running daemons to drop the cache when resynthesising across
+many speakers. Added:
+
+- `kokoro_phoneme_cache_clear(ctx)` extern-C in `kokoro.cpp`/`.h` —
+  takes the mutex, `lru.clear()` + `idx.clear()`. Cheap and
+  thread-safe.
+- Session-scoped re-export
+  `crispasr_session_kokoro_clear_phoneme_cache(session)` in
+  `crispasr_c_api.cpp` — no-op for non-kokoro backends, returns -1
+  on null handle.
+- All 7 wrappers got the method (Python `Session.clear_phoneme_cache()`,
+  Rust `Session::clear_phoneme_cache()`, Dart `clearPhonemeCache()`,
+  Go `Session.ClearPhonemeCache()`, Java `clearPhonemeCache()`,
+  JS `Module.ttsClearPhonemeCache()`, Ruby
+  `Session.clear_phoneme_cache(handle)`). Each follows the existing
+  per-binding pattern for `set_codec_path`. +55 LOC across the 5
+  trailing wrappers. PLAN #59's "open this section when a consumer
+  asks" rule was relaxed for this single-method addition because the
+  alternative (C-only surface) was ergonomically worse.
+- No-model unit tests in `tests/test_python_session.py` cover the
+  symbol export + null-handle return path. +2 PASS in 0.56 s, no
+  model required.
+
+**Side-quest: clang-format-18 CI fix** (commit `21464e3`). The
+`d393a43` PLAN #53 commit added 4 lines that local clang-format-22
+considered fine but Ubuntu CI's clang-format-18 flagged. Fixed in
+place — see LEARNINGS.md "clang-format-22 vs CI v18" lesson for the
+trap and the safer workflow.
+
+**Side-quest: 2 LEARNINGS lessons** (commit `cc82e25`).
+
+- The clang-format-22-vs-v18 destruction trap (auto-formatting whole
+  files locally produces hundreds of whitespace changes that v18 *also*
+  rejects — manually align by eye instead).
+- NeMo ref dumpers must transpose to TimeMels for parakeet/canary
+  (the C++ side uses `core_mel::Layout::TimeMels` which is
+  n_mels-fast, T_mel-slow — opposite of NeMo preprocessor's natural
+  `(B, n_mels, T_mel)` C-contiguous order; cosine-signature lookup
+  table for diagnosing layout swaps included).
