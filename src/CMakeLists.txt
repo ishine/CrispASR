@@ -305,6 +305,11 @@ add_library(crispasr-core STATIC
             core/rvq.cpp
             )
 target_include_directories(crispasr-core PUBLIC . ../include)
+# PLAN #51a: gguf_loader uses ggml_backend_buffer_init from
+# ggml-backend-impl.h to register a custom mmap-owning CPU buffer. The
+# header lives in ggml/src/ rather than ggml/include/, so we expose it
+# here as a private include path for this target only.
+target_include_directories(crispasr-core PRIVATE ../ggml/src)
 target_compile_features   (crispasr-core PUBLIC cxx_std_17)
 target_link_libraries     (crispasr-core PUBLIC ggml-base ggml)
 if(NOT MSVC)

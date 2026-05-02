@@ -3,6 +3,12 @@
 
 #include "gguf_loader.h"
 
+#include "ggml-backend-impl.h"
+#include "ggml-cpu.h"
+#ifdef GGML_USE_METAL
+#include "ggml-metal.h"
+#endif
+
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -154,8 +160,16 @@ struct MappedFile {
     size_t size = 0;
     bool ok = false;
 
-    explicit MappedFile(const char* path) {
+    // When `writable` is true, the mapping is created with copy-on-write
+    // semantics (POSIX MAP_PRIVATE + PROT_READ|PROT_WRITE / Win32
+    // FILE_MAP_COPY). Reads share the file's page cache; writes get a
+    // private anonymous duplicate of the touched page. This lets backends
+    // that mutate weights post-load (e.g. parakeet's BN-into-conv fold) run
+    // unchanged on the zero-copy path without modifying the underlying file.
+    explicit MappedFile(const char* path, bool writable = false) {
 #if defined(_WIN32)
+        const DWORD page_protect = writable ? PAGE_WRITECOPY : PAGE_READONLY;
+        const DWORD view_access = writable ? FILE_MAP_COPY : FILE_MAP_READ;
         HANDLE hFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         if (hFile == INVALID_HANDLE_VALUE)
             return;
@@ -165,11 +179,11 @@ struct MappedFile {
             return;
         }
         size = (size_t)fsize.QuadPart;
-        HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        HANDLE hMap = CreateFileMappingA(hFile, nullptr, page_protect, 0, 0, nullptr);
         CloseHandle(hFile);
         if (!hMap)
             return;
-        base = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        base = MapViewOfFile(hMap, view_access, 0, 0, 0);
         CloseHandle(hMap);
         if (!base)
             return;
@@ -185,7 +199,9 @@ struct MappedFile {
             return;
         }
         size = (size_t)st.st_size;
-        base = ::mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+        const int prot = writable ? (PROT_READ | PROT_WRITE) : PROT_READ;
+        const int flags = writable ? MAP_PRIVATE : MAP_SHARED;
+        base = ::mmap(nullptr, size, prot, flags, fd, 0);
         ::close(fd);
         fd = -1;
         if (base == MAP_FAILED) {
@@ -206,7 +222,187 @@ struct MappedFile {
     }
     MappedFile(const MappedFile&) = delete;
     MappedFile& operator=(const MappedFile&) = delete;
+
+    // Transfer ownership of the mmap region out of the RAII handle so it
+    // outlives the destructor. Used by the CRISPASR_GGUF_MMAP=1 path to
+    // hand the mapping to a backend buffer that owns it for the model's
+    // lifetime.
+    void release() {
+        base = nullptr;
+        size = 0;
+    }
 };
+
+// PLAN #51a: a CPU backend buffer whose backing memory is an mmap'd file
+// region. On free_buffer the mapping is unmapped — that's the entire
+// reason this buffer type exists. Tensors must be bound with
+// ggml_backend_tensor_alloc(); we do not provide an init_tensor path.
+//
+// We reuse ggml_backend_cpu_buffer_type() so ggml_backend_buffer_is_host()
+// returns true on this buffer (some scheduler paths key off that).
+struct mmap_buffer_ctx {
+    void* mmap_base = nullptr;   // page-aligned start of the mmap
+    size_t mmap_size = 0;        // length of the mmap
+    void* tensor_base = nullptr; // mmap_base + data_off, 32-byte aligned
+};
+
+static void* mmap_buffer_get_base(ggml_backend_buffer_t buffer) {
+    GGML_ASSERT(buffer);
+    return ((mmap_buffer_ctx*)buffer->context)->tensor_base;
+}
+
+static void mmap_buffer_free(ggml_backend_buffer_t buffer) {
+    GGML_ASSERT(buffer);
+    auto* mctx = (mmap_buffer_ctx*)buffer->context;
+    if (mctx->mmap_base) {
+#if defined(_WIN32)
+        UnmapViewOfFile(mctx->mmap_base);
+#else
+        ::munmap(mctx->mmap_base, mctx->mmap_size);
+#endif
+    }
+    delete mctx;
+}
+
+static void mmap_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor* tensor, uint8_t value, size_t offset,
+                                      size_t size) {
+    GGML_ASSERT(tensor);
+    memset((char*)tensor->data + offset, value, size);
+    GGML_UNUSED(buffer);
+}
+
+static void mmap_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor* tensor, const void* data, size_t offset,
+                                   size_t size) {
+    GGML_ASSERT(tensor);
+    memcpy((char*)tensor->data + offset, data, size);
+    GGML_UNUSED(buffer);
+}
+
+static void mmap_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor* tensor, void* data, size_t offset,
+                                   size_t size) {
+    GGML_ASSERT(tensor);
+    memcpy(data, (const char*)tensor->data + offset, size);
+    GGML_UNUSED(buffer);
+}
+
+static bool mmap_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor* src, ggml_tensor* dst) {
+    GGML_ASSERT(src);
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return true;
+    }
+    return false;
+    GGML_UNUSED(buffer);
+}
+
+static void mmap_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto* mctx = (mmap_buffer_ctx*)buffer->context;
+    memset(mctx->tensor_base, value, buffer->size);
+}
+
+static const ggml_backend_buffer_i mmap_buffer_iface = {
+    /* .free_buffer    = */ mmap_buffer_free,
+    /* .get_base       = */ mmap_buffer_get_base,
+    /* .init_tensor    = */ nullptr,
+    /* .memset_tensor  = */ mmap_buffer_memset_tensor,
+    /* .set_tensor     = */ mmap_buffer_set_tensor,
+    /* .get_tensor     = */ mmap_buffer_get_tensor,
+    /* .set_tensor_2d  = */ nullptr,
+    /* .get_tensor_2d  = */ nullptr,
+    /* .cpy_tensor     = */ mmap_buffer_cpy_tensor,
+    /* .clear          = */ mmap_buffer_clear,
+    /* .reset          = */ nullptr,
+};
+
+// PLAN #51a (Metal variant): wrap a non-CPU backend buffer (built via the
+// device's `buffer_from_host_ptr` capability) so its `free_buffer` callback
+// also munmaps the host memory the inner buffer was constructed from.
+//
+// Why a wrapper instead of modifying the inner iface: `ggml_backend_buffer_i`
+// is a `static const` table inside each backend (ggml-metal.cpp etc.); we
+// can't override per-instance. And we can't rely on the inner buffer to
+// munmap (Metal's `newBufferWithBytesNoCopy:length:options:deallocator:nil`
+// explicitly takes no ownership — `ggml_metal_buffer_free` only frees the
+// MTLBuffer ref, leaving the host pages mapped).
+//
+// All non-`free_buffer` ops delegate straight to the inner iface so Metal's
+// shared-buffer semantics (storage-mode-shared, Apple-Silicon unified memory
+// sharing) are preserved.
+struct mmap_wrap_ctx {
+    ggml_backend_buffer_t inner = nullptr;
+    void* mmap_base = nullptr;
+    size_t mmap_size = 0;
+};
+
+static void* mmap_wrap_get_base(ggml_backend_buffer_t buffer) {
+    return ggml_backend_buffer_get_base(((mmap_wrap_ctx*)buffer->context)->inner);
+}
+static enum ggml_status mmap_wrap_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor* tensor) {
+    auto* w = (mmap_wrap_ctx*)buffer->context;
+    if (w->inner->iface.init_tensor)
+        return w->inner->iface.init_tensor(w->inner, tensor);
+    return GGML_STATUS_SUCCESS;
+}
+static void mmap_wrap_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor* tensor, uint8_t value, size_t offset,
+                                    size_t size) {
+    auto* w = (mmap_wrap_ctx*)buffer->context;
+    w->inner->iface.memset_tensor(w->inner, tensor, value, offset, size);
+}
+static void mmap_wrap_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor* tensor, const void* data, size_t offset,
+                                 size_t size) {
+    auto* w = (mmap_wrap_ctx*)buffer->context;
+    w->inner->iface.set_tensor(w->inner, tensor, data, offset, size);
+}
+static void mmap_wrap_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor* tensor, void* data, size_t offset,
+                                 size_t size) {
+    auto* w = (mmap_wrap_ctx*)buffer->context;
+    w->inner->iface.get_tensor(w->inner, tensor, data, offset, size);
+}
+static bool mmap_wrap_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor* src, ggml_tensor* dst) {
+    auto* w = (mmap_wrap_ctx*)buffer->context;
+    if (w->inner->iface.cpy_tensor)
+        return w->inner->iface.cpy_tensor(w->inner, src, dst);
+    return false;
+}
+static void mmap_wrap_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto* w = (mmap_wrap_ctx*)buffer->context;
+    w->inner->iface.clear(w->inner, value);
+}
+static void mmap_wrap_free(ggml_backend_buffer_t buffer) {
+    auto* w = (mmap_wrap_ctx*)buffer->context;
+    // Free the inner backend buffer first — for Metal this releases the
+    // MTLBuffer reference that newBufferWithBytesNoCopy held over our
+    // mmap region. Once that ref is gone, the OS is free to release any
+    // page-table entries the GPU was holding.
+    ggml_backend_buffer_free(w->inner);
+    if (w->mmap_base) {
+#if defined(_WIN32)
+        UnmapViewOfFile(w->mmap_base);
+#else
+        ::munmap(w->mmap_base, w->mmap_size);
+#endif
+    }
+    delete w;
+}
+
+static const ggml_backend_buffer_i mmap_wrap_iface = {
+    /* .free_buffer    = */ mmap_wrap_free,
+    /* .get_base       = */ mmap_wrap_get_base,
+    /* .init_tensor    = */ mmap_wrap_init_tensor,
+    /* .memset_tensor  = */ mmap_wrap_memset_tensor,
+    /* .set_tensor     = */ mmap_wrap_set_tensor,
+    /* .get_tensor     = */ mmap_wrap_get_tensor,
+    /* .set_tensor_2d  = */ nullptr,
+    /* .get_tensor_2d  = */ nullptr,
+    /* .cpy_tensor     = */ mmap_wrap_cpy_tensor,
+    /* .clear          = */ mmap_wrap_clear,
+    /* .reset          = */ nullptr,
+};
+
+static bool mmap_loader_enabled() {
+    const char* v = std::getenv("CRISPASR_GGUF_MMAP");
+    return v && *v && *v != '0';
+}
 
 } // namespace
 
@@ -220,6 +416,133 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
         if (gctx)
             gguf_free(gctx);
         return false;
+    }
+
+    // PLAN #51a: zero-copy CPU path. Skip ggml_backend_alloc_ctx_tensors
+    // (which would allocate a fresh backend-side buffer) and instead bind
+    // each tensor directly into the mmap'd file. Saves one full copy of
+    // the weights — the difference between a 14.9 GB F16 GGUF loading on
+    // a 16 GB Mac and thrashing swap. Gated on CRISPASR_GGUF_MMAP=1 +
+    // CPU backend until we've validated all 24 backends.
+    if (mmap_loader_enabled() && ggml_backend_is_cpu(backend)) {
+        MappedFile mf(path, /*writable=*/true);
+        if (mf.ok) {
+            const size_t data_off = gguf_get_data_offset(gctx);
+            const size_t mmap_size = mf.size;
+            char* tensor_base = (char*)mf.base + data_off;
+            const size_t buf_size = mmap_size > data_off ? (mmap_size - data_off) : 0;
+
+            auto* mctx = new mmap_buffer_ctx{};
+            mctx->mmap_base = mf.base;
+            mctx->mmap_size = mmap_size;
+            mctx->tensor_base = tensor_base;
+            mf.release();
+
+            out.buf = ggml_backend_buffer_init(ggml_backend_cpu_buffer_type(), mmap_buffer_iface, mctx, buf_size);
+            if (!out.buf) {
+                fprintf(stderr, "%s: failed to wrap mmap in backend buffer\n", tag);
+#if defined(_WIN32)
+                UnmapViewOfFile(mctx->mmap_base);
+#else
+                ::munmap(mctx->mmap_base, mctx->mmap_size);
+#endif
+                delete mctx;
+                gguf_free(gctx);
+                ggml_free(out.ctx);
+                out.ctx = nullptr;
+                return false;
+            }
+
+            for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
+                out.tensors[ggml_get_name(t)] = t;
+                const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+                if (tid < 0)
+                    continue;
+                const size_t off = gguf_get_tensor_offset(gctx, tid);
+                ggml_backend_tensor_alloc(out.buf, t, tensor_base + off);
+            }
+
+            gguf_free(gctx);
+            return true;
+        }
+        // mmap failed — fall through to the legacy alloc + copy path. We
+        // do NOT print a warning here; mmap is best-effort and the legacy
+        // path is functionally equivalent (just with more RSS).
+    }
+
+    // PLAN #51a (Metal variant): zero-copy GPU path via the device's
+    // `buffer_from_host_ptr` capability. On Apple-Silicon Metal this maps
+    // to `[MTLDevice newBufferWithBytesNoCopy:length:options:deallocator:]`
+    // wrapping our mmap region in an MTLResourceStorageModeShared buffer
+    // — same physical pages the CPU sees thanks to unified memory, no
+    // device-side allocation, no copy. On discrete-Metal hosts (Intel +
+    // eGPU) this lets the GPU page-fault from the file directly. The
+    // device-cap probe means we silently fall through on backends that
+    // don't advertise host-pointer support (CUDA without managed memory,
+    // Vulkan, etc.).
+    if (mmap_loader_enabled() && !ggml_backend_is_cpu(backend)) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_dev_props props{};
+        ggml_backend_dev_get_props(dev, &props);
+        if (props.caps.buffer_from_host_ptr) {
+            MappedFile mf(path, /*writable=*/true);
+            if (mf.ok) {
+                const size_t data_off = gguf_get_data_offset(gctx);
+                char* tensor_base = (char*)mf.base + data_off;
+
+                // Hand the entire mmap region (including GGUF header) to
+                // the device. The backend's `buffer_from_host_ptr` uses
+                // the size for its internal MTLBuffer view; tensor binds
+                // below offset into this base.
+                ggml_backend_buffer_t inner = ggml_backend_dev_buffer_from_host_ptr(dev, mf.base, mf.size,
+                                                                                    /*max_tensor_size=*/0);
+                if (inner) {
+                    auto* w = new mmap_wrap_ctx{};
+                    w->inner = inner;
+                    w->mmap_base = mf.base;
+                    w->mmap_size = mf.size;
+                    mf.release();
+
+                    // Reuse the inner buffer's buft so usage/alignment/etc.
+                    // stay consistent with the device's expectations. The
+                    // wrapping iface intercepts `free_buffer` only.
+                    out.buf =
+                        ggml_backend_buffer_init(inner->buft, mmap_wrap_iface, w, ggml_backend_buffer_get_size(inner));
+                    if (!out.buf) {
+                        // Wrapper init failed: roll back the inner buffer
+                        // and the mmap to keep the file descriptor + page
+                        // tables clean.
+                        fprintf(stderr, "%s: failed to wrap inner buffer (Metal mmap path)\n", tag);
+                        ggml_backend_buffer_free(inner);
+#if defined(_WIN32)
+                        UnmapViewOfFile(w->mmap_base);
+#else
+                        ::munmap(w->mmap_base, w->mmap_size);
+#endif
+                        delete w;
+                        gguf_free(gctx);
+                        ggml_free(out.ctx);
+                        out.ctx = nullptr;
+                        return false;
+                    }
+
+                    for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
+                        out.tensors[ggml_get_name(t)] = t;
+                        const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+                        if (tid < 0)
+                            continue;
+                        const size_t off = gguf_get_tensor_offset(gctx, tid);
+                        ggml_backend_tensor_alloc(out.buf, t, tensor_base + off);
+                    }
+
+                    gguf_free(gctx);
+                    return true;
+                }
+                // buffer_from_host_ptr returned null — release mmap and fall
+                // through to the legacy path. No warning; same rationale as
+                // the CPU mmap branch.
+            }
+        }
     }
 
     out.buf = ggml_backend_alloc_ctx_tensors(out.ctx, backend);
