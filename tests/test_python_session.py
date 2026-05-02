@@ -219,6 +219,25 @@ class TestKokoroPhonemeCacheClear(unittest.TestCase):
 
 
 @unittest.skipUnless(LIB_PATH, "libwhisper not built")
+class TestRegistryEnumeration(unittest.TestCase):
+    """Registry enumeration via list_known_models() returns a non-empty
+    list of backend names; each looks up to a full RegistryEntry."""
+
+    def test_list_known_models(self):
+        from crispasr import list_known_models, registry_lookup
+        backends = list_known_models(lib_path=LIB_PATH)
+        self.assertIsInstance(backends, list)
+        self.assertGreater(len(backends), 10, "registry should have >10 entries")
+        self.assertIn("whisper", backends)
+        self.assertIn("parakeet", backends)
+        # First entry should be looked-up-able
+        entry = registry_lookup(backends[0], lib_path=LIB_PATH)
+        self.assertIsNotNone(entry)
+        self.assertGreater(len(entry.filename), 0)
+        self.assertTrue(entry.url.startswith("http"))
+
+
+@unittest.skipUnless(LIB_PATH, "libwhisper not built")
 class TestSessionStateSetters(unittest.TestCase):
     """PLAN #59 partial unblock: session-level setters for source_language,
     target_language, punctuation, translate, temperature, detect_language.

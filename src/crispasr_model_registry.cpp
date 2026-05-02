@@ -331,6 +331,17 @@ bool crispasr_registry_lookup_by_filename(const std::string& filename, CrispasrR
     return true;
 }
 
+int crispasr_registry_count() {
+    return (int)(sizeof(k_registry) / sizeof(k_registry[0]));
+}
+
+bool crispasr_registry_get_at(int i, CrispasrRegistryEntry& out) {
+    if (i < 0 || i >= crispasr_registry_count())
+        return false;
+    fill(out, k_registry[i]);
+    return true;
+}
+
 bool crispasr_find_cached_model(CrispasrRegistryEntry& out, const std::string& cache_dir_override) {
     // k_registry is already ordered whisper > parakeet > canary > ... —
     // first entry wins, which matches the documented preference.

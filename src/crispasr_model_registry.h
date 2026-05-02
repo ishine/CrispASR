@@ -26,6 +26,13 @@ struct CrispasrRegistryEntry {
 /// Look up a registry entry by backend name. Returns true on hit.
 bool crispasr_registry_lookup(const std::string& backend, CrispasrRegistryEntry& out);
 
+/// Number of entries in the static registry.
+int crispasr_registry_count();
+
+/// Get the i-th entry (0..count-1). Returns false on out-of-range.
+/// Iterating from 0 to count-1 visits every entry in declaration order.
+bool crispasr_registry_get_at(int i, CrispasrRegistryEntry& out);
+
 /// Look up by filename. Exact match first, then fuzzy (substring) match.
 /// Used by the file-not-found path to suggest the canonical URL for a
 /// user-supplied filename.

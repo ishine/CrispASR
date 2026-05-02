@@ -20,7 +20,8 @@ All backends support `-m auto --auto-download`. Three new ggml ops
 | **MEDIUM** | [#51c MiMo-V2.5-ASR F16 step decode](#51c-f16-step-decode) | Small | F16 step-decode validation blocked behind ≥32 GB box (see PLAN #51c); base runtime + Q4_K shipped → HISTORY §56 |
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
-| **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | TTS surface (incl. qwen3-tts variants) at full parity across all 7 wrappers; align/diarize/VAD/streaming/punctuation/LID/registry still C-ABI-only on Go/Java/Ruby/JS/Dart |
+| **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | TTS + 6 sticky-state setters (src/tgt lang, punctuation, translate, temperature, detect_language) + registry enumeration now wired in Python/Rust/Dart (May 2026); align/diarize/VAD/streaming/punctuation/LID/registry still C-ABI-only on Go/Java/Ruby/JS |
+| **HIGH** | [#62 Streaming + mic library API](#62-streaming--mic-library-api) | M-L | crispasr_stream_* whisper-only; needs Python/Rust wrappers (Dart has), generalize to session handle, library-level mic via miniaudio, native streaming for moonshine-streaming + kyutai-stt + voxtral4b |
 | **MEDIUM** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | 14 items | 60a/b/c/d/f/g DONE; 60e env-flag wired across 9 backends (mimo-asr validated, others awaiting per-backend cosine pass); 60h-n parked/skip |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
 | **LOW** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | |
@@ -1410,3 +1411,101 @@ pass; this stub keeps the section numbers stable for future readers.
 3. README matrix line for that backend updated to match
    `--list-backends`.
 4. `warn_unsupported` no longer fires for the corresponding flag.
+
+---
+
+## 62. Streaming + mic library API
+
+May 2026 — the C-ABI exposes `crispasr_stream_*` (open / feed /
+get_text / flush / close) for low-latency rolling-window decoding,
+but it's tied to a `whisper_context*` and only the Dart wrapper
+surfaces it. Several backends are architecturally streaming
+(moonshine-streaming, kyutai-stt 12.5 Hz frame-aligned, voxtral4b
+240ms latency) but called as batch through the unified Session API.
+Mic capture is CLI-only (`--mic` shells out to `rec`/`arecord`/
+`ffmpeg`) — no library API exists.
+
+This item closes the gap end-to-end so dictation / push-to-talk /
+real-time captioning use cases can ship from any wrapper without
+subprocess hacks.
+
+### Status
+
+| Piece | Today | After this work |
+|---|---|---|
+| `crispasr_stream_*` C-ABI | whisper-only (takes `whisper_context*`) | takes `crispasr_session*`; whisper still wired through |
+| Python `Session.stream_*()` | ❌ | ✅ |
+| Rust `Session::stream_*()` | ❌ | ✅ |
+| Dart `Session.stream*()` | ✅ via `_StreamOpen/_StreamFeed/...` | ✅ unchanged |
+| Library mic API (`crispasr_mic_*`) | ❌ (CLI subprocess only) | ✅ via miniaudio `ma_device` |
+| Mic in Python/Rust/Dart | ❌ | ✅ — `Session.start_mic_streaming(callback)` |
+| moonshine-streaming wired to stream API | ❌ | optional follow-up |
+| kyutai-stt wired to stream API | ❌ | optional follow-up |
+| voxtral4b native streaming | ❌ (PLAN #7) | unchanged — separate item |
+
+### Sub-items
+
+#### 62a. Python + Rust streaming wrappers
+
+Mirror the Dart surface (`StreamingUpdate { text, t0, t1 }` +
+`Session.stream_open / feed / get_text / flush / close`). ~50 LOC
+each side. Lazy `hasattr` / `providesSymbol` checks so older dylibs
+fall through gracefully.
+
+#### 62b. Generalise `crispasr_stream_open` to a session handle
+
+Today: `crispasr_stream_open(whisper_context*, n_threads, step_ms,
+length_ms, ...)`. Add: `crispasr_session_stream_open(crispasr_session*,
+n_threads, step_ms, length_ms, ...)` that internally checks
+`s->whisper_ctx` and routes through. Keep the legacy
+`crispasr_stream_open` as a thin alias for source-compat. Future
+backends plug in by extending the dispatch in
+`crispasr_session_stream_feed` (kyutai/moonshine-streaming/voxtral4b).
+
+Effort: ~30 LOC.
+
+#### 62d. Library-level mic API via miniaudio `ma_device`
+
+`miniaudio.h` already ships with the codebase (used as a WAV
+decoder). Wrap `ma_device` capture mode in
+`src/crispasr_mic.{h,cpp}`:
+
+```c
+typedef void (*crispasr_mic_callback)(const float* pcm, int n_samples, void* userdata);
+struct crispasr_mic;
+crispasr_mic* crispasr_mic_open(int sample_rate, int channels,
+                                crispasr_mic_callback cb, void* userdata);
+int crispasr_mic_start(crispasr_mic*);
+int crispasr_mic_stop(crispasr_mic*);
+void crispasr_mic_close(crispasr_mic*);
+const char* crispasr_mic_default_device_name();
+```
+
+Cross-platform (Core Audio on macOS, ALSA/PulseAudio on Linux,
+WASAPI on Windows) via miniaudio's built-in backends. Library
+consumers get raw f32 PCM frames in their callback; combine with
+`session.stream_feed()` for end-to-end dictation.
+
+Effort: ~150 LOC. Wrappers add `Session.start_mic_streaming(cb)`
+helper that sets up mic + stream + per-callback feed wiring.
+
+#### 62c (deferred). Native streaming for moonshine-streaming + kyutai-stt
+
+Both backends emit text per frame today but the unified Session
+calls them as batch. Wire them into `crispasr_session_stream_feed`
+so `session.stream_*()` gives true low-latency output for them
+(80ms frame for kyutai, ~250ms for moonshine-streaming). Each
+~80 LOC. Defer until 62a-d ship and a consumer asks.
+
+#### 62e (deferred). Voxtral4b native streaming — see PLAN #7
+
+Already tracked separately. ~200-300 LOC, decoder thread + audio
+frame injection. High complexity, separate session.
+
+### Sequencing
+
+Ship a + b + d as one PR (~400 LOC). c and e are follow-ups when
+specific consumers request them (per PLAN #59's deferral policy).
+The output of a+b+d is enough to enable dictation across all 3
+canonical wrappers using whisper as the streaming engine, with a
+clean upgrade path for kyutai/moonshine-streaming when wired.

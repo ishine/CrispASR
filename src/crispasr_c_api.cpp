@@ -2836,6 +2836,31 @@ CA_EXPORT int crispasr_registry_lookup_by_filename_abi(const char* filename, cha
     return write_entry(e, out_filename, filename_cap, out_url, url_cap, out_size, size_cap);
 }
 
+// Write a comma-separated list of every backend name in the registry to
+// `out_csv`. Returns the number of bytes written (excluding NUL) on
+// success, or a negative error. Wrappers iterate the CSV then call
+// crispasr_registry_lookup_abi(name) for full details. Mirrors the
+// shape of crispasr_session_available_backends().
+CA_EXPORT int crispasr_registry_list_backends_abi(char* out_csv, int32_t out_cap) {
+    if (!out_csv || out_cap <= 0)
+        return -1;
+    std::string acc;
+    const int n = crispasr_registry_count();
+    for (int i = 0; i < n; i++) {
+        CrispasrRegistryEntry e;
+        if (!crispasr_registry_get_at(i, e))
+            continue;
+        if (!acc.empty())
+            acc.push_back(',');
+        acc += e.backend;
+    }
+    if ((int)acc.size() + 1 > out_cap)
+        return -2;
+    std::memcpy(out_csv, acc.data(), acc.size());
+    out_csv[acc.size()] = '\0';
+    return (int)acc.size();
+}
+
 CA_EXPORT int crispasr_session_result_n_segments(crispasr_session_result* r) {
     return r ? (int)r->segments.size() : 0;
 }

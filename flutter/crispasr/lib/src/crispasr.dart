@@ -257,6 +257,23 @@ RegistryEntry? registryLookup(String backend, {DynamicLibrary? lib}) =>
 RegistryEntry? registryLookupByFilename(String filename, {DynamicLibrary? lib}) =>
     _registryCall('crispasr_registry_lookup_by_filename_abi', filename, lib);
 
+/// Every backend name in the registry, in declaration order. Each name
+/// can be passed back to [registryLookup] for full details.
+List<String> listKnownModels({DynamicLibrary? lib}) {
+  lib ??= DynamicLibrary.open(CrispASR.defaultLibName());
+  if (!lib.providesSymbol('crispasr_registry_list_backends_abi')) return const [];
+  final fn = lib.lookupFunction<Int32 Function(Pointer<Uint8>, Int32), int Function(Pointer<Uint8>, int)>(
+      'crispasr_registry_list_backends_abi');
+  final buf = calloc<Uint8>(8192);
+  try {
+    final n = fn(buf, 8192);
+    if (n < 0) return const [];
+    return buf.cast<Utf8>().toDartString().split(',').where((s) => s.isNotEmpty).toList(growable: false);
+  } finally {
+    calloc.free(buf);
+  }
+}
+
 RegistryEntry? _registryCall(String sym, String key, DynamicLibrary? lib) {
   if (key.isEmpty) return null;
   lib ??= DynamicLibrary.open(CrispASR.defaultLibName());

@@ -323,6 +323,7 @@ extern "C" {
     ) -> c_int;
 
     /// Shared known-model registry lookup by filename (exact then fuzzy).
+    pub fn crispasr_registry_list_backends_abi(out_csv: *mut c_char, out_cap: c_int) -> c_int;
     pub fn crispasr_registry_lookup_by_filename_abi(
         filename: *const c_char,
         out_filename: *mut c_char,

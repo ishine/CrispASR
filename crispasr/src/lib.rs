@@ -866,6 +866,26 @@ pub struct RegistryEntry {
 /// Look up the canonical GGUF for a backend (whisper, parakeet, canary,
 /// voxtral, voxtral4b, granite, granite-4.1, qwen3, cohere, wav2vec2). Returns `None`
 /// on miss.
+/// List every backend name in the registry, in declaration order.
+///
+/// Each name can be passed back to [`registry_lookup`] for full details
+/// (filename, URL, approximate size).
+pub fn list_known_models() -> Vec<String> {
+    let mut buf = vec![0u8; 8192];
+    let n = unsafe {
+        crispasr_sys::crispasr_registry_list_backends_abi(buf.as_mut_ptr() as *mut c_char, buf.len() as c_int)
+    };
+    if n < 0 {
+        return Vec::new();
+    }
+    let cstr = unsafe { CStr::from_ptr(buf.as_ptr() as *const c_char) };
+    cstr.to_string_lossy()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 pub fn registry_lookup(backend: &str) -> Result<Option<RegistryEntry>, String> {
     registry_call_inner(backend, true)
 }

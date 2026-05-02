@@ -19,6 +19,7 @@ from ._binding import (
     detect_language_pcm,
     diarize_segments,
     kokoro_resolve_for_lang,
+    list_known_models,
     registry_lookup,
     registry_lookup_by_filename,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "detect_language_pcm",
     "diarize_segments",
     "kokoro_resolve_for_lang",
+    "list_known_models",
     "registry_lookup",
     "registry_lookup_by_filename",
 ]

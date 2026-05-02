@@ -458,6 +458,27 @@ def registry_lookup_by_filename(filename: str, *, lib_path: Optional[str] = None
     return _registry_call("crispasr_registry_lookup_by_filename_abi", filename, lib_path)
 
 
+def list_known_models(*, lib_path: Optional[str] = None) -> list:
+    """Return every backend name in the registry, in declaration order.
+
+    Useful for wrappers building UIs (model picker, "what can I download?").
+    Each name can be passed back to :func:`registry_lookup` for full
+    details (filename, URL, approximate size).
+    """
+    lib = ctypes.CDLL(lib_path or _find_lib())
+    if not hasattr(lib, "crispasr_registry_list_backends_abi"):
+        return []
+    fn = lib.crispasr_registry_list_backends_abi
+    fn.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    fn.restype = ctypes.c_int
+    buf = ctypes.create_string_buffer(8192)
+    n = fn(buf, 8192)
+    if n < 0:
+        return []
+    csv = buf.value.decode("utf-8")
+    return [s for s in csv.split(",") if s]
+
+
 def _registry_call(sym: str, key: str, lib_path: Optional[str]) -> Optional[RegistryEntry]:
     if not key:
         return None
