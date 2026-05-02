@@ -1904,6 +1904,34 @@ class CrispasrSession {
     if (rc != 0) throw Exception('setTranslate failed (rc=$rc)');
   }
 
+  /// Sticky audio Q&A prompt for instruct-tuned audio-LLM backends
+  /// (voxtral / voxtral4b / qwen3-asr). When set, the backend answers
+  /// the question instead of producing a verbatim transcript:
+  ///
+  ///     session.setAsk("What is the speaker's tone?");
+  ///     final segs = session.transcribe(pcm);
+  ///     // segs[0].text == "The speaker sounds calm and measured..."
+  ///
+  /// Pass an empty string to clear and resume verbatim transcription.
+  /// Backends without an instruct-tuned LLM head ignore the call —
+  /// it's a no-op rather than an error so callers can set it
+  /// unconditionally.
+  void setAsk(String prompt) {
+    if (_closed) throw StateError('CrispasrSession is closed');
+    if (!_lib.providesSymbol('crispasr_session_set_ask')) {
+      throw UnsupportedError('setAsk API not present in this libcrispasr build');
+    }
+    final fn = _lib.lookupFunction<Int32 Function(Pointer<Void>, Pointer<Utf8>),
+        int Function(Pointer<Void>, Pointer<Utf8>)>('crispasr_session_set_ask');
+    final p = prompt.toNativeUtf8();
+    try {
+      final rc = fn(_handle, p);
+      if (rc != 0) throw Exception('setAsk failed (rc=$rc)');
+    } finally {
+      calloc.free(p);
+    }
+  }
+
   /// Set decoder temperature on backends that support runtime control
   /// (canary, cohere, parakeet, moonshine). Other backends silently no-op.
   /// `seed` is the RNG seed; pass 0 for time-based.
