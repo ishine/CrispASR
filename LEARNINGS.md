@@ -1190,6 +1190,55 @@ Fix: use `ne[1]` instead: `ggml_reshape_2d(ht, ht->ne[0], ht->ne[1])`.
 `ggml_conv_1d_dw` or `ggml_im2col`-based ops — the output tensor
 dimensions may shift.
 
+### Qwen3-TTS cp step-0 graph cache (2026-05-02)
+
+The O15 cp-graph cache (commit 7298dd5) handled T=1 only — the
+step-0 forward pass (T=2 prefill on `lm_head[0]`) rebuilt every
+frame. Added `QWEN3_TTS_CP_STEP0_CACHE=1` (gated, default OFF):
+build the T=2 graph once into a per-cache arena and reserve it in a
+dedicated `cp_step0_sched`, then reuse forever. Requires O15 (the
+mask + `kv_indices=positions` path makes the graph n_past-invariant).
+
+Implementation: `build_graph_code_pred_kv` gained an `arena_ctx`
+parameter, mirroring the talker-bucket pattern. `cp_step0_get_or_build`
+allocates the arena + graph on first use, caches in
+`c->cp_step0_gf` / `c->cp_step0_ctx`. Free path skips `ggml_free` on
+caller-supplied arenas (caller manages lifetime).
+
+Validated bit-identical: md5(default WAV) == md5(O15+CP_STEP0_CACHE
+WAV) on the qwen-three-bench prompt at seed=42. Bench under heavy
+contention showed `cp_step0_cache (14 calls): alloc=0.00 ms` after
+first activation (vs default's ~1-3 ms quiet, 5-15 ms contended).
+Net win is modest (~1-3 ms/frame quiet) — the per-step compute is
+unchanged, only the per-frame build+reset+alloc collapses. Kept
+gated until a clean quiet-machine bench confirms the win magnitude.
+
+### Qwen3-TTS Q8_0 KV cache — blocked on Metal cont(Q8_0)
+
+Investigated halving talker KV bandwidth by storing K/V as Q8_0
+(LEARNINGS hinted this as a "local upgrade"). Reality on Metal:
+
+- ✓ `ggml_flash_attn_ext` natively supports Q8_0 K and V
+  (`ggml-metal-device.m:1167`).
+- ✓ `ggml_set_rows` supports F32 → Q8_0 dest (write path works).
+- ✓ `ggml_cpy` supports F32 → Q8_0 dest (write path works).
+- ✗ `ggml_cont` / `ggml_cpy` / `ggml_dup` with **Q8_0 source** is
+  not supported on Metal — only F32, F16, BF16 sources are listed
+  (`ggml-metal-device.m:1199-1244`). The `kv_self_attn` read path
+  does `ggml_cont(ggml_view_3d(kv_k, hd, Lk, n_kv, ...))` to flatten
+  the layer's strided slice from `(hd, max_ctx, n_kv, n_layers)`
+  storage. Without Metal-native cont(Q8_0→*), the op falls back to
+  CPU — kills the win.
+
+Workarounds: (a) patch ggml-metal to add Q8_0-source `cpy`/`cont`
+kernels (mirror llama.cpp's cache-type-k Q8_0 dequant path); persistent
+maintenance cost across ggml bumps. (b) restructure KV storage to
+per-layer 3D tensors so the layer-extract view becomes the whole
+tensor — but the strided-Lk view (positions [0..Lk-1] from
+[0..max_ctx-1]) still needs a cont. Neither option is "local" as
+the LEARNINGS roadmap implied; deferred until someone wants to
+shoulder the kernel work.
+
 ### Grouped conv1d via ggml: im2col shape pitfalls
 
 Implementing grouped conv1d as G independent `ggml_im2col` + `ggml_mul_mat`
