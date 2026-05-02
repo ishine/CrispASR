@@ -44,6 +44,28 @@ static inline ggml_tensor* swiglu(ggml_context* ctx, ggml_tensor* x, ggml_tensor
     return ggml_mul_mat(ctx, down_w, mlp);
 }
 
+// SwiGLU with a fused gate+up matmul. `gate_up_w` has shape
+// (d_model, 2*ff_dim) — gate weights occupy the first ff_dim output rows,
+// up weights the next ff_dim. Saves one matmul per layer relative to the
+// separate-weights `swiglu` path; works for any row-wise quantized format
+// because the output axis is split per row. The split is a strided view
+// followed by ggml_cont (one materialised buffer per branch) so the
+// downstream silu/mul/down_w matmul receives contiguous tensors.
+static inline ggml_tensor* swiglu_fused_gate_up(ggml_context* ctx, ggml_tensor* x, ggml_tensor* gate_up_w,
+                                                ggml_tensor* down_w, int ff_dim) {
+    ggml_tensor* gate_up = ggml_mul_mat(ctx, gate_up_w, x);
+    const int T = (int)gate_up->ne[1];
+    const size_t row_bytes = gate_up->nb[1];
+    ggml_tensor* gate = ggml_view_2d(ctx, gate_up, ff_dim, T, row_bytes, 0);
+    ggml_tensor* up = ggml_view_2d(ctx, gate_up, ff_dim, T, row_bytes, ff_dim * ggml_type_size(gate_up->type));
+    // No ggml_cont: silu and mul are elementwise and accept strided views,
+    // and the downstream matmul (down_w × mlp) materialises mlp into its
+    // own contiguous output. Avoiding cont here saves a buffer copy on
+    // every decode step and ~30 ms on a JFK 11s decode.
+    ggml_tensor* mlp = ggml_mul(ctx, ggml_silu(ctx, gate), up);
+    return ggml_mul_mat(ctx, down_w, mlp);
+}
+
 // SwiGLU with an optional bias on the down projection. Used by voxtral4b
 // when ffn_down_b is present in the GGUF (some checkpoints).
 static inline ggml_tensor* swiglu_down_bias(ggml_context* ctx, ggml_tensor* x, ggml_tensor* gate_w, ggml_tensor* up_w,

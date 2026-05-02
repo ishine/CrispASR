@@ -945,7 +945,6 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
                         fprintf(stderr, "voxtral4b: fused QKV for %zu LLM layers (%d+%d+%d→%d, type=%s)\n",
                                 blocks.size(), q_out, kv_out, kv_out, qkv_out, ggml_type_name(t0));
                 } else {
-                    // Allocation failed — fall back to separate Q/K/V.
                     ggml_free(ctx->fused_ctx);
                     ctx->fused_ctx = nullptr;
                     for (auto& b : blocks)
@@ -953,6 +952,15 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
                 }
             }
         }
+        // FFN gate+up fuse was tried (PLAN #7 phase 2) but delivered no
+        // measurable speedup on M1 Q4_K voxtral4b — Metal's Q4_K matmul
+        // kernel appears already memory-bandwidth-bound for the
+        // (3072, 9216) shape, so combining two of those into (3072, 18432)
+        // doesn't help the per-step decode budget. Removed; the
+        // `core_ffn::swiglu_fused_gate_up` helper stays in place for any
+        // future caller (e.g. a different backend or larger model where
+        // the savings might be real). See HISTORY §71 for the
+        // measurement notes.
     }
 
     if (params.verbosity >= 1) {
