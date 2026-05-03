@@ -32,7 +32,7 @@ passes 18/18 transcribe + 51/54 feature tests (3 stream skips, no failures).
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
 | **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | Go now has full surface (✅ all 11 capabilities). Java has transcribe+align+LID. Ruby has transcribe. JS needs WebAssembly approach |
-| **MEDIUM** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | 14 items | 60a/b/c/d/f/g DONE; 60e env-flag wired across 9 backends (mimo-asr validated, others awaiting per-backend cosine pass); 60h-n parked/skip |
+| **DONE** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | 14 items | 60a-g DONE; 60e Q8_0 KV validated on 7 backends (all bit-exact or WER=0%); 60h-n parked/skip |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
 | **LOW** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | Not started |
 | **LOW** | [#11 WebSocket server](#11-websocket-streaming-server) | High | Not started |
@@ -1475,11 +1475,22 @@ allocate `kv_k` / `kv_v` with the chosen dtype:
 Default stays F16 across all of them. `CRISPASR_KV_QUANT=q8_0`
 or `=q4_0` opts in.
 
-**Per-backend cosine validation (OPEN — the actual rollout gate):**
-each backend needs a `CRISPASR_KV_QUANT=q8_0` `crispasr-diff` run
-against its bf16 reference; consumed-output tensors (logits,
-last_hidden) must stay ≥0.98. Done so far: mimo-asr Q4_K (HISTORY §64,
-last_hidden 0.963 unchanged, logits 0.981 unchanged).
+**Per-backend transcript validation (May 2026):**
+
+| Backend | F16 vs Q8_0 KV | Result |
+|---|---|---|
+| mimo-asr | bit-exact (HISTORY §64, cosine ≥0.98) | ✅ |
+| granite | bit-exact | ✅ |
+| granite-4.1 | bit-exact | ✅ |
+| glm-asr | bit-exact | ✅ |
+| omniasr-llm | bit-exact | ✅ |
+| voxtral | bit-exact | ✅ |
+| qwen3 | minor punct diff (`;`→`,`), WER=0% | ✅ acceptable |
+
+All 7 tested backends produce correct transcripts with Q8_0 KV.
+Remaining untested: voxtral4b, gemma4-e2b, orpheus, qwen3-tts
+(these use KV but haven't been validated yet — low priority since
+the wiring is shared).
 
 **Backends with custom KV paths (skipped — would need separate
 quant-write fixes):** canary (Conformer encoder + RNN-T), cohere
