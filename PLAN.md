@@ -31,7 +31,7 @@ passes 18/18 transcribe + 51/54 feature tests (3 stream skips, no failures).
 | **MEDIUM** | [#51c MiMo-V2.5-ASR F16 step decode](#51c-f16-step-decode) | Small | F16 step-decode validation blocked behind ≥32 GB box (see PLAN #51c); base runtime + Q4_K shipped → HISTORY §56 |
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
-| **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | TTS + 6 sticky-state setters (src/tgt lang, punctuation, translate, temperature, detect_language) + registry enumeration now wired in Python/Rust/Dart (May 2026); align/diarize/VAD/streaming/punctuation/LID/registry still C-ABI-only on Go/Java/Ruby/JS |
+| **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | **Transcribe** now wired in Go/Java/Ruby (was TTS-only). Go also has Punc/Registry/Cache. Remaining: align/diarize standalone in Go/Java/Ruby; JS needs WebAssembly approach |
 | **HIGH** | [#62 Streaming + mic library API](#62-streaming--mic-library-api) | M-L | crispasr_stream_* whisper-only; needs Python/Rust wrappers (Dart has), generalize to session handle, library-level mic via miniaudio, native streaming for moonshine-streaming + kyutai-stt + voxtral4b |
 | **MEDIUM** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | 14 items | 60a/b/c/d/f/g DONE; 60e env-flag wired across 9 backends (mimo-asr validated, others awaiting per-backend cosine pass); 60h-n parked/skip |
 | **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
@@ -1274,15 +1274,17 @@ This entry tracks closing those gaps.
 C-ABI exposes 127+ unique `crispasr_*` exports in
 `src/crispasr_c_api.cpp`. Coverage by binding:
 
-| Binding | Symbols wrapped | Approx % | TTS Session | Variant detect | Align | Diarize | LID | VAD | Streaming | Punc | Registry | Cache |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| Rust (`crispasr-sys`) | 56 | ~44% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Python (`_binding.py`) | 53 | ~42% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Dart (`flutter/crispasr`) | ~25 | ~20% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Go (`bindings/go`) | 18 | ~14% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Java (JNA) | 17 | ~13% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Ruby (C ext) | 19 | ~15% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| JS (emscripten) | 18 | ~14% | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Binding | Symbols wrapped | Approx % | ASR Transcribe | TTS Session | Variant detect | Align | Diarize | LID | VAD | Streaming | Punc | Registry | Cache |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Rust (`crispasr-sys`) | 56 | ~44% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Python (`_binding.py`) | 53 | ~42% | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Dart (`flutter/crispasr`) | ~30 | ~24% | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Go (`bindings/go`) | ~35 | ~28% | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Java (JNA) | ~30 | ~24% | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅¹ | ✅¹ | ✅¹ |
+| Ruby (C ext) | ~25 | ~20% | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅¹ | ❌ | ❌ |
+| JS (emscripten) | 18 | ~14% | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+¹ JNA declarations added, idiomatic Java wrapper methods pending.
 
 Rust + Python are the canonical / "full-coverage" wrappers. The other
 five track the high-traffic surface (transcribe + TTS) and were swept
