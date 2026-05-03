@@ -1,0 +1,216 @@
+// test-core-decode.cpp — unit tests for core_greedy_decode + core_beam_decode.
+//
+// These test the shared decode helpers in isolation using a trivial mock
+// "LLM" that always returns a fixed logit distribution. No models loaded,
+// no GPU needed — pure CPU, sub-millisecond.
+
+#include <catch2/catch_test_macros.hpp>
+
+#include "core/greedy_decode.h"
+#include "core/beam_decode.h"
+
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+
+// ---------------------------------------------------------------------------
+// Mock LLM: vocab_size=8, always returns logits where token 3 is highest,
+// token 5 is EOS. After generating 3 tokens of id=3, switches to EOS.
+// ---------------------------------------------------------------------------
+
+struct MockCtx {
+    int call_count = 0;
+    int vocab = 8;
+    int eos = 5;
+    int hot_tok = 3;
+};
+
+// Greedy-decode embed callback (unused — greedy helper doesn't call it)
+static float* mock_embed(MockCtx* ctx, const int32_t* ids, int n) {
+    (void)ctx; (void)ids;
+    float* e = (float*)malloc(sizeof(float) * n);
+    memset(e, 0, sizeof(float) * n);
+    return e;
+}
+
+// Greedy-decode LLM callback: returns logits with hot_tok dominant,
+// switches to EOS after 3 calls.
+static float* mock_llm(MockCtx* ctx, const float* embeds, int n_tokens,
+                        int n_past, int* out_n, int* out_vocab) {
+    (void)embeds; (void)n_tokens; (void)n_past;
+    ctx->call_count++;
+    if (out_n) *out_n = 1;
+    if (out_vocab) *out_vocab = ctx->vocab;
+    float* logits = (float*)malloc(sizeof(float) * ctx->vocab);
+    for (int i = 0; i < ctx->vocab; i++) logits[i] = -10.0f;
+    if (ctx->call_count <= 3)
+        logits[ctx->hot_tok] = 5.0f;
+    else
+        logits[ctx->eos] = 5.0f;
+    return logits;
+}
+
+// Beam-decode replay callback (takes ctx as first arg from template)
+static float* mock_replay(MockCtx* ctx, const int32_t* toks, int n_toks, int prompt_len) {
+    (void)toks; (void)prompt_len;
+    ctx->call_count++;
+    float* logits = (float*)malloc(sizeof(float) * ctx->vocab);
+    for (int i = 0; i < ctx->vocab; i++) logits[i] = -10.0f;
+    // Generate hot_tok for first 3 tokens, then EOS
+    if (n_toks < 3)
+        logits[ctx->hot_tok] = 5.0f;
+    else
+        logits[ctx->eos] = 5.0f;
+    return logits;
+}
+
+// ---------------------------------------------------------------------------
+// core_greedy_decode tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("greedy_decode: argmax picks highest logit", "[unit][decode]") {
+    float logits[] = {1.0f, 3.0f, 2.0f, 5.0f, 0.5f};
+    REQUIRE(core_greedy_decode::argmax(logits, 5) == 3);
+}
+
+TEST_CASE("greedy_decode: argmax with negative logits", "[unit][decode]") {
+    float logits[] = {-5.0f, -1.0f, -3.0f, -2.0f};
+    REQUIRE(core_greedy_decode::argmax(logits, 4) == 1);
+}
+
+TEST_CASE("greedy_decode: softmax_of returns valid probability", "[unit][decode]") {
+    float logits[] = {1.0f, 2.0f, 3.0f};
+    float p = core_greedy_decode::softmax_of(logits, 3, 2, logits[2]);
+    REQUIRE(p > 0.5f);
+    REQUIRE(p <= 1.0f);
+}
+
+TEST_CASE("greedy_decode: run_with_probs produces correct sequence", "[unit][decode]") {
+    MockCtx ctx;
+    core_greedy_decode::Config cfg;
+    cfg.max_new_tokens = 10;
+    cfg.eos_id = 5;
+    cfg.vocab_size = 8;
+
+    // Simulate prefill: first token is hot_tok=3
+    float prefill_logits[8];
+    for (int i = 0; i < 8; i++) prefill_logits[i] = -10.0f;
+    prefill_logits[3] = 5.0f;
+
+    int first_tok = core_greedy_decode::argmax(prefill_logits, 8);
+    float first_p = core_greedy_decode::softmax_of(prefill_logits, 8, first_tok, prefill_logits[first_tok]);
+
+    auto result = core_greedy_decode::run_with_probs(&ctx, first_tok, first_p, 0,
+                                                      mock_embed, mock_llm, cfg);
+
+    // Should produce [3, 3, 3, 5] (3 hot tokens + EOS)
+    REQUIRE(result.tokens.size() >= 3);
+    REQUIRE(result.tokens[0] == 3);
+    REQUIRE(result.tokens[1] == 3);
+    REQUIRE(result.tokens[2] == 3);
+    // EOS should terminate
+    bool found_eos = false;
+    for (auto t : result.tokens) if (t == 5) found_eos = true;
+    REQUIRE(found_eos);
+}
+
+// ---------------------------------------------------------------------------
+// core_beam_decode tests
+// ---------------------------------------------------------------------------
+
+TEST_CASE("beam_decode: beam_size=1 behaves like greedy", "[unit][decode]") {
+    MockCtx ctx;
+    float prefill[8];
+    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    prefill[3] = 5.0f;
+
+    core_beam_decode::Config cfg;
+    cfg.max_new_tokens = 10;
+    cfg.eos_id = 5;
+    cfg.vocab_size = 8;
+    cfg.beam_size = 1;
+    cfg.prompt_len = 0;
+
+    auto result = core_beam_decode::run_with_probs(&ctx, prefill, mock_replay, cfg);
+
+    REQUIRE(result.tokens.size() >= 3);
+    REQUIRE(result.tokens[0] == 3);
+    REQUIRE(result.tokens[1] == 3);
+    REQUIRE(result.tokens[2] == 3);
+}
+
+TEST_CASE("beam_decode: beam_size=4 produces valid output", "[unit][decode]") {
+    MockCtx ctx;
+    float prefill[8];
+    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    prefill[3] = 5.0f;
+
+    core_beam_decode::Config cfg;
+    cfg.max_new_tokens = 10;
+    cfg.eos_id = 5;
+    cfg.vocab_size = 8;
+    cfg.beam_size = 4;
+    cfg.prompt_len = 0;
+
+    auto result = core_beam_decode::run_with_probs(&ctx, prefill, mock_replay, cfg);
+
+    // With a strongly peaked distribution, beam search should agree with greedy
+    REQUIRE(!result.tokens.empty());
+    REQUIRE(result.tokens[0] == 3);
+    REQUIRE(result.probs.size() == result.tokens.size());
+    for (float p : result.probs) {
+        REQUIRE(p >= 0.0f);
+        REQUIRE(p <= 1.0f);
+    }
+}
+
+TEST_CASE("beam_decode: respects max_new_tokens", "[unit][decode]") {
+    // Mock that never produces EOS
+    struct InfCtx { int vocab = 8; };
+    InfCtx ictx;
+
+    auto inf_replay = [](InfCtx* c, const int32_t*, int, int) -> float* {
+        float* lg = (float*)malloc(sizeof(float) * c->vocab);
+        for (int i = 0; i < c->vocab; i++) lg[i] = -10.0f;
+        lg[3] = 5.0f; // always token 3, never EOS
+        return lg;
+    };
+
+    float prefill[8];
+    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    prefill[3] = 5.0f;
+
+    core_beam_decode::Config cfg;
+    cfg.max_new_tokens = 5;
+    cfg.eos_id = 7; // never generated
+    cfg.vocab_size = 8;
+    cfg.beam_size = 2;
+    cfg.prompt_len = 0;
+
+    auto result = core_beam_decode::run_with_probs(&ictx, prefill, inf_replay, cfg);
+
+    REQUIRE(result.tokens.size() == 5);
+}
+
+TEST_CASE("beam_decode: multi-EOS stops on any", "[unit][decode]") {
+    MockCtx ctx;
+    float prefill[8];
+    for (int i = 0; i < 8; i++) prefill[i] = -10.0f;
+    prefill[3] = 5.0f;
+
+    core_beam_decode::Config cfg;
+    cfg.max_new_tokens = 10;
+    cfg.eos_ids = {5, 6, 7}; // any of these is EOS
+    cfg.vocab_size = 8;
+    cfg.beam_size = 2;
+    cfg.prompt_len = 0;
+
+    auto result = core_beam_decode::run_with_probs(&ctx, prefill, mock_replay, cfg);
+
+    REQUIRE(!result.tokens.empty());
+    // Last token should be one of the EOS ids
+    int last = result.tokens.back();
+    bool is_eos = (last == 5 || last == 6 || last == 7);
+    REQUIRE(is_eos);
+}

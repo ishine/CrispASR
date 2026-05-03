@@ -177,6 +177,24 @@ catch_discover_tests(test-params
     PROPERTIES LABELS "unit"
 )
 
+# ─── test-core-decode — Catch2 unit tests for core_greedy_decode + core_beam_decode
+#
+# Tests the shared decode helpers in isolation with a mock LLM. No models
+# loaded, no GPU — pure CPU, sub-millisecond. Covers: argmax, softmax_of,
+# greedy run_with_probs, beam run_with_probs (beam_size=1,4), max_new_tokens
+# cap, multi-EOS termination.
+add_executable(test-core-decode test-core-decode.cpp)
+target_include_directories(test-core-decode PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+target_link_libraries(test-core-decode PRIVATE
+    Catch2::Catch2WithMain
+)
+catch_discover_tests(test-core-decode
+    TEST_SPEC "[unit]"
+    PROPERTIES LABELS "unit"
+)
+
 # ─── test_qwen3_audio_tower — pre-refactor numeric baseline for the audio
 # tower. Captures sum/sum_sq/max_abs + first-32/last-32 windows on the encoder
 # output for a fixed PCM (jfk.raw) so that extracting the audio tower into the
