@@ -2057,31 +2057,14 @@ is often a small patch per backend.
 **Audit baseline:** `crispasr --list-backends` output + `test-all-backends.py
 --profile=feature` run (51 PASS, 0 FAIL after registry cleanup).
 
-### Phase 1 — Beam search for LLM backends (HIGH impact)
+### Phase 1 — Beam search for LLM backends — PARTIALLY DONE
 
-Currently: whisper, voxtral, glm-asr, kyutai-stt, firered, moonshine,
-omniasr, omniasr-llm have beam search. Missing from **canary, cohere,
-granite (all variants), voxtral4b, qwen3** — all autoregressive decoders
-that use `core_greedy_decode`.
+**DONE:** granite (all variants) + qwen3 — wired `core_beam_decode::run_with_probs`
+with replay-from-prefix in the CLI backend adapters. Tested with -bs 4 on JFK.
 
-**Approach:** Each backend's transcribe function calls `core_greedy_decode::run`
-or `core_greedy_decode::run_with_probs`. Swap in `core_beam_decode::run`
-when `params.beam_size > 1`. The function signatures are near-identical
-(both take embed+llm callbacks, decode_config). Per-backend patch is
-~20 lines: add `#include "core_beam_decode.h"`, read `params.beam_size`,
-branch to `core_beam_decode::run`.
-
-**Files per backend:**
-- `src/crispasr_c_api.cpp` — canary, cohere, granite, qwen3 transcribe paths
-- `examples/cli/crispasr_backend_voxtral4b.cpp` — voxtral4b CLI path
-- `src/{canary,cohere,granite_speech,qwen3_asr}.cpp` — if beam needs
-  library-level wiring (most don't — the session API already forwards
-  beam_size)
-
-**Effort:** Small per backend (~30 min each), 5 backends = ~half day.
-
-**Cap update:** Set `CAP_BEAM_SEARCH` in each backend's `capabilities()`
-return value in `crispasr_backend_*.cpp`.
+**SKIPPED (architectural blockers):**
+- voxtral4b: per-step audio-injection decode loop incompatible with replay-from-prefix
+- canary/cohere: decode is inside opaque library calls, no beam_size parameter exposed
 
 ### Phase 2 — Auto-download gaps (SMALL)
 
@@ -2168,12 +2151,38 @@ No code changes needed; just document the GPU requirement.
 
 **Effort:** None (documentation only).
 
+### Phase 7 — Capability declaration fixes — DONE
+
+Re-audit found the initial agent report was wrong: firered-asr,
+moonshine, kyutai-stt, omniasr all already had correct capability
+declarations in their CLI backend adapters.
+
+Actual fixes applied:
+- omniasr: added CAP_AUTO_DOWNLOAD (had registry entry but not the cap flag)
+- mimo-asr: capabilities was 0, added CAP_AUTO_DOWNLOAD + CAP_TOKEN_CONFIDENCE
+- mimo-asr: added model registry entry (cstr/mimo-asr-GGUF)
+
+### Phase 8 — vibevoice CLI backend adapter — ALREADY EXISTS
+
+Re-audit found `crispasr_backend_vibevoice.cpp` already exists with
+full ASR + TTS support (160 lines, 16k→24k resample, voice loading).
+Initial agent report was incorrect.
+
+### Phase 9 — Translation for backends that support it (MEDIUM)
+
+| Backend | Model supports | CrispASR status |
+|---|---|---|
+| cohere | 13-language transcription | No CAP_TRANSLATE, no --translate handling |
+| glm-asr | LLM decoder, could translate via prompt | Not wired |
+
 ### Summary — expected matrix after all phases
 
 | Feature gained | Backends affected |
 |---|---|
-| Beam search | +canary, +cohere, +granite, +voxtral4b, +qwen3 |
+| Beam search | +granite, +qwen3 (DONE); canary/cohere/voxtral4b blocked |
+| Cap declarations | +firered, +moonshine, +kyutai-stt, +omniasr, +omniasr-llm |
 | Auto-download | +omniasr, +omniasr-llm, +mimo-asr |
 | Flash attention | +glm-asr, +kyutai-stt, +firered, +moonshine, +omniasr |
 | Word timestamps (-am) | +moonshine-streaming, +omniasr-llm, +vibevoice, +mimo-asr |
 | Auto-punctuation | +fc-ctc, +wav2vec2, +omniasr-ctc, +firered (opt-in) |
+| vibevoice CLI adapter | +vibevoice (CLI path) |

@@ -64,6 +64,8 @@ constexpr Entry k_registry[] = {
     {"wav2vec2", "wav2vec2-xlsr-en-q4_k.gguf",
      "https://huggingface.co/cstr/wav2vec2-large-xlsr-53-english-GGUF/resolve/main/wav2vec2-xlsr-en-q4_k.gguf",
      "~212 MB", nullptr, nullptr},
+    {"mimo-asr", "mimo-asr-q4_k.gguf",
+     "https://huggingface.co/cstr/mimo-asr-GGUF/resolve/main/mimo-asr-q4_k.gguf", "~4.2 GB", nullptr, nullptr},
     {"omniasr", "omniasr-ctc-1b-v2-q4_k.gguf",
      "https://huggingface.co/cstr/omniASR-CTC-1B-v2-GGUF/resolve/main/omniasr-ctc-1b-v2-q4_k.gguf", "~580 MB", nullptr, nullptr},
     {"omniasr-llm", "omniasr-llm-300m-v2-q4_k.gguf",

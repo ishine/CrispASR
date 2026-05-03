@@ -18,7 +18,7 @@ public:
     uint32_t capabilities() const override {
         // Beam-search applies only to the LLM variant; the matrix lists it
         // there. CTC variant ignores beam_size at the decode layer.
-        return CAP_TOKEN_CONFIDENCE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_PUNCTUATION_TOGGLE;
+        return CAP_TOKEN_CONFIDENCE | CAP_TEMPERATURE | CAP_BEAM_SEARCH | CAP_PUNCTUATION_TOGGLE | CAP_AUTO_DOWNLOAD;
     }
 
     bool init(const whisper_params& params) override {
