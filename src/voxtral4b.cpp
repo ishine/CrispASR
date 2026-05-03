@@ -912,9 +912,9 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
         if (can_fuse) {
             const ggml_type t0 = blocks[0].attn_q_w ? blocks[0].attn_q_w->type : GGML_TYPE_F32;
             for (auto& b : blocks) {
-                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 ||
-                    b.attn_k_w->type != t0 || b.attn_v_w->type != t0 ||
-                    b.attn_q_w->ne[0] != b.attn_k_w->ne[0] || b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
+                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 || b.attn_k_w->type != t0 ||
+                    b.attn_v_w->type != t0 || b.attn_q_w->ne[0] != b.attn_k_w->ne[0] ||
+                    b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
                     can_fuse = false;
                     break;
                 }
@@ -932,8 +932,8 @@ extern "C" struct voxtral4b_context* voxtral4b_init_from_file(const char* path,
                 for (auto& b : blocks) {
                     b.attn_qkv_w = ggml_new_tensor_2d(ctx->fused_ctx, t0, hidden, qkv_out);
                 }
-                ctx->fused_buf =
-                    ggml_backend_alloc_ctx_tensors_from_buft(ctx->fused_ctx, ggml_backend_get_default_buffer_type(ctx->backend));
+                ctx->fused_buf = ggml_backend_alloc_ctx_tensors_from_buft(
+                    ctx->fused_ctx, ggml_backend_get_default_buffer_type(ctx->backend));
                 if (ctx->fused_buf) {
                     for (auto& b : blocks) {
                         const size_t qb = ggml_nbytes(b.attn_q_w);
@@ -1405,7 +1405,7 @@ static std::vector<float> compute_mel_streaming(voxtral4b_context* ctx, const fl
 //   - "stream_enc_out": [d_model, T_chunk_enc] post-RMSNorm (pre-projector)
 //   - "stream_conv0_out_last_d": [d_model, 1] — capture last conv0-out frame for next call's conv1_lctx
 static ggml_cgraph* voxtral4b_build_graph_encoder_stream(voxtral4b_context* ctx, int T_chunk_mel, int n_past_enc,
-                                                        ggml_tensor* kv_k, ggml_tensor* kv_v) {
+                                                         ggml_tensor* kv_k, ggml_tensor* kv_v) {
     const auto& m = ctx->model;
     const auto& hp = m.hparams;
     const int d = (int)hp.audio_d_model;
@@ -1435,8 +1435,8 @@ static ggml_cgraph* voxtral4b_build_graph_encoder_stream(voxtral4b_context* ctx,
     // Capture last conv0-out frame as next call's conv1_lctx. View slice (last frame across d).
     {
         // cur is (T_chunk_mel, d, 1) row-major. Last frame is offset (T_chunk_mel - 1) along ne[0].
-        ggml_tensor* last = ggml_view_3d(ctx0, cur, 1, d, 1, cur->nb[1], cur->nb[2],
-                                          (size_t)(T_chunk_mel - 1) * cur->nb[0]);
+        ggml_tensor* last =
+            ggml_view_3d(ctx0, cur, 1, d, 1, cur->nb[1], cur->nb[2], (size_t)(T_chunk_mel - 1) * cur->nb[0]);
         last = ggml_cont(ctx0, last);
         ggml_set_name(last, "stream_conv0_last_d");
         ggml_set_output(last);
@@ -1620,16 +1620,16 @@ struct voxtral4b_stream {
     // injection-prompt audio-LLMs from encoder-decoder ASR where stable-
     // prefix heuristics matter.)
     bool live_decode_enabled;
-    bool decode_started;          // first decode step ran (logits/state initialised)
-    bool decode_finished;         // EOS emitted
-    bool decode_logits_committed; // true if decode_logits's argmax has already been emitted
-                                  // (prevents double-emission across multiple drain calls)
-    int decode_n_past;            // current LLM position cursor (advances per step)
-    int decode_adapter_pos;       // current audio_embed cursor (advances per step)
-    int decode_out_vocab;         // cached for the current logits buffer
-    int decode_last_argmax_id;    // most-recent argmax id (committed but not yet forwarded)
+    bool decode_started;              // first decode step ran (logits/state initialised)
+    bool decode_finished;             // EOS emitted
+    bool decode_logits_committed;     // true if decode_logits's argmax has already been emitted
+                                      // (prevents double-emission across multiple drain calls)
+    int decode_n_past;                // current LLM position cursor (advances per step)
+    int decode_adapter_pos;           // current audio_embed cursor (advances per step)
+    int decode_out_vocab;             // cached for the current logits buffer
+    int decode_last_argmax_id;        // most-recent argmax id (committed but not yet forwarded)
     std::vector<float> decode_logits; // last-position logits for next argmax
-    int decode_steps_done;        // total decode steps run (for timing telemetry)
+    int decode_steps_done;            // total decode steps run (for timing telemetry)
 
     // ── Decoder thread (PLAN #7 phase 4) ───────────────────────────────────
     // When `decoder_thread_enabled` is true, vox_stream_drain_decode runs
@@ -1723,20 +1723,17 @@ static int vox_stream_advance_mel(voxtral4b_stream* s) {
     // interleave per-band rows: each new chunk's row m gets appended
     // after the previous chunks' row m. So mel_pending is laid out as
     // (n_mels, T_total) and per-band slices need contiguous time.
-    const size_t prev_T = (n_mels > 0 && !s->mel_pending.empty())
-                              ? s->mel_pending.size() / n_mels
-                              : 0;
+    const size_t prev_T = (n_mels > 0 && !s->mel_pending.empty()) ? s->mel_pending.size() / n_mels : 0;
     const size_t new_T = prev_T + (size_t)T_out;
     std::vector<float> rebuilt((size_t)n_mels * new_T);
     for (int m = 0; m < n_mels; m++) {
         // Copy old per-band row.
         if (prev_T > 0)
-            std::memcpy(rebuilt.data() + (size_t)m * new_T,
-                        s->mel_pending.data() + (size_t)m * prev_T,
+            std::memcpy(rebuilt.data() + (size_t)m * new_T, s->mel_pending.data() + (size_t)m * prev_T,
                         prev_T * sizeof(float));
         // Append new per-band row.
-        std::memcpy(rebuilt.data() + (size_t)m * new_T + prev_T,
-                    mel.data() + (size_t)m * T_out, (size_t)T_out * sizeof(float));
+        std::memcpy(rebuilt.data() + (size_t)m * new_T + prev_T, mel.data() + (size_t)m * T_out,
+                    (size_t)T_out * sizeof(float));
     }
     s->mel_pending = std::move(rebuilt);
     s->pcm_next_frame_start += n_new * hop;
@@ -1791,15 +1788,13 @@ static int vox_stream_run_encoder_chunk(voxtral4b_stream* s) {
     const int T_in = T_chunk_mel + 2;
     std::vector<float> mel_in((size_t)n_mels * T_in);
     for (int m = 0; m < n_mels; m++) {
-        std::memcpy(mel_in.data() + (size_t)m * T_in,
-                    s->conv0_lctx.data() + (size_t)m * 2, 2 * sizeof(float));
-        std::memcpy(mel_in.data() + (size_t)m * T_in + 2,
-                    s->mel_pending.data() + (size_t)m * T_pending,
+        std::memcpy(mel_in.data() + (size_t)m * T_in, s->conv0_lctx.data() + (size_t)m * 2, 2 * sizeof(float));
+        std::memcpy(mel_in.data() + (size_t)m * T_in + 2, s->mel_pending.data() + (size_t)m * T_pending,
                     (size_t)T_chunk_mel * sizeof(float));
     }
 
-    ggml_cgraph* gf = voxtral4b_build_graph_encoder_stream(s->ctx, T_chunk_mel, s->enc_T_so_far, s->enc_kv_k,
-                                                            s->enc_kv_v);
+    ggml_cgraph* gf =
+        voxtral4b_build_graph_encoder_stream(s->ctx, T_chunk_mel, s->enc_T_so_far, s->enc_kv_k, s->enc_kv_v);
     ggml_backend_sched_reset(s->ctx->sched);
     if (!ggml_backend_sched_alloc_graph(s->ctx->sched, gf))
         return -2;
@@ -1825,7 +1820,7 @@ static int vox_stream_run_encoder_chunk(voxtral4b_stream* s) {
     const size_t pad_in_pending = (size_t)s->enc_frames_pending_count * d;
     s->enc_frames_pending.resize(pad_in_pending + enc_chunk_floats);
     ggml_backend_tensor_get(enc_out, s->enc_frames_pending.data() + pad_in_pending, 0,
-                             enc_chunk_floats * sizeof(float));
+                            enc_chunk_floats * sizeof(float));
     s->enc_frames_pending_count += T_chunk_enc;
 
     ggml_tensor* conv0_last = ggml_graph_get_tensor(gf, "stream_conv0_last_d");
@@ -1835,10 +1830,8 @@ static int vox_stream_run_encoder_chunk(voxtral4b_stream* s) {
     // Update conv0_lctx = last 2 mel frames of this chunk, per-band layout.
     s->conv0_lctx.assign((size_t)n_mels * 2, 0.0f);
     for (int m = 0; m < n_mels; m++) {
-        s->conv0_lctx[(size_t)m * 2 + 0] =
-            s->mel_pending[(size_t)m * T_pending + (T_chunk_mel - 2)];
-        s->conv0_lctx[(size_t)m * 2 + 1] =
-            s->mel_pending[(size_t)m * T_pending + (T_chunk_mel - 1)];
+        s->conv0_lctx[(size_t)m * 2 + 0] = s->mel_pending[(size_t)m * T_pending + (T_chunk_mel - 2)];
+        s->conv0_lctx[(size_t)m * 2 + 1] = s->mel_pending[(size_t)m * T_pending + (T_chunk_mel - 1)];
     }
 
     // Drop consumed mel frames: shift each per-band row left by T_chunk_mel,
@@ -1849,8 +1842,7 @@ static int vox_stream_run_encoder_chunk(voxtral4b_stream* s) {
         std::vector<float> rebuilt((size_t)n_mels * T_remain);
         for (int m = 0; m < n_mels; m++) {
             std::memcpy(rebuilt.data() + (size_t)m * T_remain,
-                        s->mel_pending.data() + (size_t)m * T_pending + T_chunk_mel,
-                        (size_t)T_remain * sizeof(float));
+                        s->mel_pending.data() + (size_t)m * T_pending + T_chunk_mel, (size_t)T_remain * sizeof(float));
         }
         s->mel_pending = std::move(rebuilt);
     } else {
@@ -1882,13 +1874,11 @@ static int vox_stream_advance_projector(voxtral4b_stream* s) {
     ggml_tensor* out_t = ggml_graph_get_tensor(gf, "proj_out");
     const size_t prev = s->audio_embeds.size();
     s->audio_embeds.resize(prev + (size_t)proj_out * n_groups);
-    ggml_backend_tensor_get(out_t, s->audio_embeds.data() + prev, 0,
-                             (size_t)proj_out * n_groups * sizeof(float));
+    ggml_backend_tensor_get(out_t, s->audio_embeds.data() + prev, 0, (size_t)proj_out * n_groups * sizeof(float));
     // Drop consumed enc frames.
     const int consumed = n_groups * 4;
     if (consumed < s->enc_frames_pending_count) {
-        std::memmove(s->enc_frames_pending.data(),
-                     s->enc_frames_pending.data() + (size_t)consumed * d,
+        std::memmove(s->enc_frames_pending.data(), s->enc_frames_pending.data() + (size_t)consumed * d,
                      (size_t)(s->enc_frames_pending_count - consumed) * d * sizeof(float));
     }
     s->enc_frames_pending_count -= consumed;
@@ -1953,8 +1943,7 @@ static int vox_stream_maybe_prefill(voxtral4b_stream* s) {
     voxtral4b_kv_reset(s->ctx);
 
     int out_n_tok = 0, out_vocab = 0;
-    float* logits =
-        voxtral4b_run_llm_kv(s->ctx, prompt_emb, kStreamingPromptLen, 0, &out_n_tok, &out_vocab);
+    float* logits = voxtral4b_run_llm_kv(s->ctx, prompt_emb, kStreamingPromptLen, 0, &out_n_tok, &out_vocab);
     std::free(prompt_emb);
     if (!logits || out_vocab <= 0)
         return -3;
@@ -2066,8 +2055,7 @@ static int vox_stream_drain_decode(voxtral4b_stream* s) {
         s->decode_adapter_pos++;
 
         int out_n_tok = 0, out_vocab = 0;
-        float* logits =
-            voxtral4b_run_llm_kv(s->ctx, next_emb, 1, s->decode_n_past, &out_n_tok, &out_vocab);
+        float* logits = voxtral4b_run_llm_kv(s->ctx, next_emb, 1, s->decode_n_past, &out_n_tok, &out_vocab);
         std::free(next_emb);
         if (!logits)
             return -3;
@@ -2136,7 +2124,7 @@ extern "C" struct voxtral4b_stream* voxtral4b_stream_open(struct voxtral4b_conte
     // for any valid size.
     if (const char* env = getenv("CRISPASR_VOXTRAL4B_STREAM_CHUNK_MS")) {
         const int ms = atoi(env);
-        const int frames = (ms / 10 / 8) * 8;        // round to multiple of 8 mel frames
+        const int frames = (ms / 10 / 8) * 8; // round to multiple of 8 mel frames
         s->chunk_mel_frames = frames > 0 ? frames : 8;
     } else {
         s->chunk_mel_frames = 24; // 240 ms default — phase 2 perf pass
@@ -2326,8 +2314,7 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
             if (T_padded > T_pending) {
                 std::vector<float> padded((size_t)n_mels * T_padded, 0.0f);
                 for (int m = 0; m < n_mels; m++) {
-                    std::memcpy(padded.data() + (size_t)m * T_padded,
-                                s->mel_pending.data() + (size_t)m * T_pending,
+                    std::memcpy(padded.data() + (size_t)m * T_padded, s->mel_pending.data() + (size_t)m * T_pending,
                                 (size_t)T_pending * sizeof(float));
                 }
                 s->mel_pending = std::move(padded);
@@ -2368,8 +2355,8 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
     }
     const float* audio_src = use_incremental ? s->audio_embeds.data() : batch_audio_embeds.data();
     if (getenv("CRISPASR_VOXTRAL4B_STREAM_DEBUG")) {
-        fprintf(stderr, "voxtral4b_stream: flush enc_T=%d N_audio=%d user_samples=%lld\n",
-                s->enc_T_so_far, N_audio, (long long)user_samples);
+        fprintf(stderr, "voxtral4b_stream: flush enc_T=%d N_audio=%d user_samples=%lld\n", s->enc_T_so_far, N_audio,
+                (long long)user_samples);
     }
 
     // Side-by-side: run BOTH encoders and compare. Useful only in incremental
@@ -2468,8 +2455,7 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
         voxtral4b_kv_reset(s->ctx);
         auto t_pre = std::chrono::steady_clock::now();
         int out_n_tok = 0, out_vocab = 0;
-        float* logits =
-            voxtral4b_run_llm_kv(s->ctx, prompt_emb, kStreamingPromptLen, 0, &out_n_tok, &out_vocab);
+        float* logits = voxtral4b_run_llm_kv(s->ctx, prompt_emb, kStreamingPromptLen, 0, &out_n_tok, &out_vocab);
         std::free(prompt_emb);
         if (!logits || out_vocab <= 0)
             return -8;
@@ -2489,8 +2475,7 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
         s->decode_out_vocab = out_vocab;
         s->decode_started = true;
     } else if (timing) {
-        fprintf(stderr, "voxtral4b_stream timing: prefill REUSED (saved ~250 ms); total @ %.1f ms\n",
-                elapsed_ms());
+        fprintf(stderr, "voxtral4b_stream timing: prefill REUSED (saved ~250 ms); total @ %.1f ms\n", elapsed_ms());
     }
 
     // Drain decode — runs all remaining tokens until EOS or audio exhausted.
@@ -2524,9 +2509,8 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
     }
     const int new_decode_steps = s->decode_steps_done - decode_steps_before;
     if (timing && new_decode_steps > 0) {
-        const double decode_ms = std::chrono::duration<double, std::milli>(
-                                     std::chrono::steady_clock::now() - t_decode_start)
-                                     .count();
+        const double decode_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_decode_start).count();
         fprintf(stderr,
                 "voxtral4b_stream timing: drain %d decode steps in %.1f ms (avg %.1f ms/step); flush total %.1f ms\n",
                 new_decode_steps, decode_ms, decode_ms / std::max(1, new_decode_steps), elapsed_ms());
@@ -2546,7 +2530,7 @@ extern "C" int voxtral4b_stream_flush(struct voxtral4b_stream* s) {
 }
 
 extern "C" int voxtral4b_stream_get_text(struct voxtral4b_stream* s, char* out, int cap, double* out_t0_s,
-                                          double* out_t1_s, int64_t* out_decode_counter) {
+                                         double* out_t1_s, int64_t* out_decode_counter) {
     if (!s || !out || cap <= 0)
         return -1;
     // PLAN #7 phase 4: protect out_text_unread + counter from concurrent
@@ -2554,18 +2538,24 @@ extern "C" int voxtral4b_stream_get_text(struct voxtral4b_stream* s, char* out, 
     std::lock_guard<std::mutex> lk(s->decode_state_mutex);
     if (s->out_text_unread.empty()) {
         out[0] = '\0';
-        if (out_t0_s) *out_t0_s = s->out_t0_s;
-        if (out_t1_s) *out_t1_s = s->out_t1_s;
-        if (out_decode_counter) *out_decode_counter = s->decode_counter;
+        if (out_t0_s)
+            *out_t0_s = s->out_t0_s;
+        if (out_t1_s)
+            *out_t1_s = s->out_t1_s;
+        if (out_decode_counter)
+            *out_decode_counter = s->decode_counter;
         return 0;
     }
     const int copy_n = std::min((int)s->out_text_unread.size(), cap - 1);
     std::memcpy(out, s->out_text_unread.data(), copy_n);
     out[copy_n] = '\0';
     s->out_text_unread.erase(0, copy_n);
-    if (out_t0_s) *out_t0_s = s->out_t0_s;
-    if (out_t1_s) *out_t1_s = s->out_t1_s;
-    if (out_decode_counter) *out_decode_counter = s->decode_counter;
+    if (out_t0_s)
+        *out_t0_s = s->out_t0_s;
+    if (out_t1_s)
+        *out_t1_s = s->out_t1_s;
+    if (out_decode_counter)
+        *out_decode_counter = s->decode_counter;
     return copy_n;
 }
 

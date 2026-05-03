@@ -596,7 +596,7 @@ CA_EXPORT int crispasr_stream_get_text(crispasr_stream* s, char* out_text, int o
 #if __has_include("voxtral4b.h")
     if (s->voxtral4b_stream_state) {
         return voxtral4b_stream_get_text((voxtral4b_stream*)s->voxtral4b_stream_state, out_text, out_cap, out_t0_s,
-                                          out_t1_s, out_counter);
+                                         out_t1_s, out_counter);
     }
 #endif
     if (!s->has_output) {
@@ -2213,8 +2213,8 @@ CA_EXPORT crispasr_session_result* crispasr_session_transcribe_lang(crispasr_ses
         // implementation has the right prompt convention; route session
         // transcribe through it. Bit-exact match to the CLI batch path,
         // validated via tools/bench_streaming_latency.py --check-batch-equality.
-        (void)lang;    // voxtral4b-realtime is en-only via the CLI adapter
-        (void)s->ask;  // streaming path doesn't take Q&A prompts (yet)
+        (void)lang;   // voxtral4b-realtime is en-only via the CLI adapter
+        (void)s->ask; // streaming path doesn't take Q&A prompts (yet)
         voxtral4b_stream* vs = voxtral4b_stream_open(s->voxtral4b_ctx, /*step_ms*/ 0, /*length_ms*/ 0);
         if (!vs) {
             delete r;

@@ -219,16 +219,14 @@ int process_one_input(CrispasrBackend& backend, const std::string& fname_inp, co
             // when LID is unavailable. The user can override with `-l <code>`.
             if (params.language == "auto") {
                 if (!params.no_prints) {
-                    fprintf(stderr,
-                            "crispasr: LID failed and no -l was set — "
-                            "defaulting to 'en'. Pass `-l <code>` to override.\n");
+                    fprintf(stderr, "crispasr: LID failed and no -l was set — "
+                                    "defaulting to 'en'. Pass `-l <code>` to override.\n");
                 }
                 params.language = "en";
                 if (params.source_lang.empty())
                     params.source_lang = "en";
             } else if (!params.no_prints) {
-                fprintf(stderr,
-                        "crispasr: LID failed, falling back to params.language='%s'\n",
+                fprintf(stderr, "crispasr: LID failed, falling back to params.language='%s'\n",
                         params.language.c_str());
             }
         }

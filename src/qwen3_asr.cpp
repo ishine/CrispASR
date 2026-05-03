@@ -1440,13 +1440,14 @@ extern "C" qwen3_asr_context* qwen3_asr_init_from_file(const char* path, qwen3_a
         const bool fuse_enabled = (fuse_env == nullptr) || (atoi(fuse_env) != 0);
         auto& hp = ctx->model.hparams;
         auto& blocks = ctx->model.llm.blocks;
-        bool can_fuse = fuse_enabled && !blocks.empty() && blocks[0].attn_q_w && blocks[0].attn_k_w && blocks[0].attn_v_w;
+        bool can_fuse =
+            fuse_enabled && !blocks.empty() && blocks[0].attn_q_w && blocks[0].attn_k_w && blocks[0].attn_v_w;
         if (can_fuse) {
             const ggml_type t0 = blocks[0].attn_q_w->type;
             for (auto& b : blocks) {
-                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 ||
-                    b.attn_k_w->type != t0 || b.attn_v_w->type != t0 ||
-                    b.attn_q_w->ne[0] != b.attn_k_w->ne[0] || b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
+                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 || b.attn_k_w->type != t0 ||
+                    b.attn_v_w->type != t0 || b.attn_q_w->ne[0] != b.attn_k_w->ne[0] ||
+                    b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
                     can_fuse = false;
                     break;
                 }

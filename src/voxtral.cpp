@@ -822,9 +822,9 @@ extern "C" voxtral_context* voxtral_init_from_file(const char* path, voxtral_con
         if (can_fuse) {
             const ggml_type t0 = blocks[0].attn_q_w ? blocks[0].attn_q_w->type : GGML_TYPE_F32;
             for (auto& b : blocks) {
-                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 ||
-                    b.attn_k_w->type != t0 || b.attn_v_w->type != t0 ||
-                    b.attn_q_w->ne[0] != b.attn_k_w->ne[0] || b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
+                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 || b.attn_k_w->type != t0 ||
+                    b.attn_v_w->type != t0 || b.attn_q_w->ne[0] != b.attn_k_w->ne[0] ||
+                    b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
                     can_fuse = false;
                     break;
                 }
@@ -856,8 +856,8 @@ extern "C" voxtral_context* voxtral_init_from_file(const char* path, voxtral_con
                         ggml_backend_tensor_set(b.attn_qkv_w, tmp.data(), 0, tmp.size());
                     }
                     if (params.verbosity >= 1)
-                        fprintf(stderr, "voxtral: fused QKV for %zu LLM layers (%d+%d+%d→%d, type=%s)\n",
-                                blocks.size(), q_out, kv_out, kv_out, qkv_out, ggml_type_name(t0));
+                        fprintf(stderr, "voxtral: fused QKV for %zu LLM layers (%d+%d+%d→%d, type=%s)\n", blocks.size(),
+                                q_out, kv_out, kv_out, qkv_out, ggml_type_name(t0));
                 } else {
                     ggml_free(ctx->fused_ctx);
                     ctx->fused_ctx = nullptr;

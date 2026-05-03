@@ -942,14 +942,14 @@ static std::vector<int> canary_build_prompt(canary_context* ctx, const std::stri
     p.push_back(tok("<|nodiarize|>"));
 
     static const char* names[] = {"<|startofcontext|>", "<|startoftranscript|>", "<|emo:undefined|>",
-                                   src_tok.c_str(), tgt_tok.c_str(), punctuation ? "<|pnc|>" : "<|nopnc|>",
-                                   "<|notimestamp|>", "<|nodiarize|>"};
+                                  src_tok.c_str(),      tgt_tok.c_str(),         punctuation ? "<|pnc|>" : "<|nopnc|>",
+                                  "<|notimestamp|>",    "<|nodiarize|>"};
     for (size_t i = 0; i < p.size(); i++) {
         if (p[i] < 0) {
-            fprintf(stderr, "canary: prompt contains an unknown token: '%s' "
+            fprintf(stderr,
+                    "canary: prompt contains an unknown token: '%s' "
                     "(vocab_size=%d, src='%s', tgt='%s', punc=%d)\n",
-                    names[i], (int)ctx->vocab.id_to_token.size(),
-                    src_tok.c_str(), tgt_tok.c_str(), (int)punctuation);
+                    names[i], (int)ctx->vocab.id_to_token.size(), src_tok.c_str(), tgt_tok.c_str(), (int)punctuation);
             return {};
         }
     }

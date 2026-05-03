@@ -4989,9 +4989,9 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
         if (can_fuse) {
             const ggml_type t0 = blocks[0].attn_q_w->type;
             for (auto& b : blocks) {
-                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 ||
-                    b.attn_k_w->type != t0 || b.attn_v_w->type != t0 ||
-                    b.attn_q_w->ne[0] != b.attn_k_w->ne[0] || b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
+                if (!b.attn_q_w || !b.attn_k_w || !b.attn_v_w || b.attn_q_w->type != t0 || b.attn_k_w->type != t0 ||
+                    b.attn_v_w->type != t0 || b.attn_q_w->ne[0] != b.attn_k_w->ne[0] ||
+                    b.attn_q_w->ne[0] != b.attn_v_w->ne[0]) {
                     can_fuse = false;
                     break;
                 }
@@ -5022,8 +5022,7 @@ extern "C" struct qwen3_tts_context* qwen3_tts_init_from_file(const char* path_m
                     }
                     if (params.verbosity >= 1) {
                         fprintf(stderr, "qwen3_tts: fused QKV for %zu talker layers (%d+%d+%d→%d, type=%s)\n",
-                                blocks.size(), q_out, k_out, k_out, qkv_out,
-                                ggml_type_name(blocks[0].attn_q_w->type));
+                                blocks.size(), q_out, k_out, k_out, qkv_out, ggml_type_name(blocks[0].attn_q_w->type));
                     }
                 } else {
                     for (auto& b : blocks) {
