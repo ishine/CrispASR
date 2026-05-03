@@ -90,6 +90,12 @@ public final class CrispasrSession implements AutoCloseable {
                                          int gpuDevice, int flashAttn,
                                          byte[] outLang, int outLangCap, float[] outProb);
 
+        // --- VAD (PLAN #59) ---
+        int crispasr_vad_segments(String vadModelPath, float[] pcm, int nSamples,
+                                  int sampleRate, float threshold, int minSpeechMs, int minSilenceMs,
+                                  int nThreads, int useGpu, Pointer[] outSpans);
+        void crispasr_vad_free(Pointer spans);
+
         // --- Punctuation (PLAN #59) ---
         Pointer crispasr_punc_init(String modelPath);
         String  crispasr_punc_process(Pointer ctx, String text);
@@ -518,6 +524,35 @@ public final class CrispasrSession implements AutoCloseable {
             return words;
         } finally {
             Lib.INSTANCE.crispasr_align_result_free(r);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Standalone VAD (PLAN #59)
+    // -----------------------------------------------------------------
+
+    /** One speech segment from VAD. */
+    public static final class VADSpan {
+        public final double t0, t1; // seconds
+        VADSpan(double t0, double t1) { this.t0 = t0; this.t1 = t1; }
+    }
+
+    /** Run standalone VAD. vadModelPath can be empty for auto-download. */
+    public static VADSpan[] vadSegments(String vadModelPath, float[] pcm, int sampleRate,
+                                         float threshold, int minSpeechMs, int minSilenceMs, int nThreads) {
+        Pointer[] outSpans = new Pointer[1];
+        int n = Lib.INSTANCE.crispasr_vad_segments(vadModelPath, pcm, pcm.length,
+                sampleRate, threshold, minSpeechMs, minSilenceMs, nThreads, 0, outSpans);
+        if (n < 0) throw new RuntimeException("VAD failed (rc=" + n + ")");
+        if (n == 0 || outSpans[0] == null) return new VADSpan[0];
+        try {
+            float[] raw = outSpans[0].getFloatArray(0, n * 2);
+            VADSpan[] spans = new VADSpan[n];
+            for (int i = 0; i < n; i++)
+                spans[i] = new VADSpan(raw[i * 2], raw[i * 2 + 1]);
+            return spans;
+        } finally {
+            Lib.INSTANCE.crispasr_vad_free(outSpans[0]);
         }
     }
 
