@@ -33,7 +33,7 @@ passes 18/18 transcribe + 51/54 feature tests (3 stream skips, no failures).
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
 | **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | Go now has full surface (✅ all 11 capabilities). Java has transcribe+align+LID. Ruby has transcribe. JS needs WebAssembly approach |
 | **DONE** | [#60 llama.cpp/llamafile perf trick ports](#60-cross-backend-perf-tricks-llamacpp--llamafile-ports) | 14 items | 60a-g DONE; 60e Q8_0 KV validated on 7 backends (all bit-exact or WER=0%); 60h-n parked/skip |
-| **LOW** | #41 Moonshine IPA / phoneme | High | Deferred |
+| **DONE** | #41 Moonshine IPA / phoneme | — | Superseded by kokoro espeak-ng phonemizer (#56) |
 | **LOW** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | Not started |
 | **LOW** | [#11 WebSocket server](#11-websocket-streaming-server) | High | Not started |
 | **DONE** | [#7 voxtral4b streaming](#7-native-voxtral4b-streaming) | High | Phases 1-4 shipped → HISTORY §71 |
@@ -63,17 +63,16 @@ argument order fixed for F16 kernels.
 
 ---
 
-## 41. Moonshine phoneme / IPA output
+## ~~41. Moonshine phoneme / IPA output~~ — **SUPERSEDED by kokoro espeak-ng phonemizer (#56)**
 
-moonshine-ai/moonshine has a `GraphemeToPhonemizer` — G2P (text→IPA),
-NOT audio→phoneme. Runs on transcription output.
+The original ask was G2P (text→IPA) from moonshine's pronunciation
+tables. This is now superseded by the espeak-ng phonemizer shipped in
+#56: `kokoro_phonemize_text_lib(lang, text)` and
+`kokoro_phonemize_text_popen(lang, text)` are general-purpose G2P
+covering 100+ languages via libespeak-ng. Any backend's transcript
+can be piped through them. Exposed as C ABI, usable from all wrappers.
 
-**Options:**
-1. Port G2P tables to C++ (~500 LOC, needs pronunciation dicts)
-2. Post-processing module with `--output-ipa` flag
-3. External-only (document piping through Python G2P)
-
-**Recommendation:** Option 3 for now. IPA is niche; ROI of porting is low.
+No moonshine-specific G2P port needed.
 
 ---
 
