@@ -104,9 +104,16 @@ fi
 # env, ggml device enumeration). This will trigger CUDA init in-process
 # so any GGML_LOG_ERROR from the driver/runtime mismatch lands in the
 # same log block as nvidia-smi.
-if [[ "$VERBOSE" == "1" ]]; then
-    log "CRISPASR_VERBOSE=1 — running 'crispasr --diagnostics':"
+if [[ "$VERBOSE" == "1" ]] || [[ "${CRISPASR_DIAGNOSTICS:-0}" == "1" ]]; then
+    log "running 'crispasr --diagnostics':"
     crispasr --diagnostics 2>&1 | sed 's/^/  /' >&2 || log "crispasr --diagnostics failed (continuing)"
+fi
+
+# CRISPASR_DIAGNOSTICS=1 — run diagnostics only, then exit.
+# Useful for troubleshooting GPU issues (#31) without needing a model.
+if [[ "${CRISPASR_DIAGNOSTICS:-0}" == "1" ]]; then
+    log "CRISPASR_DIAGNOSTICS=1 — diagnostics-only mode, exiting."
+    exit 0
 fi
 
 ensure_writable_dir "$CACHE_DIR" "cache"
