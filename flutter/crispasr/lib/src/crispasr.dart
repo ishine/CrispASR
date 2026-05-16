@@ -2838,9 +2838,19 @@ class CrispasrSession {
         throw Exception('synthesize returned no audio for backend $_backend');
       }
       try {
-        return Float32List.fromList(
-          List.generate(n, (i) => pcmPtr[i]),
-        );
+        // `asTypedList(n)` views the native buffer as a Float32List
+        // without copying — then `Float32List.fromList(...)` copies
+        // into Dart-owned memory before the native buffer is freed.
+        //
+        // The previous `List.generate(n, (i) => pcmPtr[i])` pattern
+        // tripped on kokoro (and possibly other TTS backends): the
+        // resulting buffer was 100% NaN despite the same C-side
+        // `kokoro_synthesize` producing valid audio when invoked
+        // through the CLI. Most likely an FFI optimisation interacting
+        // badly with element-by-element reads on the malloc'd buffer;
+        // the bulk view-then-copy path doesn't hit it.
+        final view = pcmPtr.asTypedList(n);
+        return Float32List.fromList(view);
       } finally {
         freeFn(pcmPtr);
       }
