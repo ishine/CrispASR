@@ -2306,12 +2306,25 @@ static std::vector<float> hift_vocoder_cpu(chatterbox_s3gen_context* c,
                 for (int h = 1; h < n_harm_plus1; h++)
                     phase_offset[h] = (next_u() * 2.0f - 1.0f) * (float)M_PI;
 
-                // Generate sine waves: (T_audio, 9) → voiced: sine+noise, unvoiced: noise
+                // Generate sine waves: (T_audio, 9) → voiced: sine+noise, unvoiced: noise.
+                // Issue #94 follow-up: voiced/unvoiced classification uses
+                // f0 > voiced_threshold where Python's HiFTGenerator passes
+                // nsf_voiced_threshold=10.0f down to SineGen.voiced_threshold
+                // (hifigan.py:299, 328 → SineGen.__init__:193, 197). Using
+                // 0.0f here misclassified every frame with 0 < F0 ≤ 10 Hz as
+                // voiced and synthesised sine harmonics there, while Python
+                // emitted broadband noise — flipping the spectral character
+                // of the prefix where F0 ramps up. The flipped frames pile
+                // up at utterance start, which is why "Hello chatterbox
+                // turbo" came out as "IN-N-Hello chatterbox turbo" /
+                // "HIgh-low-world" — the leading frames got an unwanted
+                // tonal precursor.
+                const float voiced_threshold = 10.0f;
                 std::vector<float> sine_waves((size_t)T_audio * n_harm_plus1, 0.0f);
                 std::vector<float> cumphase(n_harm_plus1, 0.0f);
                 for (int t = 0; t < T_audio; t++) {
                     float f0_val = f0_up[t];
-                    bool voiced = (f0_val > 0.0f);
+                    bool voiced = (f0_val > voiced_threshold);
                     float noise_amp = voiced ? noise_std : (sine_amp / 3.0f);
                     for (int h = 0; h < n_harm_plus1; h++) {
                         float freq_norm = f0_val * (float)(h + 1) / sr;
