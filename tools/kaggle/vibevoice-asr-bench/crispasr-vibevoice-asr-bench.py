@@ -93,10 +93,14 @@ step("install-deps.done")
 
 # %% [code]
 step("apt-install.begin")
+# Redirect noisy build steps to a log file; ANSI escape codes in mold/apt
+# output can produce invalid \uXXXX in the notebook cell-output JSON.
+_BUILD_LOG = WORK / "build.log"
+_blog = open(_BUILD_LOG, "a")
 subprocess.check_call(
     "apt-get update -qq && apt-get install -y --no-install-recommends "
     "cmake ninja-build g++ libopenblas-dev ccache lld mold || true",
-    shell=True)
+    shell=True, stdout=_blog, stderr=_blog)
 step("apt-install.done")
 
 # %% [code]
@@ -105,7 +109,7 @@ REPO = WORK / "CrispASR"
 if not REPO.exists():
     subprocess.check_call(
         f"git clone --depth 1 https://github.com/CrispStrobe/CrispASR.git {REPO}",
-        shell=True)
+        shell=True, stdout=_blog, stderr=_blog)
 step("git-clone.done")
 
 # %% [code]
@@ -141,14 +145,16 @@ if _linker:
     for kind in ("EXE", "SHARED", "MODULE"):
         CMAKE_FLAGS.append(f"-DCMAKE_{kind}_LINKER_FLAGS=-fuse-ld={_linker}")
 subprocess.check_call(
-    ["cmake", "-S", str(REPO), "-B", str(BUILD), "-G", "Ninja", *CMAKE_FLAGS])
+    ["cmake", "-S", str(REPO), "-B", str(BUILD), "-G", "Ninja", *CMAKE_FLAGS],
+    stdout=_blog, stderr=_blog)
 step("cmake-configure.done")
 
 # %% [code]
 step("cmake-build.begin")
 subprocess.check_call(
     ["cmake", "--build", str(BUILD), "--target", "crispasr-cli", "-j",
-     str(os.cpu_count() or 4)])
+     str(os.cpu_count() or 4)],
+    stdout=_blog, stderr=_blog)
 CRISPASR = BUILD / "bin" / "crispasr"
 assert CRISPASR.is_file(), f"binary missing: {CRISPASR}"
 step("cmake-build.done", binary=str(CRISPASR))
@@ -200,7 +206,11 @@ q4k_path = hf_hub_download(
 )
 step("download-q4_k.done", size_gb=round(Path(q4k_path).stat().st_size / 1e9, 2))
 
-results = [transcribe(Path(q4k_path), "Q4_K")]
+r_q4k = transcribe(Path(q4k_path), "Q4_K")
+results = [r_q4k]
+# Print immediately so we have the transcript even if F16 download crashes
+print(f"\nQ4_K ({r_q4k['wallclock_s']}s exit={r_q4k.get('exit','?')}): {r_q4k['transcript']!r}", flush=True)
+print(f"GOLD: {GOLD!r}\n", flush=True)
 
 # %% [code]
 # ── F16 only if ≥30 min remain ───────────────────────────────────────────────
