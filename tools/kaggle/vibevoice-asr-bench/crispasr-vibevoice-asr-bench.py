@@ -101,68 +101,32 @@ os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
 step("install-deps.done")
 
 # %% [code]
-step("apt-install.begin")
-subprocess.check_call(
-    "apt-get update -qq && apt-get install -y --no-install-recommends "
-    "cmake ninja-build g++ libopenblas-dev ccache lld mold || true",
-    shell=True, stdout=_blog, stderr=_blog)
-step("apt-install.done")
+# Download pre-built release binary — skips the 4-minute cmake/ninja build.
+RELEASE = "v0.6.6"
+TARBALL = f"crispasr-linux-x86_64.tar.gz"
+RELEASE_URL = f"https://github.com/CrispStrobe/CrispASR/releases/download/{RELEASE}/{TARBALL}"
+BIN_DIR = WORK / "bin"
+BIN_DIR.mkdir(exist_ok=True)
+CRISPASR = BIN_DIR / "crispasr"
 
-# %% [code]
-step("git-clone.begin")
+step("binary-download.begin", release=RELEASE)
+subprocess.check_call(
+    f"wget -q {RELEASE_URL} -O /tmp/crispasr.tar.gz && "
+    f"tar -xzf /tmp/crispasr.tar.gz -C {BIN_DIR} --strip-components=1",
+    shell=True, stdout=_blog, stderr=_blog)
+CRISPASR.chmod(0o755)
+assert CRISPASR.is_file(), f"binary missing after download"
+step("binary-download.done", binary=str(CRISPASR))
+
+# Clone repo only for the jfk.wav sample (no build needed)
 REPO = WORK / "CrispASR"
 if not REPO.exists():
     subprocess.check_call(
-        f"git clone --depth 1 https://github.com/CrispStrobe/CrispASR.git {REPO}",
+        "git clone --depth 1 --filter=blob:none --no-checkout "
+        f"https://github.com/CrispStrobe/CrispASR.git {REPO} && "
+        f"git -C {REPO} checkout HEAD -- samples/",
         shell=True, stdout=_blog, stderr=_blog)
-step("git-clone.done")
-
-# %% [code]
-step("cmake-configure.begin")
-BUILD = WORK / "build"
-import shutil as _shutil
-CMAKE_FLAGS = [
-    "-DCMAKE_BUILD_TYPE=Release",
-    "-DCRISPASR_BUILD_TESTS=OFF",
-    "-DCRISPASR_BUILD_EXAMPLES=ON",
-    "-DCRISPASR_BUILD_SERVER=OFF",
-    # CPU-only: avoids 10+ hour CUDA kernel compilation
-    "-DGGML_CUDA=OFF",
-    "-DGGML_BLAS=ON",
-    "-DGGML_BLAS_VENDOR=OpenBLAS",
-    # Skip warning emission — saves ~5 % compile time and log noise
-    "-DCRISPASR_ALL_WARNINGS=OFF",
-]
-if _shutil.which("ccache"):
-    CCACHE_DIR = WORK / ".ccache"
-    CCACHE_DIR.mkdir(exist_ok=True)
-    os.environ["CCACHE_DIR"] = str(CCACHE_DIR)
-    CMAKE_FLAGS += [
-        "-DCMAKE_C_COMPILER_LAUNCHER=ccache",
-        "-DCMAKE_CXX_COMPILER_LAUNCHER=ccache",
-    ]
-# Fast linker: prefer mold, fall back to lld, then default ld
-_linker = ("mold" if _shutil.which("mold")
-           else "lld" if _shutil.which("ld.lld") or _shutil.which("lld")
-           else None)
-if _linker:
-    step(f"linker.selected", linker=_linker)
-    for kind in ("EXE", "SHARED", "MODULE"):
-        CMAKE_FLAGS.append(f"-DCMAKE_{kind}_LINKER_FLAGS=-fuse-ld={_linker}")
-subprocess.check_call(
-    ["cmake", "-S", str(REPO), "-B", str(BUILD), "-G", "Ninja", *CMAKE_FLAGS],
-    stdout=_blog, stderr=_blog)
-step("cmake-configure.done")
-
-# %% [code]
-step("cmake-build.begin")
-subprocess.check_call(
-    ["cmake", "--build", str(BUILD), "--target", "crispasr-cli", "-j",
-     str(os.cpu_count() or 4)],
-    stdout=_blog, stderr=_blog)
-CRISPASR = BUILD / "bin" / "crispasr"
-assert CRISPASR.is_file(), f"binary missing: {CRISPASR}"
-step("cmake-build.done", binary=str(CRISPASR))
+step("samples.ready")
 
 # %% [code]
 WAV = REPO / "samples" / "jfk.wav"
