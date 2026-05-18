@@ -85,7 +85,7 @@ static bool pyannote_load(pyannote_model& m, const char* path) {
     }
     m.ctx = wl.ctx;
     m.buf = wl.buf;
-    m.backend = backend; // keep alive until pyannote_seg_free — Metal buffer needs its device
+    m.backend = backend; // keep alive until pyannote_seg_free
     m.tensors = std::move(wl.tensors);
 
     auto get = [&](const char* name) -> ggml_tensor* {
@@ -173,7 +173,7 @@ static void bilstm_forward(const float* input, int T, int C_in, const pyannote_l
             }
 
             // ONNX LSTM gate order is i, o, f, c (cell candidate), not
-            // PyTorch's common i, f, g, o ordering.
+            // PyTorch's common i, f, g, o ordering.  See ONNX spec §LSTM.
             for (int j = 0; j < H; j++) {
                 float i_g = sigmoid(gates[0 * H + j]);
                 float o_g = sigmoid(gates[1 * H + j]);
