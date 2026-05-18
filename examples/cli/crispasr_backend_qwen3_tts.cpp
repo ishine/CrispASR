@@ -132,8 +132,8 @@ public:
         //                          (only when the loaded model is CustomVoice)
         //   --voice X.gguf       → baked voice pack (Base)
         //   --voice X.wav --ref-text "..." → runtime ECAPA + codec encoder (Base)
-        //   --instruct "..."     → VoiceDesign natural-language description
-        //                          (only when the loaded model is VoiceDesign)
+        //   --instruct "..."     → VoiceDesign: voice description (required)
+        //                          CustomVoice: optional style control
         //
         // Cache the composite identity in `last_voice_key_` so the CLI's
         // single-shot use case still pays the load cost only once, while
