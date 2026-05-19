@@ -1201,6 +1201,10 @@ static std::vector<float> locdit_forward(voxcpm2_context* ctx, const float* x_ra
 
 static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu, const float* cond_raw, int steps,
                                           float cfg, ggml_backend_t cpu_be, const float* initial_noise = nullptr) {
+    const bool bench = vox_env_bool("VOXCPM2_BENCH");
+    const double t_cfm0 = bench ? vox_now_ms() : 0;
+    double sum_locdit = 0;
+
     int feat_dim = 64;
     int P = (int)ctx->hp.patch_frames; // 4
     int state_size = feat_dim * P;     // 256
@@ -1248,10 +1252,13 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
                 for (int c = 0; c < feat_dim; c++)
                     x_tc[t * feat_dim + c] = x[c * P + t];
 
+            double tl = bench ? vox_now_ms() : 0;
             std::vector<float> v_cond_tc = locdit_forward(ctx, x_tc.data(), mu, t_cur, cond_raw, dt_scalar, cpu_be);
             std::vector<float> zero_mu(ctx->hp.tslm_d_model, 0.0f);
             std::vector<float> v_uncond_tc =
                 locdit_forward(ctx, x_tc.data(), zero_mu.data(), t_cur, cond_raw, dt_scalar, cpu_be);
+            if (bench)
+                sum_locdit += vox_now_ms() - tl;
 
             // Transpose velocities from [T, C] back to [C, T]
             std::vector<float> v_cond(state_size), v_uncond(state_size);
@@ -1281,7 +1288,10 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
             for (int t = 0; t < P; t++)
                 for (int c = 0; c < feat_dim; c++)
                     x_tc[t * feat_dim + c] = x[c * P + t];
+            double tl = bench ? vox_now_ms() : 0;
             auto v_tc = locdit_forward(ctx, x_tc.data(), mu, t_cur, cond_raw, dt_scalar, cpu_be);
+            if (bench)
+                sum_locdit += vox_now_ms() - tl;
             // Transpose velocity [T, C] → [C, T]
             for (int t = 0; t < P; t++)
                 for (int c = 0; c < feat_dim; c++)
@@ -1293,6 +1303,11 @@ static std::vector<float> cfm_euler_solve(voxcpm2_context* ctx, const float* mu,
             x[i] -= dt_val * dphi_dt[i];
     }
 
+    if (bench) {
+        double total = vox_now_ms() - t_cfm0;
+        fprintf(stderr, "voxcpm2[bench]:   cfm.locdit_fwd %.1f ms total (%.1f%% of cfm)  cfm.total=%.1f ms\n",
+                sum_locdit, total > 0 ? 100.0 * sum_locdit / total : 0.0, total);
+    }
     return x;
 }
 
@@ -2952,6 +2967,12 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
     float stop_thresh = 0.5f;
     int step = 0;
 
+    // Per-substep accumulators gated on VOXCPM2_BENCH=1. Cheap (one
+    // vox_now_ms / step) but skips the prints when not requested.
+    const bool bench = vox_env_bool("VOXCPM2_BENCH");
+    double sum_cfm = 0, sum_locenc = 0, sum_enc_to_lm = 0;
+    double sum_tslm = 0, sum_fsq = 0, sum_fusion = 0, sum_ralm = 0, sum_stop = 0;
+
     // Python AR loop order (from voxcpm2.py _inference, lines 1060-1108):
     //   1. Build mu → CFM solve → LocEnc → enc_to_lm → collect patch
     //   2. Stop check (on PREVIOUS lm_hidden, BEFORE TSLM step)
@@ -2963,10 +2984,13 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         double t0_step = vox_now_ms();
 
         // 1a. CFM Euler solve (LocDiT)
+        double tb = bench ? vox_now_ms() : 0;
         std::vector<float> noise(feat_dim_vae * P_frames);
         fill_gaussian_noise_bf16(noise.data(), (int)noise.size(), ctx->rng);
         std::vector<float> patch = cfm_euler_solve(ctx, mu.data(), prev_patch_raw.data(), ctx->inference_steps,
                                                    ctx->cfg_value, cpu_be, noise.data());
+        if (bench)
+            sum_cfm += vox_now_ms() - tb;
 
         // 1b. Transpose patch [C=64, T=4] → [T=4, C=64]
         std::vector<float> patch_tf(feat_dim_vae * P_frames);
@@ -2975,9 +2999,13 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
                 patch_tf[t * feat_dim_vae + c] = patch[c * P_frames + t];
 
         // 1c. LocEnc on predicted patch
+        tb = bench ? vox_now_ms() : 0;
         std::vector<float> enc_out = locenc_forward(ctx, patch_tf.data(), cpu_be);
+        if (bench)
+            sum_locenc += vox_now_ms() - tb;
 
         // 1d. enc_to_lm projection
+        tb = bench ? vox_now_ms() : 0;
         std::vector<float> enc_lm(d_lm, 0.0f);
         if (ctx->weights.enc_to_lm_w && ctx->weights.enc_to_lm_b) {
             matmul_mv_bias(cpu_be, ctx->weights.enc_to_lm_w, ctx->weights.enc_to_lm_b, enc_out.data(), d_dit,
@@ -2986,6 +3014,8 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
             int copy_d = std::min(d_dit, d_lm);
             std::memcpy(enc_lm.data(), enc_out.data(), (size_t)copy_d * sizeof(float));
         }
+        if (bench)
+            sum_enc_to_lm += vox_now_ms() - tb;
 
         // 1e. Collect patch + update cond for next step
         patches.push_back(patch_tf);
@@ -2996,7 +3026,10 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         // At step 0, tslm_hidden is the normed prefill output (not FSQ'd).
         // At step >0, tslm_hidden is the FSQ'd output from the previous step.
         {
+            tb = bench ? vox_now_ms() : 0;
             float sp = stop_score(ctx, tslm_hidden.data(), cpu_be);
+            if (bench)
+                sum_stop += vox_now_ms() - tb;
             if (ctx->verbosity >= 2) {
                 fprintf(stderr, "voxcpm2: step %d stop=%.3f (%.1f ms)\n", step, sp, vox_now_ms() - t0_step);
             }
@@ -3009,6 +3042,7 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         }
 
         // 3a. TSLM step (single audio token position)
+        tb = bench ? vox_now_ms() : 0;
         {
             int tslm_pos = ctx->tslm_kv.n_past;
             std::vector<float> h = enc_lm;
@@ -3022,11 +3056,17 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
                          ctx->hp.rms_norm_eps);
             tslm_hidden = normed;
         }
+        if (bench)
+            sum_tslm += vox_now_ms() - tb;
 
         // 3b. FSQ
+        tb = bench ? vox_now_ms() : 0;
         fsq_out = fsq_forward(ctx, tslm_hidden.data(), cpu_be);
+        if (bench)
+            sum_fsq += vox_now_ms() - tb;
 
         // 3c. Fusion: cat(fsq_out, enc_lm) → fusion_proj
+        tb = bench ? vox_now_ms() : 0;
         std::vector<float> fusion_in((size_t)(d_lm + d_lm));
         std::memcpy(fusion_in.data(), fsq_out.data(), (size_t)d_lm * sizeof(float));
         std::memcpy(fusion_in.data() + d_lm, enc_lm.data(), (size_t)d_lm * sizeof(float));
@@ -3038,8 +3078,11 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
         } else {
             fusion_out = fsq_out;
         }
+        if (bench)
+            sum_fusion += vox_now_ms() - tb;
 
         // 3d. RALM step
+        tb = bench ? vox_now_ms() : 0;
         {
             std::vector<float> h = fusion_out;
             for (int l = 0; l < (int)ctx->hp.ralm_n_layers; l++) {
@@ -3052,6 +3095,8 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
                          ctx->hp.rms_norm_eps);
             ralm_hidden = normed;
         }
+        if (bench)
+            sum_ralm += vox_now_ms() - tb;
 
         // 3e. Update: tslm_hidden = FSQ'd for next step's mu + stop check
         tslm_hidden = fsq_out;
@@ -3061,6 +3106,22 @@ static float* vox_synthesize_internal(voxcpm2_context* ctx, const char* text, co
 
     if (ctx->verbosity >= 1) {
         fprintf(stderr, "voxcpm2: AR loop %d steps, %.1f ms\n", step, vox_now_ms() - t0_ar);
+    }
+    if (bench && step > 0) {
+        double tot = sum_cfm + sum_locenc + sum_enc_to_lm + sum_tslm + sum_fsq + sum_fusion + sum_ralm + sum_stop;
+        fprintf(stderr, "voxcpm2[bench]: AR per-step avg (over %d steps, %.1f ms total):\n", step,
+                vox_now_ms() - t0_ar);
+        fprintf(stderr, "voxcpm2[bench]:   cfm        %7.1f ms  (%5.1f%%)\n", sum_cfm / step, 100.0 * sum_cfm / tot);
+        fprintf(stderr, "voxcpm2[bench]:   locenc     %7.1f ms  (%5.1f%%)\n", sum_locenc / step,
+                100.0 * sum_locenc / tot);
+        fprintf(stderr, "voxcpm2[bench]:   enc_to_lm  %7.1f ms  (%5.1f%%)\n", sum_enc_to_lm / step,
+                100.0 * sum_enc_to_lm / tot);
+        fprintf(stderr, "voxcpm2[bench]:   tslm_step  %7.1f ms  (%5.1f%%)\n", sum_tslm / step, 100.0 * sum_tslm / tot);
+        fprintf(stderr, "voxcpm2[bench]:   fsq        %7.1f ms  (%5.1f%%)\n", sum_fsq / step, 100.0 * sum_fsq / tot);
+        fprintf(stderr, "voxcpm2[bench]:   fusion     %7.1f ms  (%5.1f%%)\n", sum_fusion / step,
+                100.0 * sum_fusion / tot);
+        fprintf(stderr, "voxcpm2[bench]:   ralm_step  %7.1f ms  (%5.1f%%)\n", sum_ralm / step, 100.0 * sum_ralm / tot);
+        fprintf(stderr, "voxcpm2[bench]:   stop_pred  %7.1f ms  (%5.1f%%)\n", sum_stop / step, 100.0 * sum_stop / tot);
     }
 
     // 7. VAE decode
