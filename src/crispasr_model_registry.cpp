@@ -174,6 +174,32 @@ constexpr Entry k_registry[] = {
     {"parakeet-ja", "parakeet-tdt-0.6b-ja.gguf",
      "https://huggingface.co/cstr/parakeet-tdt-0.6b-ja-GGUF/resolve/main/parakeet-tdt-0.6b-ja.gguf",
      "~1.24 GB", nullptr, nullptr},
+    // parakeet-v2 — English-only TDT (1024-vocab BPE, pred_layers=2).
+    // The original Open ASR Leaderboard topper before v3 spread capacity
+    // to 25 languages; often stronger on plain English. Same FastConformer
+    // encoder + TDT decoder as v3, just trained on a different corpus.
+    {"parakeet-v2", "parakeet-tdt-0.6b-v2-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt-0.6b-v2-GGUF/resolve/main/parakeet-tdt-0.6b-v2-q4_k.gguf",
+     "~468 MB", nullptr, nullptr},
+    // parakeet-tdt-1.1b — larger TDT, English-only, 42-layer encoder
+    // (vs 24 for 0.6b). Lowercase + no punctuation output. Slower but
+    // wins on very long-tail vocabulary.
+    {"parakeet-tdt-1.1b", "parakeet-tdt-1.1b-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt-1.1b-GGUF/resolve/main/parakeet-tdt-1.1b-q4_k.gguf",
+     "~808 MB", nullptr, nullptr},
+    // parakeet-tdt_ctc-110m — smallest hybrid TDT+CTC. pred_layers=1
+    // (single LSTM) means the TDT path can't be used; parakeet.cpp
+    // auto-flips to CTC decode on load (see parakeet_init_from_file).
+    // English-only, 17-layer encoder, d_model=512.
+    {"parakeet-tdt_ctc-110m", "parakeet-tdt_ctc-110m-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt_ctc-110m-GGUF/resolve/main/parakeet-tdt_ctc-110m-q4_k.gguf",
+     "~91 MB", nullptr, nullptr},
+    // parakeet-tdt_ctc-1.1b — larger hybrid TDT+CTC, 42-layer encoder,
+    // multilingual vocab (proper casing + punctuation). Default decode
+    // is TDT; pass `--parakeet-decoder ctc` for the CTC head.
+    {"parakeet-tdt_ctc-1.1b", "parakeet-tdt_ctc-1.1b-q4_k.gguf",
+     "https://huggingface.co/cstr/parakeet-tdt_ctc-1.1b-GGUF/resolve/main/parakeet-tdt_ctc-1.1b-q4_k.gguf",
+     "~810 MB", nullptr, nullptr},
     // Qwen3-TTS: the talker LM and the codec live in two separate HF
     // repos. Default download is Q8_0 talker (the LEARNINGS-recommended
     // deployment quant — Q4_K drifts noticeably in strict diffs) paired
@@ -675,8 +701,17 @@ std::string crispasr_resolve_model(const std::string& model_arg, const std::stri
         }
 
         // File not found — try registry-based download when permitted.
+        // Match priority:
+        //   1. exact filename / known-companion match (e.g. -m parakeet-tdt-0.6b-v2-q4_k.gguf)
+        //   2. backend-key match on the literal -m arg (e.g. -m parakeet-v2 → the parakeet-v2 entry)
+        //   3. fallback: backend name passed via --backend (e.g. -m foo.gguf --backend parakeet)
+        // Step 2 must precede step 3, otherwise the CLI's filename-inferred
+        // backend (always "parakeet" for any "parakeet*" arg) would shadow
+        // sub-variant keys like "parakeet-v2" / "parakeet-tdt-1.1b" / etc.
         CrispasrRegistryEntry match;
         bool have_match = crispasr_registry_lookup_by_filename(model_arg, match, preferred_quant);
+        if (!have_match)
+            have_match = crispasr_registry_lookup(model_arg, match, preferred_quant);
         if (!have_match && !backend_name.empty())
             have_match = crispasr_registry_lookup(backend_name, match, preferred_quant);
 

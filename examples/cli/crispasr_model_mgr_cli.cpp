@@ -131,8 +131,17 @@ std::string crispasr_resolve_model_cli(const std::string& model_arg, const std::
     }
 
     // File missing — see whether the registry recognises it.
+    // Match priority:
+    //   1. exact filename / known-companion match (e.g. -m parakeet-tdt-0.6b-v2-q4_k.gguf)
+    //   2. backend-key match on the literal -m arg (e.g. -m parakeet-v2 → the parakeet-v2 entry)
+    //   3. fallback: backend name passed via --backend (or inferred from filename)
+    // Step 2 must precede step 3, otherwise the CLI's filename-inferred
+    // backend (always "parakeet" for any "parakeet*" arg) would shadow
+    // sub-variant keys like "parakeet-v2" / "parakeet-tdt-1.1b" / etc.
     CrispasrRegistryEntry match;
     bool have_match = crispasr_registry_lookup_by_filename(effective_model_arg, match, effective_quant);
+    if (!have_match)
+        have_match = crispasr_registry_lookup(effective_model_arg, match, effective_quant);
     if (!have_match && !backend_name.empty())
         have_match = crispasr_registry_lookup(backend_name, match, effective_quant);
 
