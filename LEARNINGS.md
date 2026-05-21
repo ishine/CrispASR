@@ -12,6 +12,60 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ## VAD + chunking
 
+### Independent-chunk TDT decode loses interior content, not just boundaries (issue #89, May 2026)
+
+The 30 s auto-chunk fallback (`kLongAudioFallbackChunkSeconds`) prevents
+the catastrophic zero-output failure on long audio (z-norm drift causes
+the TDT decoder to emit blanks past ~60 s), but the auto path without
+VAD tops out at ~82 % coverage. The missing content is **interior to
+each chunk**, not at chunk boundaries.
+
+Exhaustive sweep on the issue #89 reporter's 60 s Japanese audio
+(parakeet-tdt-0.6b-ja, CPU):
+
+| chunk | overlap | chars | coverage% | max_gap |
+|-------|---------|-------|-----------|---------|
+| 15s   | 3s      | 203   | 75.6%     | 8.5s    |
+| 15s   | 5s      | 278   | 70.9%     | 5.3s    |
+| 15s   | 8s      | 229   | 61.9%     | 12.2s   |
+| 20s   | 3s      | 278   | 82.4%     | 3.4s    |  ← best chunk config
+| 20s   | 5s      | 246   | 66.5%     | 10.0s   |
+| 20s   | 8s      | 220   | 56.0%     | 12.1s   |
+| 25s   | 3s      | 183   | 54.0%     | 15.1s   |
+| 25s   | 5s      | 234   | 70.8%     | 12.4s   |
+| 25s   | 8s      | 246   | 70.3%     | 9.8s    |
+| 30s   | 3s      | 195   | 59.7%     | 19.4s   |
+| 60s   | 0s      | 294   | 99.5%     | 0s      |  ← single pass (breaks on Vulkan/AMD)
+| VAD   | silero  | 281   | 93.1%     | 3.7s    |
+
+Counterintuitive findings:
+
+1. **More overlap hurts.** 8 s overlap is worse than 3 s for *every*
+   chunk size. Larger overlap extends the z-norm window, shifting feature
+   statistics further from training distribution, and the boundary
+   trimming removes more content that legitimately belongs to the chunk.
+
+2. **The problem is decoder cold-start, not boundary stitching.** Each
+   chunk reinitialises the TDT LSTM predictor to SOS. The decoder needs
+   several seconds to "warm up" — emitting blanks or very sparse tokens
+   while the LSTM state converges. This eats 5-20 s of interior content
+   per chunk regardless of overlap.
+
+3. **NeMo doesn't have this problem** because `FrameBatchASR` /
+   `BatchedFrameASRTDT` keep the LSTM state between 1.6-4 s frame steps.
+   The decoder never cold-starts after the first frame.
+
+**Root cause:** CrispASR treats each chunk as an independent utterance
+(`lstm_init_state → SOS`). NeMo treats them as a continuous stream with
+shared decoder state. Fix: PLAN #104 (stateful frame-streaming TDT
+decode).
+
+**Practical recommendation until #104 ships:** use `--vad` (93 % coverage)
+for long Japanese audio. The auto path is a safety net against zero
+output, not a quality-optimal path.
+
+---
+
 ### Overlap-save context is for *chunks*, not for VAD slices (issue #114)
 
 `cad4c28a feat(#89): overlap-save chunking with --chunk-overlap flag`

@@ -33,6 +33,7 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | **MEDIUM** | [#56 Kokoro multilingual phonemizer](#56-kokoro-multilingual-phonemizer-espeak-ng) | Small | espeak-ng + DE backbone shipped; HF GGUFs published 2026-05-01; auto-download wired; only Mandarin tones / JA kanji + diff-harness phonemizer-step polish remain |
 | **MEDIUM** | [#58 MOSS-Audio-4B-Instruct](#58-moss-audio-4b-instruct) | Large | first audio-understanding (not just ASR) backend; introduces DeepStack cross-layer feature injection |
 | **MEDIUM** | [#59 Cross-binding C-ABI parity](#59-cross-binding-c-abi-parity) | Medium | Go now has full surface (✅ all 11 capabilities). Java has transcribe+align+LID. Ruby has transcribe. JS needs WebAssembly approach |
+| **HIGH** | [#104 Stateful TDT frame-streaming](#104-stateful-frame-streaming-tdt-decode-for-parakeet-long-form-issue-89) | M-L | Auto path tops out at 82 % coverage; NeMo's stateful 4 s frame-streaming needed for 95 %+. Split API exists, need LSTM state threading + running z-norm. |
 | **PARKED** | [#9 Parakeet TDT GPU](#9-parakeet-tdt-decoder-gpu) | Medium | Encoder 85%+ of time; LSTM+joint <0.7s; sequential steps limit GPU benefit |
 | **BLOCKED** | [#42 VibeVoice-ASR 7B](#42-vibevoice-asr-7b) | High | Needs ≥16 GB RAM |
 | **BLOCKED** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | License unclear |
@@ -3685,3 +3686,113 @@ is already v6.
 
 - Any session that touches VAD code can do this opportunistically.
   No standalone trigger needed.
+
+## 104. Stateful frame-streaming TDT decode for parakeet long-form (issue #89)
+
+**Priority: HIGH** — the auto path (no `--vad`, no `--chunk-seconds`) tops
+out at ~82 % coverage on 60 s Japanese audio. Users expect >95 %.
+
+### Problem
+
+The current chunking approach (`kLongAudioFallbackChunkSeconds = 30`)
+processes each chunk independently: fresh mel + z-norm + fresh TDT
+decoder LSTM state. The decoder cold-starts each chunk and loses 5-20 s
+of content from each chunk's interior (not just at boundaries). Sweep of
+chunk sizes 15-30 s × overlap 3-8 s on the issue #89 reporter's 60 s
+Japanese audio (parakeet-tdt-0.6b-ja, CPU-only):
+
+| chunk | overlap | chars | coverage% | max_gap |
+|-------|---------|-------|-----------|---------|
+| 20s   | 3s      | 278   | 82.4%     | 3.4s    |  ← best without VAD
+| 15s   | 5s      | 278   | 70.9%     | 5.3s    |
+| 30s   | 3s      | 195   | 59.7%     | 19.4s   |  ← current default
+| 60s   | 0s      | 294   | 99.5%     | 0s      |  ← single-pass (fails on Vulkan/AMD)
+| VAD silero | —  | 281   | 93.1%     | 3.7s    |
+
+Counterintuitively, more overlap hurts (extends z-norm window →
+distribution shift). The ceiling is the decoder cold-start, not boundary
+stitching.
+
+### NeMo's approach
+
+NeMo's `FrameBatchASR` / `BatchedFrameASRTDT` uses a fundamentally
+different architecture:
+
+| | NeMo streaming | CrispASR chunking |
+|---|---|---|
+| Frame step | 1.6-4 s | 15-30 s |
+| Buffer | 4 s rolling | chunk + overlap |
+| Z-norm | Over 4 s buffer | Over 30-33 s chunk |
+| Decoder | **Stateful** across frames | Independent per chunk |
+| Overlap ratio | 60-150 % of frame | 10-20 % of chunk |
+
+Key: NeMo keeps the TDT LSTM predictor state between frames. Each 1.6 s
+step feeds the decoder with the previous hidden state, so it never
+cold-starts. CrispASR reinitializes the LSTM (`lstm_init_state`) for
+every chunk.
+
+### Implementation plan
+
+**Phase 1: Stateful TDT decode (the core change)**
+
+The split API already exists (`parakeet.h`):
+```c
+float* parakeet_encode(ctx, samples, n_samples, &T_enc, &d_model);
+parakeet_result* parakeet_decode_frames(ctx, enc_frames, T_enc, d_model, t_offset_cs);
+```
+
+Changes needed:
+
+1. **Add `parakeet_decode_frames_stateful`**: like `parakeet_decode_frames`
+   but accepts/returns the LSTM hidden state (`parakeet_lstm_state`).
+   The TDT decode loop in `parakeet.cpp:1003` already uses `state` — just
+   need to make it an in/out parameter instead of initializing to SOS.
+
+2. **Add streaming mel with running z-norm**: instead of computing z-norm
+   per chunk, maintain running mean/variance across frames (NeMo's
+   `get_norm_consts_per_frame` approach). Add a
+   `parakeet_mel_streaming_context` that tracks the statistics.
+
+3. **Wire into `crispasr_run.cpp`**: when the long-audio fallback
+   triggers and the backend is parakeet/canary, use the streaming
+   decode path instead of independent chunk transcription:
+   ```
+   for each 4s frame:
+     mel = compute_mel(frame, streaming_mel_ctx)  // running z-norm
+     enc = parakeet_encode(mel)
+     result = parakeet_decode_frames_stateful(enc, &lstm_state)
+     merge results with LCS
+   ```
+
+**Phase 2: Tuning**
+
+4. Frame size sweep (1.6s, 2s, 4s, 8s) on the benchmark corpus.
+5. Running z-norm warmup: first frame gets per-frame z-norm, subsequent
+   frames use exponential moving average (NeMo's approach).
+6. LCS delay tuning: `lcs_delay = (buffer - frame) / model_stride`.
+
+### Files to modify
+
+- `src/parakeet.h` — add `parakeet_decode_frames_stateful`, `parakeet_mel_streaming_context`
+- `src/parakeet.cpp` — expose LSTM state in/out, add streaming mel helper
+- `src/core/mel.h` / `mel.cpp` — add running z-norm mode
+- `examples/cli/crispasr_run.cpp` — streaming decode path in `process_one_input`
+- `examples/cli/crispasr_backend_parakeet.cpp` — streaming transcribe method
+- `tests/test-issue-89-long-audio-fallback.cpp` — pin streaming path activation
+
+### Effort
+
+Medium-Large. Phase 1 is ~200-300 LOC of new code (the hot loop is
+<50 lines — the LSTM state threading is the main work). Phase 2 is
+benchmarking and tuning.
+
+### Success criteria
+
+`python tests/benchmark_asr.py --audio yt_60s.wav --backend parakeet-ja --settings auto`
+reports **coverage ≥ 95 %** on the issue #89 reporter's Japanese audio,
+without `--vad`.
+
+### Trigger
+
+Immediate — issue #89 is open and the current fix is a partial
+mitigation (prevents 0-output catastrophe but doesn't match NeMo quality).
