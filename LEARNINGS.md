@@ -5804,3 +5804,29 @@ looking up each ID and replacing the SentencePiece leading-space
 marker `▁` (U+2581, "\xE2\x96\x81") with an ASCII space. ~20 LOC
 of C++, no link-time dep. Same pattern canary-ctc / firered-asr
 already use.
+
+### FunASR audio_adaptor: use_low_frame_rate config mismatch (PLAN #99)
+
+**Symptom:** Fun-ASR-MLT-Nano-2512 hallucinated the ending of English
+transcripts (~last 5 tokens wrong), while Fun-ASR-Nano-2512 worked
+correctly through the identical C++ code path.
+
+**Root cause:** The C++ runtime hardcoded `use_low_frame_rate = true`.
+This flag controls how many adaptor output frames are spliced into
+the Qwen3-0.6B LLM prompt. The Nano config.yaml sets it to `true`
+(23 of 183 frames used on JFK); the MLT-Nano config.yaml omits it
+(upstream default is `false` — all 183 frames). With the wrong value,
+the C++ truncated 87% of the audio context.
+
+**Why the bisect was misleading:** The per-stage diff showed genuine
+attention drift (cos 0.998 at `ada_blk0_attn`), which is real F32
+cross-implementation non-determinism amplified by peaked attention
+patterns. But this drift is benign when the LLM receives the full
+audio context — the model tolerates it and still decodes correctly.
+The hallucination was caused by frame truncation, not attention
+precision. The lesson: when one model variant works and another
+doesn't through the same code, compare the config files first.
+
+**Fix:** Converter reads `audio_adaptor_conf.use_low_frame_rate` from
+`config.yaml` and writes it as a bool GGUF KV. Runtime reads the KV
+at load time, falling back to `true` for pre-fix GGUFs.
