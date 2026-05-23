@@ -39,7 +39,7 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | **BLOCKED** | [#43 Fun-ASR-Nano](#43-fun-asr-nano) | Medium | License unclear |
 | **MEDIUM** | [#80 nano-cohere-transcribe-inspired tweaks](#80-nano-cohere-transcribe-inspired-perf--chunking-tweaks) | Small | 80a parked (<1 % of wall on Metal); **80b DONE** (energy chunker live in cohere.cpp); **80c DONE**; 80d/80e TODO |
 | **DEFERRED** | [#81 Nemotron-Speech-Streaming-EN-0.6B](#81-nemotron-speech-streaming-en-06b--first-cache-aware-streaming-native-asr) | M-L | NVOML license, ~60–75 % reuse from parakeet/canary; the new bit is cache-aware FastConformer streaming. Wait for `--stream-json` (issue #84) to settle + a second user request (only mention so far is issue #85) before starting. |
-| **MEDIUM** | [#86 Per-backend flash-attention wiring](#86-per-backend-flash-attention-wiring-crisperweaver-driven) | 2–3 days | Plumbing shipped 0.6.2; kernel-level wiring per backend is the remaining work. Whisper done; orpheus/chatterbox-T3 are the next-best pickings. |
+| **DONE** | [#86 Per-backend flash-attention wiring](#86-per-backend-flash-attention-wiring-crisperweaver-driven) | — | All backends now route through core helpers (`core_attn`, `core_sanm`, `core_conformer`) that unconditionally use `ggml_flash_attn_ext`. Only t5_translate excluded (T5 rel-pos bias incompatible). |
 | **LOW** | [#87 `gpu_backend` runtime selector](#87-gpu_backend-runtime-selector-multi-backend-ggml-build) | ~1 week | Needs ggml-side multi-backend dispatch to land first. CrisperWeaver UI placeholder ready when the C-side is. |
 | **LOW** | [#95 IndexTTS Chinese TN binary alternative](#95-indextts-15-chinese-tn--binary-alternative-to-the-python-wetext-hook) | survey only | Python `INDEXTTS_TEXT_NORMALIZER` hook shipped 2026-05-19. Hand-roll (#95a) is the right next step *when* a user reports a digit/date prompt that breaks; OpenFST vendoring (#95b) only after #95a grows past ~5 cases. |
 | **LOW** | [#97 More Parakeet variants](#97-more-parakeet-variants) | Small per-variant | Converter-only for TDT / TDT+CTC variants (v2, tdt-1.1b, tdt_ctc-{110m,1.1b}); RNNT / realtime-EOU / unified-en deferred (need new decoder code or arch survey). |
@@ -2787,61 +2787,37 @@ Metal, that's a measurable perf gap on every long-running LLM
 backend (orpheus, voxtral, qwen3 ASR, qwen3-tts, granite-speech,
 chatterbox-T3, gemma4-e2b).
 
-### Per-backend status
+### Per-backend status (updated 2026-05-23)
 
-| Backend | Has `use_gpu` field | Has `flash_attn` field | Compute graph branch | Effort |
-|---|---|---|---|---|
-| whisper | ✅ (whisper.cpp upstream) | ✅ | ✅ | DONE |
-| parakeet | ✅ | ❌ | — | Small (Conformer encoder) |
-| canary | ✅ | ❌ | — | Small (encoder SA + decoder XA) |
-| qwen3 (asr) | ✅ | ❌ | — | Medium (Whisper-like enc + Qwen3 LLM) |
-| cohere | ✅ | ❌ | — | Small (Conformer encoder) |
-| granite_speech | ✅ | ❌ | — | Medium (Conformer + Granite LLM) |
-| voxtral | ✅ | ❌ | — | Medium (Whisper enc + Mistral 3B) |
-| voxtral4b | ✅ | ❌ | — | Medium (causal enc + SWA decoder) |
-| vibevoice | ✅ | ❌ | — | Small (σ-VAE encoder + Qwen2.5 talker) |
-| qwen3_tts | ✅ | ❌ | — | Medium (talker + code-predictor) |
-| orpheus | ✅ | ❌ | — | Small-Medium (Llama 3.2 3B AR loop) |
-| kokoro | ✅ | ❌ | — | Small (StyleTTS2-derived; less impact) |
-| chatterbox | ✅ | ❌ | — | Medium (T3 AR + S3Gen flow-matching) |
+**RESOLVED.** All backends now route through shared core modules
+(`core_attn::kv_self_attn`, `core_attn::encoder_self_attn`,
+`core_sanm::build_block`, `core_conformer::build_block`) that
+unconditionally use `ggml_flash_attn_ext`. The table below was
+written before the core helpers were consolidated; by the time
+individual wiring was attempted (May 2026), every backend already
+had flash attention via its core module.
 
-### Approach (per-backend recipe)
+| Backend | Core module | Flash attn | Status |
+|---|---|---|---|
+| whisper | upstream whisper.cpp | ✅ | DONE (upstream) |
+| parakeet | `core_conformer::build_block` | ✅ | DONE |
+| canary | `core_attn::kv_self_attn` | ✅ | DONE |
+| qwen3 (asr) | `core_attn::kv_self_attn` | ✅ | DONE |
+| cohere | `core_attn::kv_self_attn` | ✅ | DONE |
+| granite_speech | `core_attn::kv_self_attn` + `core_conformer_ibm` | ✅ | DONE |
+| voxtral | `core_attn::kv_self_attn` | ✅ | DONE |
+| voxtral4b | `core_attn::kv_self_attn` + `encoder_self_attn` | ✅ | DONE |
+| vibevoice | `core_attn::kv_self_attn` | ✅ | DONE |
+| qwen3_tts | `core_attn::kv_self_attn` | ✅ | DONE |
+| orpheus | `core_attn::kv_self_attn` | ✅ | DONE |
+| kokoro | `core_attn::encoder_self_attn` | ✅ | DONE |
+| chatterbox | `core_attn::kv_self_attn` | ✅ | DONE |
+| funasr | `core_sanm::build_block` + `core_attn::kv_self_attn` | ✅ | DONE |
+| sensevoice | `core_sanm::build_block` | ✅ | DONE |
+| paraformer | `core_sanm::build_block` + manual cross-attn | ✅ | DONE |
+| t5_translate | manual (T5 rel-pos bias) | ❌ | N/A — T5 additive bias incompatible with fused kernel |
 
-For each backend with a transformer attention block:
-
-1. Add `bool flash_attn` to `*_context_params` (default-init to true
-   in `*_context_default_params()`).
-2. Plumb `g_open_flash_attn_tls → cparams.flash_attn` in
-   `crispasr_session_open_explicit`'s arm for that backend (mirror
-   the existing `cparams.use_gpu` line).
-3. In the compute graph, swap the QKV path:
-   - Before: `ggml_soft_max_ext(ggml_mul_mat(K, Q), scale)` then
-     `ggml_mul_mat(V_T, softmax_out)`.
-   - After: branch on `cparams.flash_attn`:
-     - true → `ggml_flash_attn_ext(Q, K, V, mask, scale, ...)`
-     - false → keep the historical path.
-4. Verify the Metal kernel for `flash_attn_ext` exists for the
-   relevant head dim. Most are covered (D ∈ {64, 80, 96, 112, 128})
-   but check before committing.
-5. Diff-harness round-trip: dump pre/post-attention tensors with
-   the flag on vs off, confirm the kernels agree to 1e-3 (Metal
-   F16 fast-math drift is the typical failure mode — use
-   `GGML_PREC_F32` op_param if needed; same fix as #83).
-
-### Recommended order
-
-1. **orpheus + chatterbox-T3** — Llama-style AR loops, biggest
-   wall-clock win on long generations (3 B Llama / T3 dominate
-   the synth budget). Reuses the same `ggml_flash_attn_ext` pattern
-   per-block.
-2. **voxtral / voxtral4b / qwen3 ASR / granite-speech** — LLM-based
-   ASR backends where flash-attn helps both the Whisper-style
-   encoder and the LLM decoder.
-3. **qwen3-tts** — talker is Qwen3-style transformer; same recipe
-   as qwen3 ASR.
-4. **parakeet / canary / cohere** — Conformer encoders. Lower per-
-   call benefit but sums up for batch-transcribe users.
-5. **vibevoice / kokoro** — smallest impact; do last or skip.
+No further work needed. The original "recommended order" is moot.
 
 ### Effort estimate
 
