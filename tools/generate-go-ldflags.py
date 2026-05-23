@@ -31,7 +31,7 @@ GGML_LIBS = ["ggml", "ggml-base", "ggml-cpu"]
 # Transitive dependencies that backends link but crispasr doesn't
 # link directly. Must be in the Go link group because Go links all
 # static libs flat (no CMake transitive resolution).
-TRANSITIVE = ["crispasr-core", "crisp_audio"]
+TRANSITIVE = ["crispasr-core", "crisp_audio", "moonshine_tokenizer"]
 
 
 def extract_libs() -> list[str]:
