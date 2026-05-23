@@ -15,6 +15,16 @@ $ crispasr --backend kokoro -m auto --tts "Hello world" --tts-output out.wav  # 
 
 No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one C++ binary and a GGUF file.
 
+### What's new (v0.6.9+)
+
+- **Long-audio fix (issue #89):** NeMo-style streamed pipeline for parakeet / canary / fastconformer-ctc — 99.5 % coverage on 60 s Japanese audio (was 0 %). Tuneable via `CRISPASR_PARAKEET_STREAM_THRESHOLD` / `_CHUNK` / `_OVERLAP` env vars.
+- **Paraformer-zh:** non-autoregressive Mandarin+English ASR backend (220M params, single-pass CIF decode). `--backend paraformer -m auto`.
+- **Hotwords (PLAN #98):** `--hotwords "Tokyo,CrispASR"` for CTC/TDT contextual biasing + LLM prompt injection on supported backends.
+- **Global diarization (#110):** `--diarize-method sherpa` / `pyannote` now runs once on the full audio, producing consistent speaker IDs across the entire file.
+- **WhisperX aligner zoo:** 12 language-specific wav2vec2 CTC forced aligners (`-am wav2vec2-aligner-ja`, `-am wav2vec2-aligner-de`, etc.) with auto-download.
+- **Generation controls:** `--seed`, `--beam-size`, `--frequency-penalty`, `--max-new-tokens` wired through all ASR + TTS backends.
+- **Benchmark framework:** `python tests/benchmark_asr.py --audio file.wav --backend parakeet` for structured multi-backend comparison.
+
 ### Ecosystem
 
 | Project | What it does |
