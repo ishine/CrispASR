@@ -17,7 +17,7 @@ No Python. No PyTorch. No separate per-model binary. No `pip install`. Just one 
 
 ### What's new (v0.6.9+)
 
-- **Long-audio fix (issue #89):** NeMo-style streamed pipeline for parakeet / canary / fastconformer-ctc — 99.5 % coverage on 60 s Japanese audio (was 0 %). Tuneable via `CRISPASR_PARAKEET_STREAM_THRESHOLD` / `_CHUNK` / `_OVERLAP` env vars.
+- **Long-audio fix (issue #89):** NeMo-style streamed pipeline (global z-norm + 8 s chunked encode + single TDT decode) is now the default path for parakeet / canary / fastconformer-ctc at any duration. The single-pass-over-the-whole-clip encoder was numerically unstable to codec-level audio perturbations and could drop most of a 60 s clip; the streamed path is stable. Tuneable via `CRISPASR_PARAKEET_STREAM_THRESHOLD` (escape hatch back to single-pass) / `_CHUNK` / `_OVERLAP` env vars.
 - **Paraformer-zh:** non-autoregressive Mandarin+English ASR backend (220M params, single-pass CIF decode). `--backend paraformer -m auto`.
 - **Hotwords (PLAN #98):** `--hotwords "Tokyo,CrispASR"` for CTC/TDT contextual biasing + LLM prompt injection on supported backends.
 - **Global diarization (#110):** `--diarize-method sherpa` / `pyannote` now runs once on the full audio, producing consistent speaker IDs across the entire file.

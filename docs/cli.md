@@ -132,33 +132,36 @@ per-token `tokens[]` arrays when the backend populates them.
 | `--lcs-min-length N` | Minimum LCS length to act on (default 1; raise to 3-4 on long-silence audio where blank tokens dominate boundaries) |
 | `--parakeet-decoder ctc\|tdt` | Select CTC or TDT decode head for hybrid parakeet models |
 
-### Parakeet long-audio streaming (issue #89)
+### Parakeet streamed encoding (issue #89)
 
-Parakeet handles long audio internally via a NeMo-inspired streamed
-pipeline.  Audio ≤60 s is processed in a single encoder pass (best
-quality: 99.5 % coverage on the reporter's 60 s Japanese podcast clip).
-Audio >60 s is encoded in overlapping 8 s chunks with global z-norm,
-then decoded in one TDT pass — safe for any length without z-norm drift.
+Parakeet always encodes audio in overlapping 8 s windows (global
+z-norm + chunked encode + single TDT decode pass). The bidirectional
+FastConformer encoder is numerically unstable when the attention spans
+the whole utterance: codec-level perturbations as small as 0.3 % RMS
+flipped the encoder output std by ~14 % on the issue #89 reporter's
+clip, driving the TDT decoder into emit-blank-forever past ~20 s. Local
+8 s attention windows do not amplify that noise.
 
-**Env vars for tuning** (e.g. for issue triage on your hardware):
+**Env vars for tuning:**
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `CRISPASR_PARAKEET_STREAM_THRESHOLD` | 60 | Switch from single-pass to streamed at this duration (seconds).  Set 0 = always streamed, 999 = always single-pass |
-| `CRISPASR_PARAKEET_STREAM_CHUNK` | 8 | Encoder chunk size (seconds) for the streamed path |
+| `CRISPASR_PARAKEET_STREAM_THRESHOLD` | 0 | Use single-pass (no chunked encode) for audio ≤ this duration (seconds).  `0` = always streamed.  `999` = single-pass for audio under ~16 minutes (escape hatch for bit-exact NeMo reproduction). |
+| `CRISPASR_PARAKEET_STREAM_CHUNK` | 8 | Encoder chunk size (seconds) |
 | `CRISPASR_PARAKEET_STREAM_OVERLAP` | 2 | Encoder overlap (seconds) between consecutive chunks |
 
 **Example: transcribe a 5-minute Japanese podcast:**
 
 ```bash
-# Auto mode — uses single-pass for first 60s, streamed for the rest:
+# Default — streamed encoding for any length:
 crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast.wav -osrt
 
-# Force single-pass even for long audio (may fail on some Vulkan/AMD):
+# Opt into single-pass for short audio (matches upstream NeMo bit-exactly
+# on clips where the encoder doesn't go unstable):
 CRISPASR_PARAKEET_STREAM_THRESHOLD=999 \
-  crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast.wav -osrt
+  crispasr -m parakeet-tdt-0.6b-ja.gguf -f short_clip.wav -osrt
 
-# With VAD for finest segmentation (93%+ coverage, best subtitles):
+# With VAD for finest segmentation:
 crispasr -m parakeet-tdt-0.6b-ja.gguf -f podcast.wav --vad -osrt
 ```
 
@@ -212,13 +215,13 @@ crispasr --backend parakeet -m parakeet.gguf -f long_audio.wav \
   `voxtral`, `voxtral4b`, `qwen3`): use a CTC aligner together with
   `--vad`. Without VAD, leading silence can throw off sentence
   starts, especially for the qwen3 forced aligner.
-- **Long audio (>60 s):** parakeet automatically switches to the
-  NeMo-style streamed pipeline — global z-norm + overlapping 8 s
-  encoder chunks + single TDT decode pass. No manual `--chunk-seconds`
-  needed. Tune with `CRISPASR_PARAKEET_STREAM_THRESHOLD` (default 60),
-  `CRISPASR_PARAKEET_STREAM_CHUNK` (default 8), and
-  `CRISPASR_PARAKEET_STREAM_OVERLAP` (default 2). See the "Parakeet
-  long-audio streaming" section above for details.
+- **Any length:** parakeet routes through the NeMo-style streamed
+  pipeline — global z-norm + overlapping 8 s encoder chunks + single
+  TDT decode pass — by default, regardless of duration. No manual
+  `--chunk-seconds` needed. Tune chunk/overlap with
+  `CRISPASR_PARAKEET_STREAM_CHUNK` (default 8) and
+  `CRISPASR_PARAKEET_STREAM_OVERLAP` (default 2). See the
+  "Parakeet streamed encoding" section above for details.
 - **If parakeet OOMs on very long audio:** lower the stream chunk size
   with `CRISPASR_PARAKEET_STREAM_CHUNK=4`. The default 8 s chunks use
   ~30 MB per chunk for the encoder; 4 s halves that.

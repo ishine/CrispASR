@@ -1212,33 +1212,49 @@ Test audio: first 60 s of the issue #89 reporter's exact YouTube clip
 
 ### Issue #89 fix verification — parakeet-tdt-0.6b-ja
 
-**Final state (NeMo-style streamed pipeline, commit `97d2b4f`):**
+**Final state — streamed encoding is always on (default
+`CRISPASR_PARAKEET_STREAM_THRESHOLD=0`, see commit "always route
+parakeet through streamed encode").**
 
-Audio ≤60 s uses single-pass encoding (best quality).  Audio >60 s uses
-the streamed pipeline: global z-norm + overlapping 8 s encoder chunks +
-single TDT decode pass.
+Global z-norm + overlapping 8 s encoder chunks + single TDT decode pass.
 
-| path | chars | first_ts | last_ts | coverage% | gaps | notes |
-|---|---:|---:|---:|---:|---:|---|
-| **auto (single-pass ≤60 s)** | **294** | **0.16** | **59.84** | **99.5** | **0** | **default for ≤60 s** |
-| **auto (streamed >60 s)** | **294** | **0.16** | **59.84** | **99.5** | **0** | **default for >60 s** |
-| `STREAM_THRESHOLD=0` (forced streamed) | 294 | 0.16 | 59.84 | 99.5 | 0 | identical to single-pass |
-| `--vad` (silero) | 281 | 0.36 | 59.87 | 93.1 | 1 | VAD segmentation |
-| `--vad --vad-model firered` | 238 | 0.28 | 58.01 | 85.1 | 1 | firered VAD |
-| old: 30 s independent chunks | 195 | 0.16 | 58.02 | 59.7 | 2 | **pre-fix (broken)** |
-| old: 60 s auto-chunk | 0 | — | — | 0.0 | — | **pre-fix (catastrophic)** |
+The earlier "single-pass ≤60 s" default produced 99.5 % coverage on the
+cached MP3-derived copy of the reporter's clip but only ~33 % on a
+fresh `yt-dlp` extract of the same YouTube video (lenhone, issue #89
+comment 4529025103). Both extracts are perceptually identical
+(duration 60.000 s, 0.998 waveform correlation, ~0.3 % RMS diff from
+codec quantization) but the FastConformer encoder's full-clip
+bidirectional attention amplified that quantization noise enough
+(encoder output std differed by 14 %: 0.2069 vs 0.2415) to drive the
+TDT decoder into emit-blank-forever past frame 250 (≈20 s). The
+streamed path keeps attention local to 8 s windows, so codec
+perturbations don't amplify and the decoder runs to the end.
+
+| path | audio | chars | first_ts | last_ts | coverage% | gaps |
+|---|---|---:|---:|---:|---:|---:|
+| **streamed (default)** | reporter's MP3-derived `yt_60s.wav` | **309** | **0.00** | **55.84** | **~99** | **0** |
+| **streamed (default)** | fresh `yt-dlp` Opus→PCM `o_9dWkRPYC0_60s.wav` | **314** | **0.00** | **55.84** | **~99** | **0** |
+| old: single-pass ≤60 s | reporter's MP3-derived `yt_60s.wav` | 309 | 0.16 | 59.84 | 99.5 | 0 |
+| old: single-pass ≤60 s | fresh `yt-dlp` Opus→PCM `o_9dWkRPYC0_60s.wav` | 91 | 0.16 | 20.08 | **~33** | 0 |
+| `--vad` (silero) | reporter's MP3-derived | 281 | 0.36 | 59.87 | 93.1 | 1 |
+| `--vad --vad-model firered` | reporter's MP3-derived | 238 | 0.28 | 58.01 | 85.1 | 1 |
+| old: 30 s independent chunks | reporter's MP3-derived | 195 | 0.16 | 58.02 | 59.7 | 2 |
 
 **Key findings:**
-- The NeMo-style streamed pipeline gives **99.5 % coverage** — identical
-  to single-pass encoding — by using global z-norm (computed over the full
-  audio) with chunked encoding (8 s chunks for safe memory usage).
-- `--vad` (silero) gives 93 % coverage with speech-boundary segmentation.
-  Useful when you want per-utterance SRT entries rather than continuous
-  transcription.
-- The old 30 s independent-chunk approach (pre-fix) lost content due to
-  TDT decoder cold-start on each chunk (each chunk reset the LSTM state).
-- **Recommendation for Japanese:** just run `crispasr -m parakeet-tdt-0.6b-ja.gguf
-  -f audio.wav -osrt` — the auto path handles any duration.
+- Single-pass encoding over the full clip is **not robust**: a 0.3 %
+  RMS difference between two codec-quantized copies of the same speech
+  flips the encoder into emit-blank mode at the 20 s mark on one and
+  not the other. The streamed path is robust to that perturbation.
+- The streamed pipeline gives ~99 % coverage on both audio variants.
+- `--vad` (silero) gives 93 % coverage with speech-boundary
+  segmentation.  Useful when you want per-utterance SRT entries rather
+  than continuous transcription.
+- The old 30 s independent-chunk approach (pre-fix) lost content due
+  to TDT decoder cold-start on each chunk (each chunk reset the LSTM
+  state).
+- **Recommendation for Japanese:** just run `crispasr -m
+  parakeet-tdt-0.6b-ja.gguf -f audio.wav -osrt` — the default routes
+  through streamed and handles any duration on any audio source.
 
 ### Robustness validation — 2026-05-23
 
@@ -1246,6 +1262,15 @@ Full sweep on the reporter's 60 s clip (commit `0c24178e`, CPU-only).
 Streamed pipeline output is **byte-identical to single-pass** across
 every chunk/overlap combination tested — the global z-norm makes chunk
 boundaries transparent to the TDT decoder.
+
+> **Caveat (added 2026-05-24).** The "identical to single-pass" column
+> below is only true on the cached MP3-derived audio (`/mnt/storage/
+> samples/o_9dWkRPYC0.mp3` → `yt_60s.wav`). On a fresh `yt-dlp` extract
+> of the same YouTube video, single-pass collapses to ~20 s of output
+> while streamed still covers the whole clip — see the "single-pass
+> not robust" finding above. The streamed-vs-streamed numbers across
+> chunk and overlap sizes (300+ chars, 99 %+ coverage) hold across
+> both audio derivations.
 
 **Chunk-size sweep** (streamed, overlap=2 s):
 
