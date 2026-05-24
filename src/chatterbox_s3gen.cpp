@@ -1789,6 +1789,17 @@ static ggml_cgraph* build_graph_unet1d(chatterbox_s3gen_context* c, int T_mel) {
 
     ggml_tensor* x = x_in;
 
+    // PLAN #83 r9 follow-up #5: snapshot unet_input via a dup at graph start
+    // so we can dump what the GPU actually sees (post-compute readback)
+    // and compare to host-side unet_input. Gated on env so production
+    // doesn't pay the dup cost.
+    if (std::getenv("CRISPASR_S3GEN_UNET_PROBE_INPUT_SNAPSHOT") != nullptr) {
+        ggml_tensor* snap = ggml_dup(ctx0, x);
+        ggml_set_name(snap, "dump_unet_input_snapshot");
+        ggml_set_output(snap);
+        ggml_build_forward_expand(gf, snap);
+    }
+
     // ---- Down blocks (1 block) ----
     const bool dump_unet = std::getenv("CRISPASR_S3GEN_DUMP_UNET") != nullptr;
     // PLAN #83 r9 bisect: CRISPASR_S3GEN_UNET_PRESERVE_INTERMEDIATES=1
