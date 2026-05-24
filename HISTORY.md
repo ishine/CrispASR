@@ -96,6 +96,24 @@ production fix runs the same on Linux as on macOS. Branch
 
 Updated: PLAN.md #57/#83 status, LEARNINGS Round 9.
 
+**(2026-05-24 night follow-up #2)** Added a per-node gallocr
+trace (`CRISPASR_GGML_ALLOC_TRACE=1`, commit `2f4961d6`). Compared
+1-mark and 2-mark UNet allocator passes (n_nodes=2715 each, 3044
+events). 2108 lines diverge but **zero overlapping live ranges in
+either run** — the allocator is correct in both cases. The parity
+mechanism is geometric: in the 1-mark control trace, even-indexed
+`mb_*_out` tensors land at `offset=0` and odd-indexed at
+`offset=1271296`. `FREE_SKIP_OUTPUT` on the low-offset slot blocks
+~1300 downstream allocations into shifted positions; the same
+output marked on the mid-offset slot only blocks a small hole.
+The cascade is a layout shift, not aliasing. So the prior
+follow-up's "buffer aliasing in `ggml_gallocr`" hypothesis is
+ruled out. The bug must be in the Metal kernel layer (kernel
+correctness sensitive to specific address patterns, or output-path
+staging, or sched/OUTPUT-flag interaction). `tools/upstream-prs/10`
+to be revised; LEARNINGS Round 9 follow-up #2 records the
+methodology and pivots the investigation.
+
 ---
 
 ## 2026-05-23 PLAN #52 — Qwen3-TTS perf bench (FUSED_QKV Q8_0 decision)

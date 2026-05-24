@@ -51,10 +51,23 @@ reliable. It also revealed the NaN.
 - CPU backend: every configuration finite and correct.
 
 The parity pattern (even-indexed mb_*_out marks trigger; odd
-don't) strongly suggests buffer aliasing in `ggml_gallocr`. When
-two specific tensors of the same shape each reserve their own
-non-reused buffer, the allocator's placement collides on Metal in
-a way that corrupts downstream kernel writes.
+don't) is geometric, not aliasing. A per-node `ggml_gallocr` trace
+of both configurations (instrumentation merged downstream) shows
+that even-indexed `mb_*_out` tensors land at `chunk=0 offset=0`
+and odd-indexed at `chunk=0 offset=1271296` in the un-marked
+control. Pinning the low-offset slot via `set_output` →
+`FREE_SKIP_OUTPUT` blocks reuse of offset=0 and forces ~1300
+downstream allocations to shifted positions. Pinning the
+mid-offset slot only creates a small hole and a minor shift.
+
+An overlap scan over the allocator trace of both 1-mark and 2-mark
+configurations finds **zero overlapping live byte-ranges** in
+either pass — the allocator's plan is correct in both cases. The
+bug is therefore in the backend layer: a Metal kernel whose
+correctness depends on the specific address pattern produced when
+downstream allocations are shifted, or the output-staging path
+that handles `set_output`-flagged tensors, or sched-level
+interaction between OUTPUT tensors and split boundaries.
 
 ## What's been ruled out
 
@@ -92,23 +105,23 @@ the source:
 
 ## Investigation pointers
 
-- `ggml-alloc.c:622` `ggml_gallocr_allocate_node` — in-place reuse
-  decision is per-node and traversal-order-dependent. Adding a
-  single `set_output` flips downstream reuse decisions in a
-  cascade.
+- `ggml-alloc.c:622` `ggml_gallocr_allocate_node` — *not* the
+  source (verified by per-node trace + overlap scan). Adding the
+  2-mark `set_output` shifts ~1300 downstream allocation offsets
+  but produces no live-range overlap; the plan is valid.
 - `ggml-metal/ggml-metal-ops.cpp:159`
-  `ggml_metal_op_concurrency_check` — the mem-range overlap check
-  that inserts Metal barriers. Disabling concurrency entirely had
-  no effect, so this code isn't the source — but if the in-place
-  reuse map at `set_output` time produces aliased addresses, then
-  *correct* barrier insertion against an aliased map would still
-  produce wrong output.
-
-A useful next step inside ggml: dump the per-tensor address map
-that `ggml_gallocr` produces in both configurations (1 mark vs 2
-marks) and compare. The first node whose assigned address differs
-between the two — and whose new address overlaps with another
-live tensor — is the smoking gun.
+  `ggml_metal_op_concurrency_check` — barrier insertion against
+  the shifted address layout. Disabling concurrency entirely had
+  no effect on the 2-mark NaN; this code path is unlikely to be
+  the direct cause.
+- The Metal output-staging path that copies `set_output`-flagged
+  tensors out of device memory — concurrent staging copies
+  alongside in-flight kernels writing to neighbouring tensors are
+  a plausible candidate, especially when downstream kernels are
+  now reading from offsets that wouldn't normally co-occur with
+  the pinned output.
+- Backend-sched interaction with `GGML_TENSOR_FLAG_OUTPUT` at
+  split boundaries.
 
 ## How to reproduce
 

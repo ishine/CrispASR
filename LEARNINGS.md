@@ -6397,3 +6397,87 @@ your downstream bisect is unreliable. Always count + assert on
 non-finite before consuming cosine/max_abs. Same lesson would
 apply to any other Metric pipeline that aggregates over potentially
 non-finite data.
+
+### Round 9 follow-up #2 (2026-05-24, evening) — gallocr ruled out
+
+The "buffer aliasing in `ggml_gallocr`" hypothesis from the prior
+follow-up is **wrong**. The allocator is correct. The bug is
+elsewhere.
+
+**The instrumentation.** Added a per-node allocator trace
+(`CRISPASR_GGML_ALLOC_TRACE=1`) that emits one line per allocate,
+free, in-place-reuse, view-reuse, and FREE_SKIP_OUTPUT event in a
+diffable single-line format. Captured pass=37 (the first UNet
+allocator pass, n_nodes=2715) for both 1-mark and 2-mark configs.
+
+**The diff.** Of 3044 events in pass=37:
+- 2108 lines diverge (~70%).
+- Exactly +1 FREE_SKIP_OUTPUT and -1 FREE in the 2-mark case
+  (`dump_mb_0_out` now pinned instead of freed).
+- 1312 ALLOC events have shifted offsets.
+- Max chunk-0 offset reached: 8,310,688 (1-mark) vs 8,701,856
+  (2-mark) — exactly +391,168 bytes, the size of `dump_mb_0_out`.
+- Both runs use only chunk 0; no spill to a new chunk.
+
+**The overlap check.** Wrote a script that scans the trace and
+flags any pair of live tensors whose byte ranges overlap inside
+overlapping lifetimes (filtering out the legitimate parent→child
+in-place reuse). Result: **0 overlaps in both configurations.** The
+allocator's plan is correct; no two distinct live tensors share
+bytes. If the bug were aliasing, the script would have flagged it.
+
+**The parity mechanism, finally.** In the 1-mark control trace,
+even-indexed `mb_*_out` tensors are allocated at `chunk=0 offset=0`
+and odd-indexed at `chunk=0 offset=1271296`. The allocator
+naturally alternates them across the two large reusable regions of
+the same shape (391,168 bytes). Pinning a *low-offset* output
+(via `set_output` → `FREE_SKIP_OUTPUT`) blocks reuse of offset=0
+and forces ~1300 downstream allocations to higher offsets. Pinning
+a *mid-offset* output (the odd indices) is local — only a small
+hole, no cascading shift. Hence the even/odd trigger pattern. The
+parity is geometric, not aliasing-driven.
+
+**Where the bug actually is.** It must be at a layer above gallocr:
+- a Metal kernel whose correctness depends on the specific
+  address pattern produced when downstream allocations are shifted;
+- `ggml_metal_op_concurrency_check`'s barrier insertion against the
+  shifted address layout;
+- the Metal output-staging path that handles `set_output`-flagged
+  tensors;
+- or sched-level interaction between OUTPUT tensors and split
+  boundaries.
+
+`GGML_METAL_CONCURRENCY_DISABLE=1` was already negative, so it's
+not the *first-order* barrier check, but it may be the
+output-staging side. Item #6 (`kernel_flash_attn_ext` Q downcast)
+is still a known F32→half precision loss worth a separate PR; it's
+not the 2-mark NaN trigger.
+
+### Updated lesson (replace #2' above)
+
+2''. **`set_output` reshapes the allocator's plan, not its
+correctness.** When a debug `set_output` causes downstream NaN, the
+gallocr plan is still valid (no live-range overlap); what changed
+is the geometric layout of where every subsequent tensor lives.
+The bug surfaced by the mark is in whatever code path is sensitive
+to *which* addresses the kernels run on, not in the allocator
+itself. Before chasing gallocr internals, run the per-node trace
+(`CRISPASR_GGML_ALLOC_TRACE=1`) and confirm with an overlap scan;
+if it's clean, pivot to the backend's kernel/barrier/output paths.
+
+### Toolbox added
+
+| Knob | Effect |
+|---|---|
+| `CRISPASR_GGML_ALLOC_TRACE=1` | One trace line per allocator event |
+| `CRISPASR_GGML_ALLOC_TRACE_MAX_PASSES=N` | Cap to the first N passes (UNet is at pass=37 in the chatterbox CLI smoke path) |
+
+Trace format:
+```
+ggml-alloc: [TRACE] PASS pass=37 n_nodes=2715 n_leafs=909
+ggml-alloc: [TRACE] ALLOC node=<n> op=<op> buf=<b> chunk=<c> offset=<o> size=<s> inplace_from=- view_src=-
+ggml-alloc: [TRACE] ALLOC_REUSE node=<n> op=<op> ... inplace_from=<parent> view_src=-
+ggml-alloc: [TRACE] FREE node=<n> buf=<b> chunk=<c> offset=<o> size=<s>
+ggml-alloc: [TRACE] FREE_SKIP_OUTPUT node=<n> buf=<b> chunk=<c> offset=<o> size=<s>
+ggml-alloc: [TRACE] PASS_END pass=37
+```
