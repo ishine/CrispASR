@@ -1646,7 +1646,24 @@ static ggml_tensor* causal_resnet_block(ggml_context* ctx, ggml_tensor* x, ggml_
     ggml_tensor* rc_w = W("rc.weight");
     if (rc_w) {
         ggml_tensor* rc_b = W("rc.bias");
-        residual = ggml_conv_1d(ctx, rc_w, residual, 1, 0, 1);
+        // PLAN #83 r9 follow-up #5: rc.weight is a kernel-size-1 conv (a
+        // pointwise channel-mix matmul wrapped in conv1d). For KW=1, the
+        // im2col step that ggml_conv_1d generates dispatches Metal's
+        // kernel_im2col_f32 with a 1×1×1 threadgroup — a rare edge case
+        // that appears to be the manifestation of Bug B (R9 follow-up #5
+        // localized the cos=0.022 divergence between Path X and Path Y
+        // to this op specifically). Bypass the conv1d wrapper and emit
+        // a direct mul_mat: transpose residual (T, IC) → (IC, T), then
+        // mul_mat(res_T, rc_w_2d) → (T, OC). Gated on
+        // CRISPASR_S3GEN_RC_AS_MUL_MAT=1 for the experiment.
+        const char* rc_alt = std::getenv("CRISPASR_S3GEN_RC_AS_MUL_MAT");
+        if (rc_w->ne[0] == 1 && rc_alt && rc_alt[0] == '1') {
+            ggml_tensor* rc_w_2d = ggml_reshape_2d(ctx, rc_w, rc_w->ne[1], rc_w->ne[2]); // (IC, OC)
+            ggml_tensor* res_T = ggml_cont(ctx, ggml_transpose(ctx, residual));          // (T, IC) → (IC, T)
+            residual = ggml_mul_mat(ctx, res_T, rc_w_2d);                                // → (T, OC)
+        } else {
+            residual = ggml_conv_1d(ctx, rc_w, residual, 1, 0, 1);
+        }
         if (rc_b)
             residual = ggml_add(ctx, residual, ggml_reshape_2d(ctx, rc_b, 1, (int)rc_b->ne[0]));
     }
