@@ -1,156 +1,151 @@
-**Title:** `metal/ggml-alloc : long F32 GPU graphs accumulate drift sensitive to in-place buffer reuse pattern`
+**Title:** `metal/ggml-alloc : two specific ggml_set_output calls on a long F32 graph cause Metal to write all-NaN`
 
 ---
 
-This is a bug report rather than a patch. It documents a precision
-issue we hit running a 14-block diffusion UNet (the chatterbox-tts
-S3Gen conditional flow-matching decoder) on Apple Silicon Metal, and
-the bisect that points at `ggml-alloc`'s in-place buffer reuse rather
-than any single op kernel. Filing because the root-cause investigation
-needs ggml-internals knowledge beyond what an application can do.
+This is a bug report rather than a patch. Two specific
+`ggml_set_output` calls on intermediate tensors in a 14-block
+diffusion UNet (the chatterbox-tts S3Gen conditional flow-matching
+decoder) cause Apple Silicon Metal to produce all-NaN output for
+the entire graph. Without those marks the output is finite
+(degraded from a CPU reference by `cos_min ~0.94`, but no NaN).
+Either mark alone is also finite. The bug requires the
+combination.
 
-## Repro shape
+CPU backend produces correct output in every configuration tested.
 
-Pipeline: 1 down block + 12 mid blocks + 1 up block + final
-projection. Each block: `causal_resnet_block` (CausalConv1d + LayerNorm
-+ Mish + time-MLP add + CausalConv1d) + 4× BasicTransformerBlock
-(LayerNorm + Q/K/V mul_mat + flash_attn_ext + output mul_mat + add +
-LayerNorm + FFN up mul_mat + GELU + FFN down mul_mat + add). Weights
-mostly Q8_0 with some F16. Activations all F32. Graph: ~396 mul_mats
-per pass; run 10 times in a CFM Euler ODE solver.
+## Minimum repro
 
-Reference output dumped from a known-good CPU pass.
+UNet1D denoiser graph: ~14 sub-blocks (1 down + 12 mid + 1 up +
+final), ~396 mul_mats per pass, F32 activations throughout. The
+two trigger tensors:
 
-## Observed drift
+1. `dump_db_resnet` — output of the first DOWN block's
+   `causal_resnet_block` (shape `(T_mel, 256)` F32, here T_mel=102).
+2. Any one of `dump_mb_{0, 2, 4, 6, 8, 10, 11}_out` — output of an
+   *even-indexed* MID block, or the last one (`mb_11`). Same shape.
 
-CPU path (whole UNet computed on `ggml_backend_cpu`):
-`cos_min = 1.000000`, max_abs vs ref = 0.
+Marking both with `ggml_set_output` → Metal writes all-NaN to the
+final output. Either alone → output is finite. Marking an
+odd-indexed `mb_*_out` (1, 3, 5, 7, 9) instead → finite,
+deterministic.
 
-Pure GPU path (whole UNet on Metal):
-`cos_min = 0.940`, max_abs vs ref = 14.4.
+## Backstory — why `set_output` was added
 
-The GPU output is structurally similar (cos_mean = 0.976) but with
-elements deviating by up to 14× the activation scale at the worst
-positions. Downstream this produces unintelligible synthesised audio.
+`ggml_set_output` was added as a debug aid: without it, `ggml_gallocr`
+reuses the buffer of any tensor satisfying
+`hn->n_children == 1 && hn->n_views == 0` for downstream ops
+(see `ggml-alloc.c` around line 644). The debug dumper walked the
+graph and read every node whose name started with `dump_*` — but
+because some weren't `set_output`'d, their buffer had been
+recycled by the time `ggml_backend_tensor_get` ran, and the dump
+was stale data.
 
-## Bisect findings — *not* a kernel-precision bug
+Adding `ggml_set_output` to each dump point made the dump
+reliable. It also revealed the NaN.
 
-We chased this through several rounds. Each is independent evidence
-that no single op kernel is the source:
+## Why this is reportable upstream
 
-1. **Bit-match `mul_mat`.** We added a `GGML_PREC_F32` dispatch for
-   Q8_0 × F32 that pre-quantises input to Q8_0 and runs an integer-dot
-   kernel matching `ggml_vec_dot_q8_0_q8_0_generic` bit-for-bit (PR
-   09). Confirmed bit-identical to CPU mul_mat output. With this
-   kernel firing on all 350 prec-tagged UNet mul_mats, `cos_min` moves
-   from 0.940 to **0.947** — essentially no change.
+- Same model + same graph + same inputs + identical seed.
+- Only difference between "Metal output finite" and "Metal output
+  all-NaN" is two specific `ggml_set_output` calls.
+- CPU backend: every configuration finite and correct.
 
-2. **Per-op pin bisect.** With `ggml_backend_sched_set_tensor_backend`
-   used to pin a single op type to the CPU backend (and the rest of
-   the graph on GPU), we measured `cos_min` per op type pinned:
+The parity pattern (even-indexed mb_*_out marks trigger; odd
+don't) strongly suggests buffer aliasing in `ggml_gallocr`. When
+two specific tensors of the same shape each reserve their own
+non-reused buffer, the allocator's placement collides on Metal in
+a way that corrupts downstream kernel writes.
 
-   | Pin to CPU | cos_min | Frequency in UNet |
-   | - | - | - |
-   | `mul_mat` | 1.000 | high (~7/block) |
-   | `norm`, `mul`, `add`, `flash_attn_ext`, `gelu` | 1.000 | high (≥1/block) |
-   | `reshape`, `cont`, `concat`, `permute` | 1.000 | high (memory ops) |
-   | `conv_1d`, `soft_max`, `mish`, `silu`, `scale` | 0.940 | low (≤1/block) |
+## What's been ruled out
 
-   The clean correlation is **op frequency**, not op identity. Pinning
-   any op that occurs frequently restores parity; pinning a sparse op
-   doesn't. This points at sync-barrier density, not op correctness.
+These were tried during a long debug session and none of them is
+the source:
 
-3. **`ggml_set_output` bisect.** `ggml_set_output` marks a tensor as a
-   graph output, which makes `ggml_gallocr` skip the in-place buffer
-   reuse path for it (see `ggml-alloc.c` around line 644). We tested:
-
-   | What's marked output | cos_min |
-   | - | - |
-   | nothing extra (default) | 0.940 |
-   | the first block's resnet output only | **0.879** (worse!) |
-   | all 62 sub-block outputs | **1.000** |
-
-   The single-checkpoint result is the smoking gun: a `set_output` on
-   one specific tensor changes the allocator's reuse decisions
-   downstream, and the new pattern produces *more* drift, not less.
-
-4. **`GGML_NO_INPLACE=1` global knob** (added experimentally to
-   `ggml_gallocr_allocate_node` to skip the in-place reuse path).
-   Result: `cos_min = -0.97` (sign-flipped garbage), worse than
-   baseline. Adding `GGML_METAL_CONCURRENCY_DISABLE=1` on top did
-   nothing. So a clean "no in-place reuse" knob doesn't work as a
-   drop-in fix — some downstream code expects in-place semantics in
-   ways we couldn't trace within the bisect session.
-
-5. **`kernel_norm` audit.** `kernel_norm_fuse_impl` uses `float sumf`
-   accumulators end-to-end, F32 `simd_shuffle_xor` reduction, F32
-   shmem. No silent downcast. Already has prior CrispASR patches for
-   cross-simdgroup reduction (separate issue) and serial-reduction
-   workaround. Not the source.
-
-6. **`kernel_flash_attn_ext` audit.** The F32 K/V family
-   (`FA_TYPES_F32`) keeps Q as `half` in shared memory (line 6430:
-   `sq4[j*DK4 + i] = (q4_t) q4[i]` where `q4_t = half4`). Tried
-   patching `FA_TYPES_F32`'s Q triple to
-   `float, float4, simdgroup_float8x8` — `cos_min` went from 0.940
-   to **0.860** (worse). So the F16 Q downcast IS happening, but
-   "fixing" it changes the numerical ordering in a way that doesn't
-   bit-match CPU either.
-
-## What this means
-
-The chatterbox UNet output on Metal GPU drifts in a path-dependent
-way that depends on the `ggml_gallocr` buffer reuse pattern. No
-single op kernel is "the" bug. Six independent fix attempts
-(bit-match mul_mat, all 9 of the working PIN bisect ops to CPU,
-set_output on 1 vs 14 vs 62 tensors, GGML_NO_INPLACE,
-GGML_METAL_CONCURRENCY_DISABLE, F32 Q in flash_attn) either fail
-outright or work in some calling contexts and fail in others.
-
-The cleanest empirical fix — `set_output` on all 62 UNet sub-block
-intermediates — restores bit-equivalence in the diff-harness call
-context but NaNs in the smoke call context with the *exact same*
-chatterbox model, same UNet graph topology, same CFM solver, same
-seed. The diff-vs-smoke divergence is invariant to: random seed,
-T_mel value, S3-tokenizer involvement, Metal concurrency on/off,
-in-place reuse on/off. Something structural in `ggml-alloc`'s state
-across multi-graph sched invocations differs between the two call
-paths in a way our bisect couldn't isolate.
-
-Our production workaround is to load the UNet's weight tensors on
-the CPU backend (via `ggml_backend_sched`'s weight-residency
-routing) so the entire UNet executes on CPU. That avoids the issue
-entirely — homogeneous backend, no in-place-reuse interaction with
-GPU command scheduling.
+1. **`mul_mat` kernel precision.** Added a `GGML_PREC_F32` Q8_0
+   path that's bit-identical to CPU's
+   `ggml_vec_dot_q8_0_q8_0_generic` (filed as separate PR 09).
+   With this kernel firing on all 350 prec-tagged UNet mul_mats,
+   the baseline drift moves from `cos_min 0.940` to `0.947`
+   (essentially no change), and the 2-mark NaN trigger is
+   unchanged.
+2. **Per-op pin to CPU.** Pinning *any* frequent op (norm, mul,
+   add, flash_attn_ext, gelu, reshape, cont, concat, permute,
+   mul_mat) restores `cos_min = 1.000` on the baseline. Pinning a
+   sparse op (conv_1d, soft_max, mish, silu, scale) doesn't help.
+   This is a sync-barrier-density signal, not an op-identity
+   signal. Doesn't address the 2-mark NaN.
+3. **`GGML_NO_INPLACE=1`.** A global allocator knob to skip
+   in-place reuse → `cos_min = -0.97` (sign-flipped garbage).
+   Some downstream code (we didn't trace which) depends on
+   in-place semantics.
+4. **`GGML_METAL_CONCURRENCY_DISABLE=1`.** No effect on either
+   the baseline drift or the 2-mark NaN. Whatever the bug is, it
+   isn't a missing barrier between *parallel* command buffers.
+5. **`kernel_norm` F32 audit.** `kernel_norm_fuse_impl` uses
+   `float sumf` accumulators end-to-end, F32 `simd_shuffle_xor`
+   reduction, F32 shmem. Clean.
+6. **`kernel_flash_attn_ext` Q downcast.** Line 6430 downcasts Q
+   from F32 to half: `sq4[j*DK4 + i] = (q4_t) q4[i]` where
+   `q4_t = half4` even in the `FA_TYPES_F32` family. Patched to
+   `float4 / simdgroup_float8x8`; doesn't fix the 2-mark NaN
+   (and changes baseline drift in unhelpful ways).
 
 ## Investigation pointers
 
-The bisect points at `ggml-alloc.c` interaction with the Metal
-scheduler:
-
-- `ggml-alloc.c:622` `ggml_gallocr_allocate_node` — the in-place
-  reuse decision is made per node based on `n_children == 1 &&
-  n_views == 0`. The reuse choice depends on traversal order, so
-  adding an output marker flips cascading reuse decisions
-  downstream. The single-`set_output`-makes-things-WORSE finding
-  confirms this is path-sensitive, not monotonic.
-
+- `ggml-alloc.c:622` `ggml_gallocr_allocate_node` — in-place reuse
+  decision is per-node and traversal-order-dependent. Adding a
+  single `set_output` flips downstream reuse decisions in a
+  cascade.
 - `ggml-metal/ggml-metal-ops.cpp:159`
   `ggml_metal_op_concurrency_check` — the mem-range overlap check
-  that adds Metal command-buffer barriers. Looks correct on
-  inspection. Disabling concurrency entirely
-  (`GGML_METAL_CONCURRENCY_DISABLE=1`) didn't change the drift, so
-  this isn't the source either.
+  that inserts Metal barriers. Disabling concurrency entirely had
+  no effect, so this code isn't the source — but if the in-place
+  reuse map at `set_output` time produces aliased addresses, then
+  *correct* barrier insertion against an aliased map would still
+  produce wrong output.
 
-A "disable inplace reuse for graphs marked as F32-precision" knob
-in `ggml-alloc` would let applications opt into bit-equivalent GPU
-output at a memory cost, but we tested a naive global no-inplace
-knob and it broke things — apparently some other downstream code
-relies on in-place reuse semantics. A real fix would need to know
-*which* downstream code depends on in-place and audit those.
+A useful next step inside ggml: dump the per-tensor address map
+that `ggml_gallocr` produces in both configurations (1 mark vs 2
+marks) and compare. The first node whose assigned address differs
+between the two — and whose new address overlaps with another
+live tensor — is the smoking gun.
 
 ## How to reproduce
 
-Standalone repro requires the chatterbox model files (50 MB) and our
-diff-harness scaffolding; we can extract a minimal `test-backend-ops`
-case if helpful — flag this issue and we'll prepare one.
+Standalone repro needs the chatterbox model files (50 MB
+Q8_0 chatterbox-s3gen + Q8_0 chatterbox-t3) and a reference WAV.
+We can extract a minimal `test-backend-ops`-style case from this
+graph — flag this issue and we'll prepare one.
+
+Application-level repro (with our project's source):
+
+```
+# baseline (1 mark or 0 marks) — finite
+CRISPASR_CHATTERBOX_FORCE_GPU=1 \
+CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 \
+CRISPASR_S3GEN_UNET_MARK_DB_RESNET=1 \
+  ./crispasr --backend chatterbox --tts "Hello." \
+  --voice samples/jfk.wav --tts-output /tmp/cb.wav --seed 42
+
+# 2-mark trigger (DB_RESNET + mb_0_out, even index) — NaN
+CRISPASR_CHATTERBOX_FORCE_GPU=1 \
+CRISPASR_S3GEN_UNET_GPU_RESIDENCY=1 \
+CRISPASR_S3GEN_UNET_MARK_DB_RESNET=1 \
+CRISPASR_S3GEN_UNET_MARK_MB_OUT_INDEX=0 \
+  ./crispasr --backend chatterbox --tts "Hello." \
+  --voice samples/jfk.wav --tts-output /tmp/cb.wav --seed 42
+
+# 2 marks with odd index — finite
+CRISPASR_S3GEN_UNET_MARK_MB_OUT_INDEX=1 \
+[...rest same as above...]
+```
+
+## Production workaround
+
+We split the UNet weight residency: the 910 `s3.fd.*` tensors load
+on the CPU backend; the surrounding encoder/vocoder stay on GPU.
+The scheduler routes the UNet sub-graph to CPU based on weight
+residency. M1 wall-time comparable to pure CPU. Eliminates the
+2-mark NaN (and the baseline drift) because the UNet no longer
+runs on Metal at all. Not a fix — just a way to ship intelligible
+audio while the kernel-side bug is open.

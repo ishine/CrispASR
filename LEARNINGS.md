@@ -6299,3 +6299,101 @@ no internal language) per the standing repo rule
    sub-graph to CPU via where the weights live. Avoids per-op
    pinning races. Cost: forgo the GPU speedup for that sub-graph.
    On M1 with a small encoder/vocoder shell, that's nearly free.
+
+### Round 9 follow-up (2026-05-24, evening) — correcting items #6, #7, #11
+
+The investigation continued the same day. **Three of the bisect
+items above were wrong**, and the headline "set_output on 62 →
+bit-perfect in diff harness / NaN in smoke" was a measurement
+artifact. The actual bug shape is much tighter.
+
+**The measurement bug.** `compare_with_row_width` in
+`examples/cli/crispasr_diff_main.cpp` aggregated cosine and max_abs
+without checking for non-finite data. When the diff harness output
+is all-NaN, IEEE-754 silently makes every comparison
+short-circuit:
+
+- `if (ad > r.max_abs)` — `NaN > 0.0f` is `false`. `max_abs`
+  stays at its initial `0.0`.
+- `if (denom > 1e-12)` — `sqrt(NaN_sum_sq) > 1e-12` is `false`.
+  The cosine accumulator loop skips every row. `cos_min` stays at
+  initial `1.0f`, `cos_mean` stays at `1.0f`.
+
+Result: `[PASS] cos_min=1.000000 cos_mean=1.000000 max_abs=0.00e+00 rms=nan`.
+The `rms=nan` was visible the whole time but read as
+"cosmetic"; the bogus PASS hid an entirely NaN s3gen_mel. Fixed in
+commit `4c2e54c0` — `Report.n_nonfinite` is tracked, surfaced as
+`non_finite=N/N`, and forces FAIL.
+
+**With the comparison fixed, the actual picture:**
+
+| Config (GPU residency on Metal, T_mel=102) | Result |
+|---|---|
+| baseline (no marks) | PASS cos_min=0.940 (real degradation) |
+| + PRESERVE (~14 block-out marks) | PASS cos_min=0.907 (slightly worse) |
+| + DUMP_UNET (62 marks) | **FAIL non_finite=8160/8160** (all NaN, was bogus PASS 1.000) |
+| + minimal 2-mark trigger (see below) | **FAIL non_finite=8160/8160** |
+| production (CPU residency) | PASS cos_min=0.999980 |
+
+So item #6's "set_output on all 62 → bit-perfect 1.000" was a
+phantom. Item #7's "same 62 → NaN in smoke" was right but
+incomplete; **the diff harness was also producing NaN**, just
+reported as PASS. Item #11's "F32 Q in flash_attn made cos=0.860"
+is also suspect — the comparison was running on whatever data
+the patched flash_attn produced; with NaN content this metric
+isn't meaningful. The bit-match mul_mat (item #1) and the pin
+bisect (items #2–#4) measurements are still valid because their
+output stayed finite.
+
+**The actual minimum trigger.** With commit `1a37f4c8`'s granular
+bisect knobs, the smallest set of marks that flips the Metal UNet
+from "degraded but finite" to "all NaN" is **two specific
+`set_output` calls**:
+
+1. `dump_db_resnet` — output of the first DOWN block's
+   `causal_resnet_block` (shape `(T_mel, 256)`).
+2. Any one of `dump_mb_{0,2,4,6,8,10,11}_out` — output of an
+   *even-indexed* MID block (or `mb_11`, the last one).
+
+Both alone are finite. Together → NaN. The parity is reproducible:
+`mb_{1,3,5,7,9}_out` paired with `dump_db_resnet` produces
+identical finite output (`rms=15.806` deterministic). The same
+2-mark trigger fires in both the diff harness and smoke — the bug
+is **path-independent**. The handover's "diff-vs-smoke
+divergence" was entirely the comparison artifact.
+
+**What that means for the upstream story.** The path-dependence
+narrative from upstream-prs/10 was wrong. The real shape is:
+
+- 2 specific `set_output` marks on a long all-F32 Metal graph
+  cause the Metal kernel chain to write NaN.
+- The parity pattern (even mb_*_out indices trigger; odd don't)
+  strongly suggests buffer aliasing in `ggml_gallocr`: when an
+  even-indexed mb_out and the db_resnet both reserve their own
+  buffers (non-reused), the allocator places them in colliding
+  pool regions. Odd indices land elsewhere.
+- The visible NaN is then "an early kernel reads from a buffer
+  that another kernel is writing to" or "a later kernel reads from
+  the wrong-aligned region of an overlapping buffer."
+
+This is a much more tractable upstream bug than the original
+phrasing. Repro is now self-contained: two env vars + the public
+chatterbox CLI. `tools/upstream-prs/10` rewritten in commit
+[TBD] with the tight repro.
+
+### Updated lessons (replace #2 and #4 above)
+
+2'. **`ggml_set_output` is a no-monotonicity sledgehammer for
+debug.** A single mark CAN make finite output go all-NaN on Metal.
+Don't add `set_output` to "see what's happening at point X" — it
+changes the allocator's reuse map and may invent NaN that wasn't
+in the un-instrumented compute path. The data you dump is data
+the *modified* graph produced, not the *real* graph.
+
+4'. **NaN data must fail the diff harness loudly.** If a tensor
+comparison can silently report `[PASS] cos=1.000 max_abs=0`
+because both data and reference (or just data) contain NaN, all
+your downstream bisect is unreliable. Always count + assert on
+non-finite before consuming cosine/max_abs. Same lesson would
+apply to any other Metric pipeline that aggregates over potentially
+non-finite data.

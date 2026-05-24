@@ -74,6 +74,19 @@ multi-graph sched invocations differs between the two call paths in
 a way the bisect couldn't isolate within this session. Standalone
 handover prompt prepared for further investigation.
 
+**(2026-05-24 evening follow-up)** The unresolved finding above
+was *partially a measurement bug*. The diff harness's cosine
+comparison silently scored all-NaN data as `cos=1.000, max_abs=0`
+(IEEE-754 NaN comparisons all return false). Fixed in commit
+`4c2e54c0`. With the comparison fixed: both diff and smoke
+produce all-NaN under `set_output` on 62; there is **no path
+divergence**. Bisected with new granular env knobs (commit
+`1a37f4c8`): the minimum trigger is **2 specific `set_output`
+marks** (`dump_db_resnet` + any even-indexed `mb_*_out`, or
+`mb_11_out`). The same parity pattern reproduces on both paths.
+`tools/upstream-prs/10` rewritten to the tighter repro. The
+production fix is unchanged and unaffected.
+
 **Linux CPU smoke** validated on Hetzner VPS (`168.119.190.252`,
 no GPU): build clean, `s3gen_mel cos_min = 0.918695,
 cos_mean = 0.992655` in diff harness; intelligible TTS in smoke. The
