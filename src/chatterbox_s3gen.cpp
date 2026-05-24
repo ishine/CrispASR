@@ -610,7 +610,19 @@ extern "C" struct chatterbox_s3gen_context* chatterbox_s3gen_init_from_file(cons
         backends[n_be++] = c->backend;
         if (c->backend != c->backend_cpu)
             backends[n_be++] = c->backend_cpu;
-        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, false, false);
+        // PLAN #83 r9 follow-up #5: parallel=true is required to fix Bug B (CFG
+        // uncond pass divergence on M1 Metal when UNet is GPU-resident). With
+        // parallel=true sched uses n_copies=4 input-copy slots and event-based
+        // synchronisation (ggml_backend_event_record / event_wait) between
+        // backends. On Metal that goes through encodeSignalEvent /
+        // encodeWaitForEvent commands which carry GPU-cache invalidation
+        // semantics; with parallel=false sched falls back to a plain
+        // [cmd_buf_last waitUntilCompleted] which does NOT invalidate the
+        // GPU's view of a shared-storage Metal buffer that was overwritten
+        // by a CPU memcpy between consecutive command-buffer submissions.
+        // Verified no regression on CPU-residency (default production) smoke
+        // (rms=5.139 in both configurations).
+        c->sched = ggml_backend_sched_new(backends, nullptr, n_be, 32768, true, false);
         c->compute_meta.resize(ggml_tensor_overhead() * 32768 + ggml_graph_overhead_custom(32768, false));
     }
 
@@ -2094,25 +2106,11 @@ static std::vector<float> cfm_euler_solve(chatterbox_s3gen_context* c,
         auto run_denoiser = [&](const std::vector<float>& input) -> std::vector<float> {
             ggml_backend_sched_reset(c->sched);
             s3gen_maybe_pin_graph_to_cpu(c, gf, s3gen_subgraph::unet);
-            // PLAN #83 r9 follow-up #4: when the UNet runs GPU-resident, pin
-            // ONLY `unet_input` to the GPU backend. Bisect findings (cf.
-            // LEARNINGS):
-            //   - Pinning unet_input alone: cos_min 0.940 → 0.999976.
-            //   - Pinning time_emb is ACTIVELY HARMFUL — forces mish onto
-            //     GPU and changes the resnet block's cross-backend topology
-            //     in a way that produces rms ~209 nonsense.
-            //   - Pinning mask: no effect.
-            // The companion ggml-side patch (mutation log restoring src[j]
-            // pointers in ggml_backend_sched_compute_splits) is also
-            // required: without it, the SECOND graph_compute per CFM step
-            // (the CFG uncond pass) silently fails to redeliver remaining
-            // CPU→GPU inputs because their consuming nodes' src[j] points
-            // at freed input_cpy tensors from the previous call.
-            if (c->unet_on_gpu && std::getenv("CRISPASR_NO_INPUT_PIN") == nullptr) {
-                ggml_tensor* ui = ggml_graph_get_tensor(gf, "unet_input");
-                if (ui)
-                    ggml_backend_sched_set_tensor_backend(c->sched, ui, c->backend);
-            }
+            // PLAN #83 r9 follow-up #5: Bug B (CFG uncond divergence) is fixed
+            // at the sched level by `parallel=true` in ggml_backend_sched_new
+            // (see the sched_new call near the top of this file). The earlier
+            // workaround of pinning `unet_input` to the GPU backend is no
+            // longer needed and was removed; CRISPASR_NO_INPUT_PIN is gone.
             if (!ggml_backend_sched_alloc_graph(c->sched, gf)) {
                 fprintf(stderr, "s3gen: failed to alloc UNet1D graph\n");
                 return {};
