@@ -283,7 +283,7 @@ print(f"  UPLOAD           = {UPLOAD}")
 # ─────────────────────────── cell 2 (code) ───────────────────────────
 step("cell_2_begin")
 # ── Wire HF auth, install Python deps ─────────────────────────────────────
-def kaggle_secret(name: str) -> str | None:
+def kaggle_secret(name: str, retries: int = 3, backoff_s: float = 5.0) -> str | None:
     """Pull a Kaggle secret if available, with verbose diagnostics if
     not. The previous silent fall-back to anonymous made a missing
     secret look identical to a missing-attach-toggle, which burned us
@@ -294,7 +294,13 @@ def kaggle_secret(name: str) -> str | None:
     that env var is absent, no secret can possibly be read regardless
     of what the account dashboard says — the kernel-side "Add-ons →
     Secrets" Attach toggle is the gate that controls injection.
-    Surfacing this distinction up front saves a debugging round.
+
+    Retries: the Secrets service has flaked on this kernel
+    (`ConnectionError: Connection error trying to communicate with
+    service.` on v11). Retry with backoff so a transient flake doesn't
+    drop UPLOAD to False for the rest of the run. If the API is truly
+    unreachable after retries, kaggle_token_from_dataset() is the
+    proper fallback path.
     """
     try:
         from kaggle_secrets import UserSecretsClient
@@ -312,17 +318,62 @@ def kaggle_secret(name: str) -> str | None:
               f"but didn't open the kernel's per-notebook Secrets pane and "
               f"toggle Attach for {name!r}.", flush=True)
         return None
-    try:
-        return UserSecretsClient().get_secret(name)
-    except Exception as exc:
-        # JWT is present but the specific secret named is still missing
-        # or unreadable. Could be a label typo, propagation lag, or a
-        # different-secret attached.
-        print(f"kaggle_secret({name!r}): JWT present but secret read failed "
-              f"({type(exc).__name__}: {exc}). Possible causes: label typo "
-              f"(case-sensitive), or a different secret is attached.",
-              flush=True)
-        return None
+    last_exc: BaseException | None = None
+    for attempt in range(1, retries + 1):
+        try:
+            return UserSecretsClient().get_secret(name)
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries:
+                print(f"kaggle_secret({name!r}): attempt {attempt}/{retries} "
+                      f"failed ({type(exc).__name__}: {exc}); retrying in "
+                      f"{backoff_s}s", flush=True)
+                time.sleep(backoff_s)
+    print(f"kaggle_secret({name!r}): all {retries} attempts failed "
+          f"({type(last_exc).__name__}: {last_exc}). Secrets API "
+          f"unreachable; falling back to kaggle_token_from_dataset().",
+          flush=True)
+    return None
+
+
+def kaggle_token_from_dataset(filename: str = "hf_token.txt") -> str | None:
+    """Read an HF token from a private Kaggle Dataset mounted via
+    kernel-metadata.json `dataset_sources`. Bypasses the flaky Kaggle
+    Secrets API entirely — datasets are filesystem-mounted at
+    `/kaggle/input/<dataset-slug>/<files>` before the script runs.
+
+    Expected dataset: `chr1str/crispasr-hf-token` (private) containing
+    a single file `hf_token.txt` with the write-scoped HF token.
+    Mounted via `tools/kaggle/rebake/kernel-metadata.json:
+    dataset_sources: ["chr1str/crispasr-hf-token"]`.
+
+    Note: Kaggle's UI has NO "Add-ons → Variables" option — only
+    Secrets, Internet, Accelerator, Data Sources. The previous
+    comment recommending Variables was wrong. The Dataset path is
+    the only reliable non-Secrets workaround.
+    """
+    candidates = [
+        Path("/kaggle/input/crispasr-hf-token") / filename,
+    ]
+    input_root = Path("/kaggle/input")
+    if input_root.exists():
+        for sub in input_root.iterdir():
+            if "hf-token" in sub.name or "hf_token" in sub.name:
+                p = sub / filename
+                if p not in candidates:
+                    candidates.append(p)
+    for p in candidates:
+        if p.exists():
+            try:
+                tok = p.read_text().strip()
+                if tok:
+                    print(f"HF auth: HF_TOKEN read from {p} "
+                          f"(Kaggle Dataset fallback).", flush=True)
+                    return tok
+            except Exception as exc:
+                print(f"HF auth: failed to read {p} "
+                      f"({type(exc).__name__}: {exc})", flush=True)
+    return None
 
 
 # Dump Kaggle-injected env keys (no values) so we can see what auth /
@@ -331,32 +382,38 @@ def kaggle_secret(name: str) -> str | None:
 _kaggle_env_keys = sorted(k for k in os.environ if k.startswith("KAGGLE"))
 print(f"Kaggle env keys present: {_kaggle_env_keys}", flush=True)
 
-# Source 1: a Kaggle "Variable" (Add-ons → Variables) sets an env var
-# directly. Always available in script kernels, no service call needed.
+# Token sources, tried in order:
+#   1. HF_TOKEN env var (e.g. shell, .env file in test, or a future
+#      Kaggle env-var mechanism if they ever add one). Always free.
+#   2. Kaggle Secret via UserSecretsClient (with retry-with-backoff —
+#      the API flakes on batch-mode kernels with ConnectionError).
+#   3. /kaggle/input/crispasr-hf-token/hf_token.txt — a private Kaggle
+#      Dataset mounted via kernel-metadata.json:dataset_sources.
+#      Bypasses the Secrets API entirely; reliable.
+#
+# Kaggle's UI has NO "Add-ons → Variables" option despite this
+# script's earlier comment. Source 3 is the proper escape hatch.
 env_hf = os.environ.get("HF_TOKEN")
 if env_hf:
-    print("HF auth: HF_TOKEN read from env var (Kaggle Variable, env, "
-          "or shell). Skipping UserSecretsClient.", flush=True)
+    print("HF auth: HF_TOKEN read from env var (shell/.env/CI). "
+          "Skipping UserSecretsClient.", flush=True)
     hf_token = env_hf
 else:
-    # Source 2: a Kaggle "Secret" (Add-ons → Secrets), read via
-    # UserSecretsClient. Requires JWT injection (any attached secret),
-    # and the service endpoint must be reachable from this runtime.
-    # Script-kernel + batch-run combinations sometimes flake on the
-    # service call even when the JWT is present — if you see that,
-    # add HF_TOKEN as a Variable instead and re-push.
     hf_token = kaggle_secret("HF_TOKEN")
+    if not hf_token:
+        hf_token = kaggle_token_from_dataset()
 if hf_token:
     os.environ["HF_TOKEN"] = hf_token
     os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
     print("HF auth: token present (will verify next)", flush=True)
 else:
     print("HF auth: anonymous (rebake+upload will fail without HF_TOKEN). "
-          "If you've added HF_TOKEN as a Kaggle Secret and the Attach "
-          "toggle is on but it still doesn't read, try adding it as a "
-          "Kaggle Variable instead (Add-ons → Variables): script-type "
-          "kernels in batch mode sometimes can't reach the secrets API "
-          "service.", flush=True)
+          "Ensure the private Kaggle Dataset chr1str/crispasr-hf-token is "
+          "attached to this kernel (kernel-metadata.json:dataset_sources) "
+          "AND that the file hf_token.txt in it contains a write-scoped "
+          "HuggingFace token. Kaggle's Secrets API is the alternative but "
+          "has flaked with ConnectionError on this kernel's batch runs.",
+          flush=True)
 
 # Need huggingface_hub before we can preflight the token. Pulled here
 # (small, ~MB) even if the token check ends up failing — the cost of
