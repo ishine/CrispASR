@@ -48,7 +48,8 @@ test-all-backends.py passes 18/18 transcribe + 51/54 feature tests (3 stream ski
 | **LOW** | [#106 TEN-VAD](#106-ten-vad--low-latency-cross-platform-vad) | Small | Technically feasible VAD backend: C-compatible, 16 kHz / 10-16 ms frames, prebuilt libs + ONNX path. License is the gate: Apache 2.0 plus extra no-compete / own-app-only conditions from Agora. |
 | **MOSTLY DONE** | [#114 Long-form transcribe — chunking-default ladder for voxtral / cohere / canary](#114-long-form-transcribe--make-chunkingstreamed-the-default-for-all-asr-backends-issue-89-follow-up) | Medium | **Parakeet DONE 2026-05-24 (`33f9a162`).** **Voxtral + cohere DONE 2026-05-25** via (1) parallel-track per-backend opt-out fixes (`dc2295b2` cohere, `46f6848d` gemma4-e2b/glm-asr, `eaee2319` kyutai-stt, `6fef8790` voxtral) — default chunking now lands at 96-100 % coverage at 60-300 s; (2) **voxtral_transcribe_streamed** in HISTORY 2026-05-25 (matches upstream Mistral `apply_transcription_request` shape — per-30s encode, concat audio embeds, single LLM AR decode). Matrix v1 in PERFORMANCE.md was on the pre-opt-out binary and overstated the failures; matrix v2 (post-opt-out) is the correct picture and shows >90 % coverage everywhere. **Still open:** canary lang-prompt bug (separate, P3 below); qwen3 / granite / mimo audit pending (Class B LLM-AR backends — opt-out may already be applied for some, verify on the VPS matrix). |
 | **DONE** | [#105 WhisperX word alignment models](#105-whisperx-word-alignment-models-wav2vec2-ctc-zoo) | Phased | **DONE 2026-05-23.** All 10 WhisperX common languages (fr/es/it/ja/zh/nl/uk/pt/ar/cs) converted, uploaded to `cstr/*-GGUF`, registry aliases wired. Only benchmarking + docs remain. |
-| **HIGH** | [#115 mimo-asr baseline broken](#115-mimo-asr-baseline-broken-silent-empty-on-short-segfault-on-long) | Small-Medium | Discovered 2026-05-25 by `tools/check-overlap-save-bug.sh`. `crispasr -m mimo-asr-q4_k.gguf --backend mimo-asr -f samples/jfk.wav` (11 s) runs to exit 0 producing **no output**; on 5 min audio it segfaults at ~159 s. Both pre-overlap and post-overlap configs reproduce, so it is **NOT** the overlap-save bug — it's a baseline mimo-asr regression. Last known good in HISTORY §56 (Q4_K shipped + 49.4 % WER on librispeech subset). Bisect candidates: anything touching `src/mimo_asr.cpp` since the Q4_K landing; `tools/check-overlap-save-bug.sh mimo-asr` is the cheap repro. |
+| **HIGH** | [#115 mimo-asr baseline broken](#115-mimo-asr-baseline-broken-silent-empty-on-short-segfault-on-long) | Small-Medium | Discovered 2026-05-25 by `tools/check-overlap-save-bug.sh`. `crispasr -m mimo-asr-q4_k.gguf --backend mimo-asr -f samples/jfk.wav` (11 s) runs to exit 0 producing **no output**; on 5 min audio it segfaults at ~159 s. Both pre-overlap and post-overlap configs reproduce, so it is **NOT** the overlap-save bug — it's a baseline mimo-asr regression. **External confirmation 2026-05-25 via issue #125 report #12** (montvid on Blackwell sm_120): v0.6.9 `f23d9485` works, v0.6.10 `eaee2319` segfaults during decode; bisected to `6b492b2b` (FA per-head mask). Fold-into [#125](#125-issue-125--multi-backend-bug-sweep-from-montvid-12-findings) P0. Last known good in HISTORY §56 (Q4_K shipped + 49.4 % WER on librispeech subset). |
+| **HIGH** | [#125 Issue #125 — multi-backend bug sweep from montvid](#125-issue-125--multi-backend-bug-sweep-from-montvid-12-findings) | Medium | External user `montvid` ran every backend on v0.6.10 `eaee2319` on a 50 min EN FLAC + the project's own `samples/jfk.wav`, hardware NVIDIA RTX PRO 6000 Blackwell sm_120. 12 well-attested findings, all reproducible. Priority bucket: **P0 mimo-asr CUDA segfault (regression from `6b492b2b`, folds #115)**; **P1 funasr/fun-asr-mlt-nano `!`-loop + missing from `tools/test-all-backends.py`**; **P2 firered-asr drop `CAP_UNBOUNDED_INPUT` (pe_maxlen ≈ 50 s)**; **P3 omniasr-llm `is_streaming` chunking gate**; **P4 gemma4-e2b long-audio hallucinations**; **P5 mimo-asr tokenizer auto-download manifest + docs**; **P6 kyutai-stt batch-path slowdown + final-word truncation**. JFK as universal control test is the reporter's #1 methodology contribution. |
 
 **Recently completed** (full write-ups in HISTORY.md): **Issue #89 reopened — parakeet streamed-encode is now the default → HISTORY 2026-05-24** (lenhone's `yt-dlp` clip reproduced 33 % coverage where the cached MP3 derivation gave 99.5 %; same TDT model collapses on the bad audio in NeMo's stock `transcribe()` too; encoder is bit-for-bit to NeMo via the diff harness; root cause is model-level TDT-single-pass instability that bidirectional attention amplifies past ~20 s; `33f9a162` makes the streamed path the default for any duration). **#81 FA per-head additive mask → HISTORY 2026-05-24** (CUDA MMA-F16 kernel patch +87 LOC behind `GGML_CUDA_CRISPASR_FA_PERHEAD_MASK` default-OFF; byte-identical JFK transcript, 0 CPU FA splits, -37 % short-clip on A1000; `tools/upstream-prs/06-cuda-fa-perhead-mask.md` + `872303bf` write-up). **CI cleanup → HISTORY 2026-05-25** (test #148 catch_discover_tests CLI-parser fix `4fda4be5`; build.yml trimmed 1610 → 1324 lines and arm64 switched to native runners `80ac00d1`; `GG_BUILD_NO_AVX512` knob added to `ci/run.sh` and enabled on `ggml-ci-x64-cpu-high-perf` `565b16af` so the AVX512 SIGILL is structurally fixed instead of `continue-on-error`-papered; `tools/upstream-prs/13-ci-no-avx512-knob.{md,patch}` for upstream submission). **#110 Global diarization timeline → HISTORY 2026-05-23** (sherpa/ecapa runs once on full audio; `CrispasrSherpaCache` mirrors pyannote pattern; segment splitting at speaker turns; 21 tests). **#98 Hotwords A+B → HISTORY 2026-05-23** (CTC-WS Aho-Corasick trie for parakeet CTC/TDT; LLM prompt injection for qwen3-asr/voxtral; `--hotwords` CLI; 17 tests). **Paraformer-zh NAR-ASR → HISTORY 2026-05-21** (220M params, single-pass NAR decode; F16/Q4_K/Q8_0 at `cstr/paraformer-zh-GGUF`; byte-identical on Chinese + English; 4 integration tests). **#86 Flash-attn → DONE** (all backends already wired via core helpers). **#90 Session beam_size all backends → HISTORY 2026-05-23** (qwen3-asr, granite, voxtral wired via `core_beam_decode::run_with_probs`; commit `0c24178e`). **#74 Feature-matrix uplift round 2 → HISTORY 2026-05-23** (74a chatterbox lang routing, 74b cap regression tests, 74c qwen3-tts base voice-cloning cap, 74d matrix regen; commit `b848152a`). **#111 TTS `--seed` parity → HISTORY 2026-05-23** (qwen3-tts, chatterbox, vibevoice realtime/base all show same-seed reproducibility and different-seed divergence on the local backup models; qwen3 env precedence fixed so CLI/request seed wins; IndexTTS stays effectively deterministic on the tested prompt/reference). **#99 funasr MLT-Nano hallucination fix → HISTORY 2026-05-21** (root cause: `use_low_frame_rate` hardcoded true in C++, but MLT-Nano's upstream config omits it (default false) — only 23/183 adaptor frames were spliced into the LLM prompt, truncating 87% of audio context; fix: converter reads the flag from config.yaml into a GGUF KV, runtime reads it at load time; also fixed `ada_n_heads` 16→8 in converter; GGUFs re-uploaded to `cstr/funasr-{nano,mlt-nano}-GGUF`). **SenseVoiceSmall → HISTORY 2026-05-20** (encoder-only multi-task ASR: transcript + LID + emotion + audio-event in one CTC pass; 50+ langs; 9.8-21.8× realtime on M1 Metal; reuses the SANM block helper from the funasr port unchanged; `cstr/sensevoice-small-GGUF` 0.47 GB F16, wired into `-m auto`). **Fun-ASR-Nano + MLT-Nano → HISTORY 2026-05-20** (full LLM-decoder runtime — 70-block SANM encoder + 2-block Transformer adaptor + Qwen3-0.6B AR decode; 77/77 PASS byte-identical on Chinese + English diffs; ~9× realtime on M1 Metal with FA-default-on; both GGUFs at `cstr/funasr-{nano,mlt-nano}-GGUF`). **#57 chatterbox native voice clone → §82** (six-commit sprint shipping all four upstream cond extractors — VoiceEncoder LSTM, S3Tokenizer V2, CAMPPlus, 24 kHz Matcha mel — plus a Kaiser-windowed sinc resampler and atomic 5-cond install in `chatterbox_set_voice_from_wav`'s `.wav` branch; `--voice ref_24k.wav` produces real cloned speech without any python). **#69 + #72 + #73 cap-honesty + KV/layer offload knobs → §79** (14-commit session shipping `CRISPASR_KV_QUANT_K/_V` + `KV_ON_CPU` on 14 backends, `N_GPU_LAYERS` on 10 backends, gemma4/mimo GPU-residency 2.2x / 22 % faster, plus cap-honesty cleanup on parakeet/glm-asr/qwen3/gemma4/omniasr). **vibevoice #69a follow-up → §79b** (mode-aware `tts_lm.layers.` / `lm.layers.` prefix predicate). #78 Chatterbox vocoder → §78. #11 WebSocket server → §76, #63 Feature matrix parity → §72, #59 binding parity → §73, gemma4 #49 + Docker #31 → §74, tests + KV Q8_0 + cleanup → §75. Earlier: #5→§63, #16→§55, #51→§56, #51b→§60, #53→§63, #54→§61, #55→§54, #56→§63, #60d→§64.
 
@@ -3986,3 +3987,167 @@ mimo-asr is the only backend out of the 16 we A/B-swept that exhibits this. The 
 ### Effort
 
 Small if the bug is in segment emission (one missing `.push_back`-shaped fix). Medium if the decoder graph itself is wrong. The repro is trivial and runs in under a minute.
+
+---
+
+## 125. Issue #125 — multi-backend bug sweep from montvid (12 findings)
+
+External user `montvid` ran every available backend on the issue #89 reporter's 50:47 EN FLAC plus the project's own `samples/jfk.wav` smoke fixture, all on **CrispASR v0.6.10 commit `eaee2319`** (the 2026-05-25 morning build, just after the per-backend opt-out fix train), hardware NVIDIA RTX PRO 6000 Blackwell sm_120 + CUDA 12.6. Reference build for the regression bisect: **commit `f23d9485`** (v0.6.9, 2026-05-21 "fix(paraformer): suppress cppcheck invalidPointerCast"). 12 report files attached to the issue; all 12 cached at `/Volumes/backups/code/issue125-attachments/`. The reporter's analysis is high-quality — each finding pins the failing file:line and proposes a concrete fix shape.
+
+This PLAN section reproduces the priority ordering, status, and fix shape for each finding so the next contributor can pick any item off the list independently.
+
+### P0 — Regression I shipped: mimo-asr segfault on Blackwell sm_120 (report 12)
+
+**TL;DR.** v0.6.9 `f23d9485` works on `samples/jfk.wav`. v0.6.10 `eaee2319` segfaults during decode (`rc=139`). The only delta in either the mimo backend or the CUDA flash-attn path is **`6b492b2b` "feat(ggml-cuda): per-head additive mask in FLASH_ATTN_EXT (MMA-F16, #81)"** — my commit, validated only on parakeet-tdt-0.6b-v3 on A1000 sm_86. mimo-asr's attention shape (`head_dim=128, n_kv=8, n_layers=36` Qwen2-7B-style MQA) and its 6-layer Conformer audio adaptor feeding cross-attention into the same fused kernel were never in the validation set, and the reporter is on sm_120 which was also out-of-scope.
+
+Reporter also confirms: same crash with `--codec-model`, `-nfa`, `CRISPASR_N_GPU_LAYERS=0`, `MIMO_TOKENIZER_GPU=1`, `--no-punctuation`. The audio adaptor + embeddings stay on GPU regardless, so the off-switches don't reach the offending kernel. PLAN #115 already had the mimo-asr-baseline-broken note from the bisect harness on local Apple Silicon (where the failure mode was "empty output on JFK" — a different symptom on a different platform, but the same backend in a bad state). Reporter's report #12 closes the bisect for the CUDA-on-Blackwell case.
+
+**Fixes, in order of effort:**
+
+1. **Confirm by rebuild.** `cmake -DGGML_CUDA_CRISPASR_FA_PERHEAD_MASK=OFF` and re-test mimo-asr on JFK. The flag defaults OFF for the upstream-equivalent code path; if the rebuild stops crashing, the regression is proven isolated to the patch.
+2. **Tighten the kernel gate.** Right now any `gqa_ratio == 1` case enters the patched path. Add a backend-side capability flag (`CAP_FA_PERHEAD_MASK_SAFE` or similar) and only let parakeet declare it until the kernel is validated on the wider matrix. Default everything else to the upstream VEC/TILE/WMMA path.
+3. **Wider validation matrix for any future `ggml-cuda/fattn*` change.** Reporter's specific request: add mimo-asr, glm-asr, gemma4-e2b, voxtral, granite (all multi-head audio-LLM backends) to the GPU validation matrix before landing a kernel change. The 2026-05-24 validation block in HISTORY mentions only a single CTC backend on a single GPU — that's not enough coverage.
+4. **Backtrace + isolate.** `gdb --args build/bin/crispasr --backend mimo-asr -m auto -f samples/jfk.wav -l en -np -nt` — the crash should land inside `fattn-mma-f16.cuh`. Capture and check whether it's the `nb32 * (zt_Q % ne32)` offset (matrix v2 audio cross-attention with non-broadcast mask) or the gate relaxation in `fattn.cu` letting through a layout the upstream MMA-F16 kernel doesn't accept.
+
+Cross-refs: HISTORY 2026-05-24 "PLAN #81 #06 FA per-head mask lands" + `tools/upstream-prs/06-cuda-fa-perhead-mask.md`; PLAN #115 (existing JFK-empty-on-Apple-Silicon entry).
+
+### P1 — funasr / fun-asr-mlt-nano produce `!` loops at every length (reports 01, 07, 08, 09)
+
+**TL;DR.** Both funasr variants emit 60 KB of `!` regardless of audio content or `-l` value. Reproduces on **`samples/jfk.wav` in 3 seconds** (report #07 control test), so this is not a long-audio bug — the model is dead at any length. Report #08 ruled out the "Chinese-prompt vs English-audio mismatch" hypothesis by showing `-l zh` produces byte-identical output to `-l en`. Greedy argmax in `src/funasr.cpp:1375-1400` has no rep-penalty / temperature / degenerate-loop guard; once the joint logits collapse the decoder locks on token id ~5 (`!` in Qwen3 vocab) until `max_new_tokens`.
+
+The remaining suspects are the audio adaptor (`audio_adaptor.*` tensors) and the encoder. Diagnostic the reporter requests: log `frames_spliced` in `funasr_init_from_file` — if it's 0 on an 11 s JFK clip, the encoder/adaptor is the failure.
+
+Report #09 separately notes that **funasr and fun-asr-mlt-nano have no entry in `tools/test-all-backends.py`** — so this regression has been silently shipping since the 2026-05-20 port landed. Sensevoice and paraformer are also absent. The reporter proposes the smallest possible regression guard: assert `"merica"` (case-insensitive) appears in the JFK output text — that catches `!`-loops, language flips, and any obvious decode collapse.
+
+**Fixes:**
+
+1. **Add funasr + fun-asr-mlt-nano + sensevoice + paraformer to `tools/test-all-backends.py`.** Each needs a registry entry with the published GGUF location at `cstr/*-GGUF` (sample skeleton in report #09). The default JFK assertion (`werv < threshold`) at `tools/test-all-backends.py:670` catches the `!`-loop cleanly because `wer("…", "!!!!…") ≈ 1.0`.
+2. **Add a degenerate-loop guard in the funasr argmax loop.** Bail after the same `next_id` repeats > 20× in a row. Cheap, model-agnostic stop-loss. Either separately or as part of the broader `core_greedy_decode` work.
+3. **Honour `-l` on the funasr path.** The CLI's `params.language` doesn't reach `funasr.cpp`'s `PROMPT_PREFIX` (it's a `static const char*`, not a function of lang). Per-variant prompt selection + the `cstr/funasr-mlt-nano-GGUF` having an English/neutral prefix.
+4. **Diagnose the audio adaptor.** Print `frames_spliced` on init at verbose mode; ideally diff the adaptor output against the upstream FunASR Python reference on JFK. If the adaptor is the bug, the prompt fix above is window-dressing.
+
+Cross-refs: HISTORY 2026-05-20 "funasr: FunAudioLLM/Fun-ASR-{Nano,MLT-Nano}-2512 port lands"; 2026-05-21 "funasr: fix MLT-Nano hallucination (PLAN #99)" — only addressed a different failure mode (Chinese-prefix tail drift on the first ~20 correctly-decoded tokens); the present `!`-from-step-0 case is new.
+
+### P2 — firered-asr declares `CAP_UNBOUNDED_INPUT` but pe_maxlen ≈ 50 s (report 04)
+
+**TL;DR.** firered-asr's encoder has `pe_maxlen = 5000` (relative positional encoding window, ≈ 50 s at 10 ms hop after subsampling). The backend declares `CAP_UNBOUNDED_INPUT`, which tells the dispatcher to bypass per-segment VAD dispatch and pass the whole audio buffer in one call. On a 50 min file `T_sub ≈ 300 000` frames, way past the PE window; the relative-shift attention reads past the PE buffer with no bounds check, producing silent OOB / numerically degenerate output. JFK on the same backend produces a byte-perfect transcript (report #07), so the model itself is fine.
+
+**Fixes:**
+
+1. **Drop `CAP_UNBOUNDED_INPUT` from firered-asr's registry entry.** One-line fix in `examples/cli/crispasr_backend_firered_asr.cpp`. Each VAD segment is well under 50 s; the existing `--vad` path will then dispatch per-segment correctly.
+2. **Add an explicit length check** in `firered_asr_transcribe`: return an error with a clear message if `T_sub > pe_maxlen` instead of silently OOB.
+3. **Investigate the JFK silence-only output without `--vad`.** Reporter notes that short clips also sometimes return `<Sil>!` only — likely a vocab/blank-id mismatch in the auto-downloaded GGUF, separate from the cap bug.
+
+### P3 — omniasr-llm's `is_streaming` guard prevents chunking on non-streaming GGUFs (report 03)
+
+**TL;DR.** `src/omniasr.cpp:1356-1368` gates the per-segment chunking on `is_streaming` (set from `hp.n_special_tokens == 3` at L1331). For GGUFs without the streaming-mode flag, `n_segments` stays at 1 and the entire 50-minute audio gets fed to a 512-token LLM. The model produces correct text on JFK (report #07), so this is purely a long-audio dispatcher bug.
+
+**Fix:**
+
+Drop the `is_streaming` gate for the chunking decision — always segment past `segment_secs`. Keep the streaming gate only for the segment-marker token injection at L1450 (which actually depends on the special-token vocab). Reporter's patch sketch:
+
+```cpp
+const int seg_frames = (int)(hp.segment_secs * 16000.0f) / total_stride;
+const bool force_seg = (seg_frames > 0 && T_enc > seg_frames);
+if ((is_streaming || force_seg) && T_enc > 1) { ... }
+```
+
+Even with this fix, the JFK measurement at 6.8× RT means a 50-minute file would need ~30 min wall on CPU — chunking dodges the OOM, but the realistic remedy for wallclock is GPU offload for the LLM head.
+
+### P4 — gemma4-e2b hallucinates on long audio, works on short (reports 02, 07)
+
+**TL;DR.** JFK 11 s transcribes verbatim ("ANd so my fellow Americans ask not what your country can do for you, ask what you can do for your country.."). On the 50 min file the model emits unrelated LLM commentary ("…a holistic view of the self and the concept of the energy body…") starting with `<Eos>!` — meaning it emitted `<end_of_sequence>` immediately after the prompt and then continued into a generic response. So this is a **chunking / long-context bug**, not the audio-soft-token-id mismatch hypothesised in report #02 before the control test in #07.
+
+**Fixes:**
+
+1. **Audit the chunking path** — most likely the dispatcher hands the entire file to the LLM in one prompt without segmenting; the model hits `<eos>` after the first chunk's worth of audio and then continues in an "I see you started a sentence, let me complete the topic" mode.
+2. **Sanity log** at init: `audio_soft_token_id`, `proj_dim` vs `d_model`, "audio projection weights found" — even though the report #07 control test ruled these out, the original report #02 asked for them and they're cheap to surface.
+
+### P5 — mimo-asr tokenizer GGUF not in auto-download manifest (report 06)
+
+**TL;DR.** `--auto-download` fetches the 36-layer Qwen2-based LM but **not** the separate `mimo-tokenizer-q4_k.gguf` (~395 MB audio tokenizer) required to actually transcribe. The user gets exit code 1 with "no audio tokenizer GGUF found. Pass --codec-model PATH or place mimo-tokenizer-q4_k.gguf next to the LM" and a 0-byte output. The `--codec-model` flag is undocumented; `docs/cli.md` doesn't mention it under the mimo-asr section.
+
+Reporter's verified workaround (report #06):
+
+```bash
+hf download cstr/mimo-tokenizer-GGUF --local-dir ~/.cache/crispasr/mimo-tokenizer
+crispasr --backend mimo-asr -m auto --auto-download \
+  --codec-model ~/.cache/crispasr/mimo-tokenizer/mimo-tokenizer-q4_k.gguf \
+  -f samples/jfk.wav -l en -np -nt
+```
+
+This works on v0.6.9 (per report #12). On v0.6.10 it still hits the P0 segfault above; needs P0 to land first before this is testable.
+
+**Fixes:**
+
+1. **Add `mimo-tokenizer-q4_k.gguf` to the auto-download manifest** for the mimo-asr backend. Source: `cstr/mimo-tokenizer-GGUF`.
+2. **Document `--codec-model`** under the mimo-asr section of `docs/cli.md`. Include `discover_audio_tokenizer()`'s search-path convention (the three filenames it tries next to the LM).
+3. **Improve the error message** to include a concrete `huggingface-cli download` line — the current message tells the user the flag exists but not how to populate the file.
+
+### P6 — kyutai-stt: three separate issues (reports 05, 10, 11)
+
+**TL;DR.** kyutai-stt has three distinct bugs, all visible on short audio.
+
+#### P6a. Drops the final word on the 11 s JFK clip (report 10).
+
+Output ends `"…ask what you can do for your c"`. Deterministic across runs. The streaming-trained LM is causal and needs a tail of zero-frames or `<eos>` to flush the final-token state — the batch dispatcher passes the raw samples and stops. **Fix:** in `examples/cli/crispasr_backend_kyutai_stt.cpp:58`, before calling `kyutai_stt_transcribe_ex`, append ~500 ms of zeros (8000 samples) to the input. Cheap, model-agnostic. The more correct version is a `kyutai_stt_finalize(ctx_)` that walks the LM forward by N tokens with silence input until a sentence-final punctuation token is sampled or a max-tail cap is hit.
+
+#### P6b. 0.07× RT on 50 min file (reports 05, 11).
+
+Per-audio-second cost is 1.36 s/s on JFK and ≈14 s/s on the long file — 10× degradation. Cause: dispatcher passes the entire sample buffer to `kyutai_stt_transcribe_ex` in one call (single non-streaming forward); KV cache grows O(N) per token → O(N²) overall, and audio embeddings stop fitting in L1. **Fix:** dispatcher slices into ~30 s windows and calls `kyutai_stt_transcribe_ex` per chunk with an updated `t_offset_cs`. Even at the constant-factor measurement on JFK that's still ~68 min wall for a 50 min file on CPU; full remedy is GPU offload (`docs/architecture.md:248` TODO).
+
+#### P6c. Streaming model on a batch dispatcher fundamentally mismatched.
+
+The architecture entry at `docs/architecture.md:176` lists kyutai-stt as "Mimi codec + causal LM | CPU". The reporter's evidence supports treating this backend as **streaming-only** in the CLI — the batch path is a footgun. Defensive change: refuse files > 5 min unless `--force-long-audio` is passed, so users don't kill 12-minute runs thinking it's hung.
+
+### Cross-finding observations from the issue
+
+- **JFK as the universal control test.** Reports #07 and #12 both demonstrate that running the project's own 11 s fixture isolates "model is dead" from "long-audio dispatcher is broken" in <2 minutes — the two failure classes have completely different fix sites. This is the reporter's most actionable methodology observation. Future "broken backend" reports should run JFK first.
+
+- **Backend registry coverage.** Reporter found four backends missing from `tools/test-all-backends.py` (funasr, fun-asr-mlt-nano, sensevoice, paraformer). The script advertises itself as the source of truth in `docs/regression-matrix.md`; a gap there means a backend can ship broken indefinitely. Worth a parallel audit for the 18-backend registry the script does cover, to confirm nothing else has silently grown out of date.
+
+- **Capability-flag honesty.** firered-asr declaring `CAP_UNBOUNDED_INPUT` while having a 50 s PE window is the same class of failure as the previous voxtral / cohere / gemma4-e2b / glm-asr / kyutai-stt cases that drove the opt-out fix train (`dc2295b2` etc.). Worth a defensive sweep of every `CAP_UNBOUNDED_INPUT` declaration to confirm the *encoder* actually is unbounded, not just the dispatcher's input shape.
+
+- **GPU validation matrix.** The 2026-05-24 `#81 #06 FA per-head mask` patch was validated only on parakeet-tdt-0.6b-v3 on A1000 sm_86; the present mimo-asr regression on Blackwell sm_120 is the proximate cost of that narrow validation. The `tools/upstream-prs/06-cuda-fa-perhead-mask.md` PR draft should not be submitted upstream until validated on a wider matrix.
+
+### Priority for this PLAN section
+
+Reporter's classification + ours:
+
+| # | finding | reporter severity | our action priority |
+|---|---|---|---|
+| 12 | mimo-asr segfault on Blackwell (regression from `6b492b2b`) | regression | **P0** |
+| 01/07/08/09 | funasr / fun-asr-mlt-nano `!`-loop + no CI coverage | broken backend | P1 |
+| 04 | firered-asr `CAP_UNBOUNDED_INPUT` + 50 s PE window | broken on long audio, model OK | P2 |
+| 03 | omniasr-llm `is_streaming` chunking gate | broken on long audio, model OK | P3 |
+| 02 | gemma4-e2b long-audio hallucinations | broken on long audio, model OK | P4 |
+| 06 | mimo-asr auto-download manifest gap | UX bug, blocked by P0 segfault | P5 |
+| 05/10/11 | kyutai-stt batch path slow + final-word truncation | partly design-limit, partly bug | P6 |
+
+PLAN #115 (existing) folds into P0 + P5 here.
+
+### Files (tentative)
+
+- `ggml/src/ggml-cuda/CMakeLists.txt` — default `GGML_CUDA_CRISPASR_FA_PERHEAD_MASK` to OFF for non-parakeet builds, or gate it on a backend capability declaration
+- `ggml/src/ggml-cuda/fattn-mma-f16.cuh`, `fattn.cu` — kernel gate tightening (P0 option 2)
+- `tools/test-all-backends.py` — add funasr / fun-asr-mlt-nano / sensevoice / paraformer registry entries (P1)
+- `src/funasr.cpp` — degenerate-loop guard + per-variant prompt selection + `params.language` wiring (P1)
+- `examples/cli/crispasr_backend_firered_asr.cpp` — drop `CAP_UNBOUNDED_INPUT` (P2)
+- `src/firered_asr.cpp` — length check + clear error past `pe_maxlen` (P2)
+- `src/omniasr.cpp` — `is_streaming || force_seg` chunking gate (P3)
+- `examples/cli/crispasr_backend_gemma4_e2b.cpp` — chunking audit (P4)
+- `examples/cli/crispasr_backend_mimo_asr.cpp` + auto-download manifest — fold tokenizer in (P5)
+- `docs/cli.md` — document `--codec-model` for mimo-asr (P5)
+- `examples/cli/crispasr_backend_kyutai_stt.cpp` — silence tail or `finalize` (P6a), 30 s chunking (P6b)
+- `tests/test-*` — regression assertions per fix
+- `tools/upstream-prs/06-cuda-fa-perhead-mask.md` — do not submit upstream until P0 wider-matrix validation lands
+
+### Trigger conditions for completion
+
+- mimo-asr v0.6.11 (next release) does not segfault on Blackwell, validated by montvid or by us on the same GPU class.
+- funasr + fun-asr-mlt-nano produce a non-degenerate transcript on JFK; CI regression assertion in place.
+- firered-asr, omniasr-llm, gemma4-e2b all transcribe a 5-min EN clip without hangs, dropped content, or hallucinations.
+- mimo-asr `--auto-download` fetches both LM and tokenizer; `docs/cli.md` documents `--codec-model`.
+- kyutai-stt JFK transcript ends on `country.`; 5-min EN clip completes in linear wall-time.
+
+Reporter contact: `montvid` on GitHub issue #125. The 12 reports are reproducible verbatim; their environment is well-documented enough that we can re-run on our VPS to cross-check before claiming any fix.

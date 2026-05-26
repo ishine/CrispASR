@@ -6,6 +6,29 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-26 PLAN #125 logged — montvid's 12-finding bug sweep on v0.6.10
+
+External user `montvid` filed issue #125 with twelve well-attested reports against v0.6.10 commit `eaee2319`, hardware NVIDIA RTX PRO 6000 Blackwell sm_120 + CUDA 12.6, against the 50:47 EN FLAC from issue #89 plus the project's own `samples/jfk.wav`. All twelve cached at `/Volumes/backups/code/issue125-attachments/` and written up as **PLAN #125** with a P0–P6 fix priority. Reference build the reporter bisected against: v0.6.9 `f23d9485` (2026-05-21).
+
+The standout finding is **report #12: mimo-asr segfault on Blackwell sm_120** — a regression introduced by my own commit `6b492b2b` "feat(ggml-cuda): per-head additive mask in FLASH_ATTN_EXT (MMA-F16, #81)", which the 2026-05-24 validation block in this file noted was tested only on parakeet-tdt-0.6b-v3 on A1000 sm_86. mimo-asr's MQA shape (`head_dim=128, n_kv=8, n_layers=36`) plus the audio adaptor cross-attention plus the Blackwell architecture together exercise a code path the patch never saw. **The `tools/upstream-prs/06-cuda-fa-perhead-mask.md` PR draft should not be submitted upstream until validated on a wider matrix of backends/architectures.**
+
+The remaining eleven findings cluster by remediation cost:
+
+- **P1 funasr / fun-asr-mlt-nano `!`-loop on any audio length** (reports 01, 07, 08, 09) — JFK 11 s reproduces in 3 seconds, ruling out long-audio / chunking explanations. `-l zh` produces byte-identical output to `-l en`, ruling out the "Chinese-prompt mismatch" hypothesis from report #01. Suspect is the audio adaptor or encoder, not the prompt. Both backends are absent from `tools/test-all-backends.py`, which is why the regression shipped silent. The `werv < threshold` assertion at line 670 would have caught this loud (`wer("…", "!!!!…") ≈ 1.0`).
+- **P2 firered-asr declares `CAP_UNBOUNDED_INPUT` but its PE window is `pe_maxlen=5000` ≈ 50 s** (report 04). One-line fix in the backend registry; JFK proves the model is fine.
+- **P3 omniasr-llm `is_streaming` chunking gate** (report 03) — for GGUFs without the streaming-mode flag, the dispatcher feeds the entire long audio to a 512-token LLM; chunking decision needs to be `(is_streaming || T_enc > seg_frames)`.
+- **P4 gemma4-e2b long-audio hallucinations** (reports 02, 07) — JFK transcribes verbatim; 50 min clip emits unrelated LLM completion starting with `<Eos>!`. Long-context chunking bug, not the audio-soft-token-id mismatch the original report #02 hypothesised before the control test.
+- **P5 mimo-asr tokenizer GGUF missing from auto-download manifest** (report 06) — verified workaround using `hf download cstr/mimo-tokenizer-GGUF`. `--codec-model` flag is undocumented in `docs/cli.md`. Blocked by P0 for testability.
+- **P6 kyutai-stt** — three separate issues. P6a: drops the final word on the 11 s JFK clip (deterministic, output ends `"…can do for your c"`); causal LM needs zero-frame tail or `<eos>` flush. P6b: 0.07× RT on long file vs 0.73× on JFK (10× per-audio-second degradation; dispatcher passes raw samples in one call, KV grows O(N²)). P6c: backend is fundamentally streaming-trained, batch dispatcher is a footgun — refuse files > 5 min unless `--force-long-audio`.
+
+The reporter's most actionable methodology observation: **JFK as universal control test.** Running the project's own 11 s fixture isolates "model is dead" from "long-audio dispatcher is broken" in under 2 minutes — the two failure classes have completely different fix sites. Reports #07 and #12 both demonstrate this pattern; future "broken backend" reports should run JFK first.
+
+Backend registry coverage audit follow-up: reporter found four backends missing from `tools/test-all-backends.py` (funasr, fun-asr-mlt-nano, sensevoice, paraformer). The script advertises itself as the source of truth in `docs/regression-matrix.md`; the gap means a backend can ship broken indefinitely. Parallel audit warranted for the 18-backend registry the script does cover.
+
+PLAN #115 (the local-Apple-Silicon mimo-asr-baseline note from 2026-05-25) is now cross-linked to PLAN #125 P0; same root cause, different symptom on a different platform.
+
+---
+
 ## 2026-05-25 (latest) Kaggle rebake pipeline wired end-to-end — 4 new parakeet refs published; coverage 7 → 11 → 13 manifest entries
 
 Closing out the handover-prompts/extend-coverage-via-kaggle.md initiative. End-of-day state:
