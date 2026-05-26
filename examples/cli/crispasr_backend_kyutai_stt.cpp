@@ -5,6 +5,7 @@
 #include "kyutai_stt.h"
 #include "whisper_params.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -42,6 +43,32 @@ public:
         std::vector<crispasr_segment> out;
         if (!ctx_)
             return out;
+
+        // PLAN #125 P6b: kyutai's batch path scales superlinearly with
+        // n_samples (~14 s/s on the 50 min file vs 1.36 s/s on JFK, per
+        // reports 05 + 11). KV grows O(N) per emitted token, attention
+        // turns memory-bound past L1, so total cost is O(N^2). Bound
+        // per-call N by chunking at 30 s = 480 000 samples; each chunk
+        // produces its own segment and the silence-tail flush from P6a
+        // applies per-chunk so chunk boundaries close cleanly. Linear
+        // wallclock + a predictable progress for callers.
+        constexpr int kChunkSamples = 30 * 16000;
+        if (n_samples > kChunkSamples) {
+            for (int start = 0; start < n_samples; start += kChunkSamples) {
+                const int this_n = std::min(kChunkSamples, n_samples - start);
+                const int64_t chunk_offset_cs = t_offset_cs + (int64_t)((double)start / 16000.0 * 100.0);
+                auto chunk_segs = transcribe_one(samples + start, this_n, chunk_offset_cs, params);
+                for (auto& s : chunk_segs)
+                    out.push_back(std::move(s));
+            }
+            return out;
+        }
+        return transcribe_one(samples, n_samples, t_offset_cs, params);
+    }
+
+    std::vector<crispasr_segment> transcribe_one(const float* samples, int n_samples, int64_t t_offset_cs,
+                                                 const whisper_params& params) {
+        std::vector<crispasr_segment> out;
 
         // PLAN #61c: use the _ex API to get per-token + word-level
         // timestamps. The kyutai LM emits one text token per Mimi frame
