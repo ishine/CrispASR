@@ -1348,23 +1348,30 @@ static char* omniasr_transcribe_llm(omniasr_context* ctx, const std::vector<floa
                 use_lang ? " + lid + lang" : "", (seg_marker_id >= 0) ? " + seg" : "", lang_id, dd,
                 is_streaming ? " [streaming]" : "");
 
-    // 3. Segment splitting for streaming/unlimited variant.
-    // The unlimited model was trained on 15-second audio segments. For audio longer
-    // than segment_secs, split into chunks and decode each segment independently.
+    // 3. Segment splitting for audio longer than the training window.
+    // The model was trained on 15-second audio segments. For audio longer
+    // than segment_secs, split into chunks and decode each segment
+    // independently. Streaming-mode GGUFs additionally inject a segment
+    // marker between chunks (gated on is_streaming above); non-streaming
+    // variants chunk without the marker (each chunk goes through the
+    // encoder + decoder as if it were a complete utterance).
     // CNN total stride = product of cnn_strides (typically 5*2^6 = 320).
     // Frames per segment = (segment_secs * 16000) / total_stride.
     int frames_per_seg = T_enc; // default: single segment (entire audio)
     int n_segments = 1;
-    if (is_streaming && T_enc > 1) {
+    if (T_enc > 1) {
         int total_stride = 1;
         for (int s : m.cnn_strides)
             total_stride *= s;
-        frames_per_seg = (int)(hp.segment_secs * 16000.0f) / total_stride;
-        if (frames_per_seg <= 0)
-            frames_per_seg = T_enc;
-        n_segments = (T_enc + frames_per_seg - 1) / frames_per_seg;
-        if (ctx->params.verbosity >= 1 && n_segments > 1)
-            fprintf(stderr, "omniasr-llm: splitting into %d segments (%d frames each)\n", n_segments, frames_per_seg);
+        const int seg_frames = (int)(hp.segment_secs * 16000.0f) / total_stride;
+        const bool force_seg = (seg_frames > 0 && T_enc > seg_frames);
+        if (is_streaming || force_seg) {
+            frames_per_seg = seg_frames > 0 ? seg_frames : T_enc;
+            n_segments = (T_enc + frames_per_seg - 1) / frames_per_seg;
+            if (ctx->params.verbosity >= 1 && n_segments > 1)
+                fprintf(stderr, "omniasr-llm: splitting into %d segments (%d frames each, %s)\n", n_segments,
+                        frames_per_seg, is_streaming ? "streaming" : "non-streaming, length-forced");
+        }
     }
 
     // 4. Shared decode state
