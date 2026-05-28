@@ -685,14 +685,17 @@ ggml_cgraph* cv3_build_s3tok_graph(cosyvoice3_tts_context* ctx, int T_use) {
 
     ggml_tensor* x = ggml_conv_1d(ctx0, m.conv0_w, mel, /*s*/ 2, /*p*/ 1, /*d*/ 1);
     x = ggml_add(ctx0, x, bias_1d(m.conv0_b));
-    x = ggml_gelu(ctx0, x);
+    x = ggml_gelu_erf(ctx0, x);
     x = ggml_conv_1d(ctx0, m.conv1_w, x, /*s*/ 2, /*p*/ 1, /*d*/ 1);
     x = ggml_add(ctx0, x, bias_1d(m.conv1_b));
-    x = ggml_gelu(ctx0, x);
+    x = ggml_gelu_erf(ctx0, x);
 
     const int T_tok = (int)x->ne[0];
     x = ggml_reshape_2d(ctx0, x, T_tok, d);
     x = ggml_cont(ctx0, ggml_transpose(ctx0, x));
+    // Diff-harness stage tag: post-subsampler, ne=(d, T_tok) == ONNX (T,1280).
+    ggml_set_name(x, "s3tok_subsample");
+    ggml_set_output(x);
 
     ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T_tok);
     ggml_set_input(positions);
@@ -738,9 +741,14 @@ ggml_cgraph* cv3_build_s3tok_graph(cosyvoice3_tts_context* ctx, int T_use) {
         h = ggml_mul(ctx0, h, b.mlp_ln_w);
         h = ggml_add(ctx0, h, b.mlp_ln_b);
         h = ggml_add(ctx0, ggml_mul_mat(ctx0, b.mlp_up_w, h), b.mlp_up_b);
-        h = ggml_gelu(ctx0, h);
+        h = ggml_gelu_erf(ctx0, h);
         h = ggml_add(ctx0, ggml_mul_mat(ctx0, b.mlp_dn_w, h), b.mlp_dn_b);
         x = ggml_add(ctx0, residual, h);
+        // Diff-harness stage tag: per-block output, ne=(d, T_tok) == ONNX (T,1280).
+        char blk_name[32];
+        std::snprintf(blk_name, sizeof(blk_name), "s3tok_blk_%u", il);
+        ggml_set_name(x, blk_name);
+        ggml_set_output(x);
     }
 
     ggml_tensor* proj = ggml_add(ctx0, ggml_mul_mat(ctx0, m.fsq_proj_w, x), m.fsq_proj_b);
@@ -774,6 +782,12 @@ std::vector<int32_t> cv3_tokenize_s3tok(cosyvoice3_tts_context* ctx, const float
     }
     ggml_tensor* mel_t = ggml_graph_get_tensor(gf, "s3tok_mel_in");
     ggml_backend_tensor_set(mel_t, mel.data(), 0, (size_t)T_use * 128 * sizeof(float));
+    if (ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "positions")) {
+        std::vector<int32_t> pos((size_t)pos_t->ne[0]);
+        for (int i = 0; i < (int)pos.size(); i++)
+            pos[(size_t)i] = i;
+        ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * sizeof(int32_t));
+    }
     if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "cosyvoice3_tts: s3tok graph compute failed\n");
         return out;
@@ -1494,6 +1508,79 @@ extern "C" float* cosyvoice3_tts_extract_stage(struct cosyvoice3_tts_context* ct
         return nullptr;
     *out_n = 0;
     const auto& hp = ctx->hp;
+    // ---- Phase 6 s3tokenizer_v3 per-stage diff ----
+    // Input mel rides in `embeds_in` as T_use*128 floats in the same
+    // channel-major layout cv3_compute_s3tok_log_mel produces (ggml
+    // ne=(T_use,128)); n_embed_tokens = T_use (mel frames). Stages:
+    //   s3tok_subsample / s3tok_blk_<K> / s3tok_proj  -> named tensor
+    //   s3tok_tokens                                   -> FSQ-quantised ids
+    if (strncmp(stage_name, "s3tok_", 6) == 0) {
+        if (!ctx->s3tok.loaded) {
+            fprintf(stderr, "cosyvoice3_tts: %s requested but s3tok not loaded\n", stage_name);
+            return nullptr;
+        }
+        if (!embeds_in || n_embed_tokens <= 0)
+            return nullptr;
+        const int T_use = n_embed_tokens;
+        ggml_cgraph* gf = cv3_build_s3tok_graph(ctx, T_use);
+        ggml_backend_sched_reset(ctx->sched);
+        if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
+            fprintf(stderr, "cosyvoice3_tts: %s alloc_graph failed\n", stage_name);
+            return nullptr;
+        }
+        ggml_tensor* mel_t = ggml_graph_get_tensor(gf, "s3tok_mel_in");
+        if (!mel_t)
+            return nullptr;
+        ggml_backend_tensor_set(mel_t, embeds_in, 0, (size_t)T_use * 128 * sizeof(float));
+        if (ggml_tensor* pos_t = ggml_graph_get_tensor(gf, "positions")) {
+            std::vector<int32_t> pos((size_t)pos_t->ne[0]);
+            for (int i = 0; i < (int)pos.size(); i++)
+                pos[(size_t)i] = i;
+            ggml_backend_tensor_set(pos_t, pos.data(), 0, pos.size() * sizeof(int32_t));
+        }
+        if (ggml_backend_sched_graph_compute(ctx->sched, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "cosyvoice3_tts: %s compute failed\n", stage_name);
+            return nullptr;
+        }
+        if (strcmp(stage_name, "s3tok_tokens") == 0) {
+            ggml_tensor* proj_t = ggml_graph_get_tensor(gf, "s3tok_proj_down");
+            if (!proj_t)
+                return nullptr;
+            const int T_tok = (int)proj_t->ne[1];
+            std::vector<float> proj((size_t)ggml_nelements(proj_t));
+            ggml_backend_tensor_get(proj_t, proj.data(), 0, proj.size() * sizeof(float));
+            float* out = (float*)malloc((size_t)T_tok * sizeof(float));
+            if (!out)
+                return nullptr;
+            constexpr float kFsqGain = 0.9990000128746033f;
+            constexpr int kPowers[8] = {1, 3, 9, 27, 81, 243, 729, 2187};
+            for (int t = 0; t < T_tok; t++) {
+                const float* row = proj.data() + (size_t)t * 8;
+                int code = 0;
+                for (int i = 0; i < 8; i++) {
+                    int v = (int)std::nearbyint(std::tanh(row[i]) * kFsqGain) + 1;
+                    v = v < 0 ? 0 : (v > 2 ? 2 : v);
+                    code += v * kPowers[i];
+                }
+                out[(size_t)t] = (float)code;
+            }
+            *out_n = T_tok;
+            return out;
+        }
+        const char* tname = (strcmp(stage_name, "s3tok_proj") == 0) ? "s3tok_proj_down" : stage_name;
+        ggml_tensor* t = ggml_graph_get_tensor(gf, tname);
+        if (!t) {
+            fprintf(stderr, "cosyvoice3_tts: %s: no such stage tensor\n", stage_name);
+            return nullptr;
+        }
+        const size_t n = (size_t)ggml_nelements(t);
+        float* out = (float*)malloc(n * sizeof(float));
+        if (!out)
+            return nullptr;
+        ggml_backend_tensor_get(t, out, 0, n * sizeof(float));
+        *out_n = (int)n;
+        return out;
+    }
     if (strcmp(stage_name, "lm_token_embd") == 0) {
         if (!ids || n_ids <= 0)
             return nullptr;

@@ -4255,6 +4255,50 @@ int main(int argc, char** argv) {
             }
         }
 
+        // ---- Phase 6 — speech_tokenizer_v3 per-stage diff ----
+        // Load the s3tok GGUF (sibling of the LLM, or CV3_S3TOK_GGUF) and
+        // feed the reference whisper mel through each tagged stage. The mel
+        // rides in s3tok_mel_in as (128, T) channel-major == ggml ne=(T,128).
+        {
+            std::string s3_path;
+            if (const char* env = std::getenv("CV3_S3TOK_GGUF"); env && *env) {
+                s3_path = env;
+            } else {
+                s3_path = model_path;
+                const auto p = s3_path.find("llm");
+                if (p != std::string::npos)
+                    s3_path.replace(p, 3, "s3tok");
+            }
+            auto mel_pair = ref.get_f32("s3tok_mel_in");
+            if (cosyvoice3_tts_init_s3tok_from_file(ctx, s3_path.c_str()) != 0) {
+                printf("[SKIP] %-30s  (s3tok gguf '%s' not loaded; set CV3_S3TOK_GGUF)\n", "s3tok_*", s3_path.c_str());
+                n_skip++;
+            } else if (!mel_pair.first || mel_pair.second % 128 != 0) {
+                printf("[SKIP] %-30s  (s3tok_mel_in missing/!=128-multiple in reference)\n", "s3tok_*");
+                n_skip++;
+            } else {
+                const int T_mel = (int)(mel_pair.second / 128);
+                static const char* s3_stages[] = {"s3tok_subsample", "s3tok_blk_0", "s3tok_blk_11", "s3tok_proj",
+                                                  "s3tok_tokens"};
+                for (const char* sname : s3_stages) {
+                    int n_out = 0;
+                    float* buf = cosyvoice3_tts_extract_stage(ctx, sname, /*ids*/ nullptr, /*n_ids*/ 0, mel_pair.first,
+                                                              /*n_embed_tokens*/ T_mel, &n_out);
+                    if (!buf || n_out <= 0) {
+                        printf("[SKIP] %-30s  cosyvoice3_tts_extract_stage returned no data\n", sname);
+                        if (buf)
+                            free(buf);
+                        n_skip++;
+                        continue;
+                    }
+                    auto rep = ref.compare(sname, buf, (size_t)n_out);
+                    print_row(sname, rep, COS_THRESHOLD);
+                    record(rep);
+                    free(buf);
+                }
+            }
+        }
+
         cosyvoice3_tts_free(ctx);
     } else {
         fprintf(stderr,

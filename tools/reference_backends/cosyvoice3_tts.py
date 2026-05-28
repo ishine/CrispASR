@@ -120,6 +120,14 @@ DEFAULT_STAGES = [
     "hift_inference_mel_in",    # (mel_dim, T_mel)
     "hift_inference_noise_in",  # (T_audio, 9)
     "hift_inference",           # (T_mel * 480,) — final 24 kHz audio
+    # Phase 6 — speech_tokenizer_v3 (ONNX) per-stage. Driven by the real
+    # --audio arg (16 kHz mono). Compared against the C++ s3tok_* stages.
+    "s3tok_mel_in",             # whisper-128 log-mel               (128, T)
+    "s3tok_subsample",          # post 2x strided conv subsampler   (T_tok, 1280)
+    "s3tok_blk_0",              # after FSMN/attention block 0       (T_tok, 1280)
+    "s3tok_blk_11",             # after final FSMN/attention block   (T_tok, 1280)
+    "s3tok_proj",               # FSQ projection (pre-tanh)          (T_tok, 8)
+    "s3tok_tokens",             # quantised speech token ids         (T_tok,)
 ]
 
 # Fixed test-vector parameters for the Phase 3b dumps. Pinned so the
@@ -1147,6 +1155,103 @@ def _capture_hift_f0_stages(model_dir: Path, T_mel: int = HIFT_F0_T_MEL,
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 — speech_tokenizer_v3 (ONNX) per-stage capture
+# ---------------------------------------------------------------------------
+
+# Stage boundary edge names read off the ONNX graph (g.node walk):
+#   post-subsampler         /Transpose_output_0          (T_tok, 1280)
+#   per-block FFN residual   /blocks.<K>/Add_1_output_0  (T_tok, 1280)
+#   FSQ projection (pre-tanh)/quantizer/project_in/Add_output_0  (T_tok, 8)
+#   final ids                indices                     (T_tok,)
+S3TOK_EDGE = {
+    "s3tok_subsample": "/Transpose_output_0",
+    "s3tok_blk_0": "/blocks.0/Add_1_output_0",
+    "s3tok_blk_11": "/blocks.11/Add_1_output_0",
+    "s3tok_proj": "/quantizer/project_in/Add_output_0",
+    "s3tok_tokens": "indices",
+}
+
+
+def _whisper_log_mel_128(audio: np.ndarray) -> np.ndarray:
+    """openai-whisper log_mel_spectrogram(n_mels=128) replicated in numpy
+    (the `whisper` package itself won't import under numpy>=2.2). Uses
+    whisper's own mel_filters.npz so the filterbank is bit-identical to
+    what `frontend._extract_speech_token` feeds the ONNX tokenizer."""
+    import importlib.util
+
+    spec = importlib.util.find_spec("whisper")
+    if spec is None or not spec.submodule_search_locations:
+        raise SystemExit("openai-whisper not installed (needed for its mel_filters.npz)")
+    fb_path = Path(list(spec.submodule_search_locations)[0]) / "assets" / "mel_filters.npz"
+    filters = np.load(fb_path)["mel_128"]  # (128, 201)
+
+    N_FFT, HOP = 400, 160
+    w = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N_FFT) / N_FFT)  # periodic hann
+    a = np.pad(audio.astype(np.float32), N_FFT // 2, mode="reflect")
+    nfr = 1 + (len(a) - N_FFT) // HOP
+    frames = np.stack([a[i * HOP:i * HOP + N_FFT] * w for i in range(nfr)], axis=1)
+    stft = np.fft.rfft(frames, axis=0)[:, :-1]  # drop last frame (whisper)
+    mag = np.abs(stft) ** 2
+    mel = filters @ mag
+    log = np.log10(np.clip(mel, 1e-10, None))
+    log = np.maximum(log, log.max() - 8.0)
+    log = (log + 4.0) / 4.0
+    return log.astype(np.float32)  # (128, T)
+
+
+def _s3tok_onnx_path(model_dir: Path) -> Path:
+    import os
+    env = os.environ.get("CV3_S3TOK_ONNX")
+    if env:
+        return Path(env)
+    for cand in (model_dir / "speech_tokenizer_v3.onnx",
+                 Path("/Volumes/backups/ai/upstream/cosyvoice3-onnx/speech_tokenizer_v3.onnx")):
+        if cand.exists():
+            return cand
+    raise SystemExit("speech_tokenizer_v3.onnx not found (set CV3_S3TOK_ONNX)")
+
+
+def _capture_s3tok_stages(model_dir: Path, audio: np.ndarray,
+                          wanted: Set[str]) -> Dict[str, np.ndarray]:
+    """Run speech_tokenizer_v3.onnx on `audio` (real 16 kHz mono) with the
+    requested intermediate edges exposed as graph outputs. Returns
+    {stage: ndarray} in (T, C) row-major == ggml ne=(C, T) byte layout."""
+    import onnx
+    import onnxruntime as ort
+
+    mel = _whisper_log_mel_128(audio)             # (128, T)
+    feats = mel[None].astype(np.float32)          # (1, 128, T)
+    flen = np.array([mel.shape[1]], dtype=np.int32)
+
+    m = onnx.load(str(_s3tok_onnx_path(model_dir)), load_external_data=True)
+    # Expose the requested intermediate edges (besides the native `indices`).
+    existing = {o.name for o in m.graph.output}
+    add_edges = [S3TOK_EDGE[s] for s in wanted if s in S3TOK_EDGE and S3TOK_EDGE[s] != "indices"]
+    for e in add_edges:
+        if e not in existing:
+            m.graph.output.append(onnx.helper.make_tensor_value_info(e, onnx.TensorProto.FLOAT, None))
+
+    sess = ort.InferenceSession(m.SerializeToString(), providers=["CPUExecutionProvider"])
+    out_names = [o.name for o in sess.get_outputs()]
+    res = dict(zip(out_names, sess.run(None, {"feats": feats, "feats_length": flen})))
+
+    cap: Dict[str, np.ndarray] = {}
+    # mel input the C++ side feeds back (channel-major (128, T) == ggml ne=(T,128) bytes).
+    cap["s3tok_mel_in"] = np.ascontiguousarray(mel)
+    for stage in wanted:
+        edge = S3TOK_EDGE.get(stage)
+        if edge is None:
+            continue
+        if stage == "s3tok_tokens":
+            cap[stage] = res["indices"].reshape(-1).astype(np.int32)
+        else:
+            arr = res[edge]
+            arr = np.squeeze(arr, axis=0) if arr.ndim == 3 else arr  # (T, C)
+            cap[stage] = np.ascontiguousarray(arr.astype(np.float32))
+    return cap
+
+
+# ---------------------------------------------------------------------------
 # dump_reference.py entry point.
 # ---------------------------------------------------------------------------
 
@@ -1249,6 +1354,13 @@ def dump(*, model_dir: Path, audio: np.ndarray, stages: Set[str],
             if name not in requested:
                 continue
             out[name] = t.detach().cpu().numpy().astype(np.float32)
+
+    # ---- Phase 6 speech_tokenizer_v3 (ONNX) stages ----
+    if any(s.startswith("s3tok_") for s in requested):
+        s3 = _capture_s3tok_stages(model_dir, audio, requested)
+        for name, arr in s3.items():
+            if name in requested:
+                out[name] = arr
 
     return out
 
