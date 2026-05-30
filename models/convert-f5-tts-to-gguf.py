@@ -96,38 +96,28 @@ def to_f32(t: torch.Tensor) -> np.ndarray:
     return t.detach().to(torch.float32).numpy()
 
 def choose_dtype(name: str, shape: list, t: torch.Tensor):
-    """Choose F16 vs F32. Keep small/1D/embedding tensors as F32."""
+    """Choose F16 vs F32. Keep small/1D/embedding/critical tensors as F32.
+    Large weight matrices (DiT QKV, FFN, Vocos conv) go to F16."""
     n = int(np.prod(shape))
     if t.ndim <= 1 or n < 256:
         return to_f32(t), GGMLQuantizationType.F32
-    # Keep these as F32 for precision
+    # Keep these as F32 for precision (small or precision-critical)
     keep_f32 = (
-        'text_embed.weight' in name or     # embedding table
-        'text_emb' in name or              # embedding table (renamed)
+        'text_emb' in name or              # embedding table (small, lookup)
         'freqs_cis' in name or             # position encoding
-        'inv_freq' in name or              # rotary
-        'time_' in name or                 # timestep MLP
-        'conv_pos' in name or              # positional conv
-        'norm_out' in name or              # final modulation
-        'proj_out' in name or              # final projection
-        'input_proj' in name or            # input projection (renamed)
+        'inv_freq' in name or              # rotary frequencies
+        'time_' in name or                 # timestep MLP (small, critical)
+        'conv_pos' in name or              # positional conv (critical)
+        'input_proj' in name or            # input projection
         'input_embed.proj' in name or      # input projection
-        'final_adaln' in name or           # final AdaLN
+        'final_adaln' in name or           # final AdaLN (small)
         'final_proj' in name or            # final output projection
-        'adaln' in name or                 # AdaLN modulation weights
-        'attn_q' in name or               # attention Q weight
-        'attn_k' in name or               # attention K weight
-        'attn_v' in name or               # attention V weight
-        'attn_o' in name or               # attention output weight
-        'ffn_up' in name or               # FFN up projection
-        'ffn_down' in name or             # FFN down projection
-        'blk.' in name or                 # all DiT block weights
-        # Vocos: keep small tensors (gamma, embed) as F32
-        'voc.embed' in name or
+        'adaln' in name or                 # AdaLN modulation (6144 params, critical)
+        # Vocos: keep critical small tensors as F32
         'voc.norm' in name or
         'voc.final' in name or
         'voc.head' in name or
-        '.gamma' in name
+        '.layer_scale' in name
     )
     if keep_f32:
         return to_f32(t), GGMLQuantizationType.F32
