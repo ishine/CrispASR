@@ -73,3 +73,11 @@ TEST_CASE("whisper_params: n_threads defaults to sensible value", "[unit]") {
 TEST_CASE("whisper_params: language defaults to 'auto'", "[unit]") {
     REQUIRE(kDefaults.language == "auto");
 }
+
+TEST_CASE("whisper_params: print_progress defaults to false", "[unit]") {
+    REQUIRE(kDefaults.print_progress == false);
+}
+
+TEST_CASE("whisper_params: progress_step defaults to 5", "[unit]") {
+    REQUIRE(kDefaults.progress_step == 5);
+}

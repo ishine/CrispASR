@@ -950,3 +950,21 @@ target_include_directories(test-piper-tts PRIVATE
     ${PROJECT_SOURCE_DIR}/include
 )
 target_link_libraries(test-piper-tts PRIVATE piper-tts)
+
+# ─── test-progress-output — live test: -pp/--print-progress emits per-slice
+# progress on stderr for unified backends (issue #130).
+add_test(NAME test-progress-output
+    COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test-progress-output.sh
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-progress-output PROPERTIES
+    LABELS "live;progress"
+    TIMEOUT 300)
+
+# ─── test-release-workflow — validate release.yml targets (issue #131).
+# Static test: no binary or model needed, just parses YAML.
+add_test(NAME test-release-workflow
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/test_release_workflow.py
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR})
+set_tests_properties(test-release-workflow PROPERTIES
+    LABELS "unit;ci"
+    TIMEOUT 30)
