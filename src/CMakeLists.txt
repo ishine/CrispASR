@@ -1012,6 +1012,7 @@ endif()
 # ---------------------------------------------------------------------------
 # outetts — OuteAI/OuteTTS LLM-based TTS + WavTokenizer codec (native ggml runtime)
 # ---------------------------------------------------------------------------
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/outetts.cpp")
 add_library(outetts STATIC outetts.h outetts.cpp outetts_wavtok.h outetts_wavtok.cpp)
 set_target_properties(outetts PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(outetts PUBLIC .)
@@ -1019,6 +1020,7 @@ target_compile_features   (outetts PUBLIC cxx_std_17)
 target_link_libraries     (outetts PUBLIC crispasr-core ggml ggml-base ggml-cpu)
 if(NOT MSVC)
     target_compile_options(outetts PRIVATE -O3)
+endif()
 endif()
 
 # ---------------------------------------------------------------------------

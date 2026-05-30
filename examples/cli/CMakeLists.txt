@@ -35,7 +35,6 @@ add_executable(${TARGET}
     crispasr_backend_cosyvoice3.cpp
     crispasr_backend_kokoro.cpp
     crispasr_backend_piper.cpp
-    crispasr_backend_outetts.cpp
     crispasr_backend_m2m100.cpp
     crispasr_backend_t5.cpp
     crispasr_backend_glm_asr.cpp
@@ -282,6 +281,13 @@ target_link_libraries(${TARGET} PRIVATE
 
 if (CRISPASR_CURL)
     target_compile_definitions(${TARGET} PRIVATE CRISPASR_USE_LIBCURL)
+endif()
+
+# Optional outetts backend (source files may not be present in all checkouts)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_outetts.cpp")
+    target_sources(${TARGET} PRIVATE crispasr_backend_outetts.cpp)
+    target_link_libraries(${TARGET} PRIVATE outetts)
+    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_OUTETTS=1)
 endif()
 
 install(TARGETS ${TARGET} RUNTIME BUNDLE DESTINATION bin)
