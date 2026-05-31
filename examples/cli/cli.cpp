@@ -529,6 +529,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_codec_quant = ARGV_NEXT;
     } else if (arg == "--ref-text") {
         params.tts_ref_text = ARGV_NEXT;
+    } else if (arg == "--ref-asr") {
+        params.tts_ref_asr = ARGV_NEXT;
     } else if (arg == "--instruct") {
         params.tts_instruct = ARGV_NEXT;
     } else if (arg == "--voice-dir") {
@@ -1014,8 +1016,11 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --voice PATH            [%-7s] voice prompt: GGUF voice pack or reference WAV\n"
             "                                                 (.wav → 1.5B WAV cloning; .gguf → voice pack)\n",
             params.tts_voice.c_str());
-    fprintf(stderr, "             --ref-text \"TEXT\"        reference transcription (qwen3-tts; required when --voice "
-                    "is a WAV)\n");
+    fprintf(stderr,
+            "             --ref-text \"TEXT\"        reference transcription (qwen3-tts/f5-tts; auto-transcribed "
+            "if omitted)\n");
+    fprintf(stderr, "             --ref-asr BACKEND       [%-7s] ASR backend for auto-transcribing ref audio\n",
+            params.tts_ref_asr.empty() ? "whisper" : params.tts_ref_asr.c_str());
     fprintf(stderr, "             --instruct \"TEXT\"        natural-language voice/style description "
                     "(qwen3-tts: VoiceDesign = voice description; CustomVoice = style control)\n");
     fprintf(stderr,

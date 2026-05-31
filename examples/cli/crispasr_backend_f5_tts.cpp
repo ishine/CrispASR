@@ -12,7 +12,6 @@
 #include "crispasr_model_registry.h"
 #include "whisper_params.h"
 
-#include "crispasr.h" // whisper_init_from_file_with_params, whisper_full, etc.
 #include "f5_tts.h"
 
 #include <cmath>
@@ -114,56 +113,44 @@ static std::vector<float> resample_linear(const std::vector<float>& in, int sr_i
     return out;
 }
 
-// Auto-transcribe reference audio via whisper when --ref-text is missing.
-// Uses the tiny.en model for speed; loads and frees it in one shot.
-static std::string transcribe_ref_audio(const std::vector<float>& pcm_16k, int n_threads, bool quiet,
-                                        const std::string& cache_dir) {
-    // Resolve whisper tiny.en model path (uses models/ dir or auto-download cache)
-    std::string model_path = "models/ggml-tiny.en.bin";
-    {
-        FILE* probe = fopen(model_path.c_str(), "rb");
-        if (probe) {
-            fclose(probe);
-        } else {
-            // Try auto-resolve via registry
-            auto resolved = crispasr_resolve_model_cli("ggml-tiny.en.bin", "whisper", quiet, cache_dir, true);
-            if (!resolved.empty())
-                model_path = resolved;
-        }
-    }
-
-    struct whisper_context_params cparams = whisper_context_default_params();
-    cparams.use_gpu = false;
-    struct whisper_context* wctx = whisper_init_from_file_with_params(model_path.c_str(), cparams);
-    if (!wctx) {
-        if (!quiet)
-            fprintf(stderr, "crispasr[f5-tts]: could not load whisper model for ref-text auto-transcription\n");
+// Auto-transcribe reference audio using any CrispASR backend.
+// The backend name defaults to "whisper" but can be overridden via
+// --ref-asr (e.g. --ref-asr parakeet, --ref-asr moonshine).
+// The model is resolved via the registry (auto-download if needed).
+static std::string transcribe_ref_audio(const std::vector<float>& pcm_16k, const whisper_params& p,
+                                        const std::string& asr_backend) {
+    auto backend = crispasr_create_backend(asr_backend);
+    if (!backend) {
+        if (!p.no_prints)
+            fprintf(stderr, "crispasr[f5-tts]: unknown ASR backend '%s' for ref-text transcription\n",
+                    asr_backend.c_str());
         return "";
     }
 
-    struct whisper_full_params wparams = whisper_full_default_params(CRISPASR_SAMPLING_GREEDY);
-    wparams.print_progress = false;
-    wparams.print_special = false;
-    wparams.print_realtime = false;
-    wparams.print_timestamps = false;
-    wparams.no_timestamps = true;
-    wparams.single_segment = true;
-    wparams.n_threads = n_threads;
-    wparams.language = "en";
+    // Build minimal params for the ASR backend — just model + threads.
+    whisper_params asr_p = {};
+    asr_p.n_threads = p.n_threads;
+    asr_p.no_prints = true; // suppress ASR model load chatter
+    asr_p.language = p.language.empty() ? "en" : p.language;
+    asr_p.auto_download = true;
+    // Let the model resolver pick the default model for this backend.
+    asr_p.model = "auto";
 
-    if (whisper_full(wctx, wparams, pcm_16k.data(), (int)pcm_16k.size()) != 0) {
-        whisper_free(wctx);
+    if (!backend->init(asr_p)) {
+        if (!p.no_prints)
+            fprintf(stderr, "crispasr[f5-tts]: failed to init '%s' for ref-text transcription\n", asr_backend.c_str());
         return "";
     }
+
+    auto segments = backend->transcribe(pcm_16k.data(), (int)pcm_16k.size(), 0, asr_p);
+    backend->shutdown();
 
     std::string result;
-    int n_seg = whisper_full_n_segments(wctx);
-    for (int i = 0; i < n_seg; i++) {
-        const char* seg_text = whisper_full_get_segment_text(wctx, i);
-        if (seg_text)
-            result += seg_text;
+    for (const auto& seg : segments) {
+        if (!result.empty())
+            result += " ";
+        result += seg.text;
     }
-    whisper_free(wctx);
 
     // Trim leading/trailing whitespace
     size_t start = result.find_first_not_of(" \t\n\r");
@@ -229,10 +216,12 @@ public:
             if (ref_text_str.empty()) {
                 // Resample ref to 16kHz for whisper
                 auto ref_16k = resample_linear(ref_pcm, wav_sr, 16000);
+                std::string asr_name = p.tts_ref_asr.empty() ? "whisper" : p.tts_ref_asr;
                 if (!p.no_prints) {
-                    fprintf(stderr, "crispasr[f5-tts]: --ref-text not set, auto-transcribing ref audio...\n");
+                    fprintf(stderr, "crispasr[f5-tts]: --ref-text not set, auto-transcribing via %s...\n",
+                            asr_name.c_str());
                 }
-                ref_text_str = transcribe_ref_audio(ref_16k, p.n_threads, p.no_prints, "");
+                ref_text_str = transcribe_ref_audio(ref_16k, p, asr_name);
                 if (ref_text_str.empty()) {
                     if (!p.no_prints) {
                         fprintf(stderr, "crispasr[f5-tts]: auto-transcription returned empty; "

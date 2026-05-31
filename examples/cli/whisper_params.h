@@ -259,6 +259,7 @@ struct whisper_params {
     std::string tts_codec_model;
     std::string tts_codec_quant;
     std::string tts_ref_text;
+    std::string tts_ref_asr;  // ASR backend for auto-transcribing ref audio (default: whisper)
     std::string tts_instruct; // VoiceDesign: natural-language voice description
     bool tts_trim_silence = false;
 
