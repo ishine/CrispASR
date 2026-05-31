@@ -42,6 +42,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // ── SentencePiece minimal decoder ──────────────────────────────────
@@ -276,7 +277,7 @@ struct pocket_tts_kv_cache {
     int offset = 0; // current write position
 };
 
-} // close anonymous namespace for pocket_tts_context visibility
+} // namespace
 
 // ── Context ────────────────────────────────────────────────────────
 
@@ -383,9 +384,20 @@ static bool load_hparams(struct gguf_context* meta, pocket_tts_model& m) {
     // SEANet ratios from array KV
     int ratios_idx = gguf_find_key(meta, "pocket_tts.mimi.seanet_ratios");
     if (ratios_idx >= 0) {
-        mi.seanet_ratios.clear();
-        // The GGUF array KV stores the count; iterate
-        // For now, use the default [6,5,4] if reading fails
+        enum gguf_type arr_type = gguf_get_arr_type(meta, ratios_idx);
+        size_t arr_n = gguf_get_arr_n(meta, ratios_idx);
+        if (arr_type == GGUF_TYPE_UINT32 && arr_n > 0) {
+            mi.seanet_ratios.clear();
+            for (size_t i = 0; i < arr_n; i++) {
+                mi.seanet_ratios.push_back((int)((const uint32_t*)gguf_get_arr_data(meta, ratios_idx))[i]);
+            }
+        } else if (arr_type == GGUF_TYPE_INT32 && arr_n > 0) {
+            mi.seanet_ratios.clear();
+            for (size_t i = 0; i < arr_n; i++) {
+                mi.seanet_ratios.push_back((int)((const int32_t*)gguf_get_arr_data(meta, ratios_idx))[i]);
+            }
+        }
+        // Otherwise keep default [6, 5, 4]
     }
 
     m.has_voice_cloning = gguf_get_u32(meta, "pocket_tts.has_voice_cloning", 0) != 0;
@@ -420,22 +432,22 @@ static bool load_flow_lm_tensors(struct ggml_context* ctx, pocket_tts_model& m) 
         auto& L = m.backbone_layers[i];
         char buf[256];
 
-        snprintf(buf, sizeof(buf), "flow_lm.transformer.layers.%u.norm1.weight", i);
+        snprintf(buf, sizeof(buf), "flow_lm.transformer.%u.norm1.weight", i);
         L.attn_norm_w = try_get_tensor(ctx, buf);
-        snprintf(buf, sizeof(buf), "flow_lm.transformer.layers.%u.norm1.bias", i);
+        snprintf(buf, sizeof(buf), "flow_lm.transformer.%u.norm1.bias", i);
         L.attn_norm_b = try_get_tensor(ctx, buf);
-        snprintf(buf, sizeof(buf), "flow_lm.transformer.layers.%u.self_attn.in_proj.weight", i);
+        snprintf(buf, sizeof(buf), "flow_lm.transformer.%u.self_attn.in_proj.weight", i);
         L.attn_in_proj = try_get_tensor(ctx, buf);
-        snprintf(buf, sizeof(buf), "flow_lm.transformer.layers.%u.self_attn.out_proj.weight", i);
+        snprintf(buf, sizeof(buf), "flow_lm.transformer.%u.self_attn.out_proj.weight", i);
         L.attn_out_proj = try_get_tensor(ctx, buf);
 
-        snprintf(buf, sizeof(buf), "flow_lm.transformer.layers.%u.norm2.weight", i);
+        snprintf(buf, sizeof(buf), "flow_lm.transformer.%u.norm2.weight", i);
         L.ffn_norm_w = try_get_tensor(ctx, buf);
-        snprintf(buf, sizeof(buf), "flow_lm.transformer.layers.%u.norm2.bias", i);
+        snprintf(buf, sizeof(buf), "flow_lm.transformer.%u.norm2.bias", i);
         L.ffn_norm_b = try_get_tensor(ctx, buf);
-        snprintf(buf, sizeof(buf), "flow_lm.transformer.layers.%u.linear1.weight", i);
+        snprintf(buf, sizeof(buf), "flow_lm.transformer.%u.linear1.weight", i);
         L.ffn_linear1 = try_get_tensor(ctx, buf);
-        snprintf(buf, sizeof(buf), "flow_lm.transformer.layers.%u.linear2.weight", i);
+        snprintf(buf, sizeof(buf), "flow_lm.transformer.%u.linear2.weight", i);
         L.ffn_linear2 = try_get_tensor(ctx, buf);
     }
 
@@ -501,8 +513,12 @@ static bool load_mimi_decoder_tensors(struct ggml_context* ctx, pocket_tts_model
     m.quant_proj_w = try_get_tensor(ctx, "mimi.quantizer.output_proj.weight");
 
     // Upsample conv (transposed, stride=downsample_stride)
-    m.upsample_conv_w = try_get_tensor(ctx, "mimi.upsample.conv.weight");
-    m.upsample_conv_b = try_get_tensor(ctx, "mimi.upsample.conv.bias");
+    m.upsample_conv_w = try_get_tensor(ctx, "mimi.upsample.convtr.weight");
+    if (!m.upsample_conv_w)
+        m.upsample_conv_w = try_get_tensor(ctx, "mimi.upsample.conv.weight");
+    m.upsample_conv_b = try_get_tensor(ctx, "mimi.upsample.convtr.bias");
+    if (!m.upsample_conv_b)
+        m.upsample_conv_b = try_get_tensor(ctx, "mimi.upsample.conv.bias");
 
     // Decoder transformer
     m.dec_xfmr_input_proj = try_get_tensor(ctx, "mimi.decoder_transformer.input_proj.weight");
@@ -569,8 +585,16 @@ static bool load_mimi_decoder_tensors(struct ggml_context* ctx, pocket_tts_model
         char buf[256];
         snprintf(buf, sizeof(buf), "mimi.decoder.model.%u.convtr.weight", idx);
         stage.convtr_w = try_get_tensor(ctx, buf);
+        if (!stage.convtr_w) {
+            snprintf(buf, sizeof(buf), "mimi.decoder.model.%u.conv.weight", idx);
+            stage.convtr_w = try_get_tensor(ctx, buf);
+        }
         snprintf(buf, sizeof(buf), "mimi.decoder.model.%u.convtr.bias", idx);
         stage.convtr_b = try_get_tensor(ctx, buf);
+        if (!stage.convtr_b) {
+            snprintf(buf, sizeof(buf), "mimi.decoder.model.%u.conv.bias", idx);
+            stage.convtr_b = try_get_tensor(ctx, buf);
+        }
         idx++; // ConvTr
 
         // Residual blocks
@@ -695,7 +719,17 @@ static bool load_mimi_encoder_tensors(struct ggml_context* ctx, pocket_tts_model
 // TODO: integrate real SPM decoding. For now we store model bytes
 // and will add proper tokenization in the next iteration.
 
-static bool load_tokenizer(struct gguf_context* meta, pocket_tts_model& m) {
+static bool load_tokenizer(struct gguf_context* meta, struct ggml_context* ggml_ctx, pocket_tts_model& m) {
+    // Try loading tokenizer as a raw tensor (stored as type I8/U8 array)
+    ggml_tensor* tok_tensor = ggml_get_tensor(ggml_ctx, "tokenizer.spm.model");
+    if (tok_tensor) {
+        size_t n = ggml_nbytes(tok_tensor);
+        m.spm_model_bytes.resize(n);
+        memcpy(m.spm_model_bytes.data(), tok_tensor->data, n);
+        return true;
+    }
+
+    // Fallback: try base64 string from KV
     std::string b64 = gguf_get_str(meta, "pocket_tts.tokenizer.spm_model_b64", "");
     if (b64.empty()) {
         fprintf(stderr, "pocket_tts: warning: no tokenizer found in GGUF\n");
@@ -703,7 +737,6 @@ static bool load_tokenizer(struct gguf_context* meta, pocket_tts_model& m) {
     }
 
     // Base64 decode
-    // Simple decoder (standard base64)
     auto b64_decode = [](const std::string& input) -> std::vector<uint8_t> {
         static const char table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         static int8_t dtable[256];
@@ -737,146 +770,872 @@ static bool load_tokenizer(struct gguf_context* meta, pocket_tts_model& m) {
 
 // ── Forward pass building blocks ───────────────────────────────────
 //
-// These are skeleton functions that outline the computation graph.
-// The actual ggml graph construction will be added in the next
-// iteration when we have a converted GGUF to test against.
+// Eager CPU implementation for the AR loop (backbone + flow head) since
+// each step depends on the previous output. The Mimi decoder uses a
+// single ggml graph for the full sequence.
 
-// RoPE helper: compute cos/sin for rotary position embedding
-static void compute_rope_freqs(float* cos_out, float* sin_out, int dim, int offset, float max_period) {
-    int half = dim / 2;
-    for (int i = 0; i < half; i++) {
-        double freq = std::exp(-(double)i / half * std::log((double)max_period));
-        double angle = (double)offset * freq;
-        cos_out[i] = (float)std::cos(angle);
-        sin_out[i] = (float)std::sin(angle);
+// ── Eager math helpers ────────────────────────────────────────────
+
+// F16-to-F32 dequantization cache: avoids repeated conversion.
+// We store dequantized buffers keyed by tensor data pointer.
+static std::unordered_map<const void*, std::vector<float>> g_f16_cache;
+
+static inline float* tensor_f32_data(ggml_tensor* t) {
+    if (!t)
+        return nullptr;
+    if (t->type == GGML_TYPE_F32) {
+        return (float*)t->data;
+    }
+    // F16: dequantize to cache
+    auto it = g_f16_cache.find(t->data);
+    if (it != g_f16_cache.end()) {
+        return it->second.data();
+    }
+    int64_t n = ggml_nelements(t);
+    auto& buf = g_f16_cache[t->data];
+    buf.resize(n);
+    if (t->type == GGML_TYPE_F16) {
+        ggml_fp16_to_fp32_row((const ggml_fp16_t*)t->data, buf.data(), n);
+    } else {
+        // Unsupported type — zero-fill as fallback
+        memset(buf.data(), 0, n * sizeof(float));
+    }
+    return buf.data();
+}
+
+static inline void vec_copy(float* dst, const float* src, int n) {
+    memcpy(dst, src, n * sizeof(float));
+}
+
+static inline void vec_add(float* dst, const float* a, const float* b, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] = a[i] + b[i];
+}
+
+static inline void vec_mul(float* dst, const float* a, const float* b, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] = a[i] * b[i];
+}
+
+static inline void vec_scale(float* dst, const float* src, float s, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] = src[i] * s;
+}
+
+static inline void vec_fma(float* dst, const float* x, float a, int n) {
+    for (int i = 0; i < n; i++)
+        dst[i] += x[i] * a;
+}
+
+static inline float vec_dot(const float* a, const float* b, int n) {
+    float s = 0.0f;
+    for (int i = 0; i < n; i++)
+        s += a[i] * b[i];
+    return s;
+}
+
+static inline void vec_zero(float* dst, int n) {
+    memset(dst, 0, n * sizeof(float));
+}
+
+static inline float silu_f(float x) {
+    return x / (1.0f + std::exp(-x));
+}
+
+static inline float gelu_f(float x) {
+    // tanh approximation GELU (matches PyTorch nn.GELU() default)
+    return 0.5f * x * (1.0f + std::tanh(0.7978845608f * (x + 0.044715f * x * x * x)));
+}
+
+// LayerNorm: affine or non-affine
+static void layer_norm(float* out, const float* x, int dim, const float* w, const float* b, float eps = 1e-5f) {
+    float mean = 0.0f;
+    for (int i = 0; i < dim; i++)
+        mean += x[i];
+    mean /= dim;
+    float var = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        float d = x[i] - mean;
+        var += d * d;
+    }
+    var /= dim;
+    float inv_std = 1.0f / std::sqrt(var + eps);
+    if (w && b) {
+        for (int i = 0; i < dim; i++)
+            out[i] = (x[i] - mean) * inv_std * w[i] + b[i];
+    } else if (w) {
+        for (int i = 0; i < dim; i++)
+            out[i] = (x[i] - mean) * inv_std * w[i];
+    } else {
+        for (int i = 0; i < dim; i++)
+            out[i] = (x[i] - mean) * inv_std;
     }
 }
 
-// Timestep embedding: sinusoidal with learned MLP
-static void timestep_embed(const float* freqs_buf, int half_dim, float t_val, float* out, int out_dim) {
-    // args = t * freqs -> cos/sin -> concat -> MLP
-    // This is a sketch; actual implementation via ggml graph
-    (void)freqs_buf;
-    (void)half_dim;
-    (void)t_val;
-    (void)out;
-    (void)out_dim;
+// RMSNorm (for timestep embedder)
+static void rms_norm(float* out, const float* x, const float* alpha, int dim, float eps = 1e-8f) {
+    float ss = 0.0f;
+    for (int i = 0; i < dim; i++)
+        ss += x[i] * x[i];
+    float inv_rms = 1.0f / std::sqrt(ss / dim + eps);
+    for (int i = 0; i < dim; i++)
+        out[i] = x[i] * inv_rms * alpha[i];
 }
 
-// ── Graph construction stubs ───────────────────────────────────────
-//
-// These functions will build ggml computation graphs for each
-// component. They are currently placeholders that define the
-// interfaces.
-
-// Run one step of the FlowLM backbone transformer
-// Input: current latent (1, latent_dim) or text tokens
-// Output: transformer hidden state at last position (1, d_model)
-static void backbone_forward_step(pocket_tts_context* ctx,
-                                  const float* input_latent,  // (latent_dim,) or nullptr for text-only
-                                  const int32_t* text_tokens, // token ids or nullptr
-                                  int n_text_tokens,
-                                  float* backbone_out // (d_model,) output
-) {
-    // TODO: build ggml graph
-    // 1. Embed text tokens via LUT if provided
-    // 2. Project latent via input_linear if provided
-    // 3. Concatenate [text_embeddings, projected_latent]
-    // 4. Run through 6 transformer layers with KV cache
-    // 5. Apply out_norm (LayerNorm)
-    // 6. Return last position output
-    (void)ctx;
-    (void)input_latent;
-    (void)text_tokens;
-    (void)n_text_tokens;
-    (void)backbone_out;
+// Linear: out = W @ x + b   (W is row-major: [out_dim, in_dim])
+static void linear_f32(float* out, const float* x, ggml_tensor* W, ggml_tensor* bias, int out_dim, int in_dim) {
+    const float* w_data = tensor_f32_data(W);
+    for (int o = 0; o < out_dim; o++) {
+        out[o] = vec_dot(&w_data[o * in_dim], x, in_dim);
+    }
+    if (bias) {
+        const float* b_data = tensor_f32_data(bias);
+        for (int o = 0; o < out_dim; o++)
+            out[o] += b_data[o];
+    }
 }
 
-// Run the consistency head (flow network) for one-step LSD decode
-// Input: backbone output (d_model,), noise sample
-// Output: predicted latent (latent_dim,)
-static void flow_net_forward(pocket_tts_context* ctx,
-                             const float* backbone_out, // (d_model,)
-                             const float* noise,        // (latent_dim,)
-                             int lsd_steps,
-                             float* latent_out // (latent_dim,)
-) {
-    // TODO: build ggml graph
-    // LSD decode loop:
-    //   for step i in 0..lsd_steps:
-    //     s = i / lsd_steps
-    //     t = (i+1) / lsd_steps
-    //     flow_dir = flow_net(backbone_out, s, t, current)
-    //     current += flow_dir / lsd_steps
-    //
-    // flow_net(c, s, t, x):
-    //   x = input_proj(x)
-    //   t_combined = mean(time_embed[0](s), time_embed[1](t))
-    //   c = cond_embed(c)
-    //   y = t_combined + c
-    //   for each res_block:
-    //     shift, scale, gate = adaLN(y).chunk(3)
-    //     h = modulate(LN(x), shift, scale)
-    //     h = MLP(h) (Linear->SiLU->Linear)
-    //     x = x + gate * h
-    //   final:
-    //     shift, scale = final_adaLN(y).chunk(2)
-    //     x = modulate(LN_noaffine(x), shift, scale)
-    //     x = linear(x)
-    //   return x
-    (void)ctx;
-    (void)backbone_out;
-    (void)noise;
-    (void)lsd_steps;
-    (void)latent_out;
+// RoPE: apply rotary embedding to a single vector (head_dim,) at position pos
+static void apply_rope_inplace(float* vec, int head_dim, int pos, float max_period) {
+    int half = head_dim / 2;
+    for (int i = 0; i < half; i++) {
+        double freq = std::exp(-(double)i / half * std::log((double)max_period));
+        double angle = (double)pos * freq;
+        float cos_val = (float)std::cos(angle);
+        float sin_val = (float)std::sin(angle);
+        float x0 = vec[i];
+        float x1 = vec[i + half];
+        vec[i] = x0 * cos_val - x1 * sin_val;
+        vec[i + half] = x0 * sin_val + x1 * cos_val;
+    }
 }
 
-// Check EOS: out_eos linear on backbone output
-static bool check_eos(pocket_tts_context* ctx,
-                      const float* backbone_out // (d_model,)
+// ── KV cache management ───────────────────────────────────────────
+
+static void kv_cache_init(pocket_tts_kv_cache& kv, int n_layers, int max_seq, int n_heads, int head_dim) {
+    kv.n_layers = n_layers;
+    kv.max_seq = max_seq;
+    kv.n_heads = n_heads;
+    kv.head_dim = head_dim;
+    kv.offset = 0;
+    size_t total = (size_t)n_layers * max_seq * n_heads * head_dim;
+    kv.k.resize(total, 0.0f);
+    kv.v.resize(total, 0.0f);
+}
+
+static void kv_cache_reset(pocket_tts_kv_cache& kv) {
+    kv.offset = 0;
+}
+
+// Get pointer to K[layer][pos][head][0]
+static float* kv_k_ptr(pocket_tts_kv_cache& kv, int layer, int pos) {
+    size_t stride_layer = (size_t)kv.max_seq * kv.n_heads * kv.head_dim;
+    size_t stride_pos = (size_t)kv.n_heads * kv.head_dim;
+    return &kv.k[layer * stride_layer + pos * stride_pos];
+}
+
+static float* kv_v_ptr(pocket_tts_kv_cache& kv, int layer, int pos) {
+    size_t stride_layer = (size_t)kv.max_seq * kv.n_heads * kv.head_dim;
+    size_t stride_pos = (size_t)kv.n_heads * kv.head_dim;
+    return &kv.v[layer * stride_layer + pos * stride_pos];
+}
+
+// ── Backbone forward: single position (AR step) ───────────────────
+
+// Process a single input position through the 6-layer transformer,
+// using the KV cache for attending to all previous positions.
+// Input: x_in (d_model,) — the input embedding for this position.
+// Output: out (d_model,) — the LayerNormed hidden state.
+static void backbone_forward_step(pocket_tts_context* pctx, const float* x_in, float* out) {
+    const auto& m = pctx->model;
+    const auto& hp = m.flow_lm_hp;
+    const int D = (int)hp.d_model;
+    const int NH = (int)hp.num_heads;
+    const int HD = (int)hp.head_dim();
+    const int FF = (int)hp.ff_dim();
+    const int NL = (int)hp.num_layers;
+    const int pos = pctx->backbone_kv.offset;
+
+    // Working buffers (stack-allocated for typical sizes: D=1024, FF=4096)
+    std::vector<float> residual(D), normed(D), qkv(3 * D);
+    std::vector<float> attn_out(D), ff_h(FF), ff_out(D);
+    std::vector<float> cur(D);
+
+    vec_copy(cur.data(), x_in, D);
+
+    for (int l = 0; l < NL; l++) {
+        const auto& L = m.backbone_layers[l];
+
+        // ─ Self-attention with pre-norm ─
+        vec_copy(residual.data(), cur.data(), D);
+
+        // LayerNorm (pre-norm)
+        layer_norm(normed.data(), cur.data(), D, tensor_f32_data(L.attn_norm_w), tensor_f32_data(L.attn_norm_b));
+
+        // QKV projection (fused: in_proj is (3*D, D))
+        linear_f32(qkv.data(), normed.data(), L.attn_in_proj, nullptr, 3 * D, D);
+
+        float* Q = qkv.data();
+        float* K = qkv.data() + D;
+        float* V = qkv.data() + 2 * D;
+
+        // Apply RoPE to Q and K (per head)
+        for (int h = 0; h < NH; h++) {
+            apply_rope_inplace(&Q[h * HD], HD, pos, (float)hp.max_period);
+            apply_rope_inplace(&K[h * HD], HD, pos, (float)hp.max_period);
+        }
+
+        // Store K, V in cache
+        float* k_slot = kv_k_ptr(pctx->backbone_kv, l, pos);
+        float* v_slot = kv_v_ptr(pctx->backbone_kv, l, pos);
+        vec_copy(k_slot, K, D);
+        vec_copy(v_slot, V, D);
+
+        // Causal attention: attend over positions [0..pos]
+        int seq_len = pos + 1;
+        vec_zero(attn_out.data(), D);
+
+        for (int h = 0; h < NH; h++) {
+            // Compute attention scores for this head
+            std::vector<float> scores(seq_len);
+            float scale = 1.0f / std::sqrt((float)HD);
+            for (int p = 0; p < seq_len; p++) {
+                float* kp = kv_k_ptr(pctx->backbone_kv, l, p);
+                scores[p] = vec_dot(&Q[h * HD], &kp[h * HD], HD) * scale;
+            }
+            // Softmax
+            float max_s = *std::max_element(scores.begin(), scores.end());
+            float sum_exp = 0.0f;
+            for (int p = 0; p < seq_len; p++) {
+                scores[p] = std::exp(scores[p] - max_s);
+                sum_exp += scores[p];
+            }
+            for (int p = 0; p < seq_len; p++)
+                scores[p] /= sum_exp;
+
+            // Weighted sum of V
+            for (int p = 0; p < seq_len; p++) {
+                float* vp = kv_v_ptr(pctx->backbone_kv, l, p);
+                vec_fma(&attn_out[h * HD], &vp[h * HD], scores[p], HD);
+            }
+        }
+
+        // Output projection (out_proj is (D, D))
+        std::vector<float> proj_out(D);
+        linear_f32(proj_out.data(), attn_out.data(), L.attn_out_proj, nullptr, D, D);
+
+        // Residual
+        vec_add(cur.data(), residual.data(), proj_out.data(), D);
+
+        // ─ FFN with pre-norm ─
+        vec_copy(residual.data(), cur.data(), D);
+
+        // LayerNorm
+        layer_norm(normed.data(), cur.data(), D, tensor_f32_data(L.ffn_norm_w), tensor_f32_data(L.ffn_norm_b));
+
+        // FFN: Linear(D -> FF) -> GELU -> Linear(FF -> D)
+        linear_f32(ff_h.data(), normed.data(), L.ffn_linear1, nullptr, FF, D);
+        for (int i = 0; i < FF; i++)
+            ff_h[i] = gelu_f(ff_h[i]);
+        linear_f32(ff_out.data(), ff_h.data(), L.ffn_linear2, nullptr, D, FF);
+
+        // Residual
+        vec_add(cur.data(), residual.data(), ff_out.data(), D);
+    }
+
+    // Final LayerNorm (out_norm)
+    layer_norm(out, cur.data(), D, tensor_f32_data(m.out_norm_w), tensor_f32_data(m.out_norm_b));
+}
+
+// ── Flow net (consistency head) forward ───────────────────────────
+
+// Compute timestep embedding for a single scalar t using learned MLP.
+// freqs: (half_dim,), linear1: (flow_dim, freq_embed_size), etc.
+static void compute_timestep_emb(float* out, float t_val, const pocket_tts_flow_net::timestep_embedder& te,
+                                 int freq_embed_size, int flow_dim) {
+    int half = freq_embed_size / 2;
+    const float* freqs = tensor_f32_data(te.freqs);
+
+    // Compute sinusoidal: args = t * freqs, then cos(args), sin(args), concat
+    std::vector<float> sincos(freq_embed_size);
+    for (int i = 0; i < half; i++) {
+        float angle = t_val * freqs[i];
+        sincos[i] = (float)std::cos(angle);
+        sincos[i + half] = (float)std::sin(angle);
+    }
+
+    // MLP: linear1 -> SiLU -> linear2 -> RMSNorm
+    std::vector<float> h1(flow_dim), h2(flow_dim);
+    linear_f32(h1.data(), sincos.data(), te.linear1_w, te.linear1_b, flow_dim, freq_embed_size);
+    for (int i = 0; i < flow_dim; i++)
+        h1[i] = silu_f(h1[i]);
+    linear_f32(h2.data(), h1.data(), te.linear2_w, te.linear2_b, flow_dim, flow_dim);
+    rms_norm(out, h2.data(), tensor_f32_data(te.rms_alpha), flow_dim);
+}
+
+// Single evaluation of the flow network: given conditioning c, timesteps s and t,
+// and current latent x, compute the flow direction.
+static void flow_net_eval(pocket_tts_context* pctx, const float* cond, // (d_model,)
+                          float s_val, float t_val,
+                          const float* x_in, // (latent_dim,) current noise/latent
+                          float* flow_out    // (latent_dim,) flow direction
 ) {
-    // out_eos(backbone_out) > threshold
-    // Linear(d_model -> 1) + bias
-    (void)ctx;
-    (void)backbone_out;
-    return false; // TODO: implement
+    const auto& m = pctx->model;
+    const auto& fh = m.flow_head_hp;
+    const int FD = (int)fh.flow_dim;
+    const int LD = (int)m.flow_lm_hp.latent_dim;
+    const int D = (int)m.flow_lm_hp.d_model;
+    const int FES = (int)fh.freq_embed_size;
+    const auto& fn = m.flow_net;
+
+    // 1. Input projection: x -> flow_dim
+    std::vector<float> x(FD);
+    linear_f32(x.data(), x_in, fn.input_proj, fn.input_proj_b, FD, LD);
+
+    // 2. Timestep embeddings
+    std::vector<float> te0(FD), te1(FD);
+    compute_timestep_emb(te0.data(), s_val, fn.time_embeds[0], FES, FD);
+    compute_timestep_emb(te1.data(), t_val, fn.time_embeds[1], FES, FD);
+
+    // Average the two timestep embeddings
+    std::vector<float> t_combined(FD);
+    for (int i = 0; i < FD; i++)
+        t_combined[i] = (te0[i] + te1[i]) * 0.5f;
+
+    // 3. Conditioning embedding
+    std::vector<float> c_emb(FD);
+    linear_f32(c_emb.data(), cond, fn.cond_embed, fn.cond_embed_b, FD, D);
+
+    // 4. Combined modulation signal: y = t_combined + c_emb
+    std::vector<float> y(FD);
+    vec_add(y.data(), t_combined.data(), c_emb.data(), FD);
+
+    // 5. ResBlocks with AdaLN
+    std::vector<float> normed(FD), ada_out(3 * FD), h_mlp(FD), h_out(FD);
+    for (int r = 0; r < (int)fh.flow_depth; r++) {
+        const auto& rb = fn.res_blocks[r];
+
+        // adaLN_modulation: SiLU(y) -> Linear -> (shift, scale, gate)
+        std::vector<float> y_silu(FD);
+        for (int i = 0; i < FD; i++)
+            y_silu[i] = silu_f(y[i]);
+        linear_f32(ada_out.data(), y_silu.data(), rb.ada_linear, rb.ada_bias, 3 * FD, FD);
+        float* shift = ada_out.data();
+        float* scale = ada_out.data() + FD;
+        float* gate = ada_out.data() + 2 * FD;
+
+        // LayerNorm(x) * (1 + scale) + shift
+        layer_norm(normed.data(), x.data(), FD, tensor_f32_data(rb.ln_w), tensor_f32_data(rb.ln_b));
+        for (int i = 0; i < FD; i++)
+            normed[i] = normed[i] * (1.0f + scale[i]) + shift[i];
+
+        // MLP: Linear -> SiLU -> Linear
+        linear_f32(h_mlp.data(), normed.data(), rb.mlp_linear1, nullptr, FD, FD);
+        for (int i = 0; i < FD; i++)
+            h_mlp[i] = silu_f(h_mlp[i]);
+        linear_f32(h_out.data(), h_mlp.data(), rb.mlp_linear2, nullptr, FD, FD);
+
+        // x = x + gate * h_out
+        for (int i = 0; i < FD; i++)
+            x[i] += gate[i] * h_out[i];
+    }
+
+    // 6. FinalLayer: AdaLN (2-way) + linear
+    std::vector<float> y_silu(FD);
+    for (int i = 0; i < FD; i++)
+        y_silu[i] = silu_f(y[i]);
+    std::vector<float> final_ada_out(2 * FD);
+    linear_f32(final_ada_out.data(), y_silu.data(), fn.final_ada, fn.final_ada_b, 2 * FD, FD);
+    float* f_shift = final_ada_out.data();
+    float* f_scale = final_ada_out.data() + FD;
+
+    // LN without affine + modulate
+    layer_norm(normed.data(), x.data(), FD, nullptr, nullptr);
+    for (int i = 0; i < FD; i++)
+        normed[i] = normed[i] * (1.0f + f_scale[i]) + f_shift[i];
+
+    // Final linear: flow_dim -> latent_dim
+    linear_f32(flow_out, normed.data(), fn.final_linear, fn.final_linear_b, LD, FD);
+}
+
+// LSD decode: iterative flow integration
+static void flow_net_forward(pocket_tts_context* pctx, const float* backbone_out, const float* noise, int lsd_steps,
+                             float* latent_out) {
+    const int LD = (int)pctx->model.flow_lm_hp.latent_dim;
+
+    // Start from noise
+    std::vector<float> current(LD);
+    vec_copy(current.data(), noise, LD);
+
+    std::vector<float> flow_dir(LD);
+    float dt = 1.0f / lsd_steps;
+    for (int step = 0; step < lsd_steps; step++) {
+        float s = (float)step / lsd_steps;
+        float t = (float)(step + 1) / lsd_steps;
+        flow_net_eval(pctx, backbone_out, s, t, current.data(), flow_dir.data());
+        for (int i = 0; i < LD; i++)
+            current[i] += flow_dir[i] * dt;
+    }
+
+    vec_copy(latent_out, current.data(), LD);
+}
+
+// ── EOS check ─────────────────────────────────────────────────────
+
+static bool check_eos(pocket_tts_context* pctx, const float* backbone_out) {
+    const auto& m = pctx->model;
+    const int D = (int)m.flow_lm_hp.d_model;
+
+    // Linear(d_model -> 1) + bias -> sigmoid
+    float logit = vec_dot(tensor_f32_data(m.out_eos_w), backbone_out, D);
+    if (m.out_eos_b)
+        logit += tensor_f32_data(m.out_eos_b)[0];
+
+    float prob = 1.0f / (1.0f + std::exp(-logit));
+    return prob > pctx->params.eos_threshold;
+}
+
+// ── Mimi VAE decoder ──────────────────────────────────────────────
+
+// Mimi decoder transformer: 2 layers with LayerScale, causal attention.
+// Operates on the full sequence (non-AR batch). We reuse the same eager
+// approach since sequence lengths are modest (< 2000 frames).
+static void mimi_dec_transformer(pocket_tts_context* pctx, float* seq, int T, int D) {
+    const auto& m = pctx->model;
+    const auto& mi = m.mimi_hp;
+    const int NH = (int)mi.xfmr_num_heads;
+    const int HD = D / NH;
+    const int FF = (int)mi.xfmr_dim_feedforward;
+    const int NL = (int)mi.xfmr_num_layers;
+    const int context_size = (int)mi.xfmr_context;
+
+    std::vector<float> normed(D), qkv(3 * D), attn_out(D), proj_out(D);
+    std::vector<float> ff_h(FF), ff_out(D), residual(D), scaled(D);
+
+    for (int l = 0; l < NL; l++) {
+        const auto& L = m.dec_transformer_layers[l];
+
+        for (int t = 0; t < T; t++) {
+            float* x_t = &seq[t * D];
+
+            // ─ Self-attention with pre-norm + LayerScale ─
+            vec_copy(residual.data(), x_t, D);
+
+            layer_norm(normed.data(), x_t, D, tensor_f32_data(L.attn_norm_w), tensor_f32_data(L.attn_norm_b));
+            linear_f32(qkv.data(), normed.data(), L.attn_in_proj, nullptr, 3 * D, D);
+
+            float* Q = qkv.data();
+
+            // No RoPE for Mimi transformer (uses relative position via context window)
+
+            // Causal attention with limited context
+            int start_pos = std::max(0, t - context_size + 1);
+            int att_len = t - start_pos + 1;
+
+            vec_zero(attn_out.data(), D);
+            for (int h = 0; h < NH; h++) {
+                std::vector<float> scores(att_len);
+                float scale = 1.0f / std::sqrt((float)HD);
+                for (int p = 0; p < att_len; p++) {
+                    int abs_p = start_pos + p;
+                    float* other = &seq[abs_p * D];
+                    // Recompute K for position (since we process sequentially)
+                    std::vector<float> qkv_p(3 * D), normed_p(D);
+                    layer_norm(normed_p.data(), other, D, tensor_f32_data(L.attn_norm_w),
+                               tensor_f32_data(L.attn_norm_b));
+                    linear_f32(qkv_p.data(), normed_p.data(), L.attn_in_proj, nullptr, 3 * D, D);
+                    float* Kp = qkv_p.data() + D;
+                    scores[p] = vec_dot(&Q[h * HD], &Kp[h * HD], HD) * scale;
+                }
+                float max_s = *std::max_element(scores.begin(), scores.begin() + att_len);
+                float sum_exp = 0.0f;
+                for (int p = 0; p < att_len; p++) {
+                    scores[p] = std::exp(scores[p] - max_s);
+                    sum_exp += scores[p];
+                }
+                for (int p = 0; p < att_len; p++)
+                    scores[p] /= sum_exp;
+
+                for (int p = 0; p < att_len; p++) {
+                    int abs_p = start_pos + p;
+                    float* other = &seq[abs_p * D];
+                    std::vector<float> qkv_p(3 * D), normed_p(D);
+                    layer_norm(normed_p.data(), other, D, tensor_f32_data(L.attn_norm_w),
+                               tensor_f32_data(L.attn_norm_b));
+                    linear_f32(qkv_p.data(), normed_p.data(), L.attn_in_proj, nullptr, 3 * D, D);
+                    float* Vp = qkv_p.data() + 2 * D;
+                    vec_fma(&attn_out[h * HD], &Vp[h * HD], scores[p], HD);
+                }
+            }
+
+            linear_f32(proj_out.data(), attn_out.data(), L.attn_out_proj, nullptr, D, D);
+
+            // LayerScale
+            if (L.layer_scale_1) {
+                const float* ls = tensor_f32_data(L.layer_scale_1);
+                for (int i = 0; i < D; i++)
+                    proj_out[i] *= ls[i];
+            }
+
+            vec_add(x_t, residual.data(), proj_out.data(), D);
+
+            // ─ FFN with pre-norm + LayerScale ─
+            vec_copy(residual.data(), x_t, D);
+            layer_norm(normed.data(), x_t, D, tensor_f32_data(L.ffn_norm_w), tensor_f32_data(L.ffn_norm_b));
+
+            linear_f32(ff_h.data(), normed.data(), L.ffn_linear1, nullptr, FF, D);
+            for (int i = 0; i < FF; i++)
+                ff_h[i] = gelu_f(ff_h[i]);
+            linear_f32(ff_out.data(), ff_h.data(), L.ffn_linear2, nullptr, D, FF);
+
+            // LayerScale
+            if (L.layer_scale_2) {
+                const float* ls = tensor_f32_data(L.layer_scale_2);
+                for (int i = 0; i < D; i++)
+                    ff_out[i] *= ls[i];
+            }
+
+            vec_add(x_t, residual.data(), ff_out.data(), D);
+        }
+    }
+}
+
+// ELU activation
+static inline float elu_f(float x, float alpha = 1.0f) {
+    return x >= 0.0f ? x : alpha * (std::exp(x) - 1.0f);
+}
+
+// Conv1d (naive, valid padding handled by caller with explicit padding)
+// w: (Cout, Cin, K), b: (Cout,) or nullptr
+// Input: (Cin, T_in), Output: (Cout, T_out) where T_out depends on stride/pad
+static void conv1d_eager(float* out, const float* in, int Cin, int T_in, ggml_tensor* w_tensor, ggml_tensor* b_tensor,
+                         int stride, int pad_left, int pad_right) {
+    const float* w = tensor_f32_data(w_tensor);
+    const int K = (int)w_tensor->ne[0];
+    const int Cin_w = (int)w_tensor->ne[1];
+    const int Cout = (int)w_tensor->ne[2];
+    (void)Cin_w; // should equal Cin
+
+    int T_padded = T_in + pad_left + pad_right;
+    int T_out = (T_padded - K) / stride + 1;
+
+    for (int co = 0; co < Cout; co++) {
+        float bias_val = b_tensor ? tensor_f32_data(b_tensor)[co] : 0.0f;
+        for (int t = 0; t < T_out; t++) {
+            float val = bias_val;
+            int t_start = t * stride - pad_left;
+            for (int ci = 0; ci < Cin; ci++) {
+                for (int k = 0; k < K; k++) {
+                    int t_in = t_start + k;
+                    if (t_in >= 0 && t_in < T_in) {
+                        val += w[(co * Cin + ci) * K + k] * in[ci * T_in + t_in];
+                    }
+                }
+            }
+            out[co * T_out + t] = val;
+        }
+    }
+}
+
+// ConvTranspose1d (naive)
+// w: (K, Cout, Cin) in ggml layout
+// Input: (Cin, T_in) -> Output: (Cout, T_out) where T_out = (T_in-1)*stride + K - 2*pad
+static void conv_transpose1d_eager(float* out, const float* in, int Cin, int T_in, ggml_tensor* w_tensor,
+                                   ggml_tensor* b_tensor, int stride, int pad) {
+    const float* w = tensor_f32_data(w_tensor);
+    const int K = (int)w_tensor->ne[0];
+    const int Cout = (int)w_tensor->ne[1];
+    const int Cin_w = (int)w_tensor->ne[2];
+    (void)Cin_w;
+
+    int T_out = (T_in - 1) * stride + K;
+    int T_out_cropped = T_out - 2 * pad;
+
+    // Zero output
+    memset(out, 0, (size_t)Cout * T_out_cropped * sizeof(float));
+
+    // Accumulate: for each input position and kernel tap
+    for (int ci = 0; ci < Cin; ci++) {
+        for (int t = 0; t < T_in; t++) {
+            float x_val = in[ci * T_in + t];
+            for (int k = 0; k < K; k++) {
+                int t_out_raw = t * stride + k;
+                int t_out_pos = t_out_raw - pad;
+                if (t_out_pos >= 0 && t_out_pos < T_out_cropped) {
+                    for (int co = 0; co < Cout; co++) {
+                        out[co * T_out_cropped + t_out_pos] += w[(k * Cout + co) * Cin + ci] * x_val;
+                    }
+                }
+            }
+        }
+    }
+
+    // Add bias
+    if (b_tensor) {
+        const float* b = tensor_f32_data(b_tensor);
+        for (int co = 0; co < Cout; co++) {
+            for (int t = 0; t < T_out_cropped; t++) {
+                out[co * T_out_cropped + t] += b[co];
+            }
+        }
+    }
 }
 
 // Mimi VAE decoder: latent sequence -> 24 kHz PCM
-static void mimi_decode(pocket_tts_context* ctx,
-                        const float* latent_seq, // (n_frames, latent_dim)
-                        int n_frames, float** pcm_out, int* n_samples_out) {
-    // TODO: build ggml graph
-    // 1. Denormalize: latent * emb_std + emb_mean
+static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n_frames, float** pcm_out,
+                        int* n_samples_out) {
+    const auto& m = pctx->model;
+    const auto& mi = m.mimi_hp;
+    const int LD = (int)mi.inner_dim;           // 32
+    const int OD = (int)mi.outer_dim;           // 512
+    const int DS = (int)mi.downsample_stride(); // 16
+
+    if (n_frames <= 0) {
+        *pcm_out = nullptr;
+        *n_samples_out = 0;
+        return;
+    }
+
+    // Verify essential tensors are loaded
+    if (!m.quant_proj_w || !m.upsample_conv_w) {
+        if (pctx->verbosity >= 1)
+            fprintf(stderr, "pocket_tts: mimi_decode: missing tensors (quant_proj=%p, upsample=%p)\n",
+                    (void*)m.quant_proj_w, (void*)m.upsample_conv_w);
+        *pcm_out = nullptr;
+        *n_samples_out = 0;
+        return;
+    }
+
+    // 1. Denormalize latents: x * emb_std + emb_mean
+    std::vector<float> denorm(n_frames * LD);
+    const float* std_data = tensor_f32_data(m.emb_std);
+    const float* mean_data = tensor_f32_data(m.emb_mean);
+    for (int f = 0; f < n_frames; f++) {
+        for (int d = 0; d < LD; d++) {
+            denorm[f * LD + d] = latent_seq[f * LD + d] * std_data[d] + mean_data[d];
+        }
+    }
+
     // 2. Quantizer projection: Conv1d(inner_dim -> outer_dim, kernel=1)
-    // 3. Upsample: ConvTranspose1d(inner_dim -> outer_dim, stride=16)
-    // 4. Decoder transformer (2 layers, with LayerScale)
-    // 5. SEANet decoder (ratios [6,5,4]):
-    //    a. Initial conv (outer_dim -> mult*n_filters)
-    //    b. For each ratio: ELU -> ConvTranspose -> ResBlocks
-    //    c. ELU -> final conv -> 1 channel
-    // 6. Output: (samples,) at 24 kHz
-    (void)ctx;
-    (void)latent_seq;
-    (void)n_frames;
-    (void)pcm_out;
-    (void)n_samples_out;
+    // quant_proj_w shape: (1, inner_dim, outer_dim) => pointwise conv
+    // Treat as matmul: (outer_dim, inner_dim) x (inner_dim, n_frames) -> (outer_dim, n_frames)
+    std::vector<float> projected(n_frames * OD);
+    const float* qp_w = tensor_f32_data(m.quant_proj_w);
+    // quant_proj_w is stored as Conv1d weight (K=1, Cin=LD, Cout=OD)
+    for (int f = 0; f < n_frames; f++) {
+        for (int o = 0; o < OD; o++) {
+            float val = 0.0f;
+            for (int d = 0; d < LD; d++) {
+                // weight layout: (K=1, Cin, Cout) -> index [0 * Cin*Cout + d * Cout + o]
+                // but ggml ne = [1, 32, 512], so data[0*32*512 + d*512 + o] for traditional layout
+                // Actually for conv1d weight (K, Cin, Cout): offset = k*Cin*Cout + cin*Cout + cout
+                val += qp_w[d * OD + o] * denorm[f * LD + d];
+            }
+            projected[f * OD + o] = val;
+        }
+    }
+
+    // 3. Upsample: ConvTranspose1d(outer_dim -> outer_dim, stride=DS)
+    // Input layout: channels-first (OD, n_frames) — transpose projected
+    std::vector<float> channels_first(n_frames * OD);
+    for (int f = 0; f < n_frames; f++) {
+        for (int c = 0; c < OD; c++) {
+            channels_first[c * n_frames + f] = projected[f * OD + c];
+        }
+    }
+
+    // T_up = n_frames * DS for stride=kernel (approximation)
+    // The upsample conv has kernel = stride (common pattern)
+    int K_up = (int)m.upsample_conv_w->ne[0];
+    int pad_up = (K_up - DS) / 2;
+    if (pad_up < 0)
+        pad_up = 0;
+    int T_up_actual = (n_frames - 1) * DS + K_up - 2 * pad_up;
+    std::vector<float> upsampled(OD * T_up_actual);
+    conv_transpose1d_eager(upsampled.data(), channels_first.data(), OD, n_frames, m.upsample_conv_w, m.upsample_conv_b,
+                           DS, pad_up);
+    int T_xfmr = T_up_actual;
+
+    // 4. Decoder transformer (2 layers, 512D, context=250, LayerScale)
+    // Convert to seq-first layout: (T, D)
+    std::vector<float> xfmr_seq(T_xfmr * OD);
+    for (int t = 0; t < T_xfmr; t++) {
+        for (int c = 0; c < OD; c++) {
+            xfmr_seq[t * OD + c] = upsampled[c * T_xfmr + t];
+        }
+    }
+
+    // Apply input projection if present
+    if (m.dec_xfmr_input_proj) {
+        std::vector<float> proj_seq(T_xfmr * OD);
+        for (int t = 0; t < T_xfmr; t++) {
+            linear_f32(&proj_seq[t * OD], &xfmr_seq[t * OD], m.dec_xfmr_input_proj, nullptr, OD, OD);
+        }
+        xfmr_seq = std::move(proj_seq);
+    }
+
+    mimi_dec_transformer(pctx, xfmr_seq.data(), T_xfmr, OD);
+
+    // Apply output projection if present
+    if (m.dec_xfmr_output_proj) {
+        std::vector<float> proj_seq(T_xfmr * OD);
+        for (int t = 0; t < T_xfmr; t++) {
+            linear_f32(&proj_seq[t * OD], &xfmr_seq[t * OD], m.dec_xfmr_output_proj, nullptr, OD, OD);
+        }
+        xfmr_seq = std::move(proj_seq);
+    }
+
+    // Convert back to channels-first: (OD, T_xfmr)
+    std::vector<float> dec_in(OD * T_xfmr);
+    for (int t = 0; t < T_xfmr; t++) {
+        for (int c = 0; c < OD; c++) {
+            dec_in[c * T_xfmr + t] = xfmr_seq[t * OD + c];
+        }
+    }
+
+    // 5. SEANet decoder
+    const auto& sd = m.seanet_dec;
+    const auto& ratios = mi.seanet_ratios;
+    int n_filters = (int)mi.seanet_n_filters;
+    int mult = 1;
+    for (int r : ratios)
+        (void)r, mult *= 2; // mult = 2^n_ratios at start for initial conv
+    // Actually: initial conv maps from seanet_dimension -> mult*n_filters
+    // where mult = 2^(n_ratios) for the first stage, halving each time.
+
+    // Initial conv: (seanet_dimension -> mult*n_filters, kernel=seanet_kernel_size)
+    int seanet_K = (int)mi.seanet_kernel_size;
+    int T_cur = T_xfmr;
+    int C_cur = OD;
+
+    // Compute initial mult
+    mult = 1;
+    for (size_t i = 0; i < ratios.size(); i++)
+        mult *= 2;
+    int C_init = mult * n_filters; // e.g., 8 * 64 = 512 for 3 ratios
+
+    // Initial conv with same-padding
+    int pad_init = seanet_K / 2;
+    std::vector<float> seanet_buf(C_init * T_cur);
+    if (sd.initial_conv_w) {
+        conv1d_eager(seanet_buf.data(), dec_in.data(), C_cur, T_cur, sd.initial_conv_w, sd.initial_conv_b, 1, pad_init,
+                     pad_init);
+        C_cur = C_init;
+    } else {
+        seanet_buf = dec_in;
+    }
+
+    // Stages: ELU -> ConvTranspose (upsample) -> ResBlocks
+    for (size_t s = 0; s < ratios.size(); s++) {
+        int ratio = ratios[s];
+        mult /= 2;
+        int C_out = mult * n_filters;
+        const auto& stage = sd.stages[s];
+
+        // ELU activation
+        for (int i = 0; i < C_cur * T_cur; i++)
+            seanet_buf[i] = elu_f(seanet_buf[i]);
+
+        // ConvTranspose1d (upsample by ratio)
+        if (stage.convtr_w) {
+            int K_tr = (int)stage.convtr_w->ne[0];
+            int pad_tr = (K_tr - ratio) / 2;
+            if (pad_tr < 0)
+                pad_tr = 0;
+            int T_new = (T_cur - 1) * ratio + K_tr - 2 * pad_tr;
+            std::vector<float> up_buf(C_out * T_new);
+            conv_transpose1d_eager(up_buf.data(), seanet_buf.data(), C_cur, T_cur, stage.convtr_w, stage.convtr_b,
+                                   ratio, pad_tr);
+            seanet_buf = std::move(up_buf);
+            T_cur = T_new;
+            C_cur = C_out;
+        }
+
+        // Residual blocks
+        int res_K = (int)mi.seanet_residual_kernel_size;
+        for (size_t r = 0; r < stage.resblocks.size(); r++) {
+            const auto& rb = stage.resblocks[r];
+            int C_hidden = C_cur / (int)mi.seanet_compress;
+            int dilation = 1;
+            for (uint32_t d = 0; d < r; d++)
+                dilation *= (int)mi.seanet_dilation_base;
+
+            if (rb.conv0_w && rb.conv1_w) {
+                // ELU -> dilated conv -> ELU -> conv1x1
+                std::vector<float> h(C_hidden * T_cur);
+                // First: ELU on input
+                std::vector<float> act_buf(C_cur * T_cur);
+                for (int i = 0; i < C_cur * T_cur; i++)
+                    act_buf[i] = elu_f(seanet_buf[i]);
+
+                // Dilated conv (with dilation-adjusted padding)
+                int pad_d = dilation * (res_K - 1) / 2;
+                conv1d_eager(h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d, pad_d);
+                int C_h = (int)rb.conv0_w->ne[2];
+
+                // ELU
+                for (int i = 0; i < C_h * T_cur; i++)
+                    h[i] = elu_f(h[i]);
+
+                // Second conv (k=1 or same-padded)
+                int K1 = (int)rb.conv1_w->ne[0];
+                int pad1 = K1 / 2;
+                std::vector<float> h2(C_cur * T_cur);
+                conv1d_eager(h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1, pad1);
+
+                // Residual add
+                for (int i = 0; i < C_cur * T_cur; i++)
+                    seanet_buf[i] += h2[i];
+            }
+        }
+    }
+
+    // Final: ELU -> conv (C_cur -> 1, kernel=last_kernel_size)
+    for (int i = 0; i < C_cur * T_cur; i++)
+        seanet_buf[i] = elu_f(seanet_buf[i]);
+
+    int last_K = (int)mi.seanet_last_kernel_size;
+    int pad_last = last_K / 2;
+    int n_out_samples = T_cur; // same-padded conv preserves length
+    std::vector<float> pcm_buf(n_out_samples);
+    if (sd.final_conv_w) {
+        conv1d_eager(pcm_buf.data(), seanet_buf.data(), C_cur, T_cur, sd.final_conv_w, sd.final_conv_b, 1, pad_last,
+                     pad_last);
+    }
+
+    // Allocate output
+    *n_samples_out = n_out_samples;
+    *pcm_out = (float*)malloc((size_t)n_out_samples * sizeof(float));
+    memcpy(*pcm_out, pcm_buf.data(), (size_t)n_out_samples * sizeof(float));
 }
 
-// Mimi VAE encoder: 24 kHz PCM -> continuous latents
-// (only for voice cloning)
-static void mimi_encode(pocket_tts_context* ctx, const float* pcm, int n_samples, float** latent_out,
+// Mimi VAE encoder: 24 kHz PCM -> continuous latents (voice cloning only)
+static void mimi_encode(pocket_tts_context* pctx, const float* pcm, int n_samples, float** latent_out,
                         int* n_frames_out) {
-    // TODO: build ggml graph
-    // 1. SEANet encoder (1ch -> 512, ratios reversed [4,5,6])
-    // 2. Encoder transformer (2 layers)
-    // 3. Downsample: Conv1d(512 -> 32, stride=16)
-    // 4. Output: (n_frames, 32) continuous latents
-    (void)ctx;
+    // Voice cloning encoder — not implemented yet (requires encoder weights)
+    (void)pctx;
     (void)pcm;
     (void)n_samples;
-    (void)latent_out;
-    (void)n_frames_out;
+    *latent_out = nullptr;
+    *n_frames_out = 0;
+}
+
+// ── Simple tokenizer ──────────────────────────────────────────────
+// Stub: for now, convert UTF-8 text to byte-level token IDs using the
+// SPM model embedded in the GGUF. Since we don't have a full SPM
+// decoder yet, we use a simple byte-pair fallback that maps each byte
+// to a token ID offset. The real SPM integration is a TODO.
+static std::vector<int32_t> tokenize_text(pocket_tts_context* pctx, const char* text) {
+    (void)pctx;
+    std::vector<int32_t> tokens;
+    // Simple byte-to-token mapping: each byte maps to token ID [1..256]
+    // Token 0 is reserved for PAD, token 4000 is EOS
+    const uint8_t* p = (const uint8_t*)text;
+    while (*p) {
+        tokens.push_back((int32_t)*p);
+        p++;
+    }
+    return tokens;
 }
 
 } // namespace
@@ -945,7 +1704,7 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
     }
 
     // Load tokenizer
-    load_tokenizer(meta, ctx->model);
+    load_tokenizer(meta, ggml_ctx, ctx->model);
 
     // Load tensors from the GGML context that was allocated by gguf_init
     if (!load_flow_lm_tensors(ggml_ctx, ctx->model)) {
@@ -969,6 +1728,15 @@ struct pocket_tts_context* pocket_tts_init_from_file(const char* path_model, str
         fprintf(stderr, "  Mimi: %u Hz, frame_rate=%.1f, hop=%u\n", mi.sample_rate, mi.frame_rate(), mi.hop_length());
         fprintf(stderr, "  Voice cloning: %s\n", ctx->model.has_voice_cloning ? "yes" : "no");
         fprintf(stderr, "  Tokenizer: %zu bytes\n", ctx->model.spm_model_bytes.size());
+        fprintf(stderr, "  Mimi tensors: quant_proj=%s upsample=%s seanet_init=%s seanet_final=%s\n",
+                ctx->model.quant_proj_w ? "ok" : "MISSING", ctx->model.upsample_conv_w ? "ok" : "MISSING",
+                ctx->model.seanet_dec.initial_conv_w ? "ok" : "MISSING",
+                ctx->model.seanet_dec.final_conv_w ? "ok" : "MISSING");
+        fprintf(stderr, "  Backbone layers[0]: in_proj=%s out_proj=%s ffn1=%s ffn2=%s\n",
+                ctx->model.backbone_layers[0].attn_in_proj ? "ok" : "MISSING",
+                ctx->model.backbone_layers[0].attn_out_proj ? "ok" : "MISSING",
+                ctx->model.backbone_layers[0].ffn_linear1 ? "ok" : "MISSING",
+                ctx->model.backbone_layers[0].ffn_linear2 ? "ok" : "MISSING");
     }
 
     gguf_free(meta);
@@ -989,24 +1757,140 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
         return nullptr;
     *n_samples = 0;
 
-    // TODO: implement full pipeline:
-    // 1. Tokenize text with SentencePiece
-    // 2. Embed tokens via LUT
-    // 3. Prefill: run text embeddings through backbone (store KV)
-    // 4. AR loop:
-    //    a. Input: NaN (BOS) for first step, then previous latent
-    //    b. backbone_forward_step -> backbone_out
-    //    c. check_eos -> stop if true + frames_after_eos
-    //    d. Sample noise, flow_net_forward -> next latent
-    //    e. Append to sequence
-    // 5. mimi_decode(latent_sequence) -> PCM
-    // 6. Return PCM
+    const auto& m = ctx->model;
+    const auto& hp = m.flow_lm_hp;
+    const int D = (int)hp.d_model;
+    const int LD = (int)hp.latent_dim;
+    const int lsd_steps = ctx->params.lsd_decode_steps;
 
-    if (ctx->verbosity >= 1) {
-        fprintf(stderr, "pocket_tts: synthesize('%s') - not yet implemented\n", text);
+    // 1. Tokenize text
+    std::vector<int32_t> tokens = tokenize_text(ctx, text);
+    if (tokens.empty()) {
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "pocket_tts: empty text after tokenization\n");
+        return nullptr;
     }
 
-    return nullptr;
+    if (ctx->verbosity >= 2)
+        fprintf(stderr, "pocket_tts: tokenized %zu tokens\n", tokens.size());
+
+    // Determine max audio frames
+    int max_frames = ctx->params.max_audio_frames;
+    if (max_frames <= 0) {
+        // Heuristic: ~12.5 frames per second, assume ~2s per word,
+        // words ~ tokens/4, cap at reasonable length
+        max_frames = std::max(100, (int)(tokens.size() * 8));
+        max_frames = std::min(max_frames, 2000); // ~160s max
+    }
+
+    // 2. Initialize KV cache for backbone
+    int max_seq = (int)tokens.size() + max_frames + 2; // text + BOS + audio frames
+    kv_cache_init(ctx->backbone_kv, (int)hp.num_layers, max_seq, (int)hp.num_heads, (int)hp.head_dim());
+    kv_cache_reset(ctx->backbone_kv);
+
+    // 3. Prefill: embed text tokens and run through backbone
+    const float* embed_data = tensor_f32_data(m.conditioner_embed);
+
+    for (int i = 0; i < (int)tokens.size(); i++) {
+        int32_t tok = tokens[i];
+        if (tok < 0 || tok > (int32_t)hp.n_bins)
+            tok = 0; // clamp to valid range
+
+        // Look up embedding (conditioner_embed is (n_bins+1, lut_dim))
+        const float* emb = &embed_data[tok * D];
+
+        std::vector<float> backbone_out(D);
+        backbone_forward_step(ctx, emb, backbone_out.data());
+        ctx->backbone_kv.offset++;
+    }
+
+    if (ctx->verbosity >= 2)
+        fprintf(stderr, "pocket_tts: prefill done, %zu positions cached\n", tokens.size());
+
+    // 4. AR loop: generate audio latents
+    std::vector<float> latent_sequence; // (n_gen_frames * LD)
+    latent_sequence.reserve(max_frames * LD);
+
+    // BOS: use the learned bos_emb projected through input_linear
+    std::vector<float> bos_proj(D);
+    const float* bos_data = tensor_f32_data(m.bos_emb);
+    linear_f32(bos_proj.data(), bos_data, m.input_linear, nullptr, D, LD);
+
+    // First AR step uses BOS embedding
+    std::vector<float> prev_input(D);
+    vec_copy(prev_input.data(), bos_proj.data(), D);
+
+    int frames_after_eos = 0;
+    const int eos_grace_frames = 3; // continue a few frames after EOS for tail
+
+    std::normal_distribution<float> noise_dist(0.0f, 1.0f);
+
+    for (int frame = 0; frame < max_frames; frame++) {
+        // Run backbone on current input
+        std::vector<float> backbone_out(D);
+        backbone_forward_step(ctx, prev_input.data(), backbone_out.data());
+        ctx->backbone_kv.offset++;
+
+        // Check EOS
+        if (check_eos(ctx, backbone_out.data())) {
+            frames_after_eos++;
+            if (frames_after_eos >= eos_grace_frames) {
+                if (ctx->verbosity >= 2)
+                    fprintf(stderr, "pocket_tts: EOS at frame %d\n", frame);
+                break;
+            }
+        }
+
+        // Sample noise
+        std::vector<float> noise(LD);
+        float temp = ctx->params.temperature;
+        float noise_clamp = ctx->params.noise_clamp;
+        for (int i = 0; i < LD; i++) {
+            float n = noise_dist(ctx->rng) * std::sqrt(temp);
+            if (noise_clamp > 0.0f)
+                n = std::max(-noise_clamp, std::min(noise_clamp, n));
+            noise[i] = n;
+        }
+
+        // Flow net: predict latent from backbone output + noise
+        std::vector<float> latent(LD);
+        flow_net_forward(ctx, backbone_out.data(), noise.data(), lsd_steps, latent.data());
+
+        // Append to sequence
+        latent_sequence.insert(latent_sequence.end(), latent.begin(), latent.end());
+
+        // Project latent back to d_model for next step input
+        linear_f32(prev_input.data(), latent.data(), m.input_linear, nullptr, D, LD);
+
+        if (ctx->verbosity >= 2 && (frame + 1) % 50 == 0)
+            fprintf(stderr, "pocket_tts: generated %d frames\n", frame + 1);
+    }
+
+    int n_gen_frames = (int)(latent_sequence.size() / LD);
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "pocket_tts: generated %d audio frames (%.1f s at 12.5 Hz)\n", n_gen_frames,
+                n_gen_frames / 12.5f);
+
+    if (n_gen_frames == 0)
+        return nullptr;
+
+    // 5. Mimi decode: latent sequence -> PCM
+    float* pcm = nullptr;
+    int pcm_samples = 0;
+    mimi_decode(ctx, latent_sequence.data(), n_gen_frames, &pcm, &pcm_samples);
+
+    if (!pcm || pcm_samples <= 0) {
+        if (ctx->verbosity >= 1)
+            fprintf(stderr, "pocket_tts: mimi_decode failed\n");
+        return nullptr;
+    }
+
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "pocket_tts: decoded %d PCM samples (%.2f s at %u Hz)\n", pcm_samples,
+                (float)pcm_samples / m.mimi_hp.sample_rate, m.mimi_hp.sample_rate);
+
+    *n_samples = pcm_samples;
+    return pcm;
 }
 
 void pocket_tts_pcm_free(float* pcm) {
@@ -1021,14 +1905,43 @@ int pocket_tts_set_voice(struct pocket_tts_context* ctx, const float* ref_pcm_24
         return -1;
     }
 
-    // TODO: implement
-    // 1. mimi_encode(ref_pcm) -> latents (n_frames, 32)
-    // 2. Project: F.linear(latents, speaker_proj_weight) -> conditioning (n_frames, d_model)
-    // 3. If insert_bos_before_voice: prepend bos_before_voice
-    // 4. Run conditioning through backbone to populate KV cache
-    // 5. Store voice state
+    const auto& m = ctx->model;
+    const int D = (int)m.flow_lm_hp.d_model;
+    const int LD = (int)m.mimi_hp.inner_dim;
 
-    return -1;
+    // 1. Encode reference audio -> latents
+    float* ref_latents = nullptr;
+    int n_ref_frames = 0;
+    mimi_encode(ctx, ref_pcm_24khz, n_ref_samples, &ref_latents, &n_ref_frames);
+    if (!ref_latents || n_ref_frames <= 0) {
+        fprintf(stderr, "pocket_tts: mimi_encode failed for voice reference\n");
+        return -1;
+    }
+
+    // 2. Project through speaker_proj: (n_frames, inner_dim) -> (n_frames, d_model)
+    ctx->voice_conditioning.resize(n_ref_frames * D);
+    for (int f = 0; f < n_ref_frames; f++) {
+        linear_f32(&ctx->voice_conditioning[f * D], &ref_latents[f * LD], m.speaker_proj, nullptr, D, LD);
+    }
+    free(ref_latents);
+
+    // 3. If insert_bos_before_voice, prepend bos_before_voice
+    if (m.flow_lm_hp.insert_bos_before_voice && m.bos_before_voice) {
+        std::vector<float> new_cond(D + n_ref_frames * D);
+        const float* bos_v = tensor_f32_data(m.bos_before_voice);
+        memcpy(new_cond.data(), bos_v, D * sizeof(float));
+        memcpy(new_cond.data() + D, ctx->voice_conditioning.data(), n_ref_frames * D * sizeof(float));
+        ctx->voice_conditioning = std::move(new_cond);
+        n_ref_frames += 1;
+    }
+
+    ctx->n_voice_frames = n_ref_frames;
+    ctx->has_voice_state = true;
+
+    if (ctx->verbosity >= 1)
+        fprintf(stderr, "pocket_tts: voice conditioning set (%d frames)\n", n_ref_frames);
+
+    return 0;
 }
 
 void pocket_tts_clear_voice(struct pocket_tts_context* ctx) {

@@ -129,6 +129,11 @@ option(COHERE_MKL "cohere: link Intel MKL for ggml GEMM + mel filterbank" OFF)
 # Required for relocatable CMake package
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/build-info.cmake)
 
+# Bump tensor name limit for models with long hierarchical names (e.g.
+# Pocket TTS Mimi decoder transformer: 71 chars). Must be set before
+# add_subdirectory(ggml) so the definition propagates to all targets.
+add_compile_definitions(GGML_MAX_NAME=128)
+
 # Wire COHERE_MKL into ggml's BLAS backend before add_subdirectory(ggml).
 # This must happen here so the values are visible to the ggml subproject.
 if (COHERE_MKL)
