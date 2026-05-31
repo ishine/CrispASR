@@ -52,7 +52,13 @@ std::unique_ptr<CrispasrBackend> crispasr_make_speecht5_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_dia_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_parler_tts_backend();
 std::unique_ptr<CrispasrBackend> crispasr_make_fastpitch_backend();
+// csm-tts (§135) is a WIP skeleton — src/csm_tts.cpp does not compile yet
+// (core_bpe::encode unimplemented), so it is not built/linked. Guard the
+// reference so the CLI links; the integration session drops the guard once
+// csm_tts.cpp builds and src/CMakeLists.txt registers a csm-tts library.
+#ifdef CRISPASR_HAVE_CSM
 std::unique_ptr<CrispasrBackend> crispasr_make_csm_tts_backend();
+#endif
 
 #include "ggml.h"
 #include "gguf.h"
@@ -170,8 +176,10 @@ std::unique_ptr<CrispasrBackend> crispasr_create_backend(const std::string& name
         return crispasr_make_parler_tts_backend();
     if (name == "zonos" || name == "zonos-tts" || name == "zonos_tts")
         return crispasr_make_zonos_backend();
+#ifdef CRISPASR_HAVE_CSM
     if (name == "csm" || name == "csm-tts" || name == "csm_tts" || name == "sesame" || name == "sesame-csm")
         return crispasr_make_csm_tts_backend();
+#endif
 
     fprintf(stderr, "crispasr: error: unknown backend '%s'\n", name.c_str());
     return nullptr;
