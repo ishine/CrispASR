@@ -6,6 +6,40 @@ technical deep-dives are in `LEARNINGS.md`.
 
 ---
 
+## 2026-05-31 VAD #132 cache concurrency fix + all-backends benchmark refresh
+
+Two follow-ups after fast-forwarding 35 commits (the F5-TTS / Piper /
+OuteTTS native backends, canary+cohere beam wiring, and the #132 Silero
+VAD context cache).
+
+**VAD #132 — cache guarded the lookup, not the use.** The #132 fix
+(`88f82838`) caches one Silero `whisper_vad_context` across requests to
+kill the 70× init/free fragmentation regression. But `g_silero_cache_mtx`
+only wrapped `silero_vad_get_cached`; the returned context — which owns
+mutable per-request LSTM h/c buffers, the scheduler, and `probs`, all
+reset and rewritten inside `whisper_vad_segments_from_samples` — was then
+used unlocked. The server slices VAD *before* taking `model_mutex`
+(`crispasr_server.cpp`) and httplib serves on a thread pool, so two
+concurrent `/transcribe` requests raced on the one shared context (data
+race + corrupted VAD). Pre-#132 each request built its own context, so
+this was a regression introduced by the cache. Fix: renamed the getter to
+`silero_vad_get_cached_locked` (caller-holds-lock) and hold
+`g_silero_cache_mtx` across the whole detect, not just the lookup —
+keeps the perf win, restores per-request isolation. CLI is single-threaded
+and was never affected. `test-vad{,-full,-thresholds}` green.
+
+**Benchmark — `tools/kaggle-benchmark-all-backends.py` was stale.** It
+covered 21 backends (17 `BACKENDS` + 4 `SLOW_BACKENDS`); six complete ASR
+backends had never been added. Added `sensevoice`, `paraformer` (fast)
+and `granite-4.1`, `mega-asr`, `funasr`, `mimo-asr` (slow), with
+`MODEL_REGISTRY` xet-safe pre-download entries + the mimo companion
+tokenizer. `mimo-asr` gets a 420 s timeout (PLAN #115 forces it to CPU,
+~297 s for an 11 s clip). In-progress backends (`pocket`, `dia`) are not
+yet in the registry and stay excluded; TTS/diarization/LID/aligner
+backends stay excluded (the benchmark measures transcription WER).
+Now 27 backends; triggered on a Kaggle T4
+(`chr1str/crispasr-all-backends-benchmark-t4`).
+
 ## 2026-05-29 cosyvoice3: Phase 6 — native arbitrary-WAV cloning (s3tokenizer_v3 byte-exact)
 
 Adds runtime voice cloning from any 16 kHz WAV

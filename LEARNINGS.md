@@ -12,6 +12,30 @@ If a lesson is still "live" (affects current work), it's linked from
 
 ## VAD + chunking
 
+### Caching a stateful context must serialize the *use*, not just the *lookup* (#132, May 2026)
+
+The #132 fix caches one Silero `whisper_vad_context` across requests to
+avoid a 70× init/free fragmentation regression. The first cut guarded the
+cache with a mutex that only wrapped the *getter* — it returned the shared
+pointer and released the lock, then the caller ran the detect unlocked.
+That is the classic "lock the lookup, leak the use" mistake: the cached
+object owns mutable per-call state (the Silero LSTM h/c buffer, the ggml
+scheduler, and `probs`), all reset and rewritten by
+`whisper_vad_segments_from_samples`. Two callers sharing it concurrently
+race on that state.
+
+It hid in testing because the CLI is single-threaded. It only bites the
+**server**, which deliberately slices VAD *outside* `model_mutex`
+(`crispasr_server.cpp`) and serves on an httplib thread pool — so the
+cache mutex is the *only* thing serializing concurrent requests against
+the one context. The fix is to hold the mutex across the whole detect
+(getter renamed `*_locked`, caller takes the `lock_guard`). General rule:
+when you replace per-request objects with one shared cached object, the
+lock has to cover every span that touches the object's mutable state, not
+just the handle handoff. Before caching, isolation was free (each request
+had its own context); caching trades that for an explicit lock you must
+size to the *usage*, not the *handle*.
+
 ### Independent-chunk TDT decode loses interior content, not just boundaries (issue #89, May 2026)
 
 The 30 s auto-chunk fallback (`kLongAudioFallbackChunkSeconds`) prevents

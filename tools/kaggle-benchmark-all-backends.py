@@ -69,6 +69,8 @@ BACKENDS = [
     ("glm-asr",           "GLM ASR Nano",             90, "Q4_K, 1.3B params"),
     ("kyutai-stt",        "Kyutai STT 1B",            90, "Q4_K, 1B params"),
     ("vibevoice",         "VibeVoice ASR",             90, "Q4_K, 4.5B params"),
+    ("sensevoice",        "SenseVoice Small",          60, "Q4_K, ~129MB, encoder-only multitask"),
+    ("paraformer",        "Paraformer-zh NAR",         60, "Q4_K, ~123MB, zh+en char-level"),
 ]
 
 # Slow / large backends (only test if BENCHMARK_SLOW=1)
@@ -77,6 +79,10 @@ SLOW_BACKENDS = [
     ("voxtral4b",         "Voxtral 4B Realtime",     300, "Q4_K, 4B params"),
     ("granite",           "Granite Speech 1B",       300, "Q4_K, 2.9B params"),
     ("gemma4-e2b",        "Gemma-4-E2B 2.3B",        300, "Q4_K, 2.3B params"),
+    ("granite-4.1",       "Granite Speech 4.1 2B",   300, "Q4_K, ~2.94GB, LLM-AR"),
+    ("mega-asr",          "Mega-ASR 1.7B",           120, "Q4_K, ~1.3GB, qwen3 backend + robustness LoRA"),
+    ("funasr",            "Fun-ASR Nano 2512",       180, "F16 only (~1.98GB), Qwen3-0.6B decoder"),
+    ("mimo-asr",          "MiMo-ASR",                420, "Q4_K ~4.2GB; PLAN #115 forces CPU (~297s/11s clip)"),
 ]
 
 print(f"CrispASR Benchmark — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -256,7 +262,23 @@ MODEL_REGISTRY = {
     "voxtral4b":         ("voxtral-mini-4b-realtime-q4_k.gguf","cstr/voxtral-mini-4b-realtime-GGUF","voxtral-mini-4b-realtime-q4_k.gguf"),
     "granite":           ("granite-speech-4.0-1b-q4_k.gguf","cstr/granite-speech-4.0-1b-GGUF",     "granite-speech-4.0-1b-q4_k.gguf"),
     "gemma4-e2b":        ("gemma4-e2b-it-q4_k.gguf",      "cstr/gemma4-e2b-it-GGUF",              "gemma4-e2b-it-q4_k.gguf"),
+    "sensevoice":        ("sensevoice-small-q4_k.gguf",  "cstr/sensevoice-small-GGUF",            "sensevoice-small-q4_k.gguf"),
+    "paraformer":        ("paraformer-zh-q4_k.gguf",     "cstr/paraformer-zh-GGUF",               "paraformer-zh-q4_k.gguf"),
+    "granite-4.1":       ("granite-speech-4.1-2b-q4_k.gguf","cstr/granite-speech-4.1-2b-GGUF",     "granite-speech-4.1-2b-q4_k.gguf"),
+    "mega-asr":          ("mega-asr-1.7b-q4_k.gguf",     "cstr/mega-asr-GGUF",                    "mega-asr-1.7b-q4_k.gguf"),
+    "funasr":            ("funasr-nano-2512-f16.gguf",   "cstr/funasr-nano-GGUF",                 "funasr-nano-2512-f16.gguf"),
+    "mimo-asr":          ("mimo-asr-q4_k.gguf",          "cstr/mimo-asr-GGUF",                    "mimo-asr-q4_k.gguf"),
 }
+
+# mimo-asr needs a companion tokenizer GGUF alongside the main model; the
+# C++ --auto-download path fetches it, but pre-pull it here so a flaky
+# companion download doesn't fail the whole backend mid-run.
+_mimo_tok = os.path.join(CACHE_DIR, "mimo-tokenizer-q4_k.gguf")
+if not os.path.isfile(_mimo_tok):
+    try:
+        hf_hub_download("cstr/mimo-tokenizer-GGUF", "mimo-tokenizer-q4_k.gguf", local_dir=CACHE_DIR)
+    except Exception:
+        pass
 
 # Also download moonshine tokenizer
 _tok_dst = os.path.join(CACHE_DIR, "tokenizer.bin")

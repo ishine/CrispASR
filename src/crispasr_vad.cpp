@@ -40,8 +40,15 @@ static std::string g_silero_cache_path;
 
 // Return the cached Silero context (creating it on first use or when
 // the model path changed). Caller must NOT free the returned pointer.
-static whisper_vad_context* silero_vad_get_cached(const char* vad_model_path, int n_threads) {
-    std::lock_guard<std::mutex> lock(g_silero_cache_mtx);
+//
+// The caller MUST already hold g_silero_cache_mtx and keep holding it for
+// the whole duration it uses the returned context: the cached context owns
+// mutable per-request state (LSTM h/c buffer, scheduler, probs) that is
+// reset and rewritten on every detect, so two callers must not share it
+// concurrently. The server runs VAD slicing outside its model_mutex
+// (crispasr_server.cpp), so this mutex is the only thing serializing
+// concurrent requests against the single cached context (#132).
+static whisper_vad_context* silero_vad_get_cached_locked(const char* vad_model_path, int n_threads) {
     if (g_silero_cache_ctx && g_silero_cache_path == vad_model_path) {
         return g_silero_cache_ctx;
     }
@@ -191,8 +198,14 @@ std::vector<crispasr_audio_slice> crispasr_compute_vad_slices(const float* sampl
     else {
         // Default: Silero VAD via crispasr API.
         // Use a cached context to avoid the init/free cycle that causes
-        // memory fragmentation and the 70x regression (#132).
-        whisper_vad_context* vctx = silero_vad_get_cached(vad_model_path, opts.n_threads);
+        // memory fragmentation and the 70x regression (#132). The cache is
+        // shared mutable state, so hold g_silero_cache_mtx across the whole
+        // detect — the lookup alone is not enough, the context's LSTM/probs
+        // buffers are rewritten by whisper_vad_segments_from_samples and must
+        // not be touched concurrently (the server slices VAD outside its
+        // model_mutex, so concurrent requests would otherwise race here).
+        std::lock_guard<std::mutex> vad_lock(g_silero_cache_mtx);
+        whisper_vad_context* vctx = silero_vad_get_cached_locked(vad_model_path, opts.n_threads);
         if (!vctx) {
             fprintf(stderr, "crispasr: warning: failed to load VAD model '%s'\n", vad_model_path);
             return slices;
