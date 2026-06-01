@@ -545,18 +545,18 @@ static std::unordered_map<uint32_t, int> build_phoneme_map() {
     for (const char* p = letters; *p; p++) {
         map[(uint32_t)*p] = id++;
     }
-    // IPA symbols would continue here (id keeps incrementing).
-    // The full IPA table is embedded in GGUF metadata for production use.
-    return map;
-}
-
-static std::vector<int32_t> tokenize_text_simple(const char* text) {
-    static auto map = build_phoneme_map();
-
-    std::vector<int32_t> ids;
-    ids.push_back(2); // BOS
-
-    for (const char* p = text; *p;) {
+    // IPA symbols from conditioning.py: _letters_ipa
+    static const char ipa_symbols[] =
+        "\xc9\x91\xc9\x90\xc9\x92\xc3\xa6\xc9\x93\xca\x99\xce\xb2\xc9\x94\xc9\x95\xc3\xa7\xc9\x97\xc9\x96\xc3\xb0"
+        "\xca\xa4\xc9\x99\xc9\x98\xc9\x9a\xc9\x9b\xc9\x9c\xc9\x9d\xc9\x9e\xc9\x9f\xca\x84\xc9\xa1\xc9\xa0\xc9\xa2"
+        "\xca\x9b\xc9\xa6\xc9\xa7\xc4\xa7\xc9\xa5\xca\x9c\xc9\xa8\xc9\xaa\xca\x9d\xc9\xad\xc9\xac\xc9\xab\xc9\xae"
+        "\xca\x9f\xc9\xb1\xc9\xaf\xc9\xb0\xc5\x8b\xc9\xb3\xc9\xb2\xc9\xb4\xc3\xb8\xc9\xb5\xc9\xb8\xce\xb8\xc5\x93"
+        "\xc9\xb6\xca\x98\xc9\xb9\xc9\xba\xc9\xbe\xc9\xbb\xca\x80\xca\x81\xc9\xbd\xca\x82\xca\x83\xca\x88\xca\xa7"
+        "\xca\x89\xca\x8a\xca\x8b\xe2\xb1\xb1\xca\x8c\xc9\xa3\xc9\xa4\xca\x8d\xcf\x87\xca\x8e\xca\x8f\xca\x91\xca\x90"
+        "\xca\x92\xca\x94\xca\xa1\xca\x95\xca\xa2\xc7\x80\xc7\x81\xc7\x82\xc7\x83\xcb\x88\xcb\x8c\xcb\x90\xcb\x91"
+        "\xca\xbc\xca\xb4\xca\xb0\xca\xb1\xca\xb2\xca\xb7\xcb\xa0\xcb\xa4\xcb\x9e\xe2\x86\x93\xe2\x86\x91\xe2\x86\x92"
+        "\xe2\x86\x97\xe2\x86\x98\xe2\x80\x99\xcc\xa9\xe2\x80\x99\xe1\xb5\xbb";
+    for (const char* p = ipa_symbols; *p;) {
         uint32_t cp = 0;
         uint8_t c = (uint8_t)*p;
         if (c < 0x80) {
@@ -572,16 +572,83 @@ static std::vector<int32_t> tokenize_text_simple(const char* text) {
             cp = (c & 0x07) << 18 | ((uint8_t)p[1] & 0x3F) << 12 | ((uint8_t)p[2] & 0x3F) << 6 | ((uint8_t)p[3] & 0x3F);
             p += 4;
         }
-        auto it = map.find(cp);
-        if (it != map.end()) {
-            ids.push_back(it->second);
-        } else {
-            ids.push_back(1); // UNK
-        }
+        map[cp] = id++;
     }
+    return map;
+}
 
+// UTF-8 decode helper for phoneme tokenization
+static uint32_t utf8_decode(const char** pp) {
+    const uint8_t* p = (const uint8_t*)*pp;
+    uint32_t cp;
+    if (*p < 0x80) {
+        cp = *p;
+        *pp += 1;
+    } else if ((*p & 0xE0) == 0xC0) {
+        cp = (*p & 0x1F) << 6 | (p[1] & 0x3F);
+        *pp += 2;
+    } else if ((*p & 0xF0) == 0xE0) {
+        cp = (*p & 0x0F) << 12 | (p[1] & 0x3F) << 6 | (p[2] & 0x3F);
+        *pp += 3;
+    } else {
+        cp = (*p & 0x07) << 18 | (p[1] & 0x3F) << 12 | (p[2] & 0x3F) << 6 | (p[3] & 0x3F);
+        *pp += 4;
+    }
+    return cp;
+}
+
+// Convert a text string (already IPA if from espeak-ng, or raw text) to phoneme IDs.
+static std::vector<int32_t> text_to_phoneme_ids(const char* text) {
+    static auto map = build_phoneme_map();
+    std::vector<int32_t> ids;
+    ids.push_back(2); // BOS
+    for (const char* p = text; *p;) {
+        uint32_t cp = utf8_decode(&p);
+        auto it = map.find(cp);
+        ids.push_back(it != map.end() ? it->second : 1 /*UNK*/);
+    }
     ids.push_back(3); // EOS
     return ids;
+}
+
+// Run espeak-ng via popen to get IPA phonemes for the given text.
+// Returns the IPA string, or empty string on failure.
+static std::string phonemize_espeak(const std::string& lang, const std::string& text) {
+    // Build command: espeak-ng -q --ipa=3 -v <lang> "<text>"
+    // Escape text for shell
+    std::string escaped;
+    for (char c : text) {
+        if (c == '\'')
+            escaped += "'\\''";
+        else
+            escaped += c;
+    }
+    std::string cmd = "espeak-ng -q --ipa=3 -v " + lang + " '" + escaped + "' 2>/dev/null";
+    FILE* fp = popen(cmd.c_str(), "r");
+    if (!fp)
+        return "";
+    std::string out;
+    char buf[256];
+    while (fgets(buf, sizeof(buf), fp)) {
+        out += buf;
+    }
+    pclose(fp);
+    // Trim trailing whitespace
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r' || out.back() == ' '))
+        out.pop_back();
+    return out;
+}
+
+// Full tokenization: text -> espeak-ng IPA -> phoneme IDs.
+// Falls back to raw character tokenization if espeak-ng is unavailable.
+static std::vector<int32_t> tokenize_text_full(const char* text, const char* lang = "en-us") {
+    std::string ipa = phonemize_espeak(lang ? lang : "en-us", text);
+    if (!ipa.empty()) {
+        return text_to_phoneme_ids(ipa.c_str());
+    }
+    // Fallback: tokenize raw text characters
+    fprintf(stderr, "zonos_tts: WARN: espeak-ng not available, using raw text tokenization\n");
+    return text_to_phoneme_ids(text);
 }
 
 } // namespace
@@ -1200,16 +1267,21 @@ int32_t* zonos_tts_synthesize_codes(struct zonos_tts_context* ctx, const char* t
     const float cfg_scale = ctx->params.cfg_scale;
     const float temperature = ctx->params.temperature;
     const float min_p = 0.1f; // upstream default
-    const int max_steps = ctx->params.max_audio_tokens > 0 ? ctx->params.max_audio_tokens : (86 * 30);
+    const int max_steps = ctx->params.max_audio_tokens > 0 ? ctx->params.max_audio_tokens : (86 * 10);
 
     if (ctx->params.verbosity >= 1) {
         fprintf(stderr, "zonos_tts: synthesize_codes '%s'\n", text);
     }
 
-    // Step 1: Tokenize
-    auto phoneme_ids = tokenize_text_simple(text);
-    if (ctx->params.verbosity >= 2) {
-        fprintf(stderr, "zonos_tts: %zu phoneme tokens\n", phoneme_ids.size());
+    // Step 1: Tokenize text -> IPA phonemes -> phoneme IDs
+    // Determine language from cond_state (default en-us = index 25)
+    const char* lang = "en-us";
+    if (ctx->cond_state.language_id >= 0 && ctx->cond_state.language_id < (int)ctx->cond_state.language_codes.size()) {
+        lang = ctx->cond_state.language_codes[ctx->cond_state.language_id].c_str();
+    }
+    auto phoneme_ids = tokenize_text_full(text, lang);
+    if (ctx->params.verbosity >= 1) {
+        fprintf(stderr, "zonos_tts: %zu phoneme tokens (lang=%s)\n", phoneme_ids.size(), lang);
     }
 
     // Step 2: Build conditioning prefixes (conditioned + unconditioned)
@@ -1407,11 +1479,26 @@ float* zonos_tts_synthesize(struct zonos_tts_context* ctx, const char* text, int
         return nullptr;
     }
 
+    // Dump codes for external verification
+    {
+        const char* dump_path = "/mnt/storage/zonos-tts/cpp_codes.txt";
+        FILE* f = fopen(dump_path, "w");
+        if (f) {
+            fprintf(f, "%d %d\n", n_codes, n_codebooks);
+            for (int t = 0; t < n_codes; t++) {
+                for (int k = 0; k < n_codebooks; k++) {
+                    fprintf(f, "%d%c", codes[k * n_codes + t], k < n_codebooks - 1 ? ' ' : '\n');
+                }
+            }
+            fclose(f);
+            if (ctx->params.verbosity >= 1)
+                fprintf(stderr, "zonos_tts: dumped codes to %s\n", dump_path);
+        }
+    }
+
     // DAC decode requires the codec path to be set
     if (ctx->dac_codec_path.empty()) {
-        fprintf(stderr, "zonos_tts: no DAC codec path set -- returning codes only.\n"
-                        "           Use zonos_tts_set_codec_path() and zonos_tts_synthesize_codes() for code output,\n"
-                        "           or set the DAC codec path for full audio synthesis.\n");
+        fprintf(stderr, "zonos_tts: no DAC codec path set -- codes dumped, use external DAC decoder.\n");
         free(codes);
         return nullptr;
     }
