@@ -144,7 +144,10 @@ here so the upstream-PR question stays visible.
 | 5 | `ggml.c` (`ggml_conv_1d`, `ggml_conv_1d_dw`, `ggml_conv_2d`, `ggml_conv_2d_dw`) | After (1) sets `vec_dot_type=F32` for F16, conv graph builders that hardcode F16 im2col + F16 weight produce `MUL_MAT(F16, F16)` which the CPU backend rejects. Cast kernel to F32 when im2col is F32. | Carrying |
 | 6 | `ggml-cuda/ggml-cuda.cu` (`ggml_cuda_op_mul_mat_cublas`, `use_fp16`) | CUDA counterpart of (1): `MUL_MAT(F16 weight, F32 act)` takes the fp16 cuBLAS path, quantising the F32 activation to F16 → ±65504 saturation → NaN → degenerate `!-loop` on GPU only (funasr SANM 70-layer encoder; CPU has (1), Metal has a native F16×F32 kernel). Exclude F16×F32 from `use_fp16` so it falls to the F32 `cublasSgemm` path. Quantized weights unaffected (MMQ/MMVQ). Found via the all-backends Kaggle P100 run 2026-05-31. | Carrying |
 
-**Why these aren't upstream yet.** All six were found while shipping a
+| 10 | `ggml-backend.cpp` (`ggml_backend_sched_split_graph`) | Sched mutates `node->src[j]` to internal `input_cpy` tensors; after `ggml_free(sched->ctx)` between calls, the next `alloc_graph` reads dangling pointers → silently skips creating cross-backend copies → GPU reads stale data. Chatterbox CFM solver, all platforms. | Carrying; `tools/upstream-prs/10-metal-sched-buffer-reuse-drift.md` |
+| 15 | `ggml-backend.cpp` (sched backend routing) | Dual-backend `[CUDA,CPU]` sched produces Inf at LLM layer 2 → all-NaN by layer 3 in funasr Qwen2-0.6B. Same bug class as #11 (Metal NaN at large T). Workaround: `load_weights_split` to force LLM to CPU. Issue #125. | Carrying; `tools/upstream-prs/15-cuda-sched-nan-llm-decode.md` |
+
+**Why these aren't upstream yet.** All were found while shipping a
 specific CrispASR backend and were applied as the smallest local change
 that unblocked us. None of them are CrispASR-specific in nature — any
 project using ggml with similar workloads will hit them. Sending each
