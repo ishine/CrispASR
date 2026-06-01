@@ -621,14 +621,23 @@ static uint32_t utf8_decode(const char** pp) {
 }
 
 // Convert a text string (already IPA if from espeak-ng, or raw text) to phoneme IDs.
+// Skips zero-width joiners (U+200D) and other Unicode control chars that
+// espeak-ng may insert but Python's phonemizer strips.
 static std::vector<int32_t> text_to_phoneme_ids(const char* text) {
     static auto map = build_phoneme_map();
     std::vector<int32_t> ids;
     ids.push_back(2); // BOS
     for (const char* p = text; *p;) {
         uint32_t cp = utf8_decode(&p);
+        // Skip Unicode control/format characters (Cf category): ZWJ, ZWNJ, etc.
+        if (cp == 0x200D || cp == 0x200C || cp == 0x200B || cp == 0xFEFF)
+            continue;
         auto it = map.find(cp);
-        ids.push_back(it != map.end() ? it->second : 1 /*UNK*/);
+        if (it != map.end()) {
+            ids.push_back(it->second);
+        }
+        // Skip unmapped characters silently (matching Python's behavior of
+        // only tokenizing known symbols and ignoring others)
     }
     ids.push_back(3); // EOS
     return ids;
@@ -823,18 +832,29 @@ static void tensor_get_row_f32(ggml_tensor* t, int row_idx, float* out, int row_
     }
 }
 
-// Random Fourier features: input x -> cos/sin(x * weight^T * 2*pi) -> (d_model,)
-// weight shape: (d_model/2, input_dim) stored row-major in the GGUF tensor.
+// Random Fourier features:
+//   Python: x_norm = (x - min_val) / (max_val - min_val)
+//           f = 2*pi * x_norm @ weight.T
+//           return cat([cos(f), sin(f)])
+// weight shape: (d_model/2, input_dim), GGUF ne=[input_dim, half_d].
 static void compute_fourier_features(const float* input, int input_dim, ggml_tensor* weight_tensor, float* out,
-                                     int d_model) {
+                                     int d_model, float min_val = 0.0f, float max_val = 1.0f) {
     const int half_d = d_model / 2;
-    // weight_tensor ne = [input_dim, half_d] in ggml
     auto weight_data = tensor_to_float(weight_tensor);
+
+    // Normalize input to [0,1] range (critical — raw values like fmax=22050 would explode)
+    std::vector<float> normed(input_dim);
+    float range = max_val - min_val;
+    if (range <= 0.0f)
+        range = 1.0f;
+    for (int j = 0; j < input_dim; j++) {
+        normed[j] = (input[j] - min_val) / range;
+    }
 
     for (int i = 0; i < half_d; i++) {
         float dot = 0.0f;
         for (int j = 0; j < input_dim; j++) {
-            dot += weight_data[(size_t)i * input_dim + j] * input[j];
+            dot += weight_data[(size_t)i * input_dim + j] * normed[j];
         }
         dot *= 2.0f * 3.14159265358979323846f;
         out[i] = std::cos(dot);
@@ -888,7 +908,8 @@ static float* build_prefix_cpu(zonos_tts_context* ctx, const std::vector<int32_t
         auto tmp = tensor_to_float(cw.emotion.uncond_vec);
         std::memcpy(emotion_out.data(), tmp.data(), (size_t)d * sizeof(float));
     } else {
-        compute_fourier_features(cs.emotion, 8, cw.emotion.weight, emotion_out.data(), d);
+        // emotion: no explicit min/max in config → default [0, 1]
+        compute_fourier_features(cs.emotion, 8, cw.emotion.weight, emotion_out.data(), d, 0.0f, 1.0f);
     }
 
     // 4. Fmax Fourier features: (1, d_model)
@@ -898,7 +919,8 @@ static float* build_prefix_cpu(zonos_tts_context* ctx, const std::vector<int32_t
         std::memcpy(fmax_out.data(), tmp.data(), (size_t)d * sizeof(float));
     } else {
         float fmax_val = cs.fmax;
-        compute_fourier_features(&fmax_val, 1, cw.fmax.weight, fmax_out.data(), d);
+        // fmax: min=0, max=24000 (from config)
+        compute_fourier_features(&fmax_val, 1, cw.fmax.weight, fmax_out.data(), d, 0.0f, 24000.0f);
     }
 
     // 5. Pitch std Fourier features: (1, d_model)
@@ -908,7 +930,8 @@ static float* build_prefix_cpu(zonos_tts_context* ctx, const std::vector<int32_t
         std::memcpy(pitch_out.data(), tmp.data(), (size_t)d * sizeof(float));
     } else {
         float pitch_val = cs.pitch_std;
-        compute_fourier_features(&pitch_val, 1, cw.pitch_std.weight, pitch_out.data(), d);
+        // pitch_std: min=0, max=400 (from config)
+        compute_fourier_features(&pitch_val, 1, cw.pitch_std.weight, pitch_out.data(), d, 0.0f, 400.0f);
     }
 
     // 6. Speaking rate Fourier features: (1, d_model)
@@ -918,7 +941,8 @@ static float* build_prefix_cpu(zonos_tts_context* ctx, const std::vector<int32_t
         std::memcpy(rate_out.data(), tmp.data(), (size_t)d * sizeof(float));
     } else {
         float rate_val = cs.speaking_rate;
-        compute_fourier_features(&rate_val, 1, cw.speaking_rate.weight, rate_out.data(), d);
+        // speaking_rate: min=0, max=40 (from config)
+        compute_fourier_features(&rate_val, 1, cw.speaking_rate.weight, rate_out.data(), d, 0.0f, 40.0f);
     }
 
     // 7. Language integer embedding: (1, d_model)
