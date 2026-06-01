@@ -7971,21 +7971,20 @@ aborts → empty/garbage `!!!!!` transcript → WER 100%. Confirmed on P100
    but uninitialized GPU memory could cause NaN if a graph scheduling race
    reads before write. Under investigation.
 
-### Root cause (confirmed 2026-05-31, Kaggle v13)
+### Root cause (confirmed 2026-05-31/06-01, Kaggle v3–v16)
 
-The `ggml_backend_sched` with `[CUDA, CPU]` backends misroutes LLM decoder
-ops when tensors are split across backends. Specifically:
+The `ggml_backend_sched` with `[CUDA, CPU]` backends misroutes funasr's
+Qwen2-0.6B LLM decoder ops on CUDA. With all weights + KV cache on GPU,
+the sched produces **Inf at LLM layer 2** (values diverge wildly from
+CPU), which cascades to **all-NaN by layer 3** and poisons the logits.
 
-- funasr's LLM decoder uses 3 **separate** Q/K/V `ggml_mul_mat` projections
-  (not fused QKV like qwen3-asr). This gives the sched more degrees of
-  freedom in backend assignment.
-- With all weights on GPU + KV cache on GPU, the sched routes some ops to
-  CUDA and others to CPU. The cross-backend data movement produces **Inf at
-  layer 2** (first8 diverge wildly from CPU reference), which cascades to
-  **all-NaN by layer 3** and poisons every subsequent layer + the logits.
-- The same `kv_self_attn` code works for qwen3-asr because it uses a
-  **fused QKV** projection — the sched sees one large matmul and keeps it
-  on one backend consistently.
+The exact upstream sched bug is unidentified — it's not specific to the
+3-separate-Q/K/V pattern (v15 proved QKV fusion alone does NOT fix it)
+and not specific to flash-attn, F16 KV, or any single op. It appears
+to be a general `ggml_backend_sched` issue with this particular graph
+topology on CUDA. The same `kv_self_attn` code works for qwen3-asr
+(identical structure) — the difference is model-specific (Qwen2-0.6B
+with head_dim=128, GQA ratio=2, QK-norm), not code-specific.
 
 **Per-layer NaN scan (v11):**
 ```
@@ -7996,19 +7995,23 @@ llm_layer_3:  ALL NaN (47104/47104)
 llm_layer_4+: ALL NaN
 ```
 
-### Fix (commit `bc04e263`)
+### Fix (commit `f94fec90`, verified v16)
 
-Split weights via `load_weights_split`: encoder/adaptor tensors (prefix
-`funasr.*`) → GPU, LLM decoder tensors (`blk.*`, `output.*`) → CPU. Force
-the KV cache to CPU when the split is active (`model.buf_cpu != nullptr`).
-The sched then naturally routes the entire LLM to CPU (all its data is
-there) while the 70-block SANM encoder stays GPU-accelerated.
+1. **Weight split** via `load_weights_split`: encoder/adaptor tensors
+   (prefix `funasr.*`) → GPU, LLM decoder tensors (`blk.*`, `output.*`)
+   → CPU. The sched naturally routes the entire LLM to CPU.
+2. **KV cache on CPU** when the split is active (`model.buf_cpu != nullptr`).
+   Without this, KV-on-GPU + weights-on-CPU still produces Inf (v11).
+3. **QKV fusion** at init: Q(1024,2048)+K(1024,1024)+V(1024,1024) →
+   QKV(1024,4096) per layer. Good practice (fewer ops) but does NOT fix
+   the NaN on its own (v15 proved this).
+4. **KV cache zeroing** on allocation — defense-in-depth.
+5. `FUNASR_LLM_GPU=1` overrides to all-GPU for future testing.
 
-`FUNASR_LLM_GPU=1` overrides the split to all-GPU for future testing when
-the upstream `ggml_backend_sched` issue is fixed.
-
-**Kaggle v13 result:** CUDA P100, JFK 11s audio → correct transcript,
-0 NaN, 0 Inf, argmax=3976 (matches CPU baseline exactly).
+**Kaggle v16 result:** P100 CUDA, JFK 11s → correct transcript, 0 NaN,
+0 Inf, argmax=3976 (matches CPU). Elapsed 10.6s (encoder on GPU + LLM
+on CPU) vs 8.3s pure CPU — slight overhead from GPU↔CPU transfer but
+encoder benefits from CUDA for longer audio.
 
 ### What didn't work (so future investigators don't repeat)
 
@@ -8018,24 +8021,42 @@ the upstream `ggml_backend_sched` issue is fixed.
 | `FUNASR_NO_FA=1` (disable flash-attn) | Still all-NaN |
 | `CRISPASR_KV_READ_F32=1` (F32 KV reads) | Still all-NaN |
 | FA-off + KV_READ_F32 combined | Still all-NaN |
-| Single-backend GPU sched (remove CPU) | Crashes (ops need CPU fallback) |
+| Single-backend GPU sched (remove CPU) | Crashes (some ops need CPU) |
 | `parallel=true` sched flag | Still all-NaN |
-| CPU-only `llm_sched` (weights on GPU) | Crashes (weights on wrong backend) |
-| Weight split but KV on GPU | Still NaN (layer 2 Inf → layer 3 all-NaN) |
+| CPU-only `llm_sched` (weights on GPU) | Crashes (can't read GPU weights) |
+| Weight split but KV still on GPU | Inf at layer 2 → all-NaN by layer 3 |
+| **QKV fusion alone (all on GPU)** | **Still all-NaN (v15)** |
 
 ### Diagnostic protocol that worked
 
-- `FUNASR_DUMP_STAGES=1` env-gated tensor stats at every 10th encoder
-  layer + adaptor + spliced embeds + prefill logits → localized the NaN
-  to the LLM prefill in one Kaggle run instead of guessing.
-- Three-way CPU/CUDA-FA/CUDA-noFA comparison in a single kernel → ruled
-  out flash-attn as the cause definitively.
-- Full 28-layer LLM scan → pinpointed layer 2 as the first Inf source.
-- Stage dumps confirmed on Kaggle P100 → no "works on my machine".
+1. `FUNASR_DUMP_STAGES=1` env-gated tensor stats at every 10th encoder
+   layer + adaptor + spliced embeds + prefill logits → localized the NaN
+   to the LLM prefill in one Kaggle run.
+2. Three-way CPU/CUDA-FA/CUDA-noFA comparison → ruled out flash-attn.
+3. Full 28-layer LLM scan → pinpointed layer 2 as the first Inf source.
+4. Iterative Kaggle kernel versions (v3–v16) with one hypothesis per run
+   — each version either confirmed or killed a theory in ~25 minutes.
+
+### Takeaways
+
+1. **Localize first, fix second.** The per-stage tensor dump was the
+   single most valuable tool. Two prior fix attempts (commit `868aabdf`)
+   shipped architecture-level hypotheses without numerical evidence and
+   both failed.
+2. **The ggml_backend_sched is a black box.** With two backends, the sched
+   makes its own routing decisions. When those decisions are wrong, the
+   symptoms (NaN/Inf) give no clue about the root cause. The only
+   reliable approach is to force all data to one backend so the sched
+   has no choice.
+3. **QKV fusion is necessary but not sufficient.** Fusing the Q/K/V weights
+   reduces the sched's degrees of freedom but doesn't eliminate the bug.
+   The weight-split is the essential fix.
+4. **KV cache placement matters.** Even with weights on CPU, a GPU KV cache
+   confuses the sched enough to produce Inf at layer 2 (v11 finding).
 
 ### Cross-refs
 
-- `src/funasr.cpp` weight-split fix (commit `bc04e263`)
-- `tools/kaggle/funasr-cuda-debug/` kernel (v3–v13 progression)
+- `src/funasr.cpp` final fix (commit `f94fec90`)
+- `tools/kaggle/funasr-cuda-debug/` kernel (v3–v16)
 - PLAN §136
 - issue #125 (original report)

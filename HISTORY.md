@@ -7798,3 +7798,41 @@ wallclock target: ~2.4 s long-clip mean / ~150 ms p50 / RTx ~24×.
 Sidecars: `bench-issue81/results/wer-{off,on}.json` (correctness),
 `bench-issue81/results/a1000-fa-{off,on}.json` (wallclock cold-GPU),
 `bench-issue81/sched-debug-fa{off,on}.log` (split-count A/B).
+
+---
+
+### 2026-05-31 / 2026-06-01 — §136 funasr CUDA !-loop fix (issue #125)
+
+**Bug:** funasr produces `!!!!!` (token-0 repeat) on every CUDA GPU
+tested (P100 sm_60, Blackwell sm_120). Correct on CPU and Metal.
+
+**Investigation (16 Kaggle kernel versions):**
+
+1. v3: per-stage encoder dump → encoder/adaptor fine on CUDA (0 NaN).
+2. v4: LLM layer 0 fine, but ALL prefill logits NaN. Bug in LLM decoder.
+3. v4: FA-off, KV_READ_F32 → still NaN. Not flash-attn or F16 KV.
+4. v6: single-backend GPU sched → crashes (some ops need CPU fallback).
+5. v8: parallel=true → still NaN.
+6. v11: full 28-layer scan → **layer 2 produces 1 Inf** (max=6973 vs
+   CPU max=124512), **layer 3+ all-NaN**. With weight-split but KV on
+   GPU, the sched still misroutes ops.
+7. v13: weight-split + KV-on-CPU → **PASS** (correct transcript).
+8. v15: QKV fusion alone (all GPU) → still NaN. Fusion is not the fix.
+9. v16: weight-split + QKV fusion + KV-on-CPU → **PASS**.
+
+**Root cause:** `ggml_backend_sched` with `[CUDA,CPU]` produces Inf in
+funasr's Qwen2-0.6B LLM at layer 2 on CUDA. Exact sched bug unknown —
+not specific to Q/K/V split (QKV fusion doesn't help), not flash-attn,
+not F16 KV. Likely a graph-topology-specific scheduling issue.
+
+**Fix (`f94fec90`):**
+- `load_weights_split`: encoder on GPU, LLM on CPU
+- KV cache forced to CPU when split active
+- QKV fusion at init (Q+K+V → single QKV weight per layer)
+- KV cache zeroed on allocation
+- `FUNASR_LLM_GPU=1` override for future testing
+
+**Commits:** `7dfe401d` (dump instrumentation), `bc04e263` (v13 fix),
+`454e9ef8` (QKV fusion), `f94fec90` (final: split + fusion + KV-CPU).
+
+**Also:** merged stray PR #134 (session-beam test fixes).

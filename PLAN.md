@@ -4627,18 +4627,17 @@ given orpheus/indextts coverage).
 
 ## §136 — funasr CUDA !-loop fix (issue #125)
 
-**Status:** DONE — fix confirmed on Kaggle P100 (v13, 2026-05-31).
+**Status:** DONE — fix confirmed on Kaggle P100 (v16, 2026-06-01).
 
-**Root cause:** `ggml_backend_sched` with `[CUDA,CPU]` misroutes LLM
-decoder ops when funasr's 3 separate Q/K/V projections give it too many
-degrees of freedom. Inf at layer 2 → all-NaN by layer 3 → !-loop.
+**Root cause:** `ggml_backend_sched` with `[CUDA,CPU]` misroutes funasr's
+Qwen2-0.6B LLM decoder on CUDA. Produces Inf at layer 2, all-NaN by
+layer 3. Not caused by the Q/K/V split pattern specifically — v15 proved
+QKV fusion alone does NOT fix it. The exact sched bug is upstream/unknown.
 
-**Fix:** `load_weights_split` puts encoder on GPU, LLM on CPU. KV cache
-forced to CPU when the split is active. Encoder stays GPU-accelerated
-(70 SANM blocks — the bottleneck). `FUNASR_LLM_GPU=1` overrides for
-future testing. See LEARNINGS §136 for the full investigation.
+**Fix (commit `f94fec90`):** weight-split (encoder GPU, LLM+KV CPU) +
+QKV fusion + KV zeroing. `FUNASR_LLM_GPU=1` overrides to all-GPU.
+See LEARNINGS §136 for the 16-version Kaggle investigation.
 
-**Future improvement:** fuse Q/K/V into a single QKV projection (like
-qwen3-asr) so the sched can't split them across backends, then revert
-the weight split. This would give full GPU acceleration for the LLM
-decoder too.
+**Future:** file upstream ggml issue with the minimal repro (funasr Q8_0
+model, dual-backend sched, all weights on GPU → Inf at LLM layer 2).
+If fixed upstream, revert the weight split via `FUNASR_LLM_GPU=1`.
