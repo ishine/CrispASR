@@ -985,33 +985,34 @@ static float* build_prefix_cpu(zonos_tts_context* ctx, const std::vector<int32_t
     if (!result)
         return nullptr;
 
+    // Python: self.norm(self.project(concat)) — project FIRST, then LayerNorm
     const float eps = hp.norm_eps;
     for (int t = 0; t < prefix_len; t++) {
         float* row = &concat[(size_t)t * d];
-        // LayerNorm
+        // Step 1: Linear projection: projected = row @ proj_w^T + proj_b
+        float projected[2048]; // d_model = 2048
+        for (int i = 0; i < d; i++) {
+            float sum = proj_b_data[i];
+            for (int j = 0; j < d; j++) {
+                sum += proj_w_data[(size_t)i * d + j] * row[j];
+            }
+            projected[i] = sum;
+        }
+        // Step 2: LayerNorm on the projected output
         float mean = 0.0f;
         for (int i = 0; i < d; i++)
-            mean += row[i];
+            mean += projected[i];
         mean /= (float)d;
         float var = 0.0f;
         for (int i = 0; i < d; i++) {
-            float diff = row[i] - mean;
+            float diff = projected[i] - mean;
             var += diff * diff;
         }
         var /= (float)d;
         float inv_std = 1.0f / std::sqrt(var + eps);
-        float normed[2048]; // d_model = 2048
-        for (int i = 0; i < d; i++) {
-            normed[i] = (row[i] - mean) * inv_std * norm_w_data[i] + norm_b_data[i];
-        }
-        // Linear projection: out = normed @ proj_w^T + proj_b
         float* out_row = &result[(size_t)t * d];
         for (int i = 0; i < d; i++) {
-            float sum = proj_b_data[i];
-            for (int j = 0; j < d; j++) {
-                sum += proj_w_data[(size_t)i * d + j] * normed[j];
-            }
-            out_row[i] = sum;
+            out_row[i] = (projected[i] - mean) * inv_std * norm_w_data[i] + norm_b_data[i];
         }
     }
 
