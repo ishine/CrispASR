@@ -939,7 +939,263 @@ static float* kv_v_ptr(pocket_tts_kv_cache& kv, int layer, int pos) {
     return &kv.v[layer * stride_layer + pos * stride_pos];
 }
 
-// ── Backbone forward: single position (AR step) ───────────────────
+// ── Backbone forward (ggml graph, single AR step) ────────────────
+
+// Build and compute a ggml graph for one backbone step.
+// Takes a single input embedding x_in (D,), attends to all past KV entries,
+// writes new K/V to the host-side cache, and returns the LayerNormed output.
+static void backbone_forward_step_ggml(pocket_tts_context* pctx, const float* x_in, float* out) {
+    const auto& m = pctx->model;
+    const auto& hp = m.flow_lm_hp;
+    const int D = (int)hp.d_model;
+    const int NH = (int)hp.num_heads;
+    const int HD = (int)hp.head_dim();
+    const int FF = (int)hp.ff_dim();
+    const int NL = (int)hp.num_layers;
+    const int pos = pctx->backbone_kv.offset;
+    const int seq_len = pos + 1; // attend over [0..pos] (including current)
+
+    // Build graph
+    const size_t graph_nodes = 4096;
+    const size_t buf_size = ggml_tensor_overhead() * graph_nodes + ggml_graph_overhead_custom(graph_nodes, false);
+    std::vector<uint8_t> compute_meta(buf_size);
+
+    struct ggml_init_params gp = {compute_meta.size(), compute_meta.data(), true};
+    ggml_context* ctx0 = ggml_init(gp);
+
+    // Input: single token embedding (D,) -> (D, 1) for matmul
+    ggml_tensor* inp = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, D, 1);
+    ggml_set_name(inp, "x_in");
+    ggml_set_input(inp);
+
+    // Position tensor for RoPE (single position)
+    ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(pos_tensor, "pos");
+    ggml_set_input(pos_tensor);
+
+    // Past K/V tensors per layer: (HD, pos, NH) — only if pos > 0
+    // We'll create input tensors for past K/V and output tensors for new K/V
+    struct layer_kv_io {
+        ggml_tensor* past_k; // (HD, pos, NH) or nullptr if pos==0
+        ggml_tensor* past_v;
+        ggml_tensor* new_k; // (HD, 1, NH) — output
+        ggml_tensor* new_v;
+    };
+    std::vector<layer_kv_io> kv_io(NL);
+
+    for (int l = 0; l < NL; l++) {
+        char name[64];
+        if (pos > 0) {
+            snprintf(name, sizeof(name), "past_k_%d", l);
+            kv_io[l].past_k = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, HD, pos, NH);
+            ggml_set_name(kv_io[l].past_k, name);
+            ggml_set_input(kv_io[l].past_k);
+
+            snprintf(name, sizeof(name), "past_v_%d", l);
+            kv_io[l].past_v = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, HD, pos, NH);
+            ggml_set_name(kv_io[l].past_v, name);
+            ggml_set_input(kv_io[l].past_v);
+        } else {
+            kv_io[l].past_k = nullptr;
+            kv_io[l].past_v = nullptr;
+        }
+    }
+
+    ggml_tensor* x = inp; // (D, 1)
+
+    for (int l = 0; l < NL; l++) {
+        const auto& L = m.backbone_layers[l];
+        ggml_tensor* residual = x;
+
+        // Pre-norm LayerNorm
+        ggml_tensor* h = ggml_norm(ctx0, x, 1e-5f);
+        if (L.attn_norm_w)
+            h = ggml_mul(ctx0, h, L.attn_norm_w);
+        if (L.attn_norm_b)
+            h = ggml_add(ctx0, h, L.attn_norm_b);
+
+        // QKV: (3*D, D) @ (D, 1) -> (3*D, 1)
+        ggml_tensor* qkv = ggml_mul_mat(ctx0, L.attn_in_proj, h);
+
+        // Split Q, K, V: each (D, 1)
+        ggml_tensor* Q = ggml_view_2d(ctx0, qkv, D, 1, qkv->nb[1], 0);
+        ggml_tensor* K_cur =
+            ggml_view_2d(ctx0, qkv, D, 1, qkv->nb[1], (size_t)D * ggml_type_size(qkv->type));
+        ggml_tensor* V_cur =
+            ggml_view_2d(ctx0, qkv, D, 1, qkv->nb[1], (size_t)2 * D * ggml_type_size(qkv->type));
+
+        // Reshape to (HD, NH, 1) for RoPE
+        Q = ggml_reshape_3d(ctx0, ggml_cont(ctx0, Q), HD, NH, 1);
+        K_cur = ggml_reshape_3d(ctx0, ggml_cont(ctx0, K_cur), HD, NH, 1);
+        V_cur = ggml_reshape_3d(ctx0, ggml_cont(ctx0, V_cur), HD, NH, 1);
+
+        // RoPE (backbone uses max_period which may differ from 10000)
+        Q = ggml_rope_ext(ctx0, Q, pos_tensor, nullptr, HD, GGML_ROPE_TYPE_NORMAL, 0, (float)hp.max_period, 1.0f,
+                          0.0f, 1.0f, 0.0f, 0.0f);
+        K_cur = ggml_rope_ext(ctx0, K_cur, pos_tensor, nullptr, HD, GGML_ROPE_TYPE_NORMAL, 0, (float)hp.max_period,
+                              1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+        // After RoPE: Q, K_cur, V_cur are (HD, NH, 1).
+        // Permute to (HD, 1, NH) for concat with past KV (HD, pos, NH).
+        K_cur = ggml_cont(ctx0, ggml_permute(ctx0, K_cur, 0, 2, 1, 3)); // (HD, 1, NH)
+        V_cur = ggml_cont(ctx0, ggml_permute(ctx0, V_cur, 0, 2, 1, 3));
+
+        // Mark new K/V as outputs (after permute, layout = (HD, 1, NH))
+        char name[64];
+        snprintf(name, sizeof(name), "new_k_%d", l);
+        kv_io[l].new_k = ggml_cont(ctx0, K_cur);
+        ggml_set_name(kv_io[l].new_k, name);
+        ggml_set_output(kv_io[l].new_k);
+
+        snprintf(name, sizeof(name), "new_v_%d", l);
+        kv_io[l].new_v = ggml_cont(ctx0, V_cur);
+        ggml_set_name(kv_io[l].new_v, name);
+        ggml_set_output(kv_io[l].new_v);
+
+        // Concat past K/V with current for attention
+        ggml_tensor* K_full;
+        ggml_tensor* V_full;
+        if (pos > 0) {
+            K_full = ggml_concat(ctx0, kv_io[l].past_k, K_cur, 1); // (HD, seq_len, NH)
+            V_full = ggml_concat(ctx0, kv_io[l].past_v, V_cur, 1);
+        } else {
+            K_full = K_cur; // (HD, 1, NH)
+            V_full = V_cur;
+        }
+
+        // Permute Q for flash_attn: (HD, NH, 1) -> (HD, 1, NH)
+        Q = ggml_cont(ctx0, ggml_permute(ctx0, Q, 0, 2, 1, 3)); // (HD, 1, NH)
+        // K_full, V_full already in (HD, T, NH) layout
+
+        // Causal attention (no mask needed — Q has T=1, so all KV positions are attended)
+        float scale = 1.0f / sqrtf((float)HD);
+        ggml_tensor* attn = ggml_flash_attn_ext(ctx0, Q, K_full, V_full, nullptr, scale, 0.0f, 0.0f);
+
+        // Output: (HD, NH, 1) -> (D, 1)
+        attn = ggml_reshape_2d(ctx0, attn, D, 1);
+
+        // Output projection
+        attn = ggml_mul_mat(ctx0, L.attn_out_proj, attn);
+
+        x = ggml_add(ctx0, residual, attn);
+
+        // FFN
+        residual = x;
+        h = ggml_norm(ctx0, x, 1e-5f);
+        if (L.ffn_norm_w)
+            h = ggml_mul(ctx0, h, L.ffn_norm_w);
+        if (L.ffn_norm_b)
+            h = ggml_add(ctx0, h, L.ffn_norm_b);
+
+        h = ggml_mul_mat(ctx0, L.ffn_linear1, h); // (FF, 1)
+        h = ggml_gelu(ctx0, h);
+        h = ggml_mul_mat(ctx0, L.ffn_linear2, h); // (D, 1)
+
+        x = ggml_add(ctx0, residual, h);
+    }
+
+    // Final LayerNorm
+    x = ggml_norm(ctx0, x, 1e-5f);
+    if (m.out_norm_w)
+        x = ggml_mul(ctx0, x, m.out_norm_w);
+    if (m.out_norm_b)
+        x = ggml_add(ctx0, x, m.out_norm_b);
+
+    ggml_set_name(x, "backbone_out");
+    ggml_set_output(x);
+
+    // Build graph — expand main output + all new_k/new_v outputs
+    ggml_cgraph* gf = ggml_new_graph_custom(ctx0, graph_nodes, false);
+    ggml_build_forward_expand(gf, x);
+    for (int l = 0; l < NL; l++) {
+        ggml_build_forward_expand(gf, kv_io[l].new_k);
+        ggml_build_forward_expand(gf, kv_io[l].new_v);
+    }
+
+    // Allocate
+    ggml_gallocr_t galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(pctx->backend_cpu));
+    if (!ggml_gallocr_alloc_graph(galloc, gf)) {
+        fprintf(stderr, "pocket_tts: backbone_forward_step_ggml: alloc failed\n");
+        ggml_gallocr_free(galloc);
+        ggml_free(ctx0);
+        memset(out, 0, D * sizeof(float));
+        return;
+    }
+
+    // Set inputs
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "x_in"), x_in, 0, D * sizeof(float));
+    int32_t pos_val = pos;
+    ggml_backend_tensor_set(ggml_graph_get_tensor(gf, "pos"), &pos_val, 0, sizeof(int32_t));
+
+    // Upload past K/V from host cache
+    auto& kv = pctx->backbone_kv;
+    for (int l = 0; l < NL; l++) {
+        if (pos > 0) {
+            // Host cache layout: k[layer * max_seq * NH * HD + pos * NH * HD + head * HD + d]
+            // We need (HD, pos, NH) for ggml: ne[0]=HD contiguous, then pos, then NH.
+            // Host cache has: for each pos, NH*HD contiguous = (NH, HD) per pos.
+            // ggml wants: for each head, pos*HD contiguous, then next head.
+            // So we need to transpose from (pos, NH, HD) to (HD, pos, NH).
+            // Actually host layout per layer is: [pos][head][d] = stride pos = NH*HD.
+            // ggml (HD, pos, NH): ne[0]=HD, ne[1]=pos, ne[2]=NH.
+            // Data layout: for h in NH, for p in pos, for d in HD: data[h*pos*HD + p*HD + d]
+            // Host layout: for p in pos, for h in NH, for d in HD: data[p*NH*HD + h*HD + d]
+            // These differ — need to reorder.
+            size_t stride_layer = (size_t)kv.max_seq * NH * HD;
+            std::vector<float> k_reorder((size_t)NH * pos * HD);
+            std::vector<float> v_reorder((size_t)NH * pos * HD);
+            for (int h = 0; h < NH; h++) {
+                for (int p = 0; p < pos; p++) {
+                    for (int d = 0; d < HD; d++) {
+                        k_reorder[(size_t)h * pos * HD + p * HD + d] =
+                            kv.k[l * stride_layer + (size_t)p * NH * HD + h * HD + d];
+                        v_reorder[(size_t)h * pos * HD + p * HD + d] =
+                            kv.v[l * stride_layer + (size_t)p * NH * HD + h * HD + d];
+                    }
+                }
+            }
+            char name[64];
+            snprintf(name, sizeof(name), "past_k_%d", l);
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, name), k_reorder.data(), 0,
+                                    k_reorder.size() * sizeof(float));
+            snprintf(name, sizeof(name), "past_v_%d", l);
+            ggml_backend_tensor_set(ggml_graph_get_tensor(gf, name), v_reorder.data(), 0,
+                                    v_reorder.size() * sizeof(float));
+        }
+    }
+
+    // Compute
+    int n_threads = pctx->params.n_threads > 0 ? pctx->params.n_threads : 4;
+    ggml_backend_cpu_set_n_threads(pctx->backend_cpu, n_threads);
+    ggml_backend_graph_compute(pctx->backend_cpu, gf);
+
+    // Read backbone output
+    ggml_backend_tensor_get(ggml_graph_get_tensor(gf, "backbone_out"), out, 0, D * sizeof(float));
+
+    // Read new K/V and store in host cache
+    for (int l = 0; l < NL; l++) {
+        // new_k/new_v are (HD, 1, NH) — read and store at cache[layer][pos]
+        std::vector<float> new_k(NH * HD), new_v(NH * HD);
+        char name[64];
+        snprintf(name, sizeof(name), "new_k_%d", l);
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, name), new_k.data(), 0, new_k.size() * sizeof(float));
+        snprintf(name, sizeof(name), "new_v_%d", l);
+        ggml_backend_tensor_get(ggml_graph_get_tensor(gf, name), new_v.data(), 0, new_v.size() * sizeof(float));
+
+        // ggml layout: (HD, 1, NH) = for h in NH: HD values. = [h0d0..h0d63, h1d0..h1d63, ...]
+        // Host layout at cache[layer][pos]: (NH, HD) = [h0d0..h0d63, h1d0..h1d63, ...]
+        // Same layout! Just copy directly.
+        float* k_slot = kv_k_ptr(kv, l, pos);
+        float* v_slot = kv_v_ptr(kv, l, pos);
+        memcpy(k_slot, new_k.data(), new_k.size() * sizeof(float));
+        memcpy(v_slot, new_v.data(), new_v.size() * sizeof(float));
+    }
+
+    ggml_gallocr_free(galloc);
+    ggml_free(ctx0);
+}
+
+// ── Backbone forward: single position (AR step, legacy manual) ────
 
 // Process a single input position through the 6-layer transformer,
 // using the KV cache for attending to all previous positions.
@@ -1044,6 +1300,15 @@ static void backbone_forward_step(pocket_tts_context* pctx, const float* x_in, f
 
     // Final LayerNorm (out_norm)
     layer_norm(out, cur.data(), D, tensor_f32_data(m.out_norm_w), tensor_f32_data(m.out_norm_b));
+}
+
+// Dispatch: ggml or manual backbone forward step
+static void backbone_step(pocket_tts_context* pctx, const float* x_in, float* out) {
+    if (getenv("POCKET_MANUAL_BACKBONE")) {
+        backbone_forward_step(pctx, x_in, out);
+    } else {
+        backbone_forward_step_ggml(pctx, x_in, out);
+    }
 }
 
 // ── Flow net (consistency head) forward ───────────────────────────
@@ -2605,7 +2870,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
         for (int f = 0; f < n_voice; f++) {
             const float* vc = &ctx->voice_conditioning[f * D];
             std::vector<float> backbone_out(D);
-            backbone_forward_step(ctx, vc, backbone_out.data());
+            backbone_step(ctx, vc, backbone_out.data());
             ctx->backbone_kv.offset++;
         }
         if (ctx->verbosity >= 1)
@@ -2630,7 +2895,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
             text_emb_dump.insert(text_emb_dump.end(), emb, emb + D);
 
         std::vector<float> backbone_out(D);
-        backbone_forward_step(ctx, emb, backbone_out.data());
+        backbone_step(ctx, emb, backbone_out.data());
         ctx->backbone_kv.offset++;
     }
 
@@ -2687,7 +2952,7 @@ float* pocket_tts_synthesize(struct pocket_tts_context* ctx, const char* text, i
     for (int frame = 0; frame < max_frames; frame++) {
         // Run backbone on current input
         std::vector<float> backbone_out(D);
-        backbone_forward_step(ctx, prev_input.data(), backbone_out.data());
+        backbone_step(ctx, prev_input.data(), backbone_out.data());
         ctx->backbone_kv.offset++;
 
         // Dump step-0 backbone output for diff testing
