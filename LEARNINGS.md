@@ -8596,6 +8596,25 @@ wall-time impact would be negligible.
 recovers content that greedy misses entirely, not just minor spelling fixes.
 The v3 8K-vocab model benefits less (larger vocab = better greedy baseline).
 
+### Extended benchmark: all parakeet model variants (10s + 60s FLEURS, CPU)
+
+| Model | Type | 10s greedy | 10s MAES | 60s greedy→MAES time |
+|---|---|---|---|---|
+| tdt-0.6b-v2 (1K) | TDT | "...by 25%." | "...by 25 years." ✓ | 3:59 → 5:21 (+35%) |
+| tdt-0.6b-v3 (8K) | TDT | "...by 25-30 years." | "...by 25 to 30 years." ✓ | — |
+| tdt-1.1b (8K) | TDT | "...by twenty five to thirty years" | identical | — |
+| tdt_ctc-110m (1K) | TDT | garbled ("commununication") | same garble | — |
+| rnnt-0.6b (8K) | RNNT | "...by twenty five to thirty years" | identical | — |
+| rnnt-1.1b (8K) | RNNT | 60s: truncated at "lettering" | identical | 7:37 → 9:28 (+25%) |
+
+**Findings**: MAES helps most on smaller models with smaller vocabs (v2 1K).
+Larger models (1.1b) and larger vocabs (8K) already have strong greedy
+baselines where MAES matches but doesn't improve. The 110M model is too
+small — MAES can't fix model capacity limits.
+
+RNNT MAES works correctly but shows no improvement over greedy on these
+test clips — the RNNT models produce clean output on clean audio.
+
 ### CTC prefix beam search — shared core for all CTC backends
 
 Added `core_ctc::prefix_beam_search()` in `src/core/ctc.h`. Any backend
