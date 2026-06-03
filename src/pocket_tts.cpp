@@ -1617,12 +1617,12 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
         mult *= 2;
     int C_init = mult * n_filters; // e.g., 8 * 64 = 512 for 3 ratios
 
-    // Initial conv with same-padding
-    int pad_init = seanet_K / 2;
+    // Initial conv with causal padding (left-only, matching SEANet streaming convention)
+    int pad_init_left = seanet_K - 1; // effective_kernel - stride, stride=1
     std::vector<float> seanet_buf(C_init * T_cur);
     if (sd.initial_conv_w) {
-        conv1d_eager(seanet_buf.data(), dec_in.data(), C_cur, T_cur, sd.initial_conv_w, sd.initial_conv_b, 1, pad_init,
-                     pad_init);
+        conv1d_eager(seanet_buf.data(), dec_in.data(), C_cur, T_cur, sd.initial_conv_w, sd.initial_conv_b, 1,
+                     pad_init_left, 0);
         C_cur = C_init;
     } else {
         seanet_buf = dec_in;
@@ -1639,17 +1639,23 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
         for (int i = 0; i < C_cur * T_cur; i++)
             seanet_buf[i] = elu_f(seanet_buf[i]);
 
-        // ConvTranspose1d (upsample by ratio)
+        // ConvTranspose1d (upsample by ratio) — causal: no padding, trim right by K-S
         if (stage.convtr_w) {
             int K_tr = (int)stage.convtr_w->ne[0];
-            int pad_tr = (K_tr - ratio) / 2;
-            if (pad_tr < 0)
-                pad_tr = 0;
-            int T_new = (T_cur - 1) * ratio + K_tr - 2 * pad_tr;
-            std::vector<float> up_buf(C_out * T_new);
+            int T_full = (T_cur - 1) * ratio + K_tr; // full transposed conv output
+            int T_new = T_cur * ratio;               // causal: keep first T*S samples
+            std::vector<float> up_buf(C_out * T_full);
             conv_transpose1d_eager(up_buf.data(), seanet_buf.data(), C_cur, T_cur, stage.convtr_w, stage.convtr_b,
-                                   ratio, pad_tr);
-            seanet_buf = std::move(up_buf);
+                                   ratio, 0); // pad=0
+            // Trim right by (K_tr - ratio) to get causal output
+            if (T_new < T_full) {
+                std::vector<float> trimmed(C_out * T_new);
+                for (int c = 0; c < C_out; c++)
+                    memcpy(&trimmed[c * T_new], &up_buf[c * T_full], T_new * sizeof(float));
+                seanet_buf = std::move(trimmed);
+            } else {
+                seanet_buf = std::move(up_buf);
+            }
             T_cur = T_new;
             C_cur = C_out;
         }
@@ -1671,20 +1677,21 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
                 for (int i = 0; i < C_cur * T_cur; i++)
                     act_buf[i] = elu_f(seanet_buf[i]);
 
-                // Dilated conv (with dilation-adjusted padding)
-                int pad_d = dilation * (res_K - 1) / 2;
-                conv1d_eager(h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d, pad_d);
+                // Dilated conv — causal: pad_left = (K-1)*dilation, pad_right = 0
+                int eff_K = (res_K - 1) * dilation + 1; // effective kernel size
+                int pad_d_left = eff_K - 1;             // causal left padding
+                conv1d_eager(h.data(), act_buf.data(), C_cur, T_cur, rb.conv0_w, rb.conv0_b, 1, pad_d_left, 0);
                 int C_h = (int)rb.conv0_w->ne[2];
 
                 // ELU
                 for (int i = 0; i < C_h * T_cur; i++)
                     h[i] = elu_f(h[i]);
 
-                // Second conv (k=1 or same-padded)
+                // Second conv — causal: pad_left = K-1, pad_right = 0
                 int K1 = (int)rb.conv1_w->ne[0];
-                int pad1 = K1 / 2;
+                int pad1_left = K1 - 1;
                 std::vector<float> h2(C_cur * T_cur);
-                conv1d_eager(h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1, pad1);
+                conv1d_eager(h2.data(), h.data(), C_h, T_cur, rb.conv1_w, rb.conv1_b, 1, pad1_left, 0);
 
                 // Residual add
                 for (int i = 0; i < C_cur * T_cur; i++)
@@ -1698,12 +1705,12 @@ static void mimi_decode(pocket_tts_context* pctx, const float* latent_seq, int n
         seanet_buf[i] = elu_f(seanet_buf[i]);
 
     int last_K = (int)mi.seanet_last_kernel_size;
-    int pad_last = last_K / 2;
-    int n_out_samples = T_cur; // same-padded conv preserves length
+    int pad_last_left = last_K - 1; // causal
+    int n_out_samples = T_cur;      // causal pad preserves length
     std::vector<float> pcm_buf(n_out_samples);
     if (sd.final_conv_w) {
-        conv1d_eager(pcm_buf.data(), seanet_buf.data(), C_cur, T_cur, sd.final_conv_w, sd.final_conv_b, 1, pad_last,
-                     pad_last);
+        conv1d_eager(pcm_buf.data(), seanet_buf.data(), C_cur, T_cur, sd.final_conv_w, sd.final_conv_b, 1,
+                     pad_last_left, 0);
     }
 
     // Allocate output
