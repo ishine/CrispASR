@@ -1484,7 +1484,7 @@ func (s *CrispasrSession) TranslateText(text, srcLang, tgtLang string, maxTokens
 
 // TranscribeVadLang transcribes with VAD segmentation and a language hint.
 func (s *CrispasrSession) TranscribeVadLang(pcm []float32, sampleRate int,
-	vadModelPath string, language string) ([]SessionSegment, error) {
+	vadModelPath string, language string) (*TranscribeResult, error) {
 	if len(pcm) == 0 {
 		return nil, nil
 	}
@@ -1499,7 +1499,7 @@ func (s *CrispasrSession) TranscribeVadLang(pcm []float32, sampleRate int,
 		return nil, fmt.Errorf("crispasr_session_transcribe_vad_lang failed")
 	}
 	defer C.crispasr_session_result_free(res)
-	return collectSessionSegments(res), nil
+	return extractResult(res), nil
 }
 
 // DetectBackendFromGGUF returns the backend name from GGUF metadata.
