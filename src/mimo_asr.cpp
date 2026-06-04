@@ -961,23 +961,13 @@ static ggml_cgraph* mimo_asr_build_step_graph(mimo_asr_context* ctx, int n_past,
     ggml_context* ctx0 = ggml_init(ip);
     ggml_cgraph* gf = ggml_new_graph_custom(ctx0, 16384, false);
 
-    const int d = (int)hp.llm_hidden;
-    ggml_tensor* inputs_embeds;
-    if (ctx->gpu_embed_split) {
-        // PLAN #115 option B: embed_w is Q4_K on CPU (force_gpu split-load).
-        // In-graph get_rows produces a CPU-resident result the scheduler
-        // can't copy to GPU. Use an F32 input; run_lm_step fills it via
-        // host-side dequant + ggml_backend_tensor_set (host→device).
-        inputs_embeds = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d, T);
-        ggml_set_input(inputs_embeds);
-        ggml_set_name(inputs_embeds, "step_embed_input");
-    } else {
-        // CPU path: in-graph get_rows works (all tensors on same backend).
-        ggml_tensor* text_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
-        ggml_set_input(text_ids);
-        ggml_set_name(text_ids, "text_input_ids");
-        inputs_embeds = ggml_get_rows(ctx0, m.llm.embed_w, text_ids);
-    }
+    // Embed lookup straight from llm.embed_w (no audio fusion).
+    // This step graph is only used on the CPU path (gpu_embed_split routes
+    // decode steps through the prefill graph instead — see run_lm_step).
+    ggml_tensor* text_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
+    ggml_set_input(text_ids);
+    ggml_set_name(text_ids, "text_input_ids");
+    ggml_tensor* inputs_embeds = ggml_get_rows(ctx0, m.llm.embed_w, text_ids); // [d, 1]
 
     // Positions for RoPE; doubles as kv_indices when fixed_kv_len > 0.
     ggml_tensor* positions = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, T);
@@ -1451,6 +1441,7 @@ static std::vector<int32_t> mimo_asr_concat_segments(int channels_plus_text,
 //   • The KV buffer is zero-cleared at mimo_asr_kv_init (already in
 //     place at line ~459) — required to avoid CUDA / partial-CPU
 //     noise from uninit'd KV pages (cf. qwen3-tts commit 7298dd5).
+static float* mimo_asr_run_lm(mimo_asr_context* ctx, const int32_t* input_ids_9xT, int T_total, int n_past);
 static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, int n_past_groups) {
     const auto& hp = ctx->hp;
     const int vocab = (int)hp.llm_vocab;
@@ -1460,6 +1451,34 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
         return nullptr;
     }
 
+    if (ctx->gpu_embed_split) {
+        // PLAN #115 option B (GPU path): reuse the prefill graph for
+        // decode steps. The prefill graph handles the cross-backend embed
+        // lookup correctly (scheduler routes get_rows to CPU, copies the
+        // result to GPU). Building a separate T=1 step graph with an F32
+        // embed input hits scheduler backend-assignment bugs on P100.
+        // The audio branch computes zero (speech_active_mask=0) — minor
+        // overhead for 1 token with gs=4, dwarfed by the 36L LM.
+        const int gs = (int)hp.audio_group_size;
+        const int channels = (int)hp.audio_channels;
+        const int T_seg = gs; // 1 text token × gs = gs frames
+        std::vector<int32_t> block((size_t)(channels + 1) * T_seg);
+        // Row 0: text token replicated via insert_between pattern
+        auto row0 = mimo_asr_insert_between({next_token}, gs, /*fill*/ -100);
+        std::memcpy(block.data(), row0.data(), (size_t)T_seg * sizeof(int32_t));
+        // Rows 1-8: zeroemb padding
+        for (int c = 0; c < channels; c++) {
+            int32_t pad = (int32_t)hp.speech_zeroemb_idx[c];
+            for (int t = 0; t < T_seg; t++)
+                block[(size_t)(1 + c) * T_seg + t] = pad;
+        }
+        // Invalidate the cached step graph (prefill graph uses compute_meta)
+        ctx->step_t1_gf = nullptr;
+        ctx->step_t1_fixed_kv_len = 0;
+        return mimo_asr_run_lm(ctx, block.data(), T_seg, n_past_groups);
+    }
+
+    // CPU path: use the fast cached T=1 step graph with in-graph get_rows.
     const int fixed_kv = ctx->kv_max_ctx;
     const bool can_skip = (ctx->step_t1_gf != nullptr && ctx->step_t1_fixed_kv_len == fixed_kv);
 
@@ -1467,25 +1486,10 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
     if (can_skip) {
         gf = ctx->step_t1_gf;
     } else {
-        // n_past=0 here is intentional — only kv_indices (= lm_positions)
-        // controls the cache write slot when fixed_kv_len > 0, and Lk is
-        // already pinned to fixed_kv. The `n_past` parameter is unused
-        // by core_attn::kv_self_attn in that mode (the static-offset
-        // write path is suppressed by kv_indices != nullptr).
         gf = mimo_asr_build_step_graph(ctx, /*n_past*/ 0, /*fixed_kv_len*/ fixed_kv);
         if (!gf)
             return nullptr;
         ggml_backend_sched_reset(ctx->sched);
-        // PLAN #115: when using the F32 embed input, pin it to the GPU
-        // backend so the scheduler allocates it there and all downstream
-        // ops stay on GPU. Without this, the scheduler may assign the
-        // input to CPU (no weight reference to anchor it) and CUDA
-        // kernels would read an invalid pointer.
-        if (ctx->gpu_embed_split) {
-            ggml_tensor* ei = ggml_graph_get_tensor(gf, "step_embed_input");
-            if (ei)
-                ggml_backend_sched_set_tensor_backend(ctx->sched, ei, ctx->backend);
-        }
         if (!ggml_backend_sched_alloc_graph(ctx->sched, gf)) {
             fprintf(stderr, "mimo_asr_run_lm_step: alloc_graph failed\n");
             return nullptr;
@@ -1504,33 +1508,11 @@ static float* mimo_asr_run_lm_step(mimo_asr_context* ctx, int32_t next_token, in
 
     int32_t tok = next_token;
     int32_t pos = n_past_groups;
+    if (!set_t("text_input_ids", &tok, sizeof(tok)))
+        return nullptr;
     if (!set_t("lm_positions", &pos, sizeof(pos)))
         return nullptr;
 
-    if (ctx->gpu_embed_split) {
-        // PLAN #115 option B: host-side embed dequant for GPU path.
-        const int d = (int)hp.llm_hidden;
-        const ggml_tensor* ew = ctx->model.llm.embed_w;
-        const size_t row_nb = ew->nb[1];
-        std::vector<uint8_t> qrow(row_nb);
-        std::vector<float> embed(d);
-        ggml_backend_tensor_get(ew, qrow.data(), (size_t)tok * row_nb, row_nb);
-        const auto* traits = ggml_get_type_traits(ew->type);
-        if (traits->to_float) {
-            traits->to_float(qrow.data(), embed.data(), d);
-        } else {
-            std::memcpy(embed.data(), qrow.data(), d * sizeof(float));
-        }
-        if (!set_t("step_embed_input", embed.data(), d * sizeof(float)))
-            return nullptr;
-    } else {
-        // CPU path: set token id for in-graph get_rows.
-        if (!set_t("text_input_ids", &tok, sizeof(tok)))
-            return nullptr;
-    }
-
-    // Causal mask shape (fixed_kv, 1): visible up to and including
-    // position n_past_groups, -INF beyond.
     std::vector<ggml_fp16_t> mask((size_t)fixed_kv);
     const ggml_fp16_t z = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
