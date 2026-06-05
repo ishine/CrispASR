@@ -262,35 +262,27 @@ static inline ggml_tensor* wn_weight(const wn_conv& wn) {
     return wn.w;
 }
 
-// Snake1d: y = x + sin²(alpha * x) / alpha
-// Rewritten using cos double-angle identity to avoid ggml's fused
-// aa_snake_beta pattern match. sin²(u) = (1 - cos(2u))/2, so:
-// sin²(α·x)/α = (1 - cos(2·α·x)) / (2·α)
+// Snake1d: y = x + sin²(alpha * x) * inv_alpha
+// Uses pre-computed inv_alpha to avoid ggml_div (which triggers fused aa_snake).
+// Computes sin, then element-wise square (not ggml_sqr which also triggers it).
 static ggml_tensor* snake1d(ggml_context* ctx, ggml_tensor* x,
                              ggml_tensor* alpha, ggml_tensor* inv_alpha) {
     if (!alpha || !inv_alpha) return x;
     const int C = (int)x->ne[0];
+    const int T = (int)x->ne[1];
 
-    // Reshape alpha and inv_alpha to (C, 1) for broadcasting over (C, T)
     ggml_tensor* a = ggml_cast(ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, alpha, C, 1)), GGML_TYPE_F32);
     ggml_tensor* ia = ggml_cast(ctx, ggml_cont(ctx, ggml_reshape_2d(ctx, inv_alpha, C, 1)), GGML_TYPE_F32);
 
-    // two_ax = 2 * alpha * x,  shape (C, T)
-    ggml_tensor* two_ax = ggml_scale(ctx, ggml_mul(ctx, x, a), 2.0f);
+    // sin(alpha * x)
+    ggml_tensor* ax = ggml_mul(ctx, x, a);
+    ggml_tensor* sin_ax = ggml_sin(ctx, ax);
 
-    // cos_2ax = cos(2*alpha*x),  shape (C, T)
-    ggml_tensor* cos_2ax = ggml_cos(ctx, two_ax);
+    // sin²(alpha * x) = sin * sin (element-wise, avoids ggml_sqr pattern)
+    ggml_tensor* sin2 = ggml_mul(ctx, sin_ax, sin_ax);
 
-    // neg_cos = -cos(2ax) * (inv_alpha/2),  shape (C, T)
-    // This is -cos(2ax)/(2*alpha). We use ggml_mul to broadcast ia (C,1) over (C,T).
-    ggml_tensor* half_ia = ggml_scale(ctx, ia, 0.5f);   // (C, 1)
-    ggml_tensor* neg_term = ggml_mul(ctx, cos_2ax, half_ia); // (C, T) — the cos*half_ia part
-
-    // pos_term = inv_alpha/2 broadcast to (C, T) — use ggml_repeat
-    ggml_tensor* pos_term = ggml_repeat(ctx, half_ia, cos_2ax); // (C, 1) → (C, T)
-
-    // term = 1/(2*alpha) - cos(2ax)/(2*alpha) = (1 - cos(2ax)) / (2*alpha) = sin²(ax)/alpha
-    ggml_tensor* term = ggml_sub(ctx, pos_term, neg_term);
+    // sin² * inv_alpha — broadcast (C,1) over (C,T) via ggml_mul
+    ggml_tensor* term = ggml_mul(ctx, sin2, ia);
 
     return ggml_add(ctx, x, term);
 }
@@ -319,31 +311,32 @@ static ggml_tensor* wn_conv1d(ggml_context* ctx, ggml_tensor* x, const wn_conv& 
 }
 
 // ConvTranspose1d with weight-normed weights.
-// Uses core_convt::convt1d_crop pattern.
-// x: (C_in, T) → (C_out, T*stride)
+// PyTorch: ConvTranspose1d(Cin, Cout, kernel_size=2*s, stride=s, padding=ceil(s/2))
+// Output length: (T-1)*s - 2*ceil(s/2) + 2*s = (T-1)*s + 2*s - 2*ceil(s/2)
 static ggml_tensor* wn_convt1d(ggml_context* ctx, ggml_tensor* x,
                                 const wn_conv& wn, int stride) {
     ggml_tensor* w = wn_weight(wn);
     if (!w) return x;
 
-    // ggml_conv_transpose_1d expects a = (K, C_out, C_in), b = (T, C_in)
-    // GGUF stores weight as (K, C_out, C_in) — already correct, no permute needed.
+    const int K = (int)w->ne[0];   // kernel_size = 2*stride
     const int Cout = (int)w->ne[1];
     const int T = (int)x->ne[1];
-    const int T_out = T * stride;
+    const int pad = (stride + 1) / 2;  // ceil(stride/2), matches Python
+    // PyTorch output: (T-1)*stride - 2*pad + K
+    const int T_out = (T - 1) * stride - 2 * pad + K;
 
     ggml_tensor* xt = ggml_cont(ctx, ggml_transpose(ctx, x)); // (T, C_in)
+    // ggml_conv_transpose_1d with p0=0 produces raw output without cropping
     ggml_tensor* y = ggml_conv_transpose_1d(ctx, w, xt, stride, 0, 1);
-    // Result needs cropping: remove `pad` from each side
-    // y shape: roughly (T_raw, C_out)
-    int T_raw = (int)y->ne[0];
-    if (T_raw > T_out) {
-        int crop = (T_raw - T_out) / 2;
-        y = ggml_view_2d(ctx, y, T_out, Cout,
-                          y->nb[1], (size_t)crop * y->nb[0]);
-        y = ggml_cont(ctx, y);
-    }
-    y = ggml_reshape_2d(ctx, y, T_out, Cout);
+    // Raw output length from ggml: (T-1)*stride + K
+    // Crop `pad` from left, rest from right to get T_out
+    int crop_left = pad;
+    int crop_right = (T - 1) * stride + K - T_out - crop_left;
+    (void)crop_right;
+    // View into y starting at offset crop_left, taking T_out elements
+    y = ggml_view_2d(ctx, y, T_out, Cout,
+                      y->nb[1], (size_t)crop_left * sizeof(float));
+    y = ggml_cont(ctx, y);
     y = ggml_cont(ctx, ggml_transpose(ctx, y)); // (C_out, T_out)
     if (wn.b) {
         y = ggml_add(ctx, y, ggml_cast(ctx, wn.b, GGML_TYPE_F32));
@@ -499,7 +492,19 @@ static ggml_cgraph* build_decode_graph(tada_codec_context* c, int n_frames) {
     ggml_build_forward_expand(gf, dump_dac_in);
 
     // 4 decoder blocks with strides [4,4,5,6]
-    for (int b = 0; b < 4; b++) {
+    // Inline block 0 for debugging
+    {
+        auto& blk = c->blocks[0];
+        cur = snake1d(ctx0, cur, blk.snake_alpha, blk.inv_snake_alpha);
+        ggml_tensor* d_s = ggml_cont(ctx0, cur); ggml_set_name(d_s, "dump_b0_snake"); ggml_build_forward_expand(gf, d_s);
+        cur = wn_convt1d(ctx0, cur, blk.up_conv, c->strides[0]);
+        ggml_tensor* d_c = ggml_cont(ctx0, cur); ggml_set_name(d_c, "dump_b0_convt"); ggml_build_forward_expand(gf, d_c);
+        static const int dils[3] = {1, 3, 9};
+        for (int r = 0; r < 3; r++) {
+            cur = res_unit(ctx0, cur, blk.res[r], dils[r]);
+        }
+    }
+    for (int b = 1; b < 4; b++) {
         cur = dec_block(ctx0, cur, c->blocks[b], c->strides[b]);
         char dname[32];
         snprintf(dname, sizeof(dname), "dump_blk%d", b);
@@ -665,6 +670,8 @@ float* tada_codec_decode(struct tada_codec_context* ctx,
     dump("dump_attn");
     dump("dump_layer0");
     dump("dump_dac_in");
+    dump("dump_b0_snake");
+    dump("dump_b0_convt");
     dump("dump_blk0");
     dump("dump_blk1");
     dump("dump_blk2");
