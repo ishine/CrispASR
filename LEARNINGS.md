@@ -8023,6 +8023,40 @@ CPU path is unchanged (fast cached T=1 step graph with in-graph `get_rows`).
 
 **GPU is now the default** (`a429bb45`). Override: `CRISPASR_MIMO_FORCE_CPU=1`.
 
+### 2026-06-05 update — k-quant CUDA GET_ROWS fix (the proper ggml fix)
+
+The root cause of the entire PLAN #115 saga was that CUDA GET_ROWS didn't
+support k-quants (Q2_K–Q6_K). The `supports_op` list in `ggml-cuda.cu:5004`
+only covered F16/F32/BF16/I32 and legacy quants (Q4_0–Q8_0). When a Q4_K
+embedding table sat on GPU, `get_rows` was routed to CPU, which then
+dereference'd the GPU pointer as host memory → SIGSEGV.
+
+**Fix** (`3bf9a599`): add k-quant support to CUDA GET_ROWS by using the
+existing `ggml_get_to_fp32_cuda()` row-dequantize infrastructure from
+`convert.cu`. For each selected row, copy the index to host, then launch
+the type-appropriate dequantize kernel (e.g. `dequantize_block_q4_K`).
+Overhead is negligible for typical embedding lookups (1-4 rows of 4096).
+
+**Validated on RTX 3090 (RunPod):** all weights GPU-resident (no split-load),
+2.0× realtime, correct JFK transcript, 26 decode steps clean.
+
+| Approach | Split-load? | Decode ms/step | Realtime | Complexity |
+|----------|------------|----------------|----------|------------|
+| Option B: prefill-graph reuse | Yes (embed CPU) | 10 ms | 2.4× | Medium — workaround |
+| **k-quant GET_ROWS fix** | **No** | 31 ms | 2.0× | **Low — proper ggml fix** |
+
+The per-step gap (10 vs 31 ms) is because the k-quant GET_ROWS copies
+indices to host and launches sequential dequant kernels, while the
+prefill-graph approach keeps the embed on CPU and lets the scheduler
+insert one bulk copy. A fused k-quant GET_ROWS kernel (single launch,
+no host round-trip) would close the gap — filed as upstream PR 16.
+
+Both approaches produce identical transcripts. The codebase currently
+ships both: the prefill-graph workaround (faster) is used when
+`gpu_embed_split` is true, and the k-quant GET_ROWS (simpler) handles
+the all-GPU case. A future simplification could drop `gpu_embed_split`
+entirely once the fused kernel is optimized.
+
 ### Cross-refs
 
 - HISTORY 2026-05-26 "PLAN #115 — mimo-asr M1 Metal silent-empty fix (option A)" for the bisect + fix chronology
@@ -8030,6 +8064,8 @@ CPU path is unchanged (fast cached T=1 step graph with in-graph `get_rows`).
 - [[project_chatterbox_gpu_bug_s3gen]] for a different shape of the same general problem (sched parallel=true fixed it there)
 - `src/mimo_asr.cpp` commit `c887881e` for the option A landing
 - `src/mimo_asr.cpp` commit `ec3ba861` for the option B (prefill-graph reuse) landing
+- `ggml/src/ggml-cuda/getrows.cu` commit `3bf9a599` for the k-quant GET_ROWS fix
+- `tools/upstream-prs/16-sched-small-graph-cross-backend.md` for the upstream PR draft
 - `tools/runpod-gpu-test.sh` for the RunPod GPU test script
 
 ## funasr CUDA !-loop — all-NaN prefill logits (issue #125, §136)
