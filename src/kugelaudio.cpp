@@ -999,7 +999,7 @@ static bool alloc_kv_cache(kugelaudio_context* ctx, int max_ctx,
     enum ggml_type kv_type = core_attn::kv_dtype_from_env("kugelaudio");
 
     size_t kv_mem = 2 * ggml_tensor_overhead() + 256;
-    ggml_init_params kv_ip = {kv_mem, nullptr, false};
+    ggml_init_params kv_ip = {kv_mem, nullptr, true};  // no_alloc=true: data goes on backend buffer
     kv_ctx_out = ggml_init(kv_ip);
 
     kv_k_out = ggml_new_tensor_4d(kv_ctx_out, kv_type,
