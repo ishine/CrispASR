@@ -450,12 +450,20 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x,
                 (long long)enc_in.w->ne[0], (long long)enc_in.w->ne[1], (long long)enc_in.w->ne[2]);
         x = conv1d(ctx, x, enc_in.w, enc_in.b, 1, 3, 1);
         if (std::getenv("AUDIOSEAL_DEBUG")) fprintf(stderr, "  after enc_in: x ne=[%lld,%lld]\n", (long long)x->ne[0], (long long)x->ne[1]);
+        if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+            ggml_set_name(x, "stage_enc_0");
+            ggml_set_output(x);
+        }
     }
 
     // 4 blocks: resblock → ELU → downsample
     for (int i = 0; i < 4; i++) {
         if (std::getenv("AUDIOSEAL_DEBUG")) fprintf(stderr, "  resblock %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         x = build_resblock(ctx, x, res[i]);
+        if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+            char nm[32]; snprintf(nm, sizeof(nm), "stage_enc_res%d", i);
+            ggml_set_name(x, nm); ggml_set_output(x);
+        }
         if (std::getenv("AUDIOSEAL_DEBUG")) fprintf(stderr, "  after resblock %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         x = elu(ctx, x);
         if (down[i].w) {
@@ -464,13 +472,17 @@ static ggml_tensor* forward_encoder(ggml_context* ctx, ggml_tensor* x,
             int pad_total = K - ratio;
             int pad_left = pad_total / 2;
             int pad_right = pad_total - pad_left;
-            // Asymmetric padding: add extra right-pad when pad_total is odd
-            if (pad_right > pad_left) {
-                x = ggml_pad_ext(ctx, x, 0, pad_right - pad_left, 0, 0, 0, 0, 0, 0);
-            }
+            // Apply all padding externally (matching PyTorch F.pad) since
+            // ggml_conv_1d only supports symmetric padding.
+            // NOTE: ggml_pad_ext convention may swap left/right — test both
+            x = ggml_pad_ext(ctx, x, pad_right, pad_left, 0, 0, 0, 0, 0, 0);
             if (std::getenv("AUDIOSEAL_DEBUG")) fprintf(stderr, "  down %d: ratio=%d K=%d pad_l=%d pad_r=%d w ne=[%lld,%lld,%lld]\n",
                     i, ratio, K, pad_left, pad_right, (long long)down[i].w->ne[0], (long long)down[i].w->ne[1], (long long)down[i].w->ne[2]);
-            x = conv1d(ctx, x, down[i].w, down[i].b, ratio, pad_left, 1);
+            x = conv1d(ctx, x, down[i].w, down[i].b, ratio, 0, 1); // pad=0 (done externally)
+            if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+                char nm[32]; snprintf(nm, sizeof(nm), "stage_enc_down%d", i);
+                ggml_set_name(x, nm); ggml_set_output(x);
+            }
             if (std::getenv("AUDIOSEAL_DEBUG")) fprintf(stderr, "  after down %d: x ne=[%lld,%lld]\n", i, (long long)x->ne[0], (long long)x->ne[1]);
         }
     }
@@ -548,11 +560,13 @@ static ggml_tensor* forward_decoder(ggml_context* ctx, ggml_tensor* x,
             // ggml_conv_transpose_1d has no padding — crop output manually
             ggml_tensor* y = ggml_conv_transpose_1d(ctx, up[i].w, x, ratio, 0, 1);
             y = ggml_reshape_2d(ctx, y, y->ne[0], y->ne[1]);
-            // Crop pad_left from start and pad_right from end
+            // Crop pad_right from start and pad_left from end (ggml dim-0
+            // convention is reversed from PyTorch — empirically verified
+            // via encoder stage comparison).
             if (pad_total > 0) {
                 int out_t = (int)y->ne[0] - pad_left - pad_right;
                 y = ggml_view_2d(ctx, y, out_t, (int)y->ne[1],
-                                 y->nb[1], (size_t)pad_left * sizeof(float));
+                                 y->nb[1], (size_t)pad_right * sizeof(float));
                 y = ggml_cont(ctx, y);
             }
             if (up[i].b) {
@@ -668,22 +682,21 @@ float* audioseal_embed(struct audioseal_ctx* ctx,
     ggml_set_name(x_in, "audio_in");
     ggml_set_input(x_in);
 
-    // Message indices tensor: (nbits,) int32 — index = 2*bit_pos + bit_value
-    ggml_tensor* msg_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int)ctx->hp.nbits);
-    ggml_set_name(msg_idx, "msg_indices");
-    ggml_set_input(msg_idx);
-
     // Encoder
     ggml_tensor* latent = forward_encoder(ctx0, x_in,
                                            ctx->gen_enc_in, ctx->gen_enc_res,
                                            ctx->gen_enc_down, ctx->gen_enc_lstm,
                                            ctx->gen_enc_out, ctx->hp.ratios.data());
 
+    // Mark encoder output for stage extraction
+    ggml_set_name(latent, "enc_output");
+    ggml_set_output(latent);
+    ggml_build_forward_expand(gf, latent);
+
     // Message embedding: Embedding(32, 128). For each of 16 bits,
     // index = 2*bit_pos + bit_value, look up embedding, sum all 16.
     // Then broadcast-add to latent across time dimension.
     if (ctx->gen_msg_w) {
-        // Build indices from message bits: for bit i, index = 2*i + bit[i]
         ggml_tensor* indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int)ctx->hp.nbits);
         ggml_set_name(indices, "msg_indices");
         ggml_set_input(indices);
@@ -750,6 +763,33 @@ float* audioseal_embed(struct audioseal_ctx* ctx,
         ggml_gallocr_free(galloc);
         ggml_free(ctx0);
         return nullptr;
+    }
+
+    // Dump intermediate stages for debug/diff comparison
+    if (std::getenv("AUDIOSEAL_DUMP_STAGES")) {
+        const char* stage_names[] = {"stage_enc_0", "stage_enc_res0", "stage_enc_down0",
+                                     "stage_enc_res1", "stage_enc_down1",
+                                     "stage_enc_res2", "stage_enc_down2",
+                                     "stage_enc_res3", "stage_enc_down3",
+                                     "enc_output", nullptr};
+        for (int s = 0; stage_names[s]; s++) {
+            ggml_tensor* st = ggml_graph_get_tensor(gf, stage_names[s]);
+            if (!st) continue;
+            size_t nbytes = ggml_nbytes(st);
+            std::vector<float> buf(nbytes / sizeof(float));
+            ggml_backend_tensor_get(st, buf.data(), 0, nbytes);
+            char path[256];
+            snprintf(path, sizeof(path), "/tmp/as_ggml_%s.bin", stage_names[s]);
+            FILE* df = fopen(path, "wb");
+            if (df) {
+                int32_t hdr[2] = {(int32_t)st->ne[0], (int32_t)st->ne[1]};
+                fwrite(hdr, sizeof(int32_t), 2, df);
+                fwrite(buf.data(), sizeof(float), buf.size(), df);
+                fclose(df);
+                fprintf(stderr, "audioseal: dumped %s ne=[%lld,%lld] to %s\n",
+                        stage_names[s], (long long)st->ne[0], (long long)st->ne[1], path);
+            }
+        }
     }
 
     // Extract output (may be shorter than input due to encoder rounding)

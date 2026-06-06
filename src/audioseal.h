@@ -66,6 +66,15 @@ uint32_t audioseal_nbits(const struct audioseal_ctx* ctx);
 //
 // Returns a malloc'd float32 buffer of `n_samples` elements. Caller
 // frees with `free()`. Returns nullptr on error.
+// Extract a named intermediate tensor from the embed graph.
+// `stage_name` is one of: "enc_output", "audio_out".
+// Returns a malloc'd float32 buffer. Caller frees with free().
+// *out_n receives the number of elements.
+float* audioseal_embed_stage(struct audioseal_ctx* ctx,
+                             const float* pcm, int n_samples,
+                             const uint8_t* message,
+                             const char* stage_name, int* out_n);
+
 float* audioseal_embed(struct audioseal_ctx* ctx,
                        const float* pcm, int n_samples,
                        const uint8_t* message);
