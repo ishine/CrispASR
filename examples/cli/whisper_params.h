@@ -263,6 +263,11 @@ struct whisper_params {
     std::string tts_instruct; // VoiceDesign: natural-language voice description
     bool tts_trim_silence = false;
 
+    // AudioSeal neural watermark model (optional upgrade from spread-spectrum).
+    // When set, loads the GGUF and uses it for watermark embed/detect
+    // instead of the built-in spread-spectrum watermark.
+    std::string watermark_model;
+
     // C2PA (Content Credentials) signing — compile-time gated on
     // CRISPASR_HAVE_C2PA. Paths to self-signed or CA-issued X.509 cert
     // and key. Generate with: scripts/generate-c2pa-cert.sh

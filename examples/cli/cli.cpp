@@ -538,6 +538,8 @@ static bool whisper_params_parse_arg_streaming_tts(int argc, char** argv, int& i
         params.tts_voice_dir = ARGV_NEXT;
     } else if (arg == "--tts-max-input-chars") {
         params.tts_max_input_chars = std::stoi(ARGV_NEXT);
+    } else if (arg == "--watermark-model") {
+        params.watermark_model = ARGV_NEXT;
     } else if (arg == "--c2pa-cert") {
         params.c2pa_cert = ARGV_NEXT;
     } else if (arg == "--c2pa-key") {
@@ -1048,6 +1050,9 @@ static void whisper_print_usage(int /*argc*/, char** argv, const whisper_params&
             "             --tts-max-input-chars N  [%-7d] server: cap on /v1/audio/speech `input` "
             "length (0 = no cap)\n",
             params.tts_max_input_chars);
+    fprintf(stderr,
+            "             --watermark-model PATH           AudioSeal GGUF for neural watermarking "
+            "(upgrades built-in spread-spectrum)\n");
     fprintf(stderr,
             "             --c2pa-cert PATH                 X.509 cert for C2PA Content Credentials signing\n"
             "             --c2pa-key PATH                  private key for C2PA signing "
