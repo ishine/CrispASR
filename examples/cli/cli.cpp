@@ -2009,6 +2009,13 @@ int main(int argc, char** argv) {
         return ok ? 0 : 1;
     }
 
+    // --detect-watermark is a standalone verb that doesn't need any model
+    // or input files — route directly to the backend (which handles it
+    // and exits before any model resolution).
+    if (!params.detect_watermark_file.empty()) {
+        return crispasr_run_backend(params);
+    }
+
     if (params.fname_inp.empty() && !params.stream && params.tts_text.empty() && params.text_input.empty()) {
         fprintf(stderr, "error: no input files specified\n");
         whisper_print_usage(argc, argv, params);
