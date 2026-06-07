@@ -16,7 +16,7 @@ TEST_CASE("ARPAbet to IPA conversion", "[g2p][arpabet]") {
         CHECK(g2p_en::arpa_to_ipa("AA0") == "ɑː");
         CHECK(g2p_en::arpa_to_ipa("AE1") == "ˈæ");
         CHECK(g2p_en::arpa_to_ipa("IY0") == "i");    // unstressed → short
-        CHECK(g2p_en::arpa_to_ipa("UW2") == "uː");   // secondary stress not emitted
+        CHECK(g2p_en::arpa_to_ipa("UW2") == "ˌuː");   // secondary stress emitted
         CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");    // unstressed → schwa
         CHECK(g2p_en::arpa_to_ipa("EY1") == "ˈeɪ");
     }
@@ -31,10 +31,12 @@ TEST_CASE("ARPAbet to IPA conversion", "[g2p][arpabet]") {
         CHECK(g2p_en::arpa_to_ipa("HH") == "h");
         CHECK(g2p_en::arpa_to_ipa("JH") == "dʒ");
     }
-    SECTION("stress markers") {
+    SECTION("stress markers and reductions") {
         CHECK(g2p_en::arpa_to_ipa("AH0") == "ə");     // unstressed → schwa
         CHECK(g2p_en::arpa_to_ipa("AH1") == "ˈʌ");    // primary stress → ʌ
-        CHECK(g2p_en::arpa_to_ipa("AH2") == "ʌ");     // secondary not emitted
+        CHECK(g2p_en::arpa_to_ipa("AH2") == "ˌʌ");    // secondary stress
+        CHECK(g2p_en::arpa_to_ipa("IH0") == "ᵻ");     // barred-i unstressed
+        CHECK(g2p_en::arpa_to_ipa("ER1") == "ˈɜː");   // stressed → ɜː
     }
     SECTION("case insensitivity") {
         CHECK(g2p_en::arpa_to_ipa("ah0") == "ə");
@@ -294,9 +296,9 @@ TEST_CASE("CMUdict IPA output quality", "[g2p][cmudict][quality]") {
         CHECK(!ipa.empty());
     }
 
-    SECTION("world has ɹ or ɜ") {
+    SECTION("world has ɜː (stressed ER)") {
         std::string ipa = g2p_en::word_to_ipa(ctx, "world");
-        bool has_r = ipa.find("ɹ") != std::string::npos || ipa.find("ɜ") != std::string::npos;
+        bool has_r = ipa.find("ɜː") != std::string::npos || ipa.find("ɚ") != std::string::npos;
         CHECK(has_r);
     }
 

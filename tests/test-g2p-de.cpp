@@ -73,9 +73,9 @@ TEST_CASE("German LTS: consonant specifics", "[g2p_de][lts]") {
         std::string ipa = g2p_de::lts_word_to_ipa("lang");
         CHECK(ipa.find("\xC5\x8B") != std::string::npos);
     }
-    SECTION("r → ʁ") {
+    SECTION("r → r (espeak-ng DE uses plain r)") {
         std::string ipa = g2p_de::lts_word_to_ipa("rot");
-        CHECK(ipa.find("\xCA\x81") != std::string::npos);
+        CHECK(ipa.find("r") != std::string::npos);
     }
 }
 
@@ -86,9 +86,9 @@ TEST_CASE("German LTS: schwa and -er", "[g2p_de][lts]") {
         std::string ipa = g2p_de::lts_word_to_ipa("habe");
         CHECK(ipa.find("\xC9\x99") != std::string::npos);
     }
-    SECTION("final -er → ɐ") {
+    SECTION("final -er → ɜ (espeak-ng DE)") {
         std::string ipa = g2p_de::lts_word_to_ipa("besser");
-        CHECK(ipa.find("\xC9\x90") != std::string::npos);
+        CHECK(ipa.find("\xC9\x9C") != std::string::npos); // ɜ
     }
 }
 
@@ -135,14 +135,14 @@ TEST_CASE("German LTS: Auslautverhärtung", "[g2p_de][devoicing]") {
 // ══════════════════════════════════════════════════════════════════════
 
 TEST_CASE("German LTS: open-syllable lengthening", "[g2p_de][vowel_length]") {
-    SECTION("open syllable: 'name' → a is long (aː)") {
+    SECTION("open syllable: 'name' → ɑː (long)") {
         std::string ipa = g2p_de::lts_word_to_ipa("name");
-        CHECK(ipa.find("a\xCB\x90") != std::string::npos); // aː
+        CHECK(ipa.find("\xC9\x91\xCB\x90") != std::string::npos); // ɑː
     }
     SECTION("closed syllable: 'mann' → a is short") {
         std::string ipa = g2p_de::lts_word_to_ipa("mann");
-        // Should NOT have aː (double nn closes syllable)
-        bool has_long_a = ipa.find("a\xCB\x90") != std::string::npos;
+        // Should NOT have ɑː (double nn closes syllable)
+        bool has_long_a = ipa.find("\xC9\x91\xCB\x90") != std::string::npos;
         CHECK(!has_long_a);
     }
     SECTION("open syllable ö: 'mögen' → øː") {

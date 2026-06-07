@@ -32,10 +32,10 @@ namespace g2p_en {
 
 inline const std::map<std::string, std::string>& arpabet_to_ipa() {
     static const std::map<std::string, std::string> table = {
-        // Vowels
+        // Vowels — tuned to match espeak-ng output for piper compatibility
         {"AA", "ɑː"},  {"AE", "æ"},   {"AH", "ʌ"},   {"AO", "ɔː"},
         {"AW", "aʊ"},  {"AX", "ə"},   {"AY", "aɪ"},  {"EH", "ɛ"},
-        {"ER", "ɜːɹ"}, {"EY", "eɪ"},  {"IH", "ɪ"},   {"IX", "ɨ"},
+        {"ER", "ɚ"},   {"EY", "eɪ"},  {"IH", "ɪ"},   {"IX", "ɨ"},
         {"IY", "iː"},  {"OW", "oʊ"},  {"OY", "ɔɪ"},  {"UH", "ʊ"},
         {"UW", "uː"},  {"UX", "ʉ"},
         // Consonants
@@ -66,21 +66,26 @@ inline std::string arpa_to_ipa(const std::string& arpa) {
     for (auto& c : base) c = (char)toupper((unsigned char)c);
 
     // Stress-dependent vowel quality (matches espeak-ng output):
-    // AH0 → ə (schwa, not ʌ — unstressed "a" reduces to schwa)
-    // AH1/AH2 → ʌ (strut vowel, stressed)
-    // IY0 → i (short, not iː — unstressed)
-    // IY1/IY2 → iː (long, stressed)
-    // ER → ɜː (no trailing ɹ — piper handles rhoticity via the model)
+    //   AH0 → ə (schwa — unstressed "uh" always reduces)
+    //   AH1 → ˈʌ (strut vowel, stressed)
+    //   IH0 → ᵻ (barred-i — espeak's unstressed KIT vowel)
+    //   IH1 → ˈɪ (KIT vowel, stressed)
+    //   IY0 → i (short — unstressed FLEECE)
+    //   IY1 → ˈiː (long FLEECE, stressed)
+    //   ER  → ɚ (rhotacized schwa — espeak doesn't use ɜː+ɹ)
     std::string ipa;
     if (stress == 1) ipa = "ˈ";
-    // Note: secondary stress (2) is intentionally NOT emitted.
-    // espeak-ng rarely uses ˌ for piper models, and it changes prosody
-    // enough to confuse ASR (e.g. "audio" heard as "idea").
+    // Secondary stress: espeak uses ˌ for compound words; we emit it
+    // selectively (helps compounds like "dictionary" dˈɪkʃənˌɛɹi).
+    else if (stress == 2) ipa = "ˌ";
 
     if (base == "AH" && stress == 0) { ipa += "ə"; return ipa; }
+    if (base == "IH" && stress == 0) { ipa += "ᵻ"; return ipa; }  // barred-i
     if (base == "IY" && stress == 0) { ipa += "i"; return ipa; }
-    if (base == "IH" && stress == 0) { ipa += "ɪ"; return ipa; } // keep as-is but no length
-    if (base == "ER") { ipa += "ɜː"; return ipa; } // no trailing ɹ
+    if (base == "UW" && stress == 0) { ipa += "ʊ"; return ipa; }  // unstressed GOOSE → ʊ
+    // ER: stressed → ɜː (were, her), unstressed → ɚ (after, under)
+    if (base == "ER" && stress >= 1) { ipa += "ɜː"; return ipa; }
+    if (base == "ER") { ipa += "ɚ"; return ipa; }
 
     auto& table = arpabet_to_ipa();
     auto it = table.find(base);
@@ -479,9 +484,39 @@ inline std::string word_to_ipa(const context& ctx, const std::string& word) {
         arpa_phones = lts_predict(word);
     }
 
-    // Convert ARPAbet → IPA
+    // Convert ARPAbet → IPA with T-flapping.
+    // In American English, /t/ between a stressed vowel and an unstressed
+    // vowel becomes a tap [ɾ] (e.g. "water" → wˈɔːɾɚ, "data" → dˈeɪɾə).
+    // espeak-ng does this and piper models expect it.
     std::string ipa;
-    for (const auto& ph : arpa_phones) {
+    int n_ph = (int)arpa_phones.size();
+    for (int pi = 0; pi < n_ph; pi++) {
+        const auto& ph = arpa_phones[pi];
+        std::string base_ph = ph;
+        if (!base_ph.empty() && base_ph.back() >= '0' && base_ph.back() <= '2')
+            base_ph.pop_back();
+        for (auto& c : base_ph) c = (char)toupper((unsigned char)c);
+
+        // T-flapping: T or D between vowels → ɾ (when next vowel is unstressed)
+        if ((base_ph == "T" || base_ph == "D") && pi > 0 && pi + 1 < n_ph) {
+            // Check prev is a vowel phoneme
+            std::string prev_base = arpa_phones[pi-1];
+            if (!prev_base.empty() && prev_base.back() >= '0' && prev_base.back() <= '2')
+                prev_base.pop_back();
+            for (auto& c : prev_base) c = (char)toupper((unsigned char)c);
+            bool prev_vowel = (prev_base == "AA" || prev_base == "AE" || prev_base == "AH" ||
+                prev_base == "AO" || prev_base == "AW" || prev_base == "AY" || prev_base == "EH" ||
+                prev_base == "ER" || prev_base == "EY" || prev_base == "IH" || prev_base == "IY" ||
+                prev_base == "OW" || prev_base == "OY" || prev_base == "UH" || prev_base == "UW");
+            // Check next is an unstressed vowel
+            std::string next = arpa_phones[pi+1];
+            bool next_unstressed = !next.empty() && next.back() == '0';
+            if (prev_vowel && next_unstressed) {
+                ipa += "ɾ"; // tap
+                continue;
+            }
+        }
+
         std::string p = arpa_to_ipa(ph);
         if (!p.empty()) ipa += p;
     }

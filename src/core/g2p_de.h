@@ -228,10 +228,10 @@ inline std::string lts_word_to_ipa(const std::string& word) {
         if (c == 'i' && c1 == 'e') { ipa += "i\xCB\x90"; i += 2; continue; }
         if (c == 'e' && c1 == 'e') { ipa += "e\xCB\x90"; i += 2; continue; }
         if (c == 'o' && c1 == 'o') { ipa += "o\xCB\x90"; i += 2; continue; }
-        if (c == 'a' && c1 == 'a') { ipa += "a\xCB\x90"; i += 2; continue; }
+        if (c == 'a' && c1 == 'a') { ipa += "\xC9\x91\xCB\x90"; i += 2; continue; }  // aa → ɑː
         // Lengthening-h digraphs
         if (c == 'e' && c1 == 'h') { ipa += "e\xCB\x90"; i += 2; continue; }
-        if (c == 'a' && c1 == 'h') { ipa += "a\xCB\x90"; i += 2; continue; }
+        if (c == 'a' && c1 == 'h') { ipa += "\xC9\x91\xCB\x90"; i += 2; continue; }  // ah → ɑː
         if (c == 'o' && c1 == 'h') { ipa += "o\xCB\x90"; i += 2; continue; }
         if (c == 'u' && c1 == 'h') { ipa += "u\xCB\x90"; i += 2; continue; }
         if (c == 'i' && c1 == 'h') { ipa += "i\xCB\x90"; i += 2; continue; }
@@ -279,14 +279,14 @@ inline std::string lts_word_to_ipa(const std::string& word) {
 
         // --- Single vowels with open-syllable lengthening ---
         if (c == 'a') {
-            if (is_open_syllable(w, i)) ipa += "a\xCB\x90"; // aː
+            if (is_open_syllable(w, i)) ipa += "\xC9\x91\xCB\x90"; // ɑː (espeak-ng DE)
             else ipa += "a";
             i++; continue;
         }
         if (c == 'e') {
             if (i == len - 1) { ipa += "\xC9\x99"; i++; continue; } // final schwa
             if (c1 == 'r' && (i + 2 == len || at(2) == ' ' || at(2) == '-')) {
-                ipa += "\xC9\x90"; i += 2; continue; // -er → ɐ
+                ipa += "\xC9\x9C"; i += 2; continue; // -er → ɜ (espeak-ng DE)
             }
             if (is_open_syllable(w, i)) ipa += "e\xCB\x90"; // eː
             else ipa += "\xC9\x9B"; // ɛ
@@ -321,7 +321,7 @@ inline std::string lts_word_to_ipa(const std::string& word) {
         if (c == 'm') { ipa += "m"; i++; continue; }
         if (c == 'n') { ipa += "n"; i++; continue; }
         if (c == 'p') { ipa += "p"; i++; continue; }
-        if (c == 'r') { ipa += "\xCA\x81"; i++; continue; }
+        if (c == 'r') { ipa += "r"; i++; continue; }  // espeak-ng DE uses plain r
         if (c == 's') {
             if (c1 == 'a' || c1 == 'e' || c1 == 'i' || c1 == 'o' || c1 == 'u' ||
                 (unsigned char)c1 == 0xC3) {
