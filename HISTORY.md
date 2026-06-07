@@ -20,16 +20,30 @@ link. Replaced with MIT-clean `espeak_dlopen.h` (loads at runtime)
 
 | Language | Module | Approach | Dict |
 |----------|--------|----------|------|
-| English | `g2p_en.h` | CMUdict (134K, BSD) + neural GRU + LTS | auto-dl |
-| German | `g2p_de.h` | LTS (sch/ch/ei/eu/au/ä/ö/ü) + IPA dict (787K) | auto-dl |
-| French | `g2p_fr.h` | LTS (nasals/oi/eau/silent finals) + IPA dict | auto-dl |
-| Spanish | `g2p_es.h` | LTS (seseo/lenition/yeísmo/ch/ll/ñ) + IPA dict | auto-dl |
+| English | `g2p_en.h` | CMUdict (134K, BSD) + neural GRU + LTS | auto-dl from HF |
+| German | `g2p_de.h` | Auslautverhärtung + open-syllable lengthening + compound splitting + LTS | OLaPh MIT 1.12M, auto-dl |
+| French | `g2p_fr.h` | LTS (nasals/oi/eau/silent finals/s-voicing) | OLaPh MIT, auto-dl |
+| Spanish | `g2p_es.h` | LTS (seseo/lenition/yeísmo/ch/ll/ñ) | OLaPh MIT, auto-dl |
 
-Phoneme inventory validated against piper's 154-char map (zero mismatches).
-`filter_to_inventory()` added for runtime safety. Dict auto-download via
-`crispasr_cache`. Cascade: builtin_{en,de,fr,es} → espeak_dlopen → espeak_popen.
+**Phoneme inventory:** All output IPA chars validated against piper's
+154-char `phoneme_id_map`. Fixed combining tie U+0361 (not in map).
+Fixed stress-dependent vowel quality: AH0→ə (was ʌ), IY0→i (was iː),
+ER→ɜː (was ɜːɹ), dropped secondary stress ˌ. These changes match
+espeak-ng's output exactly and resolved the "audio"→"idea" whisper
+hallucination issue (was 60% error, now <20%).
 
-**Tests:** 192 assertions, 35 test cases, 4 live TTS→ASR roundtrips.
+**Dicts:** OLaPh (iisys-hof/olaph, MIT) as primary source — 13 languages,
+1.12M German entries. Uploaded to HuggingFace `cstr/g2p-dicts`. Selectable
+via `--g2p-dict olaph|open-dict|/path` CLI flag or `CRISPASR_G2P_DICT_SOURCE`
+env var. open-dict-data (CC-BY-SA) available as alternative.
+
+**Wiring:** `--g2p-dict` CLI flag → `whisper_params.g2p_dict` →
+`piper_tts_set_g2p_dict()` C API → `crispasr_session_set_g2p_dict()`
+unified session API → Go binding `SetG2PDict()`. Server via startup flag.
+
+**Tests:** 202 unit assertions across 38 test cases + 4 live roundtrips.
+
+**Docs:** README.md, docs/tts.md (G2P section), docs/cli.md updated.
 
 ---
 
