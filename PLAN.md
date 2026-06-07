@@ -5093,11 +5093,15 @@ Each language module is a header-only file (`core/g2p_XX.h`) with:
 - Phoneme inventory validated: all output chars verified against piper's
   154-char `phoneme_id_map`. Fixed combining tie U+0361 (not in map).
   Added `filter_to_inventory()` for runtime validation.
-- Dict auto-download: CMUdict (BSD), DE/FR/ES IPA dicts (CC-BY-SA)
-  via `crispasr_cache::ensure_cached_file()` when `CRISPASR_HAS_CACHE`
-  defined; local cache dir fallback otherwise.
-- Tests: 192 unit assertions (85 EN + 30 DE + 22 FR + 21 ES + 30 piper
-  + 4 inventory) across 35 test cases + 4 live TTS→ASR roundtrips.
+- Vowel quality fixes: AH0→ə (was ʌ), IY0→i (was iː), ER→ɜː (was ɜːɹ),
+  dropped secondary stress ˌ. Matches espeak-ng output exactly.
+- Dict auto-download: CMUdict (BSD) + OLaPh dicts (MIT, 13 langs) from
+  HuggingFace `cstr/g2p-dicts`. Selectable via `--g2p-dict` CLI flag
+  or `CRISPASR_G2P_DICT_SOURCE` env var. open-dict-data (CC-BY-SA) as alt.
+- Full wiring: CLI `--g2p-dict` → `whisper_params` → C API
+  `crispasr_session_set_g2p_dict()` → Go `SetG2PDict()` → server startup.
+- Tests: 202 unit assertions (85 EN + 44 DE + 22 FR + 21 ES + 30 piper)
+  across 38 test cases + 4 live TTS→ASR roundtrips.
 
 ### Phase 3 — open
 
@@ -5139,10 +5143,15 @@ Paper: arXiv 2509.20086v3. Auto-downloadable via `crispasr_cache`.
 - Could embed CMUdict / neural G2P weights per-model for zero
   external dependencies at runtime
 
-**c. Gruut CRF (MIT) for German OOV**
+**c. Gruut CRF (MIT) for German/multilingual OOV**
 - rhasspy/gruut: dictionary + CRF G2P model (18 MB, SQLite + CRFsuite)
-- Higher quality than LTS rules for unknown German words
+- Higher quality than LTS rules for unknown words (compounds, loanwords)
 - CRFsuite is BSD — native C/C++ dependency
+- Gruut supports: de, en, fr, es, it, nl, pt, ru, sv, cs, ar, fa, sw
+- Port path: extract SQLite lexicon + CRFsuite model, write C++ feature
+  extractor (~100 lines), link against libcrfsuite (BSD)
+- Lower priority now that OLaPh MIT dicts (1.12M DE entries) cover most
+  words; gruut adds value mainly for truly novel OOV words
 
 **d. Neural G2P weight distribution**
 - MeloTTS v3 GGUF has `melotts.g2p_en_json` (base64, ~4 KB weights)
