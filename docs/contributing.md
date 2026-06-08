@@ -299,6 +299,30 @@ python tools/dump_reference.py --backend voxtral \
 # summary: 2 pass, 0 fail, 0 skip (cos threshold 0.999)
 ```
 
+**`crispasr-diff` works for TTS backends too**, not only ASR. For TTS,
+the 4th argument (`audio.wav`) is ignored — pass any valid WAV (e.g.
+`samples/jfk.wav`). Text and other TTS inputs come from env vars
+(`<BACKEND>_SYN_TEXT`, `ZONOS_TTS_TEXT`, `CHATTERBOX_SYN_TEXT`, …).
+See the **`chatterbox`** dispatch in `crispasr_diff_main.cpp` as the
+canonical TTS template; `zonos-tts` follows the same pattern.
+
+```bash
+# TTS example — conditioning_prefix stage for Zonos:
+ZONOS_TTS_TEXT="Hello world." ZONOS_SPEAKER_EMB_PATH=/path/to/jfk_speaker_emb.bin \
+python tools/dump_reference.py --backend zonos-tts \
+    --model-dir Zyphra/Zonos-v0.1-transformer \
+    --audio samples/jfk.wav \
+    --stages conditioning_prefix \
+    --output /tmp/zonos-ref.gguf
+
+ZONOS_TTS_TEXT="Hello world." ZONOS_SPEAKER_EMB_PATH=/path/to/jfk_speaker_emb.bin \
+./build/bin/crispasr-diff zonos-tts \
+    zonos-v0.1-transformer-q4_k.gguf \
+    /tmp/zonos-ref.gguf \
+    samples/jfk.wav
+# [PASS/FAIL] conditioning_prefix  shape=[2048,22,2]  cos_min=…  cos_mean=…
+```
+
 The Python dumper uses PyTorch forward hooks to capture intermediate
 activations (mel, per-encoder-layer output, projector, LLM block
 output, logits, argmax) and writes them to a single **GGUF tensor
