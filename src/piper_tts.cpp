@@ -25,7 +25,11 @@
 #include "core/conv.h"
 #include "core/g2p_en.h"
 #include "core/gguf_loader.h"
+// crispasr_cache is part of crispasr-lib, not piper-tts; guard behind CRISPASR_BUILD.
+#ifdef CRISPASR_BUILD
 #include "crispasr_cache.h"
+#define PIPER_HAS_CACHE 1
+#endif
 
 #include <algorithm>
 #include <cassert>
@@ -321,7 +325,8 @@ static void g2p_ensure_espeak_dict() {
             return;
         }
     }
-    // Auto-download from HuggingFace
+    // Auto-download from HuggingFace (only when linked into crispasr-lib)
+#ifdef PIPER_HAS_CACHE
     std::string path = crispasr_cache::ensure_cached_file(
         "espeak_en_us.tsv", "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/espeak_en_us.tsv",
         /*quiet=*/true, "crispasr", "");
@@ -330,6 +335,7 @@ static void g2p_ensure_espeak_dict() {
         if (n > 0)
             fprintf(stderr, "piper_tts: espeak IPA dict loaded (%d entries)\n", n);
     }
+#endif
 }
 
 static void g2p_ensure_cmudict() {
@@ -355,12 +361,14 @@ static void g2p_ensure_cmudict() {
         if (g2p_en::load_cmudict_file(g_g2p_ctx.dict, base + "cmudict.dict") > 0)
             return;
     }
-    // 3. Auto-download from HuggingFace
+    // 3. Auto-download from HuggingFace (only when linked into crispasr-lib)
+#ifdef PIPER_HAS_CACHE
     std::string path = crispasr_cache::ensure_cached_file(
         "cmudict.dict", "https://huggingface.co/datasets/cstr/g2p-dicts/resolve/main/cmudict.dict",
         /*quiet=*/true, "crispasr", "");
     if (!path.empty())
         g2p_en::load_cmudict_file(g_g2p_ctx.dict, path);
+#endif
 }
 
 static bool phonemize_builtin(const std::string& voice, const std::string& text, std::string& out) {
