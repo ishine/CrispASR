@@ -58,6 +58,10 @@ import kaggle_harness as kh
 kh.init_progress()
 kh.resolve_hf_token()
 
+# espeak-ng is required for proper IPA phonemization
+run(["apt-get", "update", "-qq"], check=False)
+run(["apt-get", "install", "-y", "--no-install-recommends", "espeak-ng"], check=False)
+
 sha = subprocess.check_output(
     ["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True
 ).strip()
@@ -126,19 +130,15 @@ asr_model = Path(hf_hub_download(
 ))
 kh.step("models_downloaded")
 
-# ── Generate speaker embedding ──────────────────────────────────────
-# Zonos needs a 128-d speaker embedding. Pre-compute from jfk.wav
-# using a simple random embedding for testing (the actual ResNet293
-# encoder isn't in the C++ runtime yet).
-kh.step("generating_speaker_embedding")
-import numpy as np
-import struct
-spk_emb = np.random.RandomState(42).randn(128).astype(np.float32)
-spk_emb /= np.linalg.norm(spk_emb)  # unit normalize
-spk_emb_path = WORK / "speaker_emb.bin"
-with open(str(spk_emb_path), "wb") as f:
-    f.write(struct.pack("<i", 128))  # int32 dim header
-    f.write(spk_emb.tobytes())
+# ── Download pre-computed speaker embedding ─────────────────────────
+# Real 128-d LDA speaker embedding extracted from JFK audio via Zonos's
+# ResNet293 encoder. Random embeddings produce garbage output.
+kh.step("downloading_speaker_embedding")
+spk_emb_path = Path(hf_hub_download(
+    "cstr/zonos-v0.1-transformer-GGUF",
+    "jfk_speaker_emb.bin",
+    cache_dir=str(MODELS), token=token,
+))
 kh.step("speaker_embedding_done")
 
 # ── Synthesize ──────────────────────────────────────────────────────
